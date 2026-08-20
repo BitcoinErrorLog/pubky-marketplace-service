@@ -16,7 +16,8 @@ crates/domain      Canonical contracts: command envelope + payload validation,
                    emit-contracts binary.
 crates/service     axum HTTP service: Postgres schema (sqlx migrations),
                    Pubky challenge–response auth, command executor with
-                   idempotency, command handlers, reservation expiry worker.
+                   idempotency, command handlers, background worker runtime
+                   (expiry, auction close, outbox delivery with leases).
 contracts/         state-machines.json — the machine-readable state machine
                    contract emitted from crates/domain.
 docker-compose.yml Dev/test PostgreSQL 17 on port 55432.
@@ -48,11 +49,14 @@ Migrations in `crates/service/migrations/` are applied automatically at boot
 | `ALLOWED_ORIGINS` | empty | comma-separated exact CORS origins |
 | `AUTH_CHALLENGE_TTL_SECONDS` | `120` | auth challenge lifetime |
 | `AUTH_SESSION_TTL_SECONDS` | `86400` | session token lifetime |
-| `RESERVATION_SWEEP_INTERVAL_SECONDS` | `10` | expiry worker interval |
+| `WORKER_INTERVAL_SECONDS` | `10` | background worker pass interval |
+| `WORKER_LEASE_SECONDS` | `30` | worker task/outbox lease duration |
+| `MODERATOR_PUBKYS` | empty | comma-separated moderator pubkys, validated as z-base-32 at startup |
 
 Endpoints: `GET /health`, `GET /ready` (checks the database),
 `POST /v1/auth/challenges`, `POST /v1/auth/sessions`,
-`POST /v1/commands` (Bearer session required).
+`POST /v1/commands` (Bearer session required), and `GET /v1/reports`
+(Bearer session required; role-scoped — see Moderation below).
 
 ## Test
 
@@ -99,10 +103,14 @@ envelope; unknown fields and unsupported versions are rejected
 - Failures are not stored: retrying a rejected command re-executes it
   (matching the prototype engine).
 
-Commands implemented in this vertical slice: `listing.register`,
-`inventory.reserve`, `checkout.create`, plus server-time reservation expiry
-(a background sweep, not a client command). All other command kinds are
-rejected by the envelope contract until they are ported with their tests.
+Commands implemented: `listing.register`, `inventory.reserve`,
+`checkout.create`, `offer.create`, `offer.counter`, `offer.accept`,
+`offer.reject`, `offer.withdraw`, `auction.place_bid`, `auction.close`,
+`trust.report`, and `trust.decide` (this service only; see Moderation).
+Server-driven transitions (reservation expiry, offer expiry, auction close
+on server time, outbox delivery) run in the background worker runtime, not
+as client commands. All other command kinds are rejected by the envelope
+contract until they are ported with their tests.
 
 ## Authentication (task 3.2)
 
@@ -124,6 +132,45 @@ Challenge–response against the actor's Pubky (ed25519, z-base-32):
 
 CORS is restricted to the exact origins in `ALLOWED_ORIGINS`.
 
+## Background workers (task 3.4)
+
+One worker runtime (`crates/service/src/workers.rs`) drains four server-time
+tasks: reservation expiry, offer expiry, auction close, and the outbox.
+
+- **Leases.** Each task has a row in `worker_leases`; an instance takes (or
+  renews) it with a conditional upsert and holds it for
+  `WORKER_LEASE_SECONDS`. Two instances never drain the same task
+  concurrently, and a holder that dies mid-lease is recovered by any
+  instance once the lease lapses. Inside a task, due rows are additionally
+  locked with `FOR UPDATE SKIP LOCKED`, so even a lease violation cannot
+  double-process a row.
+- **Outbox.** Intents are written in the command transaction (ADR-0019 §4)
+  and delivered at least once: a claim stamps `lease_until` on the row, then
+  each row's notification insert and `delivered_at` mark commit in one
+  transaction. A crash between claim and delivery leaves the row leased but
+  undelivered; it is redelivered after the lease lapses. The consumer side
+  (the `notifications` table) dedups by `(event_id, recipient_pubky)`, so
+  redelivery never duplicates the effect.
+- **Auction close on server time.** The worker closes active auctions whose
+  `ends_at` has passed through the same code path as the seller's
+  `auction.close` command; the `active` status guard plus the partial unique
+  index `orders_one_winner_per_auction` make the close exactly-once even
+  when the command and the worker race.
+
+## Moderation (task 3.5)
+
+Moderators are the pubkys configured in `MODERATOR_PUBKYS` (validated as
+z-base-32 at startup; there is no hardcoded moderator identity and no broad
+admin role — the moderator role only grants the powers below).
+
+- `trust.report` (any authenticated user) files a report.
+- `GET /v1/reports` is role-scoped: a moderator reads every report; any
+  other user reads only the reports they submitted, never another user's.
+- `trust.decide` (moderators only) records a decision (`dismissed` or
+  `actioned`). Decisions are appended to `report_decisions`, which rejects
+  `UPDATE`/`DELETE` by trigger; the report row tracks the resulting state
+  under the usual revision compare-and-swap.
+
 ## PostgreSQL invariants (ADR-0019 §4)
 
 Each accepted command atomically persists the aggregate state/revision, one
@@ -144,7 +191,7 @@ in one transaction. Constraints enforce:
 ## State machine contract (task 3.3)
 
 The canonical state/transition tables for listing, reservation, offer,
-auction, order, and payment live in one module:
+auction, order, payment, and report live in one module:
 `crates/domain/src/state_machines.rs`. The machine-readable artifact is
 emitted to `contracts/state-machines.json`:
 
@@ -171,6 +218,13 @@ This service is canonical and resolves them as follows:
 | Reservation states | none (engine only had `active`) | `active/converted/released/expired` | The engine stored `expiresAt` but never swept it; this service implements server-time expiry, so the terminal states are modeled. |
 | Payment states | missing `detected`, extra `created/window_elapsed/external_refund_required/refunded_external` | `awaiting_entitlement/detected/confirmed/expired/manual_review` | Prototype engine enums are the executable spec (ADR-0022). |
 | Order states | extra `ready_for_pickup/return_in_transit/return_inspection`, missing `return_approved/return_received` | the 14 prototype engine states | Same; transitions are derived from the engine's command handlers. |
+| Offer expiry | engine stored `expiresAt` and rejected late actions, but never swept | server-time sweep moves due offers to `expired` and emits `offer.expired` | Offer expiry is a real server-time transition here (offer machine already declared `offer_expiry`); the event kind is new because the engine had no sweep. |
+| Auction close on server time | seller-only sandbox command | seller command **and** a worker close on `ends_at` | ADR-0019 makes server time authoritative; an auction must close without seller cooperation. Both paths share one implementation. |
+| Auction close result | `auction_result` carried `listing` + `reservation` only | also creates and returns exactly one winning `order` + sandbox `payment` (delivery address null until provided) | The schema's `orders_one_winner_per_auction` invariant (ADR-0019 §4) is enforced at close; the order uses the final visible price and the checkout shipping/tax policy so payment flows are uniform. |
+| Moderator identity | hardcoded `MARKETPLACE_SANDBOX_MODERATOR` (`m…m`) | configured `MODERATOR_PUBKYS` list, validated at startup | Task 3.5: no hardcoded roles; independent moderator role, no broad admin. |
+| Report reads | non-moderators always got `[]` (own reports invisible) | moderators read all; other users read exactly their own submissions | A reporter can see what they filed; cross-user reads stay forbidden. |
+| Report decisions | none (reports stayed `open` forever) | `trust.decide` (moderator-only) records append-only decisions; report states `open/dismissed/actioned` | Task 3.5 requires moderator decisions recorded append-only. |
+| Notifications | synchronous in-memory append inside the command | outbox intents delivered at least once by the worker, deduped by `(event_id, recipient)` | ADR-0019 §4: side effects leave the command transaction only through the outbox. Notification preferences belong to the not-yet-ported `notification.*` commands. |
 
 `processing` and `closed` (order) and `cancelled` (auction) exist in the
 canonical enums but no current transition produces them; they are declared in
@@ -188,5 +242,5 @@ hardcoded empty values).
   aggregate id, revision, and outcome code — no payload contents, no
   addresses, no message bodies.
 - `/health` is liveness; `/ready` verifies database connectivity.
-- The reservation expiry worker runs in-process; sweeps are guarded with
-  `FOR UPDATE SKIP LOCKED` and are safe to run concurrently.
+- The worker runtime runs in-process; every drain is guarded by leases plus
+  `FOR UPDATE SKIP LOCKED`, so multiple service instances are safe.

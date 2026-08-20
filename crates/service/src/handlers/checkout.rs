@@ -7,18 +7,9 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::executor::insert_event;
-use crate::handlers::{current_listing_revision, fetch_listing};
+use crate::handlers::{current_listing_revision, fetch_listing, sandbox_tax_minor, SHIPPING_MINOR};
 use crate::model::{money_json, ListingRow, OrderRow, PaymentRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
-
-/// Flat sandbox shipping per seller order, identical to the prototype engine.
-const SHIPPING_MINOR: i64 = 1_200;
-
-/// Sandbox tax: 8% of subtotal + shipping, rounded half up in integer math
-/// (`Math.round((subtotal + shipping) * 0.08)` in the prototype engine).
-fn sandbox_tax_minor(subtotal_minor: i64, shipping_minor: i64) -> i64 {
-    (8 * (subtotal_minor + shipping_minor) + 50) / 100
-}
 
 pub async fn handle(
     tx: &mut Transaction<'_, Postgres>,
@@ -144,7 +135,7 @@ pub async fn handle(
             revision: 1,
             state: "pending_payment".to_string(),
             lines: Value::Array(lines),
-            delivery_address: delivery_address.clone(),
+            delivery_address: Some(delivery_address.clone()),
             subtotal_minor,
             shipping_minor: SHIPPING_MINOR,
             tax_minor,
@@ -238,19 +229,15 @@ pub async fn handle(
 
         // Complete notification intent for the seller, delivered by workers
         // at least once (ADR-0019 §4).
-        sqlx::query(
-            "INSERT INTO outbox (event_id, kind, payload, created_at) VALUES ($1, $2, $3, $4)",
+        crate::handlers::insert_notification_intent(
+            tx,
+            event_id,
+            "order_created",
+            seller_pubky,
+            actor,
+            &order_aggregate_id,
+            now,
         )
-        .bind(event_id)
-        .bind("notification.order_created")
-        .bind(json!({
-            "event_id": event_id,
-            "recipient_pubky": seller_pubky,
-            "actor_pubky": actor,
-            "aggregate_id": order_aggregate_id,
-        }))
-        .bind(now)
-        .execute(&mut **tx)
         .await?;
 
         orders.push(order.view());

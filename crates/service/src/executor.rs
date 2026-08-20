@@ -67,7 +67,7 @@ pub async fn execute(
     }
 
     let now = state.clock.now();
-    let outcome = dispatch(&mut tx, actor, &command, now).await;
+    let outcome = dispatch(state, &mut tx, actor, &command, now).await;
     match outcome {
         Ok(Ok(success)) => {
             let body = success_body(&command, &success);
@@ -122,6 +122,7 @@ pub async fn execute(
 }
 
 async fn dispatch(
+    state: &AppState,
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
@@ -136,6 +137,41 @@ async fn dispatch(
         }
         CommandPayload::CreateCheckout(payload) => {
             crate::handlers::checkout::handle(tx, actor, command, payload, now).await
+        }
+        CommandPayload::CreateOffer(payload) => {
+            crate::handlers::offers::create(tx, actor, command, payload, now).await
+        }
+        CommandPayload::CounterOffer(payload) => {
+            crate::handlers::offers::counter(tx, actor, command, payload, now).await
+        }
+        CommandPayload::AcceptOffer(payload) => {
+            crate::handlers::offers::accept(tx, actor, command, payload, now).await
+        }
+        CommandPayload::RejectOffer(payload) => {
+            crate::handlers::offers::reject(tx, actor, command, payload, now).await
+        }
+        CommandPayload::WithdrawOffer(payload) => {
+            crate::handlers::offers::withdraw(tx, actor, command, payload, now).await
+        }
+        CommandPayload::PlaceBid(payload) => {
+            crate::handlers::auction::place_bid(tx, actor, command, payload, now).await
+        }
+        CommandPayload::CloseAuction(payload) => {
+            crate::handlers::auction::close(tx, actor, command, payload, now).await
+        }
+        CommandPayload::CreateReport(payload) => {
+            crate::handlers::report::create(tx, actor, command, payload, now).await
+        }
+        CommandPayload::DecideReport(payload) => {
+            crate::handlers::report::decide(
+                tx,
+                actor,
+                command,
+                payload,
+                &state.config.moderator_pubkys,
+                now,
+            )
+            .await
         }
     }
 }

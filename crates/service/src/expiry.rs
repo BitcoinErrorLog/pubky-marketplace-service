@@ -10,8 +10,6 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::AppState;
-
 #[derive(Debug, sqlx::FromRow)]
 struct DueReservation {
     id: Uuid,
@@ -84,21 +82,4 @@ pub async fn expire_due_reservations(pool: &PgPool, now: DateTime<Utc>) -> anyho
     }
     tx.commit().await?;
     Ok(expired)
-}
-
-/// Spawns the periodic expiry worker used by the production binary.
-pub fn spawn_worker(state: AppState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let interval =
-            std::time::Duration::from_secs(state.config.reservation_sweep_interval_seconds);
-        loop {
-            tokio::time::sleep(interval).await;
-            let now = state.clock.now();
-            match expire_due_reservations(&state.pool, now).await {
-                Ok(0) => {}
-                Ok(count) => tracing::info!(count, "reservation expiry sweep completed"),
-                Err(error) => tracing::error!(error = %error, "reservation expiry sweep failed"),
-            }
-        }
-    })
 }

@@ -13,6 +13,7 @@ pub mod handlers;
 pub mod http;
 pub mod model;
 pub mod result;
+pub mod workers;
 
 use std::sync::Arc;
 

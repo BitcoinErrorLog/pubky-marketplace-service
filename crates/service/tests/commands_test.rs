@@ -249,7 +249,7 @@ async fn rejects_unsupported_versions_and_unported_kinds(pool: PgPool) {
     assert_eq!(body["error"]["issues"][0]["path"], json!("version"));
 
     let mut unported = register_command(&seller.pubky, 1);
-    unported["kind"] = json!("offer.create");
+    unported["kind"] = json!("message.send");
     let (status, body) = execute(&app, &seller.token, &unported).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["error"]["issues"][0]["path"], json!("kind"));

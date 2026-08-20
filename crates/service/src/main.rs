@@ -5,7 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 use marketplace_service::clock::SystemClock;
 use marketplace_service::config::Config;
-use marketplace_service::{expiry, http, AppState};
+use marketplace_service::{http, workers, AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
 
     let bind_addr = config.bind_addr;
     let state = AppState::new(pool, Arc::new(SystemClock), config);
-    expiry::spawn_worker(state.clone());
+    workers::spawn(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(addr = %bind_addr, "marketplace transaction service listening");

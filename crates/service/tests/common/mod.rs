@@ -32,16 +32,28 @@ pub struct TestApp {
     pub router: Router,
     pub pool: PgPool,
     pub clock: Arc<AdjustableClock>,
+    pub state: AppState,
 }
 
 pub async fn test_app(pool: PgPool) -> TestApp {
+    test_app_with_config(pool, Config::for_tests()).await
+}
+
+pub async fn test_app_with_moderators(pool: PgPool, moderator_pubkys: Vec<String>) -> TestApp {
+    let mut config = Config::for_tests();
+    config.moderator_pubkys = moderator_pubkys;
+    test_app_with_config(pool, config).await
+}
+
+pub async fn test_app_with_config(pool: PgPool, config: Config) -> TestApp {
     let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
-    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests());
+    let state = AppState::new(pool.clone(), clock.clone(), config);
     TestApp {
-        router: build_router(state),
+        router: build_router(state.clone()),
         pool,
         clock,
+        state,
     }
 }
 
@@ -203,6 +215,131 @@ pub fn reserve_command(
         "payload": {
             "quantity": quantity,
             "reservation_ttl_seconds": 600,
+        },
+    })
+}
+
+/// The prototype's auction fixture: one unit at 45.00 USD, ten-minute
+/// runtime, 5.00 minimum increment, 60.00 reserve, 60 s anti-sniping window
+/// with a 120 s extension.
+pub fn register_auction_command(seller_pubky: &str) -> Value {
+    let mut command = register_command(seller_pubky, 1);
+    command["command_id"] = json!("00000000-0000-4000-8000-000000000600");
+    command["payload"]["unit_price"] =
+        json!({ "amount_minor": 4_500, "currency": "USD", "exponent": 2 });
+    command["payload"]["sale_format"] = json!("auction");
+    command["payload"]["auction_terms"] = json!({
+        "starts_at": "2026-08-19T22:00:00.000Z",
+        "ends_at": "2026-08-19T22:10:00.000Z",
+        "minimum_increment": { "amount_minor": 500, "currency": "USD", "exponent": 2 },
+        "reserve_price": { "amount_minor": 6_000, "currency": "USD", "exponent": 2 },
+        "anti_sniping_window_seconds": 60,
+        "anti_sniping_extension_seconds": 120,
+    });
+    command
+}
+
+pub const OFFER_COMMAND_ID: &str = "00000000-0000-4000-8000-000000000500";
+
+pub fn offer_aggregate() -> String {
+    format!("offer:{OFFER_COMMAND_ID}")
+}
+
+pub fn create_offer_command(seller_pubky: &str, quantity: i64) -> Value {
+    json!({
+        "version": 1,
+        "command_id": OFFER_COMMAND_ID,
+        "aggregate_id": listing_aggregate(seller_pubky),
+        "expected_revision": 1,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "offer.create",
+        "payload": {
+            "amount": { "amount_minor": 10_000, "currency": "USD", "exponent": 2 },
+            "quantity": quantity,
+            "expires_in_seconds": 3_600,
+            "message": "Would you take this?",
+        },
+    })
+}
+
+pub fn counter_offer_command(expected_revision: i64) -> Value {
+    json!({
+        "version": 1,
+        "command_id": "00000000-0000-4000-8000-000000000501",
+        "aggregate_id": offer_aggregate(),
+        "expected_revision": expected_revision,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "offer.counter",
+        "payload": {
+            "offer_id": OFFER_COMMAND_ID,
+            "amount": { "amount_minor": 11_000, "currency": "USD", "exponent": 2 },
+            "quantity": 1,
+            "expires_in_seconds": 3_600,
+            "message": "Meet me here.",
+        },
+    })
+}
+
+pub fn offer_action(kind: &str, expected_revision: i64, command_id: &str) -> Value {
+    json!({
+        "version": 1,
+        "command_id": command_id,
+        "aggregate_id": offer_aggregate(),
+        "expected_revision": expected_revision,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": kind,
+        "payload": { "offer_id": OFFER_COMMAND_ID },
+    })
+}
+
+pub fn place_bid_command(
+    seller_pubky: &str,
+    index: u64,
+    maximum_minor: i64,
+    expected_revision: i64,
+) -> Value {
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x8001, index),
+        "aggregate_id": listing_aggregate(seller_pubky),
+        "expected_revision": expected_revision,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "auction.place_bid",
+        "payload": {
+            "maximum_amount": { "amount_minor": maximum_minor, "currency": "USD", "exponent": 2 },
+        },
+    })
+}
+
+pub fn close_auction_command(
+    seller_pubky: &str,
+    expected_revision: i64,
+    command_number: u64,
+) -> Value {
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x8000, command_number),
+        "aggregate_id": listing_aggregate(seller_pubky),
+        "expected_revision": expected_revision,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "auction.close",
+        "payload": {},
+    })
+}
+
+pub fn report_command(command_id: &str, target_id: &str) -> Value {
+    json!({
+        "version": 1,
+        "command_id": command_id,
+        "aggregate_id": format!("report:{command_id}"),
+        "expected_revision": 0,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "trust.report",
+        "payload": {
+            "target_type": "listing",
+            "target_id": target_id,
+            "reason": "counterfeit",
+            "details": "Brand markings appear inconsistent.",
         },
     })
 }

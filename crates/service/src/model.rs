@@ -1,9 +1,61 @@
 use chrono::{DateTime, Utc};
+use marketplace_domain::Money;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::clock::format_timestamp;
+
+/// Serde adapter for the canonical wire timestamp format (RFC 3339 with
+/// milliseconds and `Z`), used inside the auction JSONB document.
+mod ts_millis {
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &DateTime<Utc>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&crate::clock::format_timestamp(*value))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<DateTime<Utc>, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// The auction sub-document stored in `listings.auction` (JSONB), matching
+/// the prototype engine's listing aggregate shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuctionState {
+    #[serde(with = "ts_millis")]
+    pub starts_at: DateTime<Utc>,
+    #[serde(with = "ts_millis")]
+    pub ends_at: DateTime<Utc>,
+    pub minimum_increment: Money,
+    pub reserve_price: Option<Money>,
+    pub anti_sniping_window_seconds: i64,
+    pub anti_sniping_extension_seconds: i64,
+    pub status: String,
+    pub current_price: Money,
+    pub leader_pubky: Option<String>,
+    pub bid_count: i64,
+    pub reserve_met: bool,
+}
+
+impl AuctionState {
+    pub fn from_value(value: &Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value.clone())
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("auction state serializes infallibly")
+    }
+}
 
 #[derive(Debug, Clone, FromRow)]
 pub struct ListingRow {
@@ -84,6 +136,109 @@ impl ReservationRow {
 }
 
 #[derive(Debug, Clone, FromRow)]
+pub struct OfferRow {
+    pub id: Uuid,
+    pub aggregate_id: String,
+    pub listing_aggregate_id: String,
+    pub buyer_pubky: String,
+    pub seller_pubky: String,
+    pub revision: i64,
+    pub state: String,
+    pub offered_by: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub exponent: i32,
+    pub quantity: i64,
+    pub message: String,
+    pub history: Value,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl OfferRow {
+    pub fn amount_json(&self) -> Value {
+        money_json(self.amount_minor, &self.currency, self.exponent)
+    }
+
+    pub fn view(&self) -> Value {
+        json!({
+            "id": self.id,
+            "aggregate_id": self.aggregate_id,
+            "listing_aggregate_id": self.listing_aggregate_id,
+            "buyer_pubky": self.buyer_pubky,
+            "seller_pubky": self.seller_pubky,
+            "revision": self.revision,
+            "state": self.state,
+            "offered_by": self.offered_by,
+            "amount": self.amount_json(),
+            "quantity": self.quantity,
+            "message": self.message,
+            "history": self.history,
+            "expires_at": format_timestamp(self.expires_at),
+            "created_at": format_timestamp(self.created_at),
+            "updated_at": format_timestamp(self.updated_at),
+        })
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct BidRow {
+    pub id: Uuid,
+    pub listing_aggregate_id: String,
+    pub bidder_pubky: String,
+    pub maximum_amount_minor: i64,
+    pub currency: String,
+    pub exponent: i32,
+    pub sequence: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+impl BidRow {
+    pub fn view(&self) -> Value {
+        json!({
+            "id": self.id,
+            "listing_aggregate_id": self.listing_aggregate_id,
+            "bidder_pubky": self.bidder_pubky,
+            "maximum_amount": money_json(self.maximum_amount_minor, &self.currency, self.exponent),
+            "sequence": self.sequence,
+            "created_at": format_timestamp(self.created_at),
+        })
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ReportRow {
+    pub id: Uuid,
+    pub reporter_pubky: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub reason: String,
+    pub details: String,
+    pub state: String,
+    pub revision: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ReportRow {
+    pub fn view(&self) -> Value {
+        json!({
+            "id": self.id,
+            "reporter_pubky": self.reporter_pubky,
+            "target_type": self.target_type,
+            "target_id": self.target_id,
+            "reason": self.reason,
+            "details": self.details,
+            "state": self.state,
+            "revision": self.revision,
+            "created_at": format_timestamp(self.created_at),
+            "updated_at": format_timestamp(self.updated_at),
+        })
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
 pub struct OrderRow {
     pub id: Uuid,
     pub buyer_pubky: String,
@@ -91,7 +246,7 @@ pub struct OrderRow {
     pub revision: i64,
     pub state: String,
     pub lines: Value,
-    pub delivery_address: Value,
+    pub delivery_address: Option<Value>,
     pub subtotal_minor: i64,
     pub shipping_minor: i64,
     pub tax_minor: i64,
@@ -115,7 +270,7 @@ impl OrderRow {
             "revision": self.revision,
             "state": self.state,
             "lines": self.lines,
-            "delivery_address": self.delivery_address,
+            "delivery_address": self.delivery_address.clone().unwrap_or(Value::Null),
             "subtotal": money_json(self.subtotal_minor, &self.currency, self.exponent),
             "shipping": money_json(self.shipping_minor, &self.currency, self.exponent),
             "tax": money_json(self.tax_minor, &self.currency, self.exponent),
