@@ -241,7 +241,10 @@ pub async fn handle(
         .await?;
 
         orders.push(order.view());
-        payments.push(payment.view());
+        // Same redaction as the read projections: the bundle id is bearer
+        // material, so it never crosses the wire, not even to the buyer who
+        // triggered the checkout. Nothing client-side consumes it.
+        payments.push(payment.projection());
     }
 
     // Move the purchased quantity to reserved with a compare-and-swap on the

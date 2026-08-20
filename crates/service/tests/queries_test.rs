@@ -229,10 +229,14 @@ async fn orders_and_payments_are_participant_scoped_and_redacted(pool: PgPool) {
         .as_str()
         .expect("payment id present")
         .to_string();
-    let locks_bundle_id = body["result"]["payments"][0]["locks_bundle_id"]
-        .as_str()
-        .expect("command result carries the bundle id")
-        .to_string();
+    // Bearer material never crosses the wire, so the command result is redacted
+    // exactly like the read projections are.
+    assert!(
+        body["result"]["payments"][0]
+            .get("locks_bundle_id")
+            .is_none(),
+        "checkout result must not expose the Locks bundle id"
+    );
     let (status, body) = execute(&app, &other_buyer.token, &checkout(&other_seller.pubky, 2)).await;
     assert_eq!(status, StatusCode::OK, "other checkout failed: {body}");
     let other_order_id = body["result"]["orders"][0]["id"]
@@ -272,7 +276,7 @@ async fn orders_and_payments_are_participant_scoped_and_redacted(pool: PgPool) {
             "no projection may carry delivery details"
         );
         assert!(
-            !serialized.contains(&locks_bundle_id),
+            !serialized.contains("locks_bundle_id"),
             "no projection may carry the Locks bundle id"
         );
     }

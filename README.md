@@ -198,7 +198,10 @@ the whole convention.
   it back once, in the checkout command result they authored; read
   projections omit it for both participants.
 - `payments.locks_bundle_id` — the Locks correlation id (`access
-  credentials or bundle_id` in ADR-0019 §8).
+  credentials or bundle_id` in ADR-0019 §8). Withheld from **command
+  results as well as read projections**: it is bearer material, nothing
+  client-side consumes it, and leaving it in one response shape but not
+  the other would put it in logs and telemetry for no benefit.
 - Reservation buyer identities and auction proxy-bid maximums; the
   auction's current `leader_pubky` stays visible because the auction state
   machine already exposes the leader to every bidder.
@@ -313,7 +316,7 @@ This service is canonical and resolves them as follows:
 | Report decisions | none (reports stayed `open` forever) | `trust.decide` (moderator-only) records append-only decisions; report states `open/dismissed/actioned` | Task 3.5 requires moderator decisions recorded append-only. |
 | Notifications | synchronous in-memory append inside the command | outbox intents delivered at least once by the worker, deduped by `(event_id, recipient)` | ADR-0019 §4: side effects leave the command transaction only through the outbox. Notification preferences belong to the not-yet-ported `notification.*` commands. |
 | Auth handshake | ed25519 challenge–response: the service issued a nonce for the client to sign | Pubky AuthToken verified with `pubky-common`; challenge endpoint removed | A browser client cannot sign — the secret key lives in the user's signer (Pubky Ring), and the SDK `Keypair` exposes no signing method. The AuthToken is the mechanism Pubky provides for exactly this proof; the service adds single-use and acceptance-window enforcement. |
-| Payment projection | client `paymentSchema` requires `locks_bundle_id` | omitted from read projections | ADR-0019 §8 forbids exposing `access credentials or bundle_id`; the client schema must drop the field or mark it optional. |
+| Payment projection | client `paymentSchema` requires `locks_bundle_id` | omitted from every response, reads and command results alike | ADR-0019 §8 forbids exposing `access credentials or bundle_id`. The client has made the field optional, so the sandbox may still send it. |
 | Order delivery address | prototype order views carried the address | omitted from read projections (the client `orderSchema` never wanted it) | ADR-0019 §8: no private delivery details in exposed records. |
 | Receipts | client `receiptSchema` + sandbox `GET /v1/receipts/{id}` | no endpoint | The durable schema has no receipts table and no command populates `orders.receipt_id`; serving the endpoint would fabricate data. |
 | Conversations | client `conversationSchema` + sandbox `GET /v1/conversations` | no endpoint | No durable conversation/message tables exist; `message.*` commands are not ported. |
