@@ -64,6 +64,16 @@
               "name": "payment_confirmation"
             }
           ]
+        },
+        {
+          "from": "sold",
+          "to": "available",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "order.cancel_approve"
+            }
+          ]
         }
       ],
       "commands": [

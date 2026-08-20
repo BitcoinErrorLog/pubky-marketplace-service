@@ -85,6 +85,12 @@ pub fn listing_machine() -> AggregateMachine {
                     Server("payment_confirmation"),
                 ],
             ),
+            // Approving the cancellation of a paid order reverses the sale:
+            // payment confirmation moved the quantities reserved -> sold on
+            // this durable ledger (the prototype engine left them reserved),
+            // so returning the cancelled order's stock necessarily moves
+            // sold -> available. See the README divergence table.
+            t("sold", "available", vec![Command("order.cancel_approve")]),
         ],
         commands: vec![
             "listing.register",
@@ -514,7 +520,17 @@ mod tests {
         assert!(can_transition(&machine, "reserved", "sold"));
         assert!(can_transition(&machine, "available", "available"));
         assert!(!can_transition(&machine, "available", "sold"));
-        assert!(!can_transition(&machine, "sold", "available"));
+        // A cancelled paid order returns its sold quantities to available;
+        // order.cancel_approve is the only trigger for this reversal.
+        assert!(can_transition(&machine, "sold", "available"));
+        assert_eq!(
+            listing_machine()
+                .transitions
+                .iter()
+                .find(|t| t.from == "sold" && t.to == "available")
+                .map(|t| t.via.clone()),
+            Some(vec![Command("order.cancel_approve")])
+        );
     }
 
     #[test]

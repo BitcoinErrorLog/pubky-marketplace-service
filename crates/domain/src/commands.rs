@@ -64,6 +64,8 @@ pub enum CommandPayload {
     PlaceBid(PlaceBidPayload),
     CloseAuction(CloseAuctionPayload),
     AdvanceSandboxPayment(AdvanceSandboxPaymentPayload),
+    RequestCancellation(RequestCancellationPayload),
+    ApproveCancellation(OrderActionPayload),
     ShipOrder(ShipOrderPayload),
     ConfirmDelivery(OrderActionPayload),
     RequestReturn(RequestReturnPayload),
@@ -93,6 +95,8 @@ impl Command {
             CommandPayload::PlaceBid(_) => "auction.place_bid",
             CommandPayload::CloseAuction(_) => "auction.close",
             CommandPayload::AdvanceSandboxPayment(_) => "payment.sandbox_advance",
+            CommandPayload::RequestCancellation(_) => "order.cancel_request",
+            CommandPayload::ApproveCancellation(_) => "order.cancel_approve",
             CommandPayload::ShipOrder(_) => "fulfillment.ship",
             CommandPayload::ConfirmDelivery(_) => "fulfillment.confirm_delivery",
             CommandPayload::RequestReturn(_) => "return.request",
@@ -125,8 +129,10 @@ impl Command {
             CommandPayload::PlaceBid(p) => serde_json::to_value(p),
             CommandPayload::CloseAuction(p) => serde_json::to_value(p),
             CommandPayload::AdvanceSandboxPayment(p) => serde_json::to_value(p),
+            CommandPayload::RequestCancellation(p) => serde_json::to_value(p),
             CommandPayload::ShipOrder(p) => serde_json::to_value(p),
             CommandPayload::ConfirmDelivery(p)
+            | CommandPayload::ApproveCancellation(p)
             | CommandPayload::ApproveReturn(p)
             | CommandPayload::ReceiveReturn(p) => serde_json::to_value(p),
             CommandPayload::RequestReturn(p) => serde_json::to_value(p),
@@ -307,11 +313,23 @@ pub struct AdvanceSandboxPaymentPayload {
 }
 
 /// Payload shared by the order commands that carry only the order id
-/// (`fulfillment.confirm_delivery`, `return.approve`, `return.receive`).
+/// (`order.cancel_approve`, `fulfillment.confirm_delivery`,
+/// `return.approve`, `return.receive`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrderActionPayload {
     pub order_id: Uuid,
+}
+
+/// Buyer cancellation request (`order.cancel_request`). From
+/// `pending_payment` the cancel applies immediately; from `paid` or
+/// `processing` it moves the order to `cancel_requested` awaiting the
+/// seller's `order.cancel_approve`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestCancellationPayload {
+    pub order_id: Uuid,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -550,6 +568,12 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         "auction.close" => parse_payload(&envelope.payload).map(CommandPayload::CloseAuction)?,
         "payment.sandbox_advance" => {
             parse_payload(&envelope.payload).and_then(validate_advance_sandbox_payment)?
+        }
+        "order.cancel_request" => {
+            parse_payload(&envelope.payload).and_then(validate_request_cancellation)?
+        }
+        "order.cancel_approve" => {
+            parse_payload(&envelope.payload).map(CommandPayload::ApproveCancellation)?
         }
         "fulfillment.ship" => parse_payload(&envelope.payload).and_then(validate_ship_order)?,
         "fulfillment.confirm_delivery" => {
@@ -840,6 +864,18 @@ fn validate_advance_sandbox_payment(
     }
     if issues.is_empty() {
         Ok(CommandPayload::AdvanceSandboxPayment(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_request_cancellation(
+    mut payload: RequestCancellationPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed("payload.reason", &mut payload.reason, 1, 500, &mut issues);
+    if issues.is_empty() {
+        Ok(CommandPayload::RequestCancellation(payload))
     } else {
         Err(issues)
     }
@@ -1384,9 +1420,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_return_refund_dispute_and_review_commands() {
+    fn parses_cancellation_return_refund_dispute_and_review_commands() {
         let order_id = "00000000-0000-4000-8000-00000000aaaa";
         for (kind, payload) in [
+            (
+                "order.cancel_request",
+                json!({ "order_id": order_id, "reason": "Changed mind" }),
+            ),
+            ("order.cancel_approve", json!({ "order_id": order_id })),
             (
                 "return.request",
                 json!({ "order_id": order_id, "reason": "Differs", "requested_amount_minor": 14_796 }),
@@ -1445,6 +1486,27 @@ mod tests {
             json!({ "order_id": order_id, "reason": "r", "requested_remedy": "escrow" }),
         );
         parse_command(&bad_remedy).expect_err("unknown remedy invalid");
+    }
+
+    #[test]
+    fn rejects_out_of_range_cancellation_reasons() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        for reason in ["", "  ", &"x".repeat(501)] {
+            let command = order_command_json(
+                "order.cancel_request",
+                json!({ "order_id": order_id, "reason": reason }),
+            );
+            let issues = parse_command(&command).expect_err("out-of-range reason invalid");
+            assert!(issues.iter().any(|i| i.path == "payload.reason"));
+        }
+
+        let extra_field = order_command_json(
+            "order.cancel_approve",
+            json!({ "order_id": order_id, "private_address": "secret-address" }),
+        );
+        let issues = parse_command(&extra_field).expect_err("unknown payload field invalid");
+        let serialized = serde_json::to_string(&issues).expect("issues serialize");
+        assert!(!serialized.contains("secret-address"));
     }
 
     #[test]

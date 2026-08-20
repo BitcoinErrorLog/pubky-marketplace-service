@@ -162,6 +162,12 @@ async fn dispatch(
         CommandPayload::AdvanceSandboxPayment(payload) => {
             crate::handlers::payment::advance(tx, actor, command, payload, now).await
         }
+        CommandPayload::RequestCancellation(payload) => {
+            crate::handlers::cancellation::request(tx, actor, command, payload, now).await
+        }
+        CommandPayload::ApproveCancellation(payload) => {
+            crate::handlers::cancellation::approve(tx, actor, command, payload, now).await
+        }
         CommandPayload::ShipOrder(payload) => {
             crate::handlers::fulfillment::ship(tx, actor, command, payload, now).await
         }

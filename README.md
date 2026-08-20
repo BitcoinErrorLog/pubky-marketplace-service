@@ -111,7 +111,8 @@ envelope; unknown fields and unsupported versions are rejected
 Commands implemented: `listing.register`, `inventory.reserve`,
 `checkout.create`, `offer.create`, `offer.counter`, `offer.accept`,
 `offer.reject`, `offer.withdraw`, `auction.place_bid`, `auction.close`,
-`payment.sandbox_advance`, `fulfillment.ship`,
+`payment.sandbox_advance`, `order.cancel_request`, `order.cancel_approve`,
+`fulfillment.ship`,
 `fulfillment.confirm_delivery`, `return.request`, `return.approve`,
 `return.receive`, `refund.record_external`, `dispute.open`,
 `dispute.evidence` (this service only; see Post-purchase lifecycle),
@@ -143,6 +144,23 @@ and refund branches) exactly as the prototype engine did:
   currently refuses to send `payment.sandbox_advance` to the durable
   service as a matter of client policy; the command exists here so the
   post-purchase lifecycle is real and testable end to end.)
+- **Cancellation.** `order.cancel_request` (buyer only, from
+  `pending_payment`/`paid`/`processing`): an unpaid order cancels
+  immediately and its held stock returns to the listing; a paid order moves
+  to `cancel_requested` awaiting the seller. `order.cancel_approve` (seller
+  only, from `cancel_requested`) moves the order to `cancelled` and returns
+  the sold quantities to available under the same quantity-balance
+  constraint (see the divergence table for the resulting listing
+  `sold → available` transition). Cancellation never touches the payment
+  record: a confirmed payment stays confirmed with its receipt intact, and
+  the only money path out of a cancelled order is the externally evidenced
+  `refund.record_external` — the service never claims to move funds. An
+  auction winner's cancel releases the winning hold through the reservation
+  compare-and-swap (`active → released`); if the hold already lapsed on
+  server time, the expiry sweep has returned the unit and the cancel
+  succeeds without double-releasing. A cancelled order refuses every
+  subsequent payment, fulfillment, return, dispute, and cancellation
+  command.
 - **Fulfillment.** `fulfillment.ship` (seller, with carrier and tracking
   number) and `fulfillment.confirm_delivery` (buyer) drive
   `paid/processing → shipped → delivered`. There is no separate
@@ -180,7 +198,9 @@ Every post-purchase command is participant-scoped (moderator-scoped for
 `dispute.resolve`), enforces `expected_revision` compare-and-swap, replays
 idempotently by `command_id`, appends one immutable event per accepted
 command, and emits outbox notifications exactly where the prototype did
-(`payment_confirmed`, `order_shipped`, `order_delivered`, `return_updated`,
+(`payment_confirmed`, `order_cancelled` — to the seller on a cancellation
+request, to the buyer on approval — `order_shipped`, `order_delivered`,
+`return_updated`,
 `refund_recorded`, `dispute_updated` to both parties on resolution,
 `review_received`). `dispute.evidence` and `review.update` emit none — the
 prototype had no counterpart to copy.
@@ -301,9 +321,10 @@ Participant-visible by decision (ambiguities resolved and documented):
 
 - **Shipment carrier and tracking numbers** — participants need them to
   follow the shipment; they identify a parcel, not a person or address.
-- **Dispute `reason`/`rationale` and return `reason`** — like offer
-  messages, they are content exchanged between exactly the participants
-  (plus the deciding moderator), served only to that same audience.
+- **Dispute `reason`/`rationale`, return `reason`, and cancellation
+  `reason`** — like offer messages, they are content exchanged between
+  exactly the participants (plus the deciding moderator for disputes),
+  served only to that same audience.
 - **Review text** — reviews are authored for publication to the counter
   party; the projection audience is the two participants.
 
@@ -412,7 +433,10 @@ tests, per ADR-0022). Any artifact change here fails the client's
 `state-machines.contract.test.ts` until the JSON is re-vendored — and the
 addition of the `return` and `dispute` machines additionally requires the
 client to register them in `commerceAggregateMachines` with matching state
-enums, since that test asserts the aggregate sets match exactly.
+enums, since that test asserts the aggregate sets match exactly. The
+cancellation port added one listing edge (`sold → available` via
+`order.cancel_approve`), so re-vendoring for it also requires the client's
+listing transition table to accept that edge.
 
 ## Resolved contract divergences
 
@@ -440,6 +464,8 @@ This service is canonical and resolves them as follows:
 | Receipts | client `receiptSchema` + sandbox `GET /v1/receipts/{id}` | durable `receipts` table (append-only), issued exactly once on payment confirmation; `GET /v1/receipts/{id}` for issuer and recipient | The table and issuing transition now exist, so the endpoint serves real rows; `orders.receipt_id` is populated on confirmation. |
 | Inventory after payment confirmation | prototype left the sold quantity in `reservedQuantity` forever | confirmation moves the order's line quantities reserved → sold and marks the winning auction reservation `converted` | The contract already declared listing `reserved → sold` and reservation `active → converted` under `payment_confirmation`; a durable ledger cannot hold quantities in a hold state forever. |
 | Confirming a lapsed auction hold | impossible in the prototype (no reservation expiry) | refused with `INVALID_STATE` once the winner's 30-minute hold has expired on server time | This service sweeps expired holds back to `available`; confirming afterwards would sell inventory the order no longer holds. |
+| Inventory release on cancelling a paid order | the prototype's `releaseOrderInventory` moved the quantity reserved → available (it never moved paid quantities out of `reservedQuantity`) | `order.cancel_approve` returns the cancelled order's sold quantities to available; the listing machine declares `sold → available` via `order.cancel_approve` | Payment confirmation here moves quantities reserved → sold (see above), so reversing a cancelled paid sale on the durable ledger necessarily reverses the sold quantities — otherwise every cancelled paid order would understock the listing forever. Same prototype semantics (held stock returns to available), expressed against the durable columns. |
+| Cancelling a lapsed auction hold | impossible in the prototype (no reservation expiry) | the cancel succeeds; the reservation compare-and-swap (`active → released`) finds the hold already `expired`, so no quantities move | The sweep already returned the unit; releasing again would double-count it, and refusing would strand an order that can be neither paid (confirmation is refused, see above) nor cancelled. |
 | Review uniqueness | application check on the in-memory order's `reviews` array | `reviews_one_per_order_role` UNIQUE constraint; the review insert precedes the order revision CAS so a same-role race is decided by the constraint (`INVARIANT_VIOLATION`), sequential duplicates by the ported check (`INVALID_STATE`) | ADR-0019 §4: one participant review per order/role is a database invariant, not code. |
 | Review editing | none (reviews were immutable) | `review.update` (this service only): the reviewer may revise rating/text within 24 hours of creation, under the order's revision CAS with a `review.updated` event | The task's bounded edit window; the window is a documented policy constant (`REVIEW_EDIT_WINDOW_SECONDS`). No notification is emitted — the prototype had none to copy. |
 | Dispute evidence | none (disputes carried only the opening reason) | `dispute.evidence` (this service only): participants append evidence to an open dispute; bodies stay out of general projections and command results (only `evidence_count` is visible there) and are served solely by the scoped case-file read `GET /v1/orders/{id}/evidence` to the two participants and configured moderators, with moderator reads audited append-only in `dispute_evidence_reads` | ADR-0019 lists order evidence as service-owned private data, and §8 directs operator queries to role-scoped, deliberately redacted views; without a scoped read path the moderator required by `dispute.resolve` could never see the case they are deciding. |
@@ -452,10 +478,7 @@ This service is canonical and resolves them as follows:
 `processing` and `closed` (order) and `cancelled` (auction) exist in the
 canonical enums but no current transition produces them; they are declared in
 `unreachable_states` in the contract artifact and are reserved for future
-commands, exactly as in the engine. The order cancellation commands
-(`order.cancel_request`, `order.cancel_approve`) remain declared in the
-contract but unported, so the `cancel_requested`/`cancelled` branch (and
-the refund-after-cancellation path) is specified but not yet reachable.
+commands, exactly as in the engine.
 
 ## Operations
 
