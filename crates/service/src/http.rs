@@ -9,7 +9,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::{self, Actor};
-use crate::{executor, AppState};
+use crate::{executor, queries, AppState};
 
 pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
@@ -20,6 +20,12 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/commands", post(execute_command))
         .route("/v1/reports", get(list_reports))
+        .route("/v1/listings/{aggregate_id}", get(queries::get_listing))
+        .route("/v1/offers", get(queries::list_offers))
+        .route("/v1/orders", get(queries::list_orders))
+        .route("/v1/orders/{id}", get(queries::get_order))
+        .route("/v1/payments/{id}", get(queries::get_payment))
+        .route("/v1/notifications", get(queries::list_notifications))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,

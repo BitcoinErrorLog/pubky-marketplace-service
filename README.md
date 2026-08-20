@@ -55,8 +55,12 @@ Migrations in `crates/service/migrations/` are applied automatically at boot
 
 Endpoints: `GET /health`, `GET /ready` (checks the database),
 `POST /v1/auth/sessions`,
-`POST /v1/commands` (Bearer session required), and `GET /v1/reports`
-(Bearer session required; role-scoped — see Moderation below).
+`POST /v1/commands` (Bearer session required), `GET /v1/reports`
+(Bearer session required; role-scoped — see Moderation below), and the
+role-scoped read projections (Bearer session required — see Read
+projections below): `GET /v1/listings/{aggregate_id}`, `GET /v1/offers`,
+`GET /v1/orders`, `GET /v1/orders/{id}`, `GET /v1/payments/{id}`, and
+`GET /v1/notifications`.
 
 ## Test
 
@@ -159,6 +163,62 @@ one extra prompt) is an open product decision, not a technical one.
 
 CORS is restricted to the exact origins in `ALLOWED_ORIGINS`.
 
+## Read projections
+
+Role-scoped snake_case read models so a client can render state and supply
+`expected_revision` on its next command. Every endpoint requires the same
+Bearer session as `/v1/commands`; every projection carries the aggregate's
+current revision (`server_revision` on listings, `revision` on offers,
+orders, and payments).
+
+| Endpoint | Scope | Body |
+| --- | --- | --- |
+| `GET /v1/listings/{aggregate_id}` | any authenticated user (public catalog data) | the listing/inventory projection: quantities, state, `server_revision`, unit price, sale format, and the auction state when present |
+| `GET /v1/offers` | offers where the caller is buyer or seller | `{ "offers": [...] }` |
+| `GET /v1/orders` | orders where the caller is buyer or seller | `{ "orders": [...] }`, each order with its embedded `payment` projection |
+| `GET /v1/orders/{id}` | participants only | one order with its embedded `payment` projection |
+| `GET /v1/payments/{id}` | participants only | one payment projection |
+| `GET /v1/notifications` | the recipient only | `{ "notifications": [...] }` |
+
+Object-level participation is enforced in the SQL `WHERE` clause, exactly
+like `GET /v1/reports`: the authenticated actor is bound as a query
+parameter, so a non-participant's query cannot match another user's rows.
+Single-object endpoints return 404 for absent **and** foreign aggregates,
+so they do not reveal whether an aggregate exists.
+
+**Pagination.** List endpoints accept `?limit=` between 1 and 200
+(default 50); out-of-range values are rejected with 422
+`INVALID_COMMAND`. Ordering is newest-first and stable:
+`created_at DESC, id DESC`. There is no cursor yet; the bounded limit is
+the whole convention.
+
+**Redaction (ADR-0019 §8).** Projections never expose:
+
+- `orders.delivery_address` — private delivery detail. The buyer receives
+  it back once, in the checkout command result they authored; read
+  projections omit it for both participants.
+- `payments.locks_bundle_id` — the Locks correlation id (`access
+  credentials or bundle_id` in ADR-0019 §8).
+- Reservation buyer identities and auction proxy-bid maximums; the
+  auction's current `leader_pubky` stays visible because the auction state
+  machine already exposes the leader to every bidder.
+
+Offer `message`/`history` are returned: they are negotiation content
+between exactly the two offer participants, the projection is readable by
+exactly those two participants, and the offer command results already
+return the same view to the same audience.
+
+Not served, deliberately (no fabricated or empty-by-default reads):
+
+- **Receipts** — the durable schema has no receipts table and no command
+  populates `orders.receipt_id`; a `GET /v1/receipts/{id}` would never
+  return anything. The column is projected truthfully (currently always
+  null).
+- **Conversations/messages** — no durable tables exist; the `message.*`
+  commands have not been ported.
+- **Notification preferences** — the `notification.*` commands have not
+  been ported.
+
 ## Background workers (task 3.4)
 
 One worker runtime (`crates/service/src/workers.rs`) drains four server-time
@@ -253,6 +313,11 @@ This service is canonical and resolves them as follows:
 | Report decisions | none (reports stayed `open` forever) | `trust.decide` (moderator-only) records append-only decisions; report states `open/dismissed/actioned` | Task 3.5 requires moderator decisions recorded append-only. |
 | Notifications | synchronous in-memory append inside the command | outbox intents delivered at least once by the worker, deduped by `(event_id, recipient)` | ADR-0019 §4: side effects leave the command transaction only through the outbox. Notification preferences belong to the not-yet-ported `notification.*` commands. |
 | Auth handshake | ed25519 challenge–response: the service issued a nonce for the client to sign | Pubky AuthToken verified with `pubky-common`; challenge endpoint removed | A browser client cannot sign — the secret key lives in the user's signer (Pubky Ring), and the SDK `Keypair` exposes no signing method. The AuthToken is the mechanism Pubky provides for exactly this proof; the service adds single-use and acceptance-window enforcement. |
+| Payment projection | client `paymentSchema` requires `locks_bundle_id` | omitted from read projections | ADR-0019 §8 forbids exposing `access credentials or bundle_id`; the client schema must drop the field or mark it optional. |
+| Order delivery address | prototype order views carried the address | omitted from read projections (the client `orderSchema` never wanted it) | ADR-0019 §8: no private delivery details in exposed records. |
+| Receipts | client `receiptSchema` + sandbox `GET /v1/receipts/{id}` | no endpoint | The durable schema has no receipts table and no command populates `orders.receipt_id`; serving the endpoint would fabricate data. |
+| Conversations | client `conversationSchema` + sandbox `GET /v1/conversations` | no endpoint | No durable conversation/message tables exist; `message.*` commands are not ported. |
+| Notification projection | client `notificationSchema` requires a positive `revision` | no `revision` field | Delivered notifications are immutable outbox-consumer rows, not revisioned aggregates; no `notification.*` command exists that would need an `expected_revision`. |
 
 `processing` and `closed` (order) and `cancelled` (auction) exist in the
 canonical enums but no current transition produces them; they are declared in

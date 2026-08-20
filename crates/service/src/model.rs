@@ -262,6 +262,18 @@ pub struct OrderRow {
 }
 
 impl OrderRow {
+    /// The participant-facing read projection: [`Self::view`] minus the
+    /// delivery address, which is a private delivery detail that read
+    /// projections must not expose (ADR-0019 §8). The buyer receives the
+    /// address back once, in the checkout command result they authored.
+    pub fn projection(&self) -> Value {
+        let mut view = self.view();
+        view.as_object_mut()
+            .expect("order view is an object")
+            .remove("delivery_address");
+        view
+    }
+
     pub fn view(&self) -> Value {
         json!({
             "id": self.id,
@@ -304,6 +316,17 @@ pub struct PaymentRow {
 }
 
 impl PaymentRow {
+    /// The participant-facing read projection: [`Self::view`] minus the
+    /// Locks bundle correlation id, which ADR-0019 §8 forbids in exposed
+    /// records (`access credentials or bundle_id`).
+    pub fn projection(&self) -> Value {
+        let mut view = self.view();
+        view.as_object_mut()
+            .expect("payment view is an object")
+            .remove("locks_bundle_id");
+        view
+    }
+
     pub fn view(&self) -> Value {
         json!({
             "id": self.id,
@@ -318,6 +341,35 @@ impl PaymentRow {
             "amount": money_json(self.amount_minor, &self.currency, self.exponent),
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
+        })
+    }
+}
+
+/// A delivered notification (outbox consumer row). Notifications are
+/// immutable delivery records, not revisioned aggregates: there is no
+/// notification command surface yet, so the projection carries no revision.
+#[derive(Debug, Clone, FromRow)]
+pub struct NotificationRow {
+    pub id: Uuid,
+    pub recipient_pubky: String,
+    pub actor_pubky: String,
+    #[sqlx(rename = "type")]
+    pub notification_type: String,
+    pub aggregate_id: String,
+    pub created_at: DateTime<Utc>,
+    pub read_at: Option<DateTime<Utc>>,
+}
+
+impl NotificationRow {
+    pub fn view(&self) -> Value {
+        json!({
+            "id": self.id,
+            "recipient_pubky": self.recipient_pubky,
+            "actor_pubky": self.actor_pubky,
+            "type": self.notification_type,
+            "aggregate_id": self.aggregate_id,
+            "created_at": format_timestamp(self.created_at),
+            "read_at": self.read_at.map(format_timestamp),
         })
     }
 }

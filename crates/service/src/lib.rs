@@ -12,6 +12,7 @@ pub mod expiry;
 pub mod handlers;
 pub mod http;
 pub mod model;
+pub mod queries;
 pub mod result;
 pub mod workers;
 
