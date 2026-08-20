@@ -59,8 +59,8 @@ Endpoints: `GET /health`, `GET /ready` (checks the database),
 (Bearer session required; role-scoped — see Moderation below), and the
 role-scoped read projections (Bearer session required — see Read
 projections below): `GET /v1/listings/{aggregate_id}`, `GET /v1/offers`,
-`GET /v1/orders`, `GET /v1/orders/{id}`, `GET /v1/payments/{id}`, and
-`GET /v1/notifications`.
+`GET /v1/orders`, `GET /v1/orders/{id}`, `GET /v1/payments/{id}`,
+`GET /v1/receipts/{id}`, and `GET /v1/notifications`.
 
 ## Test
 
@@ -110,11 +110,76 @@ envelope; unknown fields and unsupported versions are rejected
 Commands implemented: `listing.register`, `inventory.reserve`,
 `checkout.create`, `offer.create`, `offer.counter`, `offer.accept`,
 `offer.reject`, `offer.withdraw`, `auction.place_bid`, `auction.close`,
+`payment.sandbox_advance`, `fulfillment.ship`,
+`fulfillment.confirm_delivery`, `return.request`, `return.approve`,
+`return.receive`, `refund.record_external`, `dispute.open`,
+`dispute.evidence` (this service only; see Post-purchase lifecycle),
+`dispute.resolve`, `review.create`, `review.update` (this service only),
 `trust.report`, and `trust.decide` (this service only; see Moderation).
 Server-driven transitions (reservation expiry, offer expiry, auction close
 on server time, outbox delivery) run in the background worker runtime, not
 as client commands. All other command kinds are rejected by the envelope
 contract until they are ported with their tests.
+
+## Post-purchase lifecycle
+
+The post-purchase commands drive the canonical order machine
+(`processing → shipped → delivered → completed` plus the return, dispute,
+and refund branches) exactly as the prototype engine did:
+
+- **Payments and receipts.** `payment.sandbox_advance` (buyer only) drives
+  the sandbox payment adapter; the service records these transitions and
+  **never observes, holds, or moves funds**. Confirmation is the transition
+  that issues the durable receipt (`receipts` table, one per order/payment,
+  append-only) and moves the order to `paid`. The receipt `content_hash` is
+  the BLAKE3 hex digest of the canonical snake_case receipt payload
+  (`order_id`, `payment_id`, `total`, `issued_at`, in that field order).
+  Confirmation also converts the held inventory from reserved to sold and
+  marks the winning auction reservation converted — the
+  `payment_confirmation` triggers declared in the contract. If a winning
+  auction hold has already lapsed on server time, confirmation is refused
+  (`INVALID_STATE`) rather than overselling. (The pubky-app client
+  currently refuses to send `payment.sandbox_advance` to the durable
+  service as a matter of client policy; the command exists here so the
+  post-purchase lifecycle is real and testable end to end.)
+- **Fulfillment.** `fulfillment.ship` (seller, with carrier and tracking
+  number) and `fulfillment.confirm_delivery` (buyer) drive
+  `paid/processing → shipped → delivered`. There is no separate
+  seller-marks-delivered command: the buyer's confirmation is the delivery
+  transition, as in the prototype. `delivered → completed` is reached
+  through `review.create` (or a seller-favor dispute resolution).
+- **Returns.** `return.request` (buyer, from `delivered`/`completed`, capped
+  at the order total), `return.approve` and `return.receive` (seller). The
+  return sub-state (`requested → approved → received → refunded`) is a
+  canonical machine in the contract artifact.
+- **External refunds.** `refund.record_external` (seller, from
+  `return_received`/`disputed`/`cancelled`) records **independently supplied
+  seller evidence** — an external transaction id of at least 8 characters —
+  and advances the order to `refunded_external`. The service never claims
+  to have moved funds (ADR-0019 §7); a CHECK constraint keeps the recorded
+  amount within the order total.
+- **Disputes.** `dispute.open` (either participant, one dispute per order),
+  `dispute.evidence` (participants, open disputes only; this service only),
+  and `dispute.resolve` (configured moderators only). Resolution **is** the
+  close: the dispute machine is `open → resolved`. Buyer remedies
+  (`buyer_refund`/`partial_refund`) leave the order `disputed` awaiting the
+  external refund record; other resolutions complete it.
+- **Reviews.** `review.create` (participants, from
+  `delivered`/`completed`/`closed`): one review per participant per order
+  per role, enforced by the `reviews_one_per_order_role` database
+  constraint rather than application logic — the insert happens before the
+  order's revision compare-and-swap, so a same-role race is decided by the
+  constraint. `review.update` (this service only) lets the reviewer revise
+  rating and text within 24 hours of creation.
+
+Every post-purchase command is participant-scoped (moderator-scoped for
+`dispute.resolve`), enforces `expected_revision` compare-and-swap, replays
+idempotently by `command_id`, appends one immutable event per accepted
+command, and emits outbox notifications exactly where the prototype did
+(`payment_confirmed`, `order_shipped`, `order_delivered`, `return_updated`,
+`refund_recorded`, `dispute_updated` to both parties on resolution,
+`review_received`). `dispute.evidence` and `review.update` emit none — the
+prototype had no counterpart to copy.
 
 ## Authentication (task 3.2)
 
@@ -175,9 +240,10 @@ orders, and payments).
 | --- | --- | --- |
 | `GET /v1/listings/{aggregate_id}` | any authenticated user (public catalog data) | the listing/inventory projection: quantities, state, `server_revision`, unit price, sale format, and the auction state when present |
 | `GET /v1/offers` | offers where the caller is buyer or seller | `{ "offers": [...] }` |
-| `GET /v1/orders` | orders where the caller is buyer or seller | `{ "orders": [...] }`, each order with its embedded `payment` projection |
-| `GET /v1/orders/{id}` | participants only | one order with its embedded `payment` projection |
+| `GET /v1/orders` | orders where the caller is buyer or seller | `{ "orders": [...] }`, each order with its embedded `payment` projection plus the `shipment`, `return_request`, `dispute`, `external_refund`, and `reviews` sub-objects (client `orderSchema` field names) |
+| `GET /v1/orders/{id}` | participants only | one order with the same embedded projections |
 | `GET /v1/payments/{id}` | participants only | one payment projection |
+| `GET /v1/receipts/{id}` | issuer (seller) and recipient (buyer) only | one receipt: ids, participants, `total`, `content_hash`, `issued_at` (client `receiptSchema` shape) |
 | `GET /v1/notifications` | the recipient only | `{ "notifications": [...] }` |
 
 Object-level participation is enforced in the SQL `WHERE` clause, exactly
@@ -196,15 +262,30 @@ the whole convention.
 
 - `orders.delivery_address` — private delivery detail. The buyer receives
   it back once, in the checkout command result they authored; read
-  projections omit it for both participants.
+  projections and every post-purchase command result omit it for both
+  participants.
 - `payments.locks_bundle_id` — the Locks correlation id (`access
   credentials or bundle_id` in ADR-0019 §8). Withheld from **command
   results as well as read projections**: it is bearer material, nothing
   client-side consumes it, and leaving it in one response shape but not
   the other would put it in logs and telemetry for no benefit.
+- **Dispute evidence bodies** — private order evidence (ADR-0019 §8).
+  Stored append-only in `dispute_evidence`; never served by any read
+  projection or command result, not even back to the submitter. The
+  dispute sub-object carries only a content-free `evidence_count`.
 - Reservation buyer identities and auction proxy-bid maximums; the
   auction's current `leader_pubky` stays visible because the auction state
   machine already exposes the leader to every bidder.
+
+Participant-visible by decision (ambiguities resolved and documented):
+
+- **Shipment carrier and tracking numbers** — participants need them to
+  follow the shipment; they identify a parcel, not a person or address.
+- **Dispute `reason`/`rationale` and return `reason`** — like offer
+  messages, they are content exchanged between exactly the participants
+  (plus the deciding moderator), served only to that same audience.
+- **Review text** — reviews are authored for publication to the counter
+  party; the projection audience is the two participants.
 
 Offer `message`/`history` are returned: they are negotiation content
 between exactly the two offer participants, the projection is readable by
@@ -213,10 +294,6 @@ return the same view to the same audience.
 
 Not served, deliberately (no fabricated or empty-by-default reads):
 
-- **Receipts** — the durable schema has no receipts table and no command
-  populates `orders.receipt_id`; a `GET /v1/receipts/{id}` would never
-  return anything. The column is projected truthfully (currently always
-  null).
 - **Conversations/messages** — no durable tables exist; the `message.*`
   commands have not been ported.
 - **Notification preferences** — the `notification.*` commands have not
@@ -281,9 +358,11 @@ in one transaction. Constraints enforce:
 ## State machine contract (task 3.3)
 
 The canonical state/transition tables for listing, reservation, offer,
-auction, order, payment, and report live in one module:
-`crates/domain/src/state_machines.rs`. The machine-readable artifact is
-emitted to `contracts/state-machines.json`:
+auction, order, payment, return, dispute, and report live in one module:
+`crates/domain/src/state_machines.rs`. The return and dispute machines are
+the order's sub-state vocabularies the client's `orderSchema` already
+declares (`returnRequest.state`, `dispute.state`). The machine-readable
+artifact is emitted to `contracts/state-machines.json`:
 
 ```sh
 cargo run -p marketplace-domain --bin emit-contracts
@@ -293,7 +372,11 @@ The domain test `contract_artifact_is_in_sync` fails whenever the JSON on
 disk is stale, so the artifact cannot drift from the Rust tables. The
 pubky-app client validates its TypeScript contracts in
 `src/libs/commerce` against this artifact in CI (cross-language contract
-tests, per ADR-0022).
+tests, per ADR-0022). Any artifact change here fails the client's
+`state-machines.contract.test.ts` until the JSON is re-vendored — and the
+addition of the `return` and `dispute` machines additionally requires the
+client to register them in `commerceAggregateMachines` with matching state
+enums, since that test asserts the aggregate sets match exactly.
 
 ## Resolved contract divergences
 
@@ -318,19 +401,24 @@ This service is canonical and resolves them as follows:
 | Auth handshake | ed25519 challenge–response: the service issued a nonce for the client to sign | Pubky AuthToken verified with `pubky-common`; challenge endpoint removed | A browser client cannot sign — the secret key lives in the user's signer (Pubky Ring), and the SDK `Keypair` exposes no signing method. The AuthToken is the mechanism Pubky provides for exactly this proof; the service adds single-use and acceptance-window enforcement. |
 | Payment projection | client `paymentSchema` requires `locks_bundle_id` | omitted from every response, reads and command results alike | ADR-0019 §8 forbids exposing `access credentials or bundle_id`. The client has made the field optional, so the sandbox may still send it. |
 | Order delivery address | prototype order views carried the address | omitted from read projections (the client `orderSchema` never wanted it) | ADR-0019 §8: no private delivery details in exposed records. |
-| Receipts | client `receiptSchema` + sandbox `GET /v1/receipts/{id}` | no endpoint | The durable schema has no receipts table and no command populates `orders.receipt_id`; serving the endpoint would fabricate data. |
+| Receipts | client `receiptSchema` + sandbox `GET /v1/receipts/{id}` | durable `receipts` table (append-only), issued exactly once on payment confirmation; `GET /v1/receipts/{id}` for issuer and recipient | The table and issuing transition now exist, so the endpoint serves real rows; `orders.receipt_id` is populated on confirmation. |
+| Inventory after payment confirmation | prototype left the sold quantity in `reservedQuantity` forever | confirmation moves the order's line quantities reserved → sold and marks the winning auction reservation `converted` | The contract already declared listing `reserved → sold` and reservation `active → converted` under `payment_confirmation`; a durable ledger cannot hold quantities in a hold state forever. |
+| Confirming a lapsed auction hold | impossible in the prototype (no reservation expiry) | refused with `INVALID_STATE` once the winner's 30-minute hold has expired on server time | This service sweeps expired holds back to `available`; confirming afterwards would sell inventory the order no longer holds. |
+| Review uniqueness | application check on the in-memory order's `reviews` array | `reviews_one_per_order_role` UNIQUE constraint; the review insert precedes the order revision CAS so a same-role race is decided by the constraint (`INVARIANT_VIOLATION`), sequential duplicates by the ported check (`INVALID_STATE`) | ADR-0019 §4: one participant review per order/role is a database invariant, not code. |
+| Review editing | none (reviews were immutable) | `review.update` (this service only): the reviewer may revise rating/text within 24 hours of creation, under the order's revision CAS with a `review.updated` event | The task's bounded edit window; the window is a documented policy constant (`REVIEW_EDIT_WINDOW_SECONDS`). No notification is emitted — the prototype had none to copy. |
+| Dispute evidence | none (disputes carried only the opening reason) | `dispute.evidence` (this service only): participants append evidence to an open dispute; bodies are stored append-only and never served (ADR-0019 §8), only `evidence_count` is visible | ADR-0019 lists order evidence as service-owned private data; the durable record exists for moderation and audit without any exposure path. |
+| Dispute close | `dispute.resolve` was the terminal action | same — resolution **is** the close (`open → resolved`); no separate close command | Neither the prototype nor the client contracts have a distinct close; inventing one would add unspecified surface. |
+| Dispute moderator | hardcoded `MARKETPLACE_SANDBOX_MODERATOR` | configured `MODERATOR_PUBKYS`, the same role as `trust.decide` | Task 3.5 precedent: no hardcoded roles. |
 | Conversations | client `conversationSchema` + sandbox `GET /v1/conversations` | no endpoint | No durable conversation/message tables exist; `message.*` commands are not ported. |
 | Notification projection | client `notificationSchema` requires a positive `revision` | no `revision` field | Delivered notifications are immutable outbox-consumer rows, not revisioned aggregates; no `notification.*` command exists that would need an `expected_revision`. |
 
 `processing` and `closed` (order) and `cancelled` (auction) exist in the
 canonical enums but no current transition produces them; they are declared in
 `unreachable_states` in the contract artifact and are reserved for future
-commands, exactly as in the engine.
-
-Further deliberate deviations from the prototype engine are listed in the
-repository report (order/payment views omit the not-yet-implemented
-`shipment/return/dispute/refund/review` sub-objects rather than emitting
-hardcoded empty values).
+commands, exactly as in the engine. The order cancellation commands
+(`order.cancel_request`, `order.cancel_approve`) remain declared in the
+contract but unported, so the `cancel_requested`/`cancelled` branch (and
+the refund-after-cancellation path) is specified but not yet reachable.
 
 ## Operations
 

@@ -1150,6 +1150,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "blake3",
  "chrono",
  "http-body-util",
  "marketplace-domain",

@@ -63,6 +63,18 @@ pub enum CommandPayload {
     WithdrawOffer(OfferActionPayload),
     PlaceBid(PlaceBidPayload),
     CloseAuction(CloseAuctionPayload),
+    AdvanceSandboxPayment(AdvanceSandboxPaymentPayload),
+    ShipOrder(ShipOrderPayload),
+    ConfirmDelivery(OrderActionPayload),
+    RequestReturn(RequestReturnPayload),
+    ApproveReturn(OrderActionPayload),
+    ReceiveReturn(OrderActionPayload),
+    RecordExternalRefund(RecordExternalRefundPayload),
+    OpenDispute(OpenDisputePayload),
+    AddDisputeEvidence(DisputeEvidencePayload),
+    ResolveDispute(ResolveDisputePayload),
+    CreateReview(ReviewTermsPayload),
+    UpdateReview(ReviewTermsPayload),
     CreateReport(CreateReportPayload),
     DecideReport(DecideReportPayload),
 }
@@ -80,6 +92,18 @@ impl Command {
             CommandPayload::WithdrawOffer(_) => "offer.withdraw",
             CommandPayload::PlaceBid(_) => "auction.place_bid",
             CommandPayload::CloseAuction(_) => "auction.close",
+            CommandPayload::AdvanceSandboxPayment(_) => "payment.sandbox_advance",
+            CommandPayload::ShipOrder(_) => "fulfillment.ship",
+            CommandPayload::ConfirmDelivery(_) => "fulfillment.confirm_delivery",
+            CommandPayload::RequestReturn(_) => "return.request",
+            CommandPayload::ApproveReturn(_) => "return.approve",
+            CommandPayload::ReceiveReturn(_) => "return.receive",
+            CommandPayload::RecordExternalRefund(_) => "refund.record_external",
+            CommandPayload::OpenDispute(_) => "dispute.open",
+            CommandPayload::AddDisputeEvidence(_) => "dispute.evidence",
+            CommandPayload::ResolveDispute(_) => "dispute.resolve",
+            CommandPayload::CreateReview(_) => "review.create",
+            CommandPayload::UpdateReview(_) => "review.update",
             CommandPayload::CreateReport(_) => "trust.report",
             CommandPayload::DecideReport(_) => "trust.decide",
         }
@@ -100,6 +124,19 @@ impl Command {
             | CommandPayload::WithdrawOffer(p) => serde_json::to_value(p),
             CommandPayload::PlaceBid(p) => serde_json::to_value(p),
             CommandPayload::CloseAuction(p) => serde_json::to_value(p),
+            CommandPayload::AdvanceSandboxPayment(p) => serde_json::to_value(p),
+            CommandPayload::ShipOrder(p) => serde_json::to_value(p),
+            CommandPayload::ConfirmDelivery(p)
+            | CommandPayload::ApproveReturn(p)
+            | CommandPayload::ReceiveReturn(p) => serde_json::to_value(p),
+            CommandPayload::RequestReturn(p) => serde_json::to_value(p),
+            CommandPayload::RecordExternalRefund(p) => serde_json::to_value(p),
+            CommandPayload::OpenDispute(p) => serde_json::to_value(p),
+            CommandPayload::AddDisputeEvidence(p) => serde_json::to_value(p),
+            CommandPayload::ResolveDispute(p) => serde_json::to_value(p),
+            CommandPayload::CreateReview(p) | CommandPayload::UpdateReview(p) => {
+                serde_json::to_value(p)
+            }
             CommandPayload::CreateReport(p) => serde_json::to_value(p),
             CommandPayload::DecideReport(p) => serde_json::to_value(p),
         }
@@ -239,6 +276,142 @@ pub struct PlaceBidPayload {
 #[serde(deny_unknown_fields)]
 pub struct CloseAuctionPayload {}
 
+/// Sandbox payment target states (`payment.sandbox_advance`). The sandbox
+/// adapter records these transitions; it never observes or moves funds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxPaymentTarget {
+    Detected,
+    Confirmed,
+    Expired,
+    ManualReview,
+}
+
+impl SandboxPaymentTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SandboxPaymentTarget::Detected => "detected",
+            SandboxPaymentTarget::Confirmed => "confirmed",
+            SandboxPaymentTarget::Expired => "expired",
+            SandboxPaymentTarget::ManualReview => "manual_review",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvanceSandboxPaymentPayload {
+    pub payment_id: Uuid,
+    pub target: SandboxPaymentTarget,
+    pub confirmations: i64,
+}
+
+/// Payload shared by the order commands that carry only the order id
+/// (`fulfillment.confirm_delivery`, `return.approve`, `return.receive`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderActionPayload {
+    pub order_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShipOrderPayload {
+    pub order_id: Uuid,
+    pub carrier: String,
+    pub tracking_number: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestReturnPayload {
+    pub order_id: Uuid,
+    pub reason: String,
+    pub requested_amount_minor: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordExternalRefundPayload {
+    pub order_id: Uuid,
+    pub amount_minor: i64,
+    pub transaction_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisputeRemedy {
+    Refund,
+    PartialRefund,
+    Replacement,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenDisputePayload {
+    pub order_id: Uuid,
+    pub reason: String,
+    pub requested_remedy: DisputeRemedy,
+}
+
+/// Evidence attached to an open dispute (`dispute.evidence`, this service
+/// only). The body is stored append-only and is never echoed back in any
+/// response (ADR-0019 §8: order evidence stays private).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisputeEvidencePayload {
+    pub order_id: Uuid,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisputeResolution {
+    BuyerRefund,
+    PartialRefund,
+    SellerFavor,
+    Replacement,
+}
+
+impl DisputeResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DisputeResolution::BuyerRefund => "buyer_refund",
+            DisputeResolution::PartialRefund => "partial_refund",
+            DisputeResolution::SellerFavor => "seller_favor",
+            DisputeResolution::Replacement => "replacement",
+        }
+    }
+
+    /// Buyer remedies leave the order disputed awaiting the external refund;
+    /// the others complete the order (prototype engine semantics).
+    pub fn favors_buyer(self) -> bool {
+        matches!(
+            self,
+            DisputeResolution::BuyerRefund | DisputeResolution::PartialRefund
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveDisputePayload {
+    pub order_id: Uuid,
+    pub resolution: DisputeResolution,
+    pub rationale: String,
+}
+
+/// Review terms shared by `review.create` and `review.update` (the update
+/// command is this service only; the prototype had no review editing).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewTermsPayload {
+    pub order_id: Uuid,
+    pub rating: i64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportTargetType {
@@ -375,6 +548,28 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         "offer.withdraw" => parse_payload(&envelope.payload).map(CommandPayload::WithdrawOffer)?,
         "auction.place_bid" => parse_payload(&envelope.payload).and_then(validate_place_bid)?,
         "auction.close" => parse_payload(&envelope.payload).map(CommandPayload::CloseAuction)?,
+        "payment.sandbox_advance" => {
+            parse_payload(&envelope.payload).and_then(validate_advance_sandbox_payment)?
+        }
+        "fulfillment.ship" => parse_payload(&envelope.payload).and_then(validate_ship_order)?,
+        "fulfillment.confirm_delivery" => {
+            parse_payload(&envelope.payload).map(CommandPayload::ConfirmDelivery)?
+        }
+        "return.request" => parse_payload(&envelope.payload).and_then(validate_request_return)?,
+        "return.approve" => parse_payload(&envelope.payload).map(CommandPayload::ApproveReturn)?,
+        "return.receive" => parse_payload(&envelope.payload).map(CommandPayload::ReceiveReturn)?,
+        "refund.record_external" => {
+            parse_payload(&envelope.payload).and_then(validate_record_external_refund)?
+        }
+        "dispute.open" => parse_payload(&envelope.payload).and_then(validate_open_dispute)?,
+        "dispute.evidence" => {
+            parse_payload(&envelope.payload).and_then(validate_dispute_evidence)?
+        }
+        "dispute.resolve" => parse_payload(&envelope.payload).and_then(validate_resolve_dispute)?,
+        "review.create" => parse_payload(&envelope.payload)
+            .and_then(|payload| validate_review_terms(payload, CommandPayload::CreateReview))?,
+        "review.update" => parse_payload(&envelope.payload)
+            .and_then(|payload| validate_review_terms(payload, CommandPayload::UpdateReview))?,
         "trust.report" => parse_payload(&envelope.payload).and_then(validate_create_report)?,
         "trust.decide" => parse_payload(&envelope.payload).and_then(validate_decide_report)?,
         _ => return Err(vec![issue("kind", "Unsupported command kind")]),
@@ -628,6 +823,144 @@ fn validate_place_bid(payload: PlaceBidPayload) -> Result<CommandPayload, Vec<Va
     );
     if issues.is_empty() {
         Ok(CommandPayload::PlaceBid(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_advance_sandbox_payment(
+    payload: AdvanceSandboxPaymentPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if !(0..=6).contains(&payload.confirmations) {
+        issues.push(issue(
+            "payload.confirmations",
+            "Expected between 0 and 6 confirmations",
+        ));
+    }
+    if issues.is_empty() {
+        Ok(CommandPayload::AdvanceSandboxPayment(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_ship_order(
+    mut payload: ShipOrderPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed("payload.carrier", &mut payload.carrier, 1, 100, &mut issues);
+    validate_trimmed(
+        "payload.tracking_number",
+        &mut payload.tracking_number,
+        1,
+        200,
+        &mut issues,
+    );
+    if issues.is_empty() {
+        Ok(CommandPayload::ShipOrder(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_request_return(
+    mut payload: RequestReturnPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed("payload.reason", &mut payload.reason, 1, 1_000, &mut issues);
+    if !(1..=MAX_SAFE_INTEGER).contains(&payload.requested_amount_minor) {
+        issues.push(issue(
+            "payload.requested_amount_minor",
+            "Expected a positive requested amount",
+        ));
+    }
+    if issues.is_empty() {
+        Ok(CommandPayload::RequestReturn(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_record_external_refund(
+    mut payload: RecordExternalRefundPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if !(1..=MAX_SAFE_INTEGER).contains(&payload.amount_minor) {
+        issues.push(issue(
+            "payload.amount_minor",
+            "Expected a positive refund amount",
+        ));
+    }
+    // The transaction id is the independently supplied external evidence; a
+    // refund cannot be recorded without it (ADR-0019 §7).
+    validate_trimmed(
+        "payload.transaction_id",
+        &mut payload.transaction_id,
+        8,
+        200,
+        &mut issues,
+    );
+    if issues.is_empty() {
+        Ok(CommandPayload::RecordExternalRefund(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_open_dispute(
+    mut payload: OpenDisputePayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed("payload.reason", &mut payload.reason, 1, 2_000, &mut issues);
+    if issues.is_empty() {
+        Ok(CommandPayload::OpenDispute(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_dispute_evidence(
+    mut payload: DisputeEvidencePayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed("payload.body", &mut payload.body, 1, 2_000, &mut issues);
+    if issues.is_empty() {
+        Ok(CommandPayload::AddDisputeEvidence(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_resolve_dispute(
+    mut payload: ResolveDisputePayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed(
+        "payload.rationale",
+        &mut payload.rationale,
+        1,
+        2_000,
+        &mut issues,
+    );
+    if issues.is_empty() {
+        Ok(CommandPayload::ResolveDispute(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_review_terms(
+    mut payload: ReviewTermsPayload,
+    wrap: fn(ReviewTermsPayload) -> CommandPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if !(1..=5).contains(&payload.rating) {
+        issues.push(issue("payload.rating", "Expected a rating between 1 and 5"));
+    }
+    validate_trimmed("payload.text", &mut payload.text, 1, 5_000, &mut issues);
+    if issues.is_empty() {
+        Ok(wrap(payload))
     } else {
         Err(issues)
     }
@@ -992,6 +1325,126 @@ mod tests {
             parse_command(&decide).expect("valid decide").kind(),
             "trust.decide"
         );
+    }
+
+    fn order_command_json(kind: &str, payload: Value) -> Value {
+        json!({
+            "version": 1,
+            "command_id": "00000000-0000-4000-8000-000000001201",
+            "aggregate_id": "order:00000000-0000-4000-8000-00000000aaaa",
+            "expected_revision": 2,
+            "issued_at": "2026-08-19T22:00:00.000Z",
+            "kind": kind,
+            "payload": payload,
+        })
+    }
+
+    #[test]
+    fn parses_payment_and_fulfillment_commands() {
+        let advance = order_command_json(
+            "payment.sandbox_advance",
+            json!({
+                "payment_id": "00000000-0000-4000-8000-00000000bbbb",
+                "target": "confirmed",
+                "confirmations": 1,
+            }),
+        );
+        assert_eq!(
+            parse_command(&advance).expect("valid advance").kind(),
+            "payment.sandbox_advance"
+        );
+
+        let mut too_many = advance.clone();
+        too_many["payload"]["confirmations"] = json!(7);
+        let issues = parse_command(&too_many).expect_err("7 confirmations invalid");
+        assert!(issues.iter().any(|i| i.path == "payload.confirmations"));
+
+        let ship = order_command_json(
+            "fulfillment.ship",
+            json!({
+                "order_id": "00000000-0000-4000-8000-00000000aaaa",
+                "carrier": " Sandbox Post ",
+                "tracking_number": "TRACK-123",
+            }),
+        );
+        let command = parse_command(&ship).expect("valid ship");
+        let CommandPayload::ShipOrder(payload) = &command.payload else {
+            panic!("expected ship payload");
+        };
+        assert_eq!(payload.carrier, "Sandbox Post");
+
+        let confirm = order_command_json(
+            "fulfillment.confirm_delivery",
+            json!({ "order_id": "00000000-0000-4000-8000-00000000aaaa" }),
+        );
+        assert_eq!(
+            parse_command(&confirm).expect("valid confirm").kind(),
+            "fulfillment.confirm_delivery"
+        );
+    }
+
+    #[test]
+    fn parses_return_refund_dispute_and_review_commands() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        for (kind, payload) in [
+            (
+                "return.request",
+                json!({ "order_id": order_id, "reason": "Differs", "requested_amount_minor": 14_796 }),
+            ),
+            ("return.approve", json!({ "order_id": order_id })),
+            ("return.receive", json!({ "order_id": order_id })),
+            (
+                "refund.record_external",
+                json!({ "order_id": order_id, "amount_minor": 14_796, "transaction_id": "bitcoin-tx-evidence-123" }),
+            ),
+            (
+                "dispute.open",
+                json!({ "order_id": order_id, "reason": "No response", "requested_remedy": "refund" }),
+            ),
+            (
+                "dispute.evidence",
+                json!({ "order_id": order_id, "body": "Carrier photo reference 42." }),
+            ),
+            (
+                "dispute.resolve",
+                json!({ "order_id": order_id, "resolution": "buyer_refund", "rationale": "Evidence supports the buyer." }),
+            ),
+            (
+                "review.create",
+                json!({ "order_id": order_id, "rating": 5, "text": "Accurate and fast." }),
+            ),
+            (
+                "review.update",
+                json!({ "order_id": order_id, "rating": 4, "text": "Revised after wear." }),
+            ),
+        ] {
+            let command = order_command_json(kind, payload);
+            assert_eq!(parse_command(&command).expect("valid command").kind(), kind);
+        }
+    }
+
+    #[test]
+    fn rejects_refunds_without_evidence_and_out_of_range_reviews() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let missing_evidence = order_command_json(
+            "refund.record_external",
+            json!({ "order_id": order_id, "amount_minor": 100, "transaction_id": "short" }),
+        );
+        let issues = parse_command(&missing_evidence).expect_err("evidence under 8 chars invalid");
+        assert!(issues.iter().any(|i| i.path == "payload.transaction_id"));
+
+        let zero_rating = order_command_json(
+            "review.create",
+            json!({ "order_id": order_id, "rating": 0, "text": "x" }),
+        );
+        let issues = parse_command(&zero_rating).expect_err("rating 0 invalid");
+        assert!(issues.iter().any(|i| i.path == "payload.rating"));
+
+        let bad_remedy = order_command_json(
+            "dispute.open",
+            json!({ "order_id": order_id, "reason": "r", "requested_remedy": "escrow" }),
+        );
+        parse_command(&bad_remedy).expect_err("unknown remedy invalid");
     }
 
     #[test]

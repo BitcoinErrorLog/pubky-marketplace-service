@@ -30,17 +30,19 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::auth::Actor;
-use crate::handlers::{offers::OFFER_COLUMNS, LISTING_COLUMNS};
-use crate::model::{ListingRow, NotificationRow, OfferRow, OrderRow, PaymentRow};
+use crate::handlers::{offers::OFFER_COLUMNS, LISTING_COLUMNS, REVIEW_COLUMNS};
+use crate::model::{
+    ListingRow, NotificationRow, OfferRow, OrderRow, PaymentRow, ReceiptRow, ReviewRow,
+};
 use crate::AppState;
 
 pub const DEFAULT_LIMIT: i64 = 50;
 pub const MAX_LIMIT: i64 = 200;
 
-pub const ORDER_COLUMNS: &str = "id, buyer_pubky, seller_pubky, revision, state, lines, \
-     delivery_address, subtotal_minor, shipping_minor, tax_minor, total_minor, currency, \
-     exponent, guarantee_policy_version, payment_id, receipt_id, cancellation_reason, \
-     created_at, updated_at";
+pub const ORDER_COLUMNS: &str = "id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
+     state, lines, delivery_address, subtotal_minor, shipping_minor, tax_minor, total_minor, \
+     currency, exponent, guarantee_policy_version, payment_id, receipt_id, cancellation_reason, \
+     shipment, return_request, dispute, external_refund, created_at, updated_at";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
      state, confirmations, locks_bundle_id, amount_minor, currency, exponent, created_at, \
@@ -48,6 +50,9 @@ pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revi
 
 pub const NOTIFICATION_COLUMNS: &str =
     "id, recipient_pubky, actor_pubky, type, aggregate_id, created_at, read_at";
+
+pub const RECEIPT_COLUMNS: &str = "id, order_id, payment_id, issuer_pubky, recipient_pubky, \
+     total_minor, currency, exponent, content_hash, issued_at";
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
@@ -142,14 +147,18 @@ pub async fn list_offers(
 }
 
 /// Attaches the order's payment projection when it exists ("each with its
-/// payment if present"). Receipts are not part of the durable schema, so no
-/// receipt object is ever attached; `receipt_id` stays in the projection as
-/// the schema's truthful (currently always null) column.
-fn order_with_payment(order: &OrderRow, payment: Option<&PaymentRow>) -> Value {
+/// payment if present") and its reviews. `receipt_id` points at the durable
+/// receipt served by `GET /v1/receipts/{id}`.
+fn order_with_payment(
+    order: &OrderRow,
+    payment: Option<&PaymentRow>,
+    reviews: &[&ReviewRow],
+) -> Value {
     let mut view = order.projection();
     if let Some(payment) = payment {
         view["payment"] = payment.projection();
     }
+    view["reviews"] = Value::Array(reviews.iter().map(|review| review.view()).collect());
     view
 }
 
@@ -186,11 +195,25 @@ pub async fn list_orders(
         Ok(payments) => payments,
         Err(error) => return internal_error("payments", &error),
     };
+    let reviews: Vec<ReviewRow> = match sqlx::query_as(&format!(
+        "SELECT {REVIEW_COLUMNS} FROM reviews WHERE order_id = ANY($1) ORDER BY created_at, id"
+    ))
+    .bind(&order_ids)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(reviews) => reviews,
+        Err(error) => return internal_error("reviews", &error),
+    };
     let views: Vec<Value> = orders
         .iter()
         .map(|order| {
             let payment = payments.iter().find(|payment| payment.order_id == order.id);
-            order_with_payment(order, payment)
+            let order_reviews: Vec<&ReviewRow> = reviews
+                .iter()
+                .filter(|review| review.order_id == order.id)
+                .collect();
+            order_with_payment(order, payment, &order_reviews)
         })
         .collect();
     (StatusCode::OK, Json(json!({ "orders": views }))).into_response()
@@ -222,13 +245,49 @@ pub async fn get_order(
     .bind(order.id)
     .fetch_optional(&state.pool)
     .await;
-    match payment {
-        Ok(payment) => (
-            StatusCode::OK,
-            Json(order_with_payment(&order, payment.as_ref())),
-        )
-            .into_response(),
-        Err(error) => internal_error("payment", &error),
+    let payment = match payment {
+        Ok(payment) => payment,
+        Err(error) => return internal_error("payment", &error),
+    };
+    let reviews: Result<Vec<ReviewRow>, sqlx::Error> = sqlx::query_as(&format!(
+        "SELECT {REVIEW_COLUMNS} FROM reviews WHERE order_id = $1 ORDER BY created_at, id"
+    ))
+    .bind(order.id)
+    .fetch_all(&state.pool)
+    .await;
+    match reviews {
+        Ok(reviews) => {
+            let order_reviews: Vec<&ReviewRow> = reviews.iter().collect();
+            (
+                StatusCode::OK,
+                Json(order_with_payment(&order, payment.as_ref(), &order_reviews)),
+            )
+                .into_response()
+        }
+        Err(error) => internal_error("reviews", &error),
+    }
+}
+
+/// `GET /v1/receipts/{id}`: a single receipt, readable only by its issuer
+/// (the seller) and recipient (the buyer); absent and foreign receipts are
+/// both 404.
+pub async fn get_receipt(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let receipt: Result<Option<ReceiptRow>, sqlx::Error> = sqlx::query_as(&format!(
+        "SELECT {RECEIPT_COLUMNS} FROM receipts \
+         WHERE id = $1 AND (issuer_pubky = $2 OR recipient_pubky = $2)"
+    ))
+    .bind(id)
+    .bind(&actor.0)
+    .fetch_optional(&state.pool)
+    .await;
+    match receipt {
+        Ok(Some(receipt)) => (StatusCode::OK, Json(receipt.view())).into_response(),
+        Ok(None) => query_error(ErrorCode::NotFound, "The receipt was not found."),
+        Err(error) => internal_error("receipt", &error),
     }
 }
 

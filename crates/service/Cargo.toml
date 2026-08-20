@@ -11,6 +11,7 @@ marketplace-domain.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
+blake3.workspace = true
 chrono.workspace = true
 pubky-common.workspace = true
 rand.workspace = true

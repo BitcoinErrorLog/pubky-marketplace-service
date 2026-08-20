@@ -130,6 +130,7 @@ pub async fn handle(
 
         let order = OrderRow {
             id: order_id,
+            auction_aggregate_id: None,
             buyer_pubky: actor.to_string(),
             seller_pubky: seller_pubky.clone(),
             revision: 1,
@@ -146,6 +147,10 @@ pub async fn handle(
             payment_id,
             receipt_id: None,
             cancellation_reason: None,
+            shipment: None,
+            return_request: None,
+            dispute: None,
+            external_refund: None,
             created_at: now,
             updated_at: now,
         };

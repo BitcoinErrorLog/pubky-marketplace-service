@@ -13,6 +13,9 @@ marketplace-domain = { path = "crates/domain" }
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
+# Receipt content hashes use BLAKE3, the same function the prototype engine
+# and the client attachment hashing use (@noble/hashes/blake3).
+blake3 = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 http-body-util = "0.1"
 # Pinned: the authoritative Pubky AuthToken implementation, from the same

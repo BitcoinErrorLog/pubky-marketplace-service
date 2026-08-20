@@ -77,7 +77,14 @@ pub fn listing_machine() -> AggregateMachine {
                     Command("order.cancel_approve"),
                 ],
             ),
-            t("reserved", "sold", vec![Server("payment_confirmation")]),
+            t(
+                "reserved",
+                "sold",
+                vec![
+                    Command("payment.sandbox_advance"),
+                    Server("payment_confirmation"),
+                ],
+            ),
         ],
         commands: vec![
             "listing.register",
@@ -105,7 +112,14 @@ pub fn reservation_machine() -> AggregateMachine {
                     Command("order.cancel_approve"),
                 ],
             ),
-            t("active", "converted", vec![Server("payment_confirmation")]),
+            t(
+                "active",
+                "converted",
+                vec![
+                    Command("payment.sandbox_advance"),
+                    Server("payment_confirmation"),
+                ],
+            ),
         ],
         commands: vec!["inventory.reserve"],
         unreachable_states: vec![],
@@ -274,6 +288,7 @@ pub fn order_machine() -> AggregateMachine {
         ],
         commands: vec![
             "checkout.create",
+            "payment.sandbox_advance",
             "order.cancel_request",
             "order.cancel_approve",
             "fulfillment.ship",
@@ -283,10 +298,56 @@ pub fn order_machine() -> AggregateMachine {
             "return.receive",
             "refund.record_external",
             "dispute.open",
+            "dispute.evidence",
             "dispute.resolve",
             "review.create",
+            "review.update",
         ],
         unreachable_states: vec!["processing", "closed"],
+    }
+}
+
+/// The return request sub-state carried on an order (the client's
+/// `orderSchema.returnRequest.state` enum). `refunded` is reached through the
+/// externally evidenced refund record, never a funds movement by this
+/// service.
+pub fn return_machine() -> AggregateMachine {
+    AggregateMachine {
+        aggregate: "return",
+        states: vec!["requested", "approved", "received", "refunded"],
+        initial: "requested",
+        transitions: vec![
+            t("requested", "approved", vec![Command("return.approve")]),
+            t("approved", "received", vec![Command("return.receive")]),
+            t(
+                "received",
+                "refunded",
+                vec![Command("refund.record_external")],
+            ),
+        ],
+        commands: vec![
+            "return.request",
+            "return.approve",
+            "return.receive",
+            "refund.record_external",
+        ],
+        unreachable_states: vec![],
+    }
+}
+
+/// The dispute sub-state carried on an order (the client's
+/// `orderSchema.dispute.state` enum). The moderator decision
+/// (`dispute.resolve`) is the close transition; evidence
+/// (`dispute.evidence`, this service only) appends to the record without a
+/// state change.
+pub fn dispute_machine() -> AggregateMachine {
+    AggregateMachine {
+        aggregate: "dispute",
+        states: vec!["open", "resolved"],
+        initial: "open",
+        transitions: vec![t("open", "resolved", vec![Command("dispute.resolve")])],
+        commands: vec!["dispute.open", "dispute.evidence", "dispute.resolve"],
+        unreachable_states: vec![],
     }
 }
 
@@ -364,6 +425,8 @@ pub fn all_machines() -> Vec<AggregateMachine> {
         auction_machine(),
         order_machine(),
         payment_machine(),
+        return_machine(),
+        dispute_machine(),
         report_machine(),
     ]
 }
@@ -463,7 +526,7 @@ mod tests {
                 .as_array()
                 .expect("aggregates array")
                 .len(),
-            7
+            9
         );
     }
 

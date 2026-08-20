@@ -1,16 +1,25 @@
 pub mod auction;
 pub mod checkout;
+pub mod disputes;
+pub mod fulfillment;
 pub mod offers;
+pub mod payment;
 pub mod register_listing;
 pub mod report;
 pub mod reserve_inventory;
+pub mod returns;
+pub mod reviews;
 
 use chrono::{DateTime, Utc};
-use serde_json::json;
+use marketplace_domain::{ids, Command, ErrorCode};
+use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::model::ListingRow;
+use crate::executor::insert_event;
+use crate::model::{ListingRow, OrderRow, ReviewRow};
+use crate::queries::ORDER_COLUMNS;
+use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 pub const LISTING_COLUMNS: &str = "aggregate_id, seller_pubky, listing_id, title, \
      listing_revision, content_hash, server_revision, state, total_quantity, \
@@ -60,6 +69,127 @@ pub async fn current_listing_revision(
             .fetch_optional(&mut **tx)
             .await?;
     Ok(revision.map(|(value,)| value).unwrap_or(0))
+}
+
+pub async fn fetch_order(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+) -> Result<Option<OrderRow>, sqlx::Error> {
+    sqlx::query_as(&format!("SELECT {ORDER_COLUMNS} FROM orders WHERE id = $1"))
+        .bind(order_id)
+        .fetch_optional(&mut **tx)
+        .await
+}
+
+pub async fn fetch_order_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+) -> Result<Option<OrderRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT {ORDER_COLUMNS} FROM orders WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(order_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// The prototype engine's `getOrderAction` guard sequence: participant
+/// check, aggregate identity check, then the revision compare. The caller
+/// handles the not-found case (the fetch).
+pub fn guard_order_action(
+    actor: &str,
+    command: &Command,
+    order: &OrderRow,
+) -> Option<CommandFailure> {
+    if actor != order.buyer_pubky && actor != order.seller_pubky {
+        return Some(CommandFailure::new(
+            ErrorCode::Unauthorized,
+            "Only order participants may act on it.",
+        ));
+    }
+    if command.aggregate_id != ids::order_aggregate_id(order.id) {
+        return Some(CommandFailure::new(
+            ErrorCode::InvalidCommand,
+            "The order aggregate id is invalid.",
+        ));
+    }
+    if command.expected_revision != order.revision {
+        return Some(CommandFailure::with_revision(
+            ErrorCode::RevisionConflict,
+            "The order revision is stale.",
+            order.revision,
+        ));
+    }
+    None
+}
+
+pub const REVIEW_COLUMNS: &str = "id, order_id, reviewer_pubky, reviewer_role, subject_pubky, \
+     rating, text, created_at, updated_at";
+
+pub async fn fetch_order_reviews(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+) -> Result<Vec<ReviewRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT {REVIEW_COLUMNS} FROM reviews WHERE order_id = $1 ORDER BY created_at, id"
+    ))
+    .bind(order_id)
+    .fetch_all(&mut **tx)
+    .await
+}
+
+/// The redacted order projection with its reviews attached, the shape every
+/// order-action command result returns (never the delivery address).
+pub fn order_json_with_reviews(order: &OrderRow, reviews: &[ReviewRow]) -> Value {
+    let mut view = order.projection();
+    view["reviews"] = Value::Array(reviews.iter().map(ReviewRow::view).collect());
+    view
+}
+
+/// Persists the shared tail of an order action, mirroring the prototype's
+/// `persistOrderAction`: one immutable event on the order aggregate plus one
+/// outbox notification intent (`notification` is `(type, recipient)`),
+/// returning `{ kind: "order", order }`.
+pub async fn finish_order_action(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    command: &Command,
+    order: &OrderRow,
+    event_kind: &str,
+    notification: (&str, &str),
+    now: DateTime<Utc>,
+) -> Result<HandlerResult, sqlx::Error> {
+    let (notification_type, notification_recipient) = notification;
+    let order_aggregate_id = ids::order_aggregate_id(order.id);
+    let event_id = insert_event(
+        tx,
+        command.command_id,
+        &order_aggregate_id,
+        order.revision,
+        actor,
+        event_kind,
+        now,
+    )
+    .await?;
+    insert_notification_intent(
+        tx,
+        event_id,
+        notification_type,
+        notification_recipient,
+        actor,
+        &order_aggregate_id,
+        now,
+    )
+    .await?;
+    let reviews = fetch_order_reviews(tx, order.id).await?;
+    Ok(Ok(HandlerSuccess {
+        revision: order.revision,
+        event_ids: vec![event_id],
+        result: json!({
+            "kind": "order",
+            "order": order_json_with_reviews(order, &reviews),
+        }),
+    }))
 }
 
 /// Writes a complete notification intent to the outbox in the same

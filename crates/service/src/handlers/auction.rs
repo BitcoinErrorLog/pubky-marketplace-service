@@ -267,14 +267,18 @@ pub struct AuctionCloseOutcome {
 
 impl AuctionCloseOutcome {
     pub fn result_json(&self) -> Value {
+        // The order and payment use the redacted projections: no delivery
+        // address (always null here — the winner has not supplied one) and
+        // no Locks bundle id, which stays out of command results exactly as
+        // out of read projections (ADR-0019 §8).
         json!({
             "kind": "auction_result",
             "outcome": if self.sold { "sold" } else { "unsold" },
             "winner_pubky": self.winner_pubky,
             "listing": self.listing.view(),
             "reservation": self.reservation.as_ref().map(ReservationRow::view),
-            "order": self.order.as_ref().map(OrderRow::view),
-            "payment": self.payment.as_ref().map(PaymentRow::view),
+            "order": self.order.as_ref().map(OrderRow::projection),
+            "payment": self.payment.as_ref().map(PaymentRow::projection),
         })
     }
 }
@@ -385,6 +389,7 @@ pub async fn close_locked_auction(
         }]);
         let order = OrderRow {
             id: order_id,
+            auction_aggregate_id: Some(listing.aggregate_id.clone()),
             buyer_pubky: winner_pubky.clone(),
             seller_pubky: listing.seller_pubky.clone(),
             revision: 1,
@@ -401,6 +406,10 @@ pub async fn close_locked_auction(
             payment_id,
             receipt_id: None,
             cancellation_reason: None,
+            shipment: None,
+            return_request: None,
+            dispute: None,
+            external_refund: None,
             created_at: now,
             updated_at: now,
         };

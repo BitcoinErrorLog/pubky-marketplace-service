@@ -56,6 +56,10 @@
           "to": "sold",
           "via": [
             {
+              "trigger": "command",
+              "name": "payment.sandbox_advance"
+            },
+            {
               "trigger": "server",
               "name": "payment_confirmation"
             }
@@ -109,6 +113,10 @@
           "from": "active",
           "to": "converted",
           "via": [
+            {
+              "trigger": "command",
+              "name": "payment.sandbox_advance"
+            },
             {
               "trigger": "server",
               "name": "payment_confirmation"
@@ -565,6 +573,7 @@
       ],
       "commands": [
         "checkout.create",
+        "payment.sandbox_advance",
         "order.cancel_request",
         "order.cancel_approve",
         "fulfillment.ship",
@@ -574,8 +583,10 @@
         "return.receive",
         "refund.record_external",
         "dispute.open",
+        "dispute.evidence",
         "dispute.resolve",
-        "review.create"
+        "review.create",
+        "review.update"
       ],
       "unreachable_states": [
         "processing",
@@ -660,6 +671,81 @@
       ],
       "commands": [
         "payment.sandbox_advance"
+      ],
+      "unreachable_states": []
+    },
+    {
+      "aggregate": "return",
+      "states": [
+        "requested",
+        "approved",
+        "received",
+        "refunded"
+      ],
+      "initial": "requested",
+      "transitions": [
+        {
+          "from": "requested",
+          "to": "approved",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "return.approve"
+            }
+          ]
+        },
+        {
+          "from": "approved",
+          "to": "received",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "return.receive"
+            }
+          ]
+        },
+        {
+          "from": "received",
+          "to": "refunded",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "refund.record_external"
+            }
+          ]
+        }
+      ],
+      "commands": [
+        "return.request",
+        "return.approve",
+        "return.receive",
+        "refund.record_external"
+      ],
+      "unreachable_states": []
+    },
+    {
+      "aggregate": "dispute",
+      "states": [
+        "open",
+        "resolved"
+      ],
+      "initial": "open",
+      "transitions": [
+        {
+          "from": "open",
+          "to": "resolved",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "dispute.resolve"
+            }
+          ]
+        }
+      ],
+      "commands": [
+        "dispute.open",
+        "dispute.evidence",
+        "dispute.resolve"
       ],
       "unreachable_states": []
     },

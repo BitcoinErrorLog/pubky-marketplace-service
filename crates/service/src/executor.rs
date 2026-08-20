@@ -159,6 +159,50 @@ async fn dispatch(
         CommandPayload::CloseAuction(payload) => {
             crate::handlers::auction::close(tx, actor, command, payload, now).await
         }
+        CommandPayload::AdvanceSandboxPayment(payload) => {
+            crate::handlers::payment::advance(tx, actor, command, payload, now).await
+        }
+        CommandPayload::ShipOrder(payload) => {
+            crate::handlers::fulfillment::ship(tx, actor, command, payload, now).await
+        }
+        CommandPayload::ConfirmDelivery(payload) => {
+            crate::handlers::fulfillment::confirm_delivery(tx, actor, command, payload, now).await
+        }
+        CommandPayload::RequestReturn(payload) => {
+            crate::handlers::returns::request(tx, actor, command, payload, now).await
+        }
+        CommandPayload::ApproveReturn(payload) => {
+            crate::handlers::returns::approve(tx, actor, command, payload, now).await
+        }
+        CommandPayload::ReceiveReturn(payload) => {
+            crate::handlers::returns::receive(tx, actor, command, payload, now).await
+        }
+        CommandPayload::RecordExternalRefund(payload) => {
+            crate::handlers::returns::record_external_refund(tx, actor, command, payload, now).await
+        }
+        CommandPayload::OpenDispute(payload) => {
+            crate::handlers::disputes::open(tx, actor, command, payload, now).await
+        }
+        CommandPayload::AddDisputeEvidence(payload) => {
+            crate::handlers::disputes::add_evidence(tx, actor, command, payload, now).await
+        }
+        CommandPayload::ResolveDispute(payload) => {
+            crate::handlers::disputes::resolve(
+                tx,
+                actor,
+                command,
+                payload,
+                &state.config.moderator_pubkys,
+                now,
+            )
+            .await
+        }
+        CommandPayload::CreateReview(payload) => {
+            crate::handlers::reviews::create(tx, actor, command, payload, now).await
+        }
+        CommandPayload::UpdateReview(payload) => {
+            crate::handlers::reviews::update(tx, actor, command, payload, now).await
+        }
         CommandPayload::CreateReport(payload) => {
             crate::handlers::report::create(tx, actor, command, payload, now).await
         }

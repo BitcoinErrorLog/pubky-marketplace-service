@@ -241,6 +241,8 @@ impl ReportRow {
 #[derive(Debug, Clone, FromRow)]
 pub struct OrderRow {
     pub id: Uuid,
+    /// Internal correlation to the winning auction, never serialized.
+    pub auction_aggregate_id: Option<String>,
     pub buyer_pubky: String,
     pub seller_pubky: String,
     pub revision: i64,
@@ -257,6 +259,10 @@ pub struct OrderRow {
     pub payment_id: Uuid,
     pub receipt_id: Option<Uuid>,
     pub cancellation_reason: Option<String>,
+    pub shipment: Option<Value>,
+    pub return_request: Option<Value>,
+    pub dispute: Option<Value>,
+    pub external_refund: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -291,6 +297,67 @@ impl OrderRow {
             "payment_id": self.payment_id,
             "receipt_id": self.receipt_id,
             "cancellation_reason": self.cancellation_reason,
+            "shipment": self.shipment.clone().unwrap_or(Value::Null),
+            "return_request": self.return_request.clone().unwrap_or(Value::Null),
+            "dispute": self.dispute.clone().unwrap_or(Value::Null),
+            "external_refund": self.external_refund.clone().unwrap_or(Value::Null),
+            "created_at": format_timestamp(self.created_at),
+            "updated_at": format_timestamp(self.updated_at),
+        })
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ReceiptRow {
+    pub id: Uuid,
+    pub order_id: Uuid,
+    pub payment_id: Uuid,
+    pub issuer_pubky: String,
+    pub recipient_pubky: String,
+    pub total_minor: i64,
+    pub currency: String,
+    pub exponent: i32,
+    pub content_hash: String,
+    pub issued_at: DateTime<Utc>,
+}
+
+impl ReceiptRow {
+    pub fn view(&self) -> Value {
+        json!({
+            "id": self.id,
+            "order_id": self.order_id,
+            "payment_id": self.payment_id,
+            "issuer_pubky": self.issuer_pubky,
+            "recipient_pubky": self.recipient_pubky,
+            "total": money_json(self.total_minor, &self.currency, self.exponent),
+            "content_hash": self.content_hash,
+            "issued_at": format_timestamp(self.issued_at),
+        })
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ReviewRow {
+    pub id: Uuid,
+    pub order_id: Uuid,
+    pub reviewer_pubky: String,
+    pub reviewer_role: String,
+    pub subject_pubky: String,
+    pub rating: i32,
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ReviewRow {
+    pub fn view(&self) -> Value {
+        json!({
+            "id": self.id,
+            "reviewer_pubky": self.reviewer_pubky,
+            "reviewer_role": self.reviewer_role,
+            "subject_pubky": self.subject_pubky,
+            "rating": self.rating,
+            "text": self.text,
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
         })

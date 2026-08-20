@@ -391,6 +391,95 @@ pub fn checkout_command(seller_pubky: &str) -> Value {
     checkout_command_with_id(seller_pubky, "00000000-0000-4000-8000-000000001000")
 }
 
+/// The prototype's `paymentCommand` fixture.
+pub fn payment_command(
+    payment_id: &str,
+    expected_revision: i64,
+    target: &str,
+    confirmations: i64,
+    command_number: u64,
+) -> Value {
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x8000, command_number),
+        "aggregate_id": format!("payment:{payment_id}"),
+        "expected_revision": expected_revision,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "payment.sandbox_advance",
+        "payload": {
+            "payment_id": payment_id,
+            "target": target,
+            "confirmations": confirmations,
+        },
+    })
+}
+
+/// The prototype's `orderCommand` fixture: an order-aggregate command whose
+/// payload carries the order id plus command-specific fields.
+pub fn order_command(
+    kind: &str,
+    order_id: &str,
+    expected_revision: i64,
+    mut payload: Value,
+    command_number: u64,
+) -> Value {
+    payload["order_id"] = json!(order_id);
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x8000, command_number),
+        "aggregate_id": format!("order:{order_id}"),
+        "expected_revision": expected_revision,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": kind,
+        "payload": payload,
+    })
+}
+
+pub struct PaidOrder {
+    pub order_id: String,
+    pub payment_id: String,
+    pub receipt_id: String,
+    pub total_minor: i64,
+}
+
+/// The prototype's `createPaidOrder` fixture: register one unit, check out
+/// as the buyer, and confirm the sandbox payment (which issues the receipt
+/// and moves the order to `paid` at revision 2).
+pub async fn create_paid_order(app: &TestApp, seller: &TestActor, buyer: &TestActor) -> PaidOrder {
+    let (status, body) = execute(app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
+    let (status, body) = execute(app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id present")
+        .to_string();
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id present")
+        .to_string();
+    let total_minor = body["result"]["orders"][0]["total"]["amount_minor"]
+        .as_i64()
+        .expect("order total present");
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &payment_command(&payment_id, 1, "confirmed", 1, 1_050),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment fixture failed: {body}");
+    let receipt_id = body["result"]["receipt"]["id"]
+        .as_str()
+        .expect("receipt id present")
+        .to_string();
+    PaidOrder {
+        order_id,
+        payment_id,
+        receipt_id,
+        total_minor,
+    }
+}
+
 pub async fn count(pool: &PgPool, sql: &str) -> i64 {
     let (value,): (i64,) = sqlx::query_as(sql)
         .fetch_one(pool)

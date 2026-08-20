@@ -256,7 +256,8 @@ async fn rejects_unsupported_versions_and_unported_kinds(pool: PgPool) {
 }
 
 // TS case: "creates an immutable checkout snapshot, reservation, order, and
-// sandbox payment" (sandbox payment advancement is outside this slice).
+// sandbox payment" (sandbox payment advancement is covered in
+// post_purchase_test.rs).
 #[sqlx::test]
 async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgPool) {
     let app = test_app(pool).await;
@@ -320,7 +321,8 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
 }
 
 // TS case: "rejects duplicate checkout lines, stale stock, self-purchase, and
-// invalid payment transitions" (payment transitions are outside this slice).
+// invalid payment transitions" (the payment-transition half lives in
+// post_purchase_test.rs).
 #[sqlx::test]
 async fn rejects_duplicate_lines_self_purchase_stale_stock_and_oversell(pool: PgPool) {
     let app = test_app(pool).await;
