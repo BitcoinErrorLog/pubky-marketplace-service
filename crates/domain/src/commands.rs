@@ -56,6 +56,15 @@ pub enum CommandPayload {
     RegisterListing(RegisterListingPayload),
     ReserveInventory(ReserveInventoryPayload),
     CreateCheckout(CreateCheckoutPayload),
+    CreateOffer(OfferTermsPayload),
+    CounterOffer(CounterOfferPayload),
+    AcceptOffer(OfferActionPayload),
+    RejectOffer(OfferActionPayload),
+    WithdrawOffer(OfferActionPayload),
+    PlaceBid(PlaceBidPayload),
+    CloseAuction(CloseAuctionPayload),
+    CreateReport(CreateReportPayload),
+    DecideReport(DecideReportPayload),
 }
 
 impl Command {
@@ -64,6 +73,15 @@ impl Command {
             CommandPayload::RegisterListing(_) => "listing.register",
             CommandPayload::ReserveInventory(_) => "inventory.reserve",
             CommandPayload::CreateCheckout(_) => "checkout.create",
+            CommandPayload::CreateOffer(_) => "offer.create",
+            CommandPayload::CounterOffer(_) => "offer.counter",
+            CommandPayload::AcceptOffer(_) => "offer.accept",
+            CommandPayload::RejectOffer(_) => "offer.reject",
+            CommandPayload::WithdrawOffer(_) => "offer.withdraw",
+            CommandPayload::PlaceBid(_) => "auction.place_bid",
+            CommandPayload::CloseAuction(_) => "auction.close",
+            CommandPayload::CreateReport(_) => "trust.report",
+            CommandPayload::DecideReport(_) => "trust.decide",
         }
     }
 
@@ -75,6 +93,15 @@ impl Command {
             CommandPayload::RegisterListing(p) => serde_json::to_value(p),
             CommandPayload::ReserveInventory(p) => serde_json::to_value(p),
             CommandPayload::CreateCheckout(p) => serde_json::to_value(p),
+            CommandPayload::CreateOffer(p) => serde_json::to_value(p),
+            CommandPayload::CounterOffer(p) => serde_json::to_value(p),
+            CommandPayload::AcceptOffer(p)
+            | CommandPayload::RejectOffer(p)
+            | CommandPayload::WithdrawOffer(p) => serde_json::to_value(p),
+            CommandPayload::PlaceBid(p) => serde_json::to_value(p),
+            CommandPayload::CloseAuction(p) => serde_json::to_value(p),
+            CommandPayload::CreateReport(p) => serde_json::to_value(p),
+            CommandPayload::DecideReport(p) => serde_json::to_value(p),
         }
         .expect("command payloads serialize infallibly");
         json!({
@@ -173,6 +200,100 @@ pub struct CreateCheckoutPayload {
     pub guarantee_policy_version: u32,
 }
 
+/// Offer terms shared by `offer.create` and `offer.counter`
+/// (`offerTermsSchema` in the prototype contracts).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfferTermsPayload {
+    pub amount: Money,
+    pub quantity: i64,
+    pub expires_in_seconds: i64,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterOfferPayload {
+    pub offer_id: Uuid,
+    pub amount: Money,
+    pub quantity: i64,
+    pub expires_in_seconds: i64,
+    pub message: String,
+}
+
+/// Payload for `offer.accept`, `offer.reject`, and `offer.withdraw`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfferActionPayload {
+    pub offer_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaceBidPayload {
+    pub maximum_amount: Money,
+}
+
+/// `auction.close` carries an empty payload; unknown fields are rejected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseAuctionPayload {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportTargetType {
+    Listing,
+    User,
+    Message,
+    Review,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportReason {
+    ProhibitedItem,
+    Counterfeit,
+    Scam,
+    Harassment,
+    Unsafe,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateReportPayload {
+    pub target_type: ReportTargetType,
+    pub target_id: String,
+    pub reason: ReportReason,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportDecision {
+    Dismissed,
+    Actioned,
+}
+
+impl ReportDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReportDecision::Dismissed => "dismissed",
+            ReportDecision::Actioned => "actioned",
+        }
+    }
+}
+
+/// Moderator decision on a report (`trust.decide`, this service only; the
+/// prototype engine has no report decisions).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecideReportPayload {
+    pub report_id: Uuid,
+    pub decision: ReportDecision,
+    pub rationale: String,
+}
+
 fn aggregate_id_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -247,6 +368,15 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
             parse_payload(&envelope.payload).and_then(validate_reserve_inventory)?
         }
         "checkout.create" => parse_payload(&envelope.payload).and_then(validate_create_checkout)?,
+        "offer.create" => parse_payload(&envelope.payload).and_then(validate_create_offer)?,
+        "offer.counter" => parse_payload(&envelope.payload).and_then(validate_counter_offer)?,
+        "offer.accept" => parse_payload(&envelope.payload).map(CommandPayload::AcceptOffer)?,
+        "offer.reject" => parse_payload(&envelope.payload).map(CommandPayload::RejectOffer)?,
+        "offer.withdraw" => parse_payload(&envelope.payload).map(CommandPayload::WithdrawOffer)?,
+        "auction.place_bid" => parse_payload(&envelope.payload).and_then(validate_place_bid)?,
+        "auction.close" => parse_payload(&envelope.payload).map(CommandPayload::CloseAuction)?,
+        "trust.report" => parse_payload(&envelope.payload).and_then(validate_create_report)?,
+        "trust.decide" => parse_payload(&envelope.payload).and_then(validate_decide_report)?,
         _ => return Err(vec![issue("kind", "Unsupported command kind")]),
     };
 
@@ -427,6 +557,124 @@ fn validate_reserve_inventory(
     }
 }
 
+/// One week, the maximum offer lifetime accepted by the prototype contracts.
+const MAX_OFFER_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+fn validate_offer_terms(
+    amount: &Money,
+    quantity: i64,
+    expires_in_seconds: i64,
+    message: &mut String,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    validate_positive_money("payload.amount", amount, issues);
+    if !(1..=1_000_000).contains(&quantity) {
+        issues.push(issue(
+            "payload.quantity",
+            "Expected a quantity between 1 and 1000000",
+        ));
+    }
+    if !(300..=MAX_OFFER_TTL_SECONDS).contains(&expires_in_seconds) {
+        issues.push(issue(
+            "payload.expires_in_seconds",
+            "Expected an offer lifetime between 300 and 604800 seconds",
+        ));
+    }
+    validate_trimmed("payload.message", message, 0, 500, issues);
+}
+
+fn validate_create_offer(
+    mut payload: OfferTermsPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_offer_terms(
+        &payload.amount,
+        payload.quantity,
+        payload.expires_in_seconds,
+        &mut payload.message,
+        &mut issues,
+    );
+    if issues.is_empty() {
+        Ok(CommandPayload::CreateOffer(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_counter_offer(
+    mut payload: CounterOfferPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_offer_terms(
+        &payload.amount,
+        payload.quantity,
+        payload.expires_in_seconds,
+        &mut payload.message,
+        &mut issues,
+    );
+    if issues.is_empty() {
+        Ok(CommandPayload::CounterOffer(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_place_bid(payload: PlaceBidPayload) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_positive_money(
+        "payload.maximum_amount",
+        &payload.maximum_amount,
+        &mut issues,
+    );
+    if issues.is_empty() {
+        Ok(CommandPayload::PlaceBid(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_create_report(
+    mut payload: CreateReportPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if payload.target_id.is_empty() || payload.target_id.chars().count() > 300 {
+        issues.push(issue(
+            "payload.target_id",
+            "Expected between 1 and 300 characters",
+        ));
+    }
+    validate_trimmed(
+        "payload.details",
+        &mut payload.details,
+        1,
+        2_000,
+        &mut issues,
+    );
+    if issues.is_empty() {
+        Ok(CommandPayload::CreateReport(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_decide_report(
+    mut payload: DecideReportPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed(
+        "payload.rationale",
+        &mut payload.rationale,
+        1,
+        2_000,
+        &mut issues,
+    );
+    if issues.is_empty() {
+        Ok(CommandPayload::DecideReport(payload))
+    } else {
+        Err(issues)
+    }
+}
+
 fn validate_create_checkout(
     mut payload: CreateCheckoutPayload,
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
@@ -588,7 +836,7 @@ mod tests {
         assert_eq!(issues[0].path, "version");
 
         let mut raw = register_command_json();
-        raw["kind"] = json!("offer.create");
+        raw["kind"] = json!("message.send");
         let issues = parse_command(&raw).expect_err("kind not yet supported");
         assert_eq!(issues[0].path, "kind");
     }
@@ -619,6 +867,131 @@ mod tests {
         changed_raw["payload"]["quantity"] = json!(2);
         let changed = parse_command(&changed_raw).expect("valid");
         assert_ne!(original.request_hash(), changed.request_hash());
+    }
+
+    fn offer_command_json() -> Value {
+        json!({
+            "version": 1,
+            "command_id": "00000000-0000-4000-8000-000000000500",
+            "aggregate_id": format!("listing:{}_boots_01", "y".repeat(52)),
+            "expected_revision": 1,
+            "issued_at": "2026-08-19T22:00:00.000Z",
+            "kind": "offer.create",
+            "payload": {
+                "amount": { "amount_minor": 10_000, "currency": "USD", "exponent": 2 },
+                "quantity": 1,
+                "expires_in_seconds": 3_600,
+                "message": "Would you take this?",
+            },
+        })
+    }
+
+    #[test]
+    fn parses_offer_lifecycle_commands() {
+        let created = parse_command(&offer_command_json()).expect("valid offer.create");
+        assert_eq!(created.kind(), "offer.create");
+
+        let mut counter = offer_command_json();
+        counter["kind"] = json!("offer.counter");
+        counter["aggregate_id"] = json!("offer:00000000-0000-4000-8000-000000000500");
+        counter["payload"]["offer_id"] = json!("00000000-0000-4000-8000-000000000500");
+        assert_eq!(
+            parse_command(&counter).expect("valid offer.counter").kind(),
+            "offer.counter"
+        );
+
+        for kind in ["offer.accept", "offer.reject", "offer.withdraw"] {
+            let mut action = offer_command_json();
+            action["kind"] = json!(kind);
+            action["aggregate_id"] = json!("offer:00000000-0000-4000-8000-000000000500");
+            action["payload"] = json!({ "offer_id": "00000000-0000-4000-8000-000000000500" });
+            assert_eq!(parse_command(&action).expect("valid action").kind(), kind);
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_offer_terms() {
+        let mut short = offer_command_json();
+        short["payload"]["expires_in_seconds"] = json!(299);
+        let issues = parse_command(&short).expect_err("lifetime below 300s invalid");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.expires_in_seconds"));
+
+        let mut long_message = offer_command_json();
+        long_message["payload"]["message"] = json!("x".repeat(501));
+        let issues = parse_command(&long_message).expect_err("501-char message invalid");
+        assert!(issues.iter().any(|i| i.path == "payload.message"));
+
+        let mut negative = offer_command_json();
+        negative["payload"]["amount"]["amount_minor"] = json!(0);
+        let issues = parse_command(&negative).expect_err("zero amount invalid");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.amount.amount_minor"));
+    }
+
+    #[test]
+    fn parses_auction_bid_and_close_commands() {
+        let mut bid = offer_command_json();
+        bid["kind"] = json!("auction.place_bid");
+        bid["payload"] = json!({
+            "maximum_amount": { "amount_minor": 10_000, "currency": "USD", "exponent": 2 },
+        });
+        assert_eq!(
+            parse_command(&bid).expect("valid bid").kind(),
+            "auction.place_bid"
+        );
+
+        let mut close = offer_command_json();
+        close["kind"] = json!("auction.close");
+        close["payload"] = json!({});
+        assert_eq!(
+            parse_command(&close).expect("valid close").kind(),
+            "auction.close"
+        );
+
+        let mut close_extra = offer_command_json();
+        close_extra["kind"] = json!("auction.close");
+        close_extra["payload"] = json!({ "private_address": "secret-address" });
+        let issues = parse_command(&close_extra).expect_err("close payload must be empty");
+        let serialized = serde_json::to_string(&issues).expect("issues serialize");
+        assert!(!serialized.contains("secret-address"));
+    }
+
+    #[test]
+    fn parses_trust_report_and_decide_commands() {
+        let mut report = offer_command_json();
+        report["kind"] = json!("trust.report");
+        report["aggregate_id"] = json!("report:00000000-0000-4000-8000-000000000500");
+        report["expected_revision"] = json!(0);
+        report["payload"] = json!({
+            "target_type": "listing",
+            "target_id": format!("listing:{}_boots_01", "y".repeat(52)),
+            "reason": "counterfeit",
+            "details": "Brand markings appear inconsistent.",
+        });
+        assert_eq!(
+            parse_command(&report).expect("valid report").kind(),
+            "trust.report"
+        );
+
+        let mut bad_reason = report.clone();
+        bad_reason["payload"]["reason"] = json!("not-a-reason");
+        parse_command(&bad_reason).expect_err("unknown reason invalid");
+
+        let mut decide = offer_command_json();
+        decide["kind"] = json!("trust.decide");
+        decide["aggregate_id"] = json!("report:00000000-0000-4000-8000-000000000500");
+        decide["payload"] = json!({
+            "report_id": "00000000-0000-4000-8000-000000000500",
+            "decision": "actioned",
+            "rationale": "Listing removed after review.",
+        });
+        assert_eq!(
+            parse_command(&decide).expect("valid decide").kind(),
+            "trust.decide"
+        );
     }
 
     #[test]

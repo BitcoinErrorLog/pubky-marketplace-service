@@ -154,8 +154,16 @@ pub fn auction_machine() -> AggregateMachine {
         initial: "scheduled",
         transitions: vec![
             t("scheduled", "active", vec![Server("auction_start")]),
-            t("active", "sold", vec![Command("auction.close")]),
-            t("active", "unsold", vec![Command("auction.close")]),
+            t(
+                "active",
+                "sold",
+                vec![Command("auction.close"), Server("auction_close")],
+            ),
+            t(
+                "active",
+                "unsold",
+                vec![Command("auction.close"), Server("auction_close")],
+            ),
         ],
         commands: vec!["listing.register", "auction.place_bid", "auction.close"],
         unreachable_states: vec!["cancelled"],
@@ -330,6 +338,24 @@ pub fn payment_machine() -> AggregateMachine {
     }
 }
 
+/// Trust reports (task 3.5). Reports are created by any authenticated user;
+/// decisions are moderator-only and recorded append-only. The prototype
+/// engine stored reports with a single `open` state and no decisions; the
+/// decision flow is canonical to this service.
+pub fn report_machine() -> AggregateMachine {
+    AggregateMachine {
+        aggregate: "report",
+        states: vec!["open", "dismissed", "actioned"],
+        initial: "open",
+        transitions: vec![
+            t("open", "dismissed", vec![Command("trust.decide")]),
+            t("open", "actioned", vec![Command("trust.decide")]),
+        ],
+        commands: vec!["trust.report", "trust.decide"],
+        unreachable_states: vec![],
+    }
+}
+
 pub fn all_machines() -> Vec<AggregateMachine> {
     vec![
         listing_machine(),
@@ -338,6 +364,7 @@ pub fn all_machines() -> Vec<AggregateMachine> {
         auction_machine(),
         order_machine(),
         payment_machine(),
+        report_machine(),
     ]
 }
 
@@ -436,7 +463,7 @@ mod tests {
                 .as_array()
                 .expect("aggregates array")
                 .len(),
-            6
+            7
         );
     }
 

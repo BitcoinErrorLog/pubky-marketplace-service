@@ -15,3 +15,11 @@ pub fn order_aggregate_id(order_id: Uuid) -> String {
 pub fn payment_aggregate_id(payment_id: Uuid) -> String {
     format!("payment:{payment_id}")
 }
+
+pub fn offer_aggregate_id(offer_id: Uuid) -> String {
+    format!("offer:{offer_id}")
+}
+
+pub fn report_aggregate_id(report_id: Uuid) -> String {
+    format!("report:{report_id}")
+}
