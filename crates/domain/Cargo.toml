@@ -1,0 +1,19 @@
+[package]
+name = "marketplace-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Canonical domain contracts for the Pubky Marketplace Transaction Service"
+
+[dependencies]
+chrono.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[[bin]]
+name = "emit-contracts"
+path = "src/bin/emit_contracts.rs"
