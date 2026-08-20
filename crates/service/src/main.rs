@@ -1,0 +1,34 @@
+use std::sync::Arc;
+
+use sqlx::postgres::PgPoolOptions;
+use tracing_subscriber::EnvFilter;
+
+use marketplace_service::clock::SystemClock;
+use marketplace_service::config::Config;
+use marketplace_service::{expiry, http, AppState};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let config = Config::from_env()?;
+    let pool = PgPoolOptions::new()
+        .max_connections(20)
+        .connect(&config.database_url)
+        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    tracing::info!("database migrations applied");
+
+    let bind_addr = config.bind_addr;
+    let state = AppState::new(pool, Arc::new(SystemClock), config);
+    expiry::spawn_worker(state.clone());
+
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    tracing::info!(addr = %bind_addr, "marketplace transaction service listening");
+    axum::serve(listener, http::build_router(state)).await?;
+    Ok(())
+}
