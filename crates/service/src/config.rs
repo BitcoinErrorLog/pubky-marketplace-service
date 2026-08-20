@@ -10,7 +10,12 @@ pub struct Config {
     /// Exact origins allowed by CORS. Empty means no browser origin is
     /// allowed (non-browser clients are unaffected).
     pub allowed_origins: Vec<HeaderValue>,
-    pub challenge_ttl_seconds: i64,
+    /// Acceptance window (seconds) around server time for an AuthToken's
+    /// signing timestamp. Tokens outside `now ± window` are rejected. The
+    /// verifying library additionally rejects tokens more than 3 minutes
+    /// from system time, so values above 180 only widen the future bound in
+    /// deployments where the injected clock diverges from system time.
+    pub auth_token_window_seconds: i64,
     pub session_ttl_seconds: i64,
     pub worker_interval_seconds: u64,
     pub worker_lease_seconds: i64,
@@ -38,7 +43,7 @@ impl Config {
                     .map_err(|_| anyhow::anyhow!("invalid origin in ALLOWED_ORIGINS"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let challenge_ttl_seconds = env_i64("AUTH_CHALLENGE_TTL_SECONDS", 120)?;
+        let auth_token_window_seconds = env_i64("AUTH_TOKEN_WINDOW_SECONDS", 120)?;
         let session_ttl_seconds = env_i64("AUTH_SESSION_TTL_SECONDS", 86_400)?;
         let worker_interval_seconds = env_i64("WORKER_INTERVAL_SECONDS", 10)?.try_into()?;
         let worker_lease_seconds = env_i64("WORKER_LEASE_SECONDS", 30)?;
@@ -48,7 +53,7 @@ impl Config {
             bind_addr,
             database_url,
             allowed_origins,
-            challenge_ttl_seconds,
+            auth_token_window_seconds,
             session_ttl_seconds,
             worker_interval_seconds,
             worker_lease_seconds,
@@ -66,7 +71,7 @@ impl Config {
             bind_addr: "127.0.0.1:0".parse().expect("valid test bind address"),
             database_url: String::new(),
             allowed_origins: vec![HeaderValue::from_static("http://localhost:3000")],
-            challenge_ttl_seconds: 120,
+            auth_token_window_seconds: 120,
             session_ttl_seconds: 86_400,
             worker_interval_seconds: 3_600,
             worker_lease_seconds: 30,

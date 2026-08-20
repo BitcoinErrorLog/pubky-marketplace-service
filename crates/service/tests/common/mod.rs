@@ -1,6 +1,6 @@
 //! Shared integration test harness: builds the real router against a real
 //! Postgres database (provisioned per test by `#[sqlx::test]`) and drives it
-//! through the full HTTP stack, including Pubky challenge–response auth.
+//! through the full HTTP stack, including Pubky AuthToken auth.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -8,18 +8,16 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signer, SigningKey};
 use http_body_util::BodyExt;
-use rand::rngs::OsRng;
+use pubky_common::auth::AuthToken;
+use pubky_common::capabilities::Capability;
+use pubky_common::crypto::Keypair;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::util::ServiceExt;
 
-use marketplace_service::auth::CHALLENGE_CONTEXT;
-use marketplace_service::clock::AdjustableClock;
+use marketplace_service::clock::{AdjustableClock, Clock};
 use marketplace_service::config::Config;
 use marketplace_service::http::build_router;
 use marketplace_service::AppState;
@@ -58,15 +56,21 @@ pub async fn test_app_with_config(pool: PgPool, config: Config) -> TestApp {
 }
 
 pub struct TestActor {
-    pub signing: SigningKey,
+    pub keypair: Keypair,
     pub pubky: String,
     pub token: String,
 }
 
-pub fn random_keypair() -> (SigningKey, String) {
-    let signing = SigningKey::generate(&mut OsRng);
-    let pubky = z32::encode(signing.verifying_key().as_bytes());
-    (signing, pubky)
+pub fn random_keypair() -> (Keypair, String) {
+    let keypair = Keypair::random();
+    let pubky = keypair.public_key().z32();
+    (keypair, pubky)
+}
+
+/// Signs a genuine AuthToken with the library the service verifies against
+/// and returns its canonical postcard bytes.
+pub fn auth_token_bytes(keypair: &Keypair) -> Vec<u8> {
+    AuthToken::sign(keypair, vec![Capability::root()]).serialize()
 }
 
 pub async fn send(
@@ -104,47 +108,58 @@ pub async fn send(
     (status, value)
 }
 
-pub fn sign_challenge(signing: &SigningKey, nonce: &[u8]) -> String {
-    let mut message = CHALLENGE_CONTEXT.to_vec();
-    message.extend_from_slice(nonce);
-    URL_SAFE_NO_PAD.encode(signing.sign(&message).to_bytes())
+/// Sends a request whose body is raw bytes (the AuthToken wire form).
+pub async fn send_bytes(
+    router: Router,
+    method: &str,
+    uri: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::from(body))
+        .expect("request builds");
+    let response = router.oneshot(request).await.expect("request executes");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("body is JSON")
+    };
+    (status, value)
 }
 
-/// Full challenge–response authentication over HTTP with a real keypair.
-pub async fn authenticate(app: &TestApp, signing: &SigningKey, pubky: &str) -> String {
-    let (status, challenge) = send(
-        app.router.clone(),
-        "POST",
-        "/v1/auth/challenges",
-        None,
-        &json!({ "pubky": pubky }),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "challenge issue failed: {challenge}"
-    );
-    let nonce = URL_SAFE_NO_PAD
-        .decode(challenge["nonce"].as_str().expect("nonce present"))
-        .expect("nonce decodes");
-    let (status, session) = send(
+/// Establishes a session by signing a genuine AuthToken and posting its
+/// bytes to `/v1/auth/sessions`.
+///
+/// `AuthToken::sign` stamps the token with real system time, so the
+/// adjustable test clock is aligned with system time for the exchange (the
+/// service's acceptance window is measured against its clock) and restored
+/// to the fixture instant afterwards.
+pub async fn authenticate(app: &TestApp, keypair: &Keypair) -> String {
+    let fixture_now = app.clock.now();
+    app.clock.set(Utc::now());
+    let (status, session) = send_bytes(
         app.router.clone(),
         "POST",
         "/v1/auth/sessions",
-        None,
-        &json!({
-            "pubky": pubky,
-            "challenge_id": challenge["challenge_id"],
-            "signature": sign_challenge(signing, &nonce),
-        }),
+        auth_token_bytes(keypair),
     )
     .await;
+    app.clock.set(fixture_now);
     assert_eq!(
         status,
         StatusCode::CREATED,
         "session issue failed: {session}"
     );
+    assert_eq!(session["pubky"], json!(keypair.public_key().z32()));
     session["token"]
         .as_str()
         .expect("token present")
@@ -152,10 +167,10 @@ pub async fn authenticate(app: &TestApp, signing: &SigningKey, pubky: &str) -> S
 }
 
 pub async fn new_actor(app: &TestApp) -> TestActor {
-    let (signing, pubky) = random_keypair();
-    let token = authenticate(app, &signing, &pubky).await;
+    let (keypair, pubky) = random_keypair();
+    let token = authenticate(app, &keypair).await;
     TestActor {
-        signing,
+        keypair,
         pubky,
         token,
     }

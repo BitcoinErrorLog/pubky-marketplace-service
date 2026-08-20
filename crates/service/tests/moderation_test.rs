@@ -50,9 +50,9 @@ async fn list_reports(app: &common::TestApp, token: &str) -> Value {
 // role-scoped GET /v1/reports endpoint.
 #[sqlx::test]
 async fn records_structured_trust_reports_without_exposing_them_to_ordinary_users(pool: PgPool) {
-    let (moderator_signing, moderator_pubky) = random_keypair();
+    let (moderator_keypair, moderator_pubky) = random_keypair();
     let app = test_app_with_moderators(pool, vec![moderator_pubky.clone()]).await;
-    let moderator_token = authenticate(&app, &moderator_signing, &moderator_pubky).await;
+    let moderator_token = authenticate(&app, &moderator_keypair).await;
     let buyer = new_actor(&app).await;
     let other_user = new_actor(&app).await;
 
@@ -119,9 +119,9 @@ async fn non_moderators_read_only_their_own_reports(pool: PgPool) {
 // append-only, and final (a decided report cannot be re-decided).
 #[sqlx::test]
 async fn moderator_decisions_are_recorded_append_only(pool: PgPool) {
-    let (moderator_signing, moderator_pubky) = random_keypair();
+    let (moderator_keypair, moderator_pubky) = random_keypair();
     let app = test_app_with_moderators(pool, vec![moderator_pubky.clone()]).await;
-    let moderator_token = authenticate(&app, &moderator_signing, &moderator_pubky).await;
+    let moderator_token = authenticate(&app, &moderator_keypair).await;
     let buyer = new_actor(&app).await;
     let report_id = "00000000-0000-4000-8000-000000001243";
     execute(
@@ -204,9 +204,9 @@ async fn moderator_decisions_are_recorded_append_only(pool: PgPool) {
 // authority over other users' aggregates.
 #[sqlx::test]
 async fn moderator_role_grants_no_broad_admin_authority(pool: PgPool) {
-    let (moderator_signing, moderator_pubky) = random_keypair();
+    let (moderator_keypair, moderator_pubky) = random_keypair();
     let app = test_app_with_moderators(pool, vec![moderator_pubky.clone()]).await;
-    let moderator_token = authenticate(&app, &moderator_signing, &moderator_pubky).await;
+    let moderator_token = authenticate(&app, &moderator_keypair).await;
     let seller = new_actor(&app).await;
     execute(
         &app,

@@ -15,7 +15,7 @@ crates/domain      Canonical contracts: command envelope + payload validation,
                    money, aggregate ids, error codes, state machines, and the
                    emit-contracts binary.
 crates/service     axum HTTP service: Postgres schema (sqlx migrations),
-                   Pubky challenge–response auth, command executor with
+                   Pubky AuthToken auth, command executor with
                    idempotency, command handlers, background worker runtime
                    (expiry, auction close, outbox delivery with leases).
 contracts/         state-machines.json — the machine-readable state machine
@@ -25,7 +25,7 @@ docker-compose.yml Dev/test PostgreSQL 17 on port 55432.
 
 ## Setup
 
-Requirements: Rust (1.85+), Docker.
+Requirements: Rust (1.89+), Docker.
 
 ```sh
 docker compose up -d --wait          # PostgreSQL 17 on localhost:55432
@@ -47,14 +47,14 @@ Migrations in `crates/service/migrations/` are applied automatically at boot
 | `DATABASE_URL` | required | Postgres connection string |
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `ALLOWED_ORIGINS` | empty | comma-separated exact CORS origins |
-| `AUTH_CHALLENGE_TTL_SECONDS` | `120` | auth challenge lifetime |
+| `AUTH_TOKEN_WINDOW_SECONDS` | `120` | acceptance window around server time for an AuthToken's signing timestamp |
 | `AUTH_SESSION_TTL_SECONDS` | `86400` | session token lifetime |
 | `WORKER_INTERVAL_SECONDS` | `10` | background worker pass interval |
 | `WORKER_LEASE_SECONDS` | `30` | worker task/outbox lease duration |
 | `MODERATOR_PUBKYS` | empty | comma-separated moderator pubkys, validated as z-base-32 at startup |
 
 Endpoints: `GET /health`, `GET /ready` (checks the database),
-`POST /v1/auth/challenges`, `POST /v1/auth/sessions`,
+`POST /v1/auth/sessions`,
 `POST /v1/commands` (Bearer session required), and `GET /v1/reports`
 (Bearer session required; role-scoped — see Moderation below).
 
@@ -114,21 +114,40 @@ contract until they are ported with their tests.
 
 ## Authentication (task 3.2)
 
-Challenge–response against the actor's Pubky (ed25519, z-base-32):
+Session establishment verifies a **Pubky AuthToken** — a signed, time-bound
+proof of key ownership produced by the Pubky auth flow. The original
+challenge–response handshake required the client to sign a nonce, which no
+real browser client can do: in the normal Pubky App flow the user signs in
+through Pubky Ring (an external signer device) and the app never holds the
+secret key. The challenge endpoint has been removed.
 
-1. `POST /v1/auth/challenges` `{ "pubky": "<52-char z-base-32>" }` returns a
-   random 32-byte nonce (base64url), bound to that pubky, single-use, short
-   TTL (120 s).
-2. The client signs `"pubky-marketplace-transaction-service:auth:v1\n" || nonce`
-   with its ed25519 key (domain separation binds the signature to this
-   service and protocol version).
-3. `POST /v1/auth/sessions` `{ pubky, challenge_id, signature }` verifies the
-   signature against the z-base-32-decoded public key (`ed25519-dalek`
-   `verify_strict`) and returns an opaque 32-byte session token. Only the
-   SHA-256 of the token is stored.
-4. `POST /v1/commands` requires `Authorization: Bearer <token>`; middleware
+1. The app runs the Pubky auth flow; `awaitToken()` resolves after the user
+   approves on their signer device and yields an `AuthToken`. The app sends
+   `token.toBytes()` (canonical postcard binary) as the raw request body of
+   `POST /v1/auth/sessions`.
+2. The service verifies the bytes with the
+   [`pubky-common`](https://crates.io/crates/pubky-common) crate (pinned at
+   0.11.0 — the same version and repository as the `@synonymdev/pubky` SDK,
+   so client and server share one implementation of the token format). The
+   token's public key becomes the authenticated actor; its capabilities are
+   recorded as the session's granted scope.
+3. Replay protection is enforced by the service, not assumed from the
+   token: the token's `(public key, timestamp)` identity is recorded in
+   `auth_token_uses`, so each token is single-use; its signing timestamp
+   must fall within `AUTH_TOKEN_WINDOW_SECONDS` of the authoritative server
+   clock (the library independently rejects tokens more than 3 minutes from
+   system time). Server time is authoritative throughout.
+4. On success the service returns its own opaque 32-byte session token
+   (base64url) with a TTL; only the SHA-256 of the token is stored.
+5. `POST /v1/commands` requires `Authorization: Bearer <token>`; middleware
    resolves the actor pubky from the stored hash. There are no trust-me
    actor headers, and body fields can never select a different actor.
+
+Establishing a marketplace session therefore requires a signer approval
+(`awaitToken()` blocks on it). Whether that approval is folded into the
+app's existing sign-in (one prompt granting marketplace capability to every
+user) or kept as a separate first-transaction approval (scoped authority,
+one extra prompt) is an open product decision, not a technical one.
 
 CORS is restricted to the exact origins in `ALLOWED_ORIGINS`.
 
@@ -225,6 +244,7 @@ This service is canonical and resolves them as follows:
 | Report reads | non-moderators always got `[]` (own reports invisible) | moderators read all; other users read exactly their own submissions | A reporter can see what they filed; cross-user reads stay forbidden. |
 | Report decisions | none (reports stayed `open` forever) | `trust.decide` (moderator-only) records append-only decisions; report states `open/dismissed/actioned` | Task 3.5 requires moderator decisions recorded append-only. |
 | Notifications | synchronous in-memory append inside the command | outbox intents delivered at least once by the worker, deduped by `(event_id, recipient)` | ADR-0019 §4: side effects leave the command transaction only through the outbox. Notification preferences belong to the not-yet-ported `notification.*` commands. |
+| Auth handshake | ed25519 challenge–response: the service issued a nonce for the client to sign | Pubky AuthToken verified with `pubky-common`; challenge endpoint removed | A browser client cannot sign — the secret key lives in the user's signer (Pubky Ring), and the SDK `Keypair` exposes no signing method. The AuthToken is the mechanism Pubky provides for exactly this proof; the service adds single-use and acceptance-window enforcement. |
 
 `processing` and `closed` (order) and `cancelled` (auction) exist in the
 canonical enums but no current transition produces them; they are declared in

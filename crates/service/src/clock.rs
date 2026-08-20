@@ -3,7 +3,8 @@ use std::sync::Mutex;
 use chrono::{DateTime, SecondsFormat, Utc};
 
 /// Server time authority. `issued_at` on commands is diagnostic only; every
-/// deadline (reservation expiry, challenge/session TTL) uses this clock.
+/// deadline (reservation expiry, auth token window, session TTL) uses this
+/// clock.
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> DateTime<Utc>;
 }

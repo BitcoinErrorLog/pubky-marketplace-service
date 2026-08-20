@@ -28,7 +28,6 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/v1/auth/challenges", post(auth::create_challenge))
         .route("/v1/auth/sessions", post(auth::create_session))
         .merge(protected)
         .layer(cors)

@@ -1,7 +1,7 @@
 //! Vertical-slice command tests ported one-for-one from the TypeScript
 //! prototype suite (`services/marketplace/src/transaction-service.test.ts`).
 //! Actor pubkys are real ed25519 keypairs authenticated through the full
-//! challenge–response flow; assertions are adapted to the snake_case wire
+//! AuthToken flow; assertions are adapted to the snake_case wire
 //! format defined by ADR-0019 §3.
 
 mod common;

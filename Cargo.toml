@@ -6,7 +6,7 @@ members = ["crates/domain", "crates/service"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [workspace.dependencies]
 marketplace-domain = { path = "crates/domain" }
@@ -14,8 +14,12 @@ anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 http-body-util = "0.1"
+# Pinned: the authoritative Pubky AuthToken implementation. The wire format
+# changed between minor versions (signature encoding), so this must stay in
+# lockstep with the @synonymdev/pubky SDK version used by clients (also
+# 0.11.0, built from the same pubky/pubky-homeserver repository).
+pubky-common = "=0.11.0"
 rand = "0.8"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
@@ -38,7 +42,6 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-z32 = "1"
 
 [profile.dev]
 debug = 1

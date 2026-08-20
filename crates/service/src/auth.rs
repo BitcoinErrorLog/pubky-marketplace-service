@@ -1,14 +1,24 @@
-//! Pubky challenge–response authentication (plan task 3.2).
+//! Pubky AuthToken authentication.
 //!
 //! Flow:
-//! 1. `POST /v1/auth/challenges` issues a random 32-byte nonce bound to the
-//!    requesting pubky, stored server-side with a short TTL, single use.
-//! 2. The client signs `CHALLENGE_CONTEXT || nonce` with its ed25519 key.
-//! 3. `POST /v1/auth/sessions` verifies the signature against the z-base-32
-//!    pubky and issues an opaque 32-byte session token, stored hashed.
-//! 4. The token is presented as `Authorization: Bearer <token>`; middleware
-//!    resolves the actor pubky from the stored hash. No trust-me headers.
+//! 1. The client obtains an `AuthToken` through the Pubky auth flow: the
+//!    user approves on their signer device (e.g. Pubky Ring), which signs a
+//!    time-bound proof of key ownership. The app never holds the secret key.
+//! 2. `POST /v1/auth/sessions` receives the postcard-serialized token bytes
+//!    as the raw request body and verifies them with `pubky-common` — the
+//!    same crate the Pubky homeserver and the `@synonymdev/pubky` SDK are
+//!    built on. The token's public key becomes the authenticated actor and
+//!    its capabilities the granted scope.
+//! 3. Replay protection is enforced by this service, not assumed from the
+//!    token: each token is single-use (its `(public key, timestamp)` identity
+//!    is recorded in Postgres) and must fall within a bounded acceptance
+//!    window around the authoritative server clock.
+//! 4. On success the service issues an opaque 32-byte session token, stored
+//!    hashed (SHA-256), presented as `Authorization: Bearer <token>`;
+//!    middleware resolves the actor pubky from the stored hash. No trust-me
+//!    headers.
 
+use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -17,47 +27,80 @@ use axum::Json;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, VerifyingKey};
+use pubky_common::auth::AuthToken;
 use rand::RngCore;
-use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::clock::format_timestamp;
 use crate::AppState;
 
-/// Domain separation for challenge signatures: binds the signature to this
-/// service and protocol version so it cannot be replayed elsewhere.
-pub const CHALLENGE_CONTEXT: &[u8] = b"pubky-marketplace-transaction-service:auth:v1\n";
+/// Minimum length of a serialized v0 AuthToken: 64-byte signature, 10-byte
+/// namespace, and 1 version byte precede the variable-length remainder.
+/// `AuthToken::verify` indexes the version byte directly, so the length is
+/// guarded before delegating to it.
+const MIN_TOKEN_LENGTH: usize = 75;
+
+/// `pubky-common` itself rejects tokens more than 3 minutes from system
+/// time. Used only to size the retention of single-use records: a token
+/// older than both windows can never be accepted again, so its record is
+/// prunable.
+const LIBRARY_TIMESTAMP_WINDOW_SECONDS: i64 = 180;
 
 /// The authenticated actor, resolved from a session token by middleware.
 #[derive(Debug, Clone)]
 pub struct Actor(pub String);
 
-/// Verifies an ed25519 signature over `CHALLENGE_CONTEXT || nonce` against a
-/// z-base-32 pubky. Pure function; all failures collapse to `false`.
-pub fn verify_challenge_signature(pubky: &str, nonce: &[u8], signature: &[u8]) -> bool {
-    if !marketplace_domain::pubky::is_valid_pubky(pubky) {
-        return false;
+/// The claims extracted from a cryptographically verified AuthToken.
+#[derive(Debug, PartialEq, Eq)]
+pub struct VerifiedAuthToken {
+    /// The signer's public key as a 52-character z-base-32 pubky.
+    pub pubky: String,
+    /// The granted capabilities in their canonical string form.
+    pub capabilities: String,
+    /// The token's signing timestamp in microseconds since the Unix epoch;
+    /// together with the pubky it is the token's unique identity.
+    pub timestamp_micros: i64,
+}
+
+/// Why an AuthToken was not accepted. All variants map to HTTP 401.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthTokenRejection {
+    /// Too short to contain the fixed-length signature/namespace/version
+    /// header.
+    Malformed,
+    /// Rejected by `pubky-common`: parse failure, invalid signature, unknown
+    /// version, or outside the library's own window against system time.
+    Invalid,
+    /// Outside this service's acceptance window relative to the
+    /// authoritative server clock.
+    OutsideAcceptanceWindow,
+}
+
+/// Verifies postcard-serialized AuthToken bytes and enforces the service's
+/// acceptance window around `now`. Signature and structure verification is
+/// delegated entirely to `pubky-common`; nothing about the wire format is
+/// reimplemented here.
+pub fn verify_auth_token(
+    bytes: &[u8],
+    now: DateTime<Utc>,
+    window_seconds: i64,
+) -> Result<VerifiedAuthToken, AuthTokenRejection> {
+    if bytes.len() < MIN_TOKEN_LENGTH {
+        return Err(AuthTokenRejection::Malformed);
     }
-    let Ok(key_bytes) = z32::decode(pubky.as_bytes()) else {
-        return false;
-    };
-    let Ok(key_bytes) = <[u8; 32]>::try_from(key_bytes.as_slice()) else {
-        return false;
-    };
-    let Ok(verifying_key) = VerifyingKey::from_bytes(&key_bytes) else {
-        return false;
-    };
-    let Ok(signature_bytes) = <[u8; 64]>::try_from(signature) else {
-        return false;
-    };
-    let signature = Signature::from_bytes(&signature_bytes);
-    let mut message = Vec::with_capacity(CHALLENGE_CONTEXT.len() + nonce.len());
-    message.extend_from_slice(CHALLENGE_CONTEXT);
-    message.extend_from_slice(nonce);
-    verifying_key.verify_strict(&message, &signature).is_ok()
+    let token = AuthToken::verify(bytes).map_err(|_| AuthTokenRejection::Invalid)?;
+    let timestamp_micros =
+        i64::try_from(token.timestamp().as_u64()).map_err(|_| AuthTokenRejection::Invalid)?;
+    let drift_micros = timestamp_micros - now.timestamp_micros();
+    if drift_micros.abs() > window_seconds.saturating_mul(1_000_000) {
+        return Err(AuthTokenRejection::OutsideAcceptanceWindow);
+    }
+    Ok(VerifiedAuthToken {
+        pubky: token.public_key().z32(),
+        capabilities: token.capabilities().to_string(),
+        timestamp_micros,
+    })
 }
 
 pub fn hash_token(token: &[u8]) -> Vec<u8> {
@@ -68,113 +111,71 @@ fn auth_error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": { "message": message } }))).into_response()
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChallengeRequest {
-    pub pubky: String,
-}
-
-pub async fn create_challenge(
-    State(state): State<AppState>,
-    Json(request): Json<ChallengeRequest>,
-) -> Response {
-    if !marketplace_domain::pubky::is_valid_pubky(&request.pubky) {
-        return auth_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Expected a 52-character z-base-32 Pubky.",
-        );
-    }
+pub async fn create_session(State(state): State<AppState>, body: Bytes) -> Response {
     let now = state.clock.now();
-    let expires_at = now + chrono::Duration::seconds(state.config.challenge_ttl_seconds);
-    let mut nonce = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let challenge_id = Uuid::new_v4();
-
-    let inserted = sqlx::query(
-        "INSERT INTO auth_challenges (id, pubky, nonce, created_at, expires_at) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(challenge_id)
-    .bind(&request.pubky)
-    .bind(nonce.as_slice())
-    .bind(now)
-    .bind(expires_at)
-    .execute(&state.pool)
-    .await;
-    if let Err(error) = inserted {
-        tracing::error!(error = %error, "failed to store auth challenge");
-        return auth_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Challenge could not be issued.",
-        );
-    }
-
-    tracing::info!(challenge_id = %challenge_id, "issued auth challenge");
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "challenge_id": challenge_id,
-            "nonce": URL_SAFE_NO_PAD.encode(nonce),
-            "context": String::from_utf8_lossy(CHALLENGE_CONTEXT).trim_end(),
-            "expires_at": format_timestamp(expires_at),
-        })),
-    )
-        .into_response()
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionRequest {
-    pub pubky: String,
-    pub challenge_id: Uuid,
-    /// base64url (unpadded) ed25519 signature over `CHALLENGE_CONTEXT || nonce`.
-    pub signature: String,
-}
-
-pub async fn create_session(
-    State(state): State<AppState>,
-    Json(request): Json<SessionRequest>,
-) -> Response {
-    let now = state.clock.now();
-    let Ok(signature) = URL_SAFE_NO_PAD.decode(&request.signature) else {
-        return auth_error(
-            StatusCode::UNAUTHORIZED,
-            "The challenge response is invalid.",
-        );
+    let verified = match verify_auth_token(&body, now, state.config.auth_token_window_seconds) {
+        Ok(verified) => verified,
+        Err(rejection) => {
+            tracing::info!(rejection = ?rejection, "rejected auth token");
+            return auth_error(StatusCode::UNAUTHORIZED, "The auth token is invalid.");
+        }
     };
 
-    // Consume the challenge atomically: bound pubky, unused, and unexpired.
-    let consumed: Option<(Vec<u8>,)> = match sqlx::query_as(
-        "UPDATE auth_challenges SET used_at = $1 \
-         WHERE id = $2 AND pubky = $3 AND used_at IS NULL AND expires_at > $1 \
-         RETURNING nonce",
-    )
-    .bind(now)
-    .bind(request.challenge_id)
-    .bind(&request.pubky)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(row) => row,
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
         Err(error) => {
-            tracing::error!(error = %error, "failed to consume auth challenge");
+            tracing::error!(error = %error, "failed to open auth transaction");
             return auth_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Session could not be created.",
             );
         }
     };
-    let Some((nonce,)) = consumed else {
-        return auth_error(
-            StatusCode::UNAUTHORIZED,
-            "The challenge response is invalid.",
-        );
-    };
 
-    if !verify_challenge_signature(&request.pubky, &nonce, &signature) {
+    // Prune single-use records that can never match an acceptable token
+    // again (older than both the service and library windows, doubled for
+    // margin).
+    let retention_seconds = 2 * state
+        .config
+        .auth_token_window_seconds
+        .max(LIBRARY_TIMESTAMP_WINDOW_SECONDS);
+    let prune = sqlx::query("DELETE FROM auth_token_uses WHERE used_at < $1")
+        .bind(now - chrono::Duration::seconds(retention_seconds))
+        .execute(&mut *tx)
+        .await;
+    if let Err(error) = prune {
+        tracing::error!(error = %error, "failed to prune auth token uses");
+        return auth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Session could not be created.",
+        );
+    }
+
+    // Single use: the (pubky, timestamp) pair is the token's identity. A
+    // conflict means this exact token was already accepted once.
+    let recorded = match sqlx::query(
+        "INSERT INTO auth_token_uses (pubky, token_timestamp_micros, used_at) \
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(&verified.pubky)
+    .bind(verified.timestamp_micros)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to record auth token use");
+            return auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Session could not be created.",
+            );
+        }
+    };
+    if recorded.rows_affected() == 0 {
         return auth_error(
             StatusCode::UNAUTHORIZED,
-            "The challenge response is invalid.",
+            "The auth token has already been used.",
         );
     }
 
@@ -182,14 +183,15 @@ pub async fn create_session(
     rand::rngs::OsRng.fill_bytes(&mut token);
     let expires_at = now + chrono::Duration::seconds(state.config.session_ttl_seconds);
     let stored = sqlx::query(
-        "INSERT INTO auth_sessions (token_hash, pubky, created_at, expires_at) \
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO auth_sessions (token_hash, pubky, capabilities, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(hash_token(&token))
-    .bind(&request.pubky)
+    .bind(&verified.pubky)
+    .bind(&verified.capabilities)
     .bind(now)
     .bind(expires_at)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
     if let Err(error) = stored {
         tracing::error!(error = %error, "failed to store auth session");
@@ -198,12 +200,21 @@ pub async fn create_session(
             "Session could not be created.",
         );
     }
+    if let Err(error) = tx.commit().await {
+        tracing::error!(error = %error, "failed to commit auth session");
+        return auth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Session could not be created.",
+        );
+    }
 
-    tracing::info!(challenge_id = %request.challenge_id, "issued auth session");
+    tracing::info!(pubky = %verified.pubky, "issued auth session");
     (
         StatusCode::CREATED,
         Json(json!({
             "token": URL_SAFE_NO_PAD.encode(token),
+            "pubky": verified.pubky,
+            "capabilities": verified.capabilities,
             "expires_at": format_timestamp(expires_at),
         })),
     )
@@ -258,80 +269,106 @@ pub async fn require_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-    use rand::rngs::OsRng;
+    use pubky_common::capabilities::Capability;
+    use pubky_common::crypto::Keypair;
 
-    fn keypair() -> (SigningKey, String) {
-        let signing = SigningKey::generate(&mut OsRng);
-        let pubky = z32::encode(signing.verifying_key().as_bytes());
-        (signing, pubky)
-    }
+    const WINDOW_SECONDS: i64 = 120;
 
-    fn sign_challenge(signing: &SigningKey, nonce: &[u8]) -> Vec<u8> {
-        let mut message = CHALLENGE_CONTEXT.to_vec();
-        message.extend_from_slice(nonce);
-        signing.sign(&message).to_bytes().to_vec()
+    fn genuine_token_bytes(keypair: &Keypair) -> Vec<u8> {
+        AuthToken::sign(keypair, vec![Capability::root()]).serialize()
     }
 
     #[test]
-    fn accepts_a_genuine_signature_from_the_key_owner() {
-        let (signing, pubky) = keypair();
-        let nonce = [7u8; 32];
-        let signature = sign_challenge(&signing, &nonce);
-        assert!(verify_challenge_signature(&pubky, &nonce, &signature));
+    fn accepts_a_genuine_token_and_extracts_the_signer() {
+        let keypair = Keypair::random();
+        let bytes = genuine_token_bytes(&keypair);
+
+        let verified = verify_auth_token(&bytes, Utc::now(), WINDOW_SECONDS)
+            .expect("freshly signed token verifies");
+
+        assert_eq!(verified.pubky, keypair.public_key().z32());
+        assert_eq!(verified.capabilities, "/:rw");
+        assert!(marketplace_domain::pubky::is_valid_pubky(&verified.pubky));
     }
 
     #[test]
-    fn rejects_a_forged_signature() {
-        let (_, pubky) = keypair();
-        let (forger, _) = keypair();
-        let nonce = [7u8; 32];
-        let forged = sign_challenge(&forger, &nonce);
-        assert!(!verify_challenge_signature(&pubky, &nonce, &forged));
+    fn a_token_identifies_its_signer_and_no_one_else() {
+        let alice = Keypair::random();
+        let bob = Keypair::random();
+        let bytes = genuine_token_bytes(&alice);
+
+        let verified = verify_auth_token(&bytes, Utc::now(), WINDOW_SECONDS)
+            .expect("freshly signed token verifies");
+
+        assert_eq!(verified.pubky, alice.public_key().z32());
+        assert_ne!(verified.pubky, bob.public_key().z32());
     }
 
     #[test]
-    fn rejects_a_mismatched_pubky() {
-        let (signing, _) = keypair();
-        let (_, other_pubky) = keypair();
-        let nonce = [7u8; 32];
-        let signature = sign_challenge(&signing, &nonce);
-        assert!(!verify_challenge_signature(
-            &other_pubky,
-            &nonce,
-            &signature
-        ));
+    fn rejects_a_tampered_signature() {
+        let keypair = Keypair::random();
+        let mut bytes = genuine_token_bytes(&keypair);
+        bytes[0] ^= 0x01;
+
+        assert_eq!(
+            verify_auth_token(&bytes, Utc::now(), WINDOW_SECONDS),
+            Err(AuthTokenRejection::Invalid)
+        );
     }
 
     #[test]
-    fn rejects_a_signature_over_a_different_nonce() {
-        let (signing, pubky) = keypair();
-        let signature = sign_challenge(&signing, &[1u8; 32]);
-        assert!(!verify_challenge_signature(&pubky, &[2u8; 32], &signature));
+    fn rejects_a_tampered_payload() {
+        let keypair = Keypair::random();
+        let mut bytes = genuine_token_bytes(&keypair);
+        // The capabilities live at the tail; changing them breaks the
+        // signature over the signable region.
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+
+        assert_eq!(
+            verify_auth_token(&bytes, Utc::now(), WINDOW_SECONDS),
+            Err(AuthTokenRejection::Invalid)
+        );
     }
 
     #[test]
-    fn rejects_a_signature_without_the_domain_context() {
-        let (signing, pubky) = keypair();
-        let nonce = [7u8; 32];
-        let raw = signing.sign(&nonce).to_bytes().to_vec();
-        assert!(!verify_challenge_signature(&pubky, &nonce, &raw));
+    fn rejects_truncated_and_garbage_bytes() {
+        let keypair = Keypair::random();
+        let bytes = genuine_token_bytes(&keypair);
+
+        assert_eq!(
+            verify_auth_token(&bytes[..MIN_TOKEN_LENGTH - 1], Utc::now(), WINDOW_SECONDS),
+            Err(AuthTokenRejection::Malformed)
+        );
+        assert_eq!(
+            verify_auth_token(&[], Utc::now(), WINDOW_SECONDS),
+            Err(AuthTokenRejection::Malformed)
+        );
+        assert_eq!(
+            verify_auth_token(&bytes[..bytes.len() - 1], Utc::now(), WINDOW_SECONDS),
+            Err(AuthTokenRejection::Invalid)
+        );
+        assert_eq!(
+            verify_auth_token(&[0u8; 128], Utc::now(), WINDOW_SECONDS),
+            Err(AuthTokenRejection::Invalid)
+        );
     }
 
     #[test]
-    fn rejects_malformed_pubkys_and_signatures() {
-        let (signing, pubky) = keypair();
-        let nonce = [7u8; 32];
-        let signature = sign_challenge(&signing, &nonce);
-        assert!(!verify_challenge_signature(
-            "not-a-pubky",
-            &nonce,
-            &signature
-        ));
-        assert!(!verify_challenge_signature(
-            &pubky,
-            &nonce,
-            &signature[..63]
-        ));
+    fn rejects_tokens_outside_the_service_acceptance_window() {
+        let keypair = Keypair::random();
+        let bytes = genuine_token_bytes(&keypair);
+        let drift = chrono::Duration::seconds(WINDOW_SECONDS + 1);
+
+        // Server clock far ahead of the token: the token is expired.
+        assert_eq!(
+            verify_auth_token(&bytes, Utc::now() + drift, WINDOW_SECONDS),
+            Err(AuthTokenRejection::OutsideAcceptanceWindow)
+        );
+        // Server clock behind the token: the token is from the future.
+        assert_eq!(
+            verify_auth_token(&bytes, Utc::now() - drift, WINDOW_SECONDS),
+            Err(AuthTokenRejection::OutsideAcceptanceWindow)
+        );
     }
 }
