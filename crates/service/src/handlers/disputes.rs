@@ -5,9 +5,12 @@
 //! for `trust.decide`.
 //!
 //! Evidence bodies are private order evidence (ADR-0019 §8): they are stored
-//! append-only in `dispute_evidence` and never appear in any read projection
-//! or command result. The dispute sub-document carries only a content-free
-//! `evidence_count`.
+//! append-only in `dispute_evidence` and never appear in general read
+//! projections or command results — the dispute sub-document carries only a
+//! content-free `evidence_count`. The case file is served exclusively by the
+//! scoped read `GET /v1/orders/{id}/evidence` (the two dispute participants
+//! plus configured moderators, with moderator reads audited append-only);
+//! see [`crate::queries::list_evidence`].
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{

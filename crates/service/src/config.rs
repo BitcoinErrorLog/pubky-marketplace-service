@@ -21,8 +21,9 @@ pub struct Config {
     pub worker_lease_seconds: i64,
     /// Pubkys holding the moderator role (`MODERATOR_PUBKYS`, comma
     /// separated). Validated as z-base-32 at startup. The role is scoped to
-    /// moderation (reading all reports, deciding reports) — it grants no
-    /// other authority.
+    /// moderation (reading all reports, deciding reports, and adjudicating
+    /// disputes: the dispute queue, disputed-order projections, and audited
+    /// evidence reads) — it grants no other authority.
     pub moderator_pubkys: Vec<String>,
 }
 

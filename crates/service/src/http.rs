@@ -24,6 +24,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/offers", get(queries::list_offers))
         .route("/v1/orders", get(queries::list_orders))
         .route("/v1/orders/{id}", get(queries::get_order))
+        .route("/v1/orders/{id}/evidence", get(queries::list_evidence))
+        .route("/v1/disputes", get(queries::list_disputes))
         .route("/v1/payments/{id}", get(queries::get_payment))
         .route("/v1/receipts/{id}", get(queries::get_receipt))
         .route("/v1/notifications", get(queries::list_notifications))

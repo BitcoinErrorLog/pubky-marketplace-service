@@ -59,8 +59,9 @@ Endpoints: `GET /health`, `GET /ready` (checks the database),
 (Bearer session required; role-scoped — see Moderation below), and the
 role-scoped read projections (Bearer session required — see Read
 projections below): `GET /v1/listings/{aggregate_id}`, `GET /v1/offers`,
-`GET /v1/orders`, `GET /v1/orders/{id}`, `GET /v1/payments/{id}`,
-`GET /v1/receipts/{id}`, and `GET /v1/notifications`.
+`GET /v1/orders`, `GET /v1/orders/{id}`, `GET /v1/orders/{id}/evidence`,
+`GET /v1/disputes`, `GET /v1/payments/{id}`, `GET /v1/receipts/{id}`, and
+`GET /v1/notifications`.
 
 ## Test
 
@@ -163,7 +164,10 @@ and refund branches) exactly as the prototype engine did:
   and `dispute.resolve` (configured moderators only). Resolution **is** the
   close: the dispute machine is `open → resolved`. Buyer remedies
   (`buyer_refund`/`partial_refund`) leave the order `disputed` awaiting the
-  external refund record; other resolutions complete it.
+  external refund record; other resolutions complete it. Adjudication reads
+  are `GET /v1/disputes` (the moderator queue) and
+  `GET /v1/orders/{id}/evidence` (the case file — see Read projections and
+  Moderation below).
 - **Reviews.** `review.create` (participants, from
   `delivered`/`completed`/`closed`): one review per participant per order
   per role, enforced by the `reviews_one_per_order_role` database
@@ -241,7 +245,9 @@ orders, and payments).
 | `GET /v1/listings/{aggregate_id}` | any authenticated user (public catalog data) | the listing/inventory projection: quantities, state, `server_revision`, unit price, sale format, and the auction state when present |
 | `GET /v1/offers` | offers where the caller is buyer or seller | `{ "offers": [...] }` |
 | `GET /v1/orders` | orders where the caller is buyer or seller | `{ "orders": [...] }`, each order with its embedded `payment` projection plus the `shipment`, `return_request`, `dispute`, `external_refund`, and `reviews` sub-objects (client `orderSchema` field names) |
-| `GET /v1/orders/{id}` | participants only | one order with the same embedded projections |
+| `GET /v1/orders/{id}` | participants; also configured moderators, but only when the order is under (or was previously under) dispute | one order with the same embedded projections |
+| `GET /v1/orders/{id}/evidence` | the two dispute participants and configured moderators (moderators only for orders under, or previously under, dispute) | `{ "order_id", "evidence": [...] }` — the dispute case file: each item's `id`, `submitter_pubky`, `body`, `body_bytes`, `created_at` |
+| `GET /v1/disputes` | configured moderators only; everyone else is refused 403, never handed `[]` | `{ "disputes": [...] }` — the adjudication queue: the order projection of every order under (or previously under) dispute |
 | `GET /v1/payments/{id}` | participants only | one payment projection |
 | `GET /v1/receipts/{id}` | issuer (seller) and recipient (buyer) only | one receipt: ids, participants, `total`, `content_hash`, `issued_at` (client `receiptSchema` shape) |
 | `GET /v1/notifications` | the recipient only | `{ "notifications": [...] }` |
@@ -270,9 +276,23 @@ the whole convention.
   client-side consumes it, and leaving it in one response shape but not
   the other would put it in logs and telemetry for no benefit.
 - **Dispute evidence bodies** — private order evidence (ADR-0019 §8).
-  Stored append-only in `dispute_evidence`; never served by any read
-  projection or command result, not even back to the submitter. The
-  dispute sub-object carries only a content-free `evidence_count`.
+  Stored append-only in `dispute_evidence`; never served by any general
+  read projection or command result, not even back to the submitter, and
+  never logged. The dispute sub-object carries only a content-free
+  `evidence_count`. The **only** exposure path is the scoped case-file
+  read `GET /v1/orders/{id}/evidence`, whose audience is exactly the two
+  dispute participants plus the configured moderator role. §8's intent is
+  that evidence never leaks into public records, general projections, or
+  telemetry — while §8 itself requires that "operator queries return
+  role-scoped, deliberately redacted views", and a moderator who cannot
+  read the case file cannot execute `dispute.resolve` honestly. The
+  audience matches the one already documented for dispute
+  `reason`/`rationale` (the participants plus the deciding moderator).
+  Both parties see the full file deliberately: a dispute where one side
+  cannot see what the other alleged cannot be answered, and a resolution
+  based on evidence hidden from a party could not be contested. Moderator
+  reads are audited (see Moderation); a non-authorized reader gets the
+  same 404 an absent order returns, never an empty list.
 - Reservation buyer identities and auction proxy-bid maximums; the
   auction's current `leader_pubky` stays visible because the auction state
   machine already exposes the leader to every bidder.
@@ -337,6 +357,22 @@ admin role — the moderator role only grants the powers below).
   `actioned`). Decisions are appended to `report_decisions`, which rejects
   `UPDATE`/`DELETE` by trigger; the report row tracks the resulting state
   under the usual revision compare-and-swap.
+- **Dispute adjudication reads.** The moderator role also grants
+  `GET /v1/disputes` (the queue of orders under, or previously under,
+  dispute — the projection carries the dispute `reason`, state, and the
+  order `revision` that `dispute.resolve` requires), the single-order
+  projection for disputed orders, and the evidence case file
+  `GET /v1/orders/{id}/evidence`. The scope is enforced in SQL
+  (`dispute IS NOT NULL`): the role reaches no undisputed order, and the
+  delivery address stays redacted from every moderator view.
+- **Evidence read audit.** Reading evidence through the moderator role is
+  privileged cross-user access, so every such read appends a row to
+  `dispute_evidence_reads` (reader, order, items served, timestamp) —
+  append-only by trigger, mirroring `report_decisions` — written in the
+  same transaction as the read itself, so a failed audit write refuses the
+  read instead of serving unaudited data. Participant reads of their own
+  case file are ordinary object participation, like every other
+  participant-scoped projection, and are not audited.
 
 ## PostgreSQL invariants (ADR-0019 §4)
 
@@ -406,7 +442,8 @@ This service is canonical and resolves them as follows:
 | Confirming a lapsed auction hold | impossible in the prototype (no reservation expiry) | refused with `INVALID_STATE` once the winner's 30-minute hold has expired on server time | This service sweeps expired holds back to `available`; confirming afterwards would sell inventory the order no longer holds. |
 | Review uniqueness | application check on the in-memory order's `reviews` array | `reviews_one_per_order_role` UNIQUE constraint; the review insert precedes the order revision CAS so a same-role race is decided by the constraint (`INVARIANT_VIOLATION`), sequential duplicates by the ported check (`INVALID_STATE`) | ADR-0019 §4: one participant review per order/role is a database invariant, not code. |
 | Review editing | none (reviews were immutable) | `review.update` (this service only): the reviewer may revise rating/text within 24 hours of creation, under the order's revision CAS with a `review.updated` event | The task's bounded edit window; the window is a documented policy constant (`REVIEW_EDIT_WINDOW_SECONDS`). No notification is emitted — the prototype had none to copy. |
-| Dispute evidence | none (disputes carried only the opening reason) | `dispute.evidence` (this service only): participants append evidence to an open dispute; bodies are stored append-only and never served (ADR-0019 §8), only `evidence_count` is visible | ADR-0019 lists order evidence as service-owned private data; the durable record exists for moderation and audit without any exposure path. |
+| Dispute evidence | none (disputes carried only the opening reason) | `dispute.evidence` (this service only): participants append evidence to an open dispute; bodies stay out of general projections and command results (only `evidence_count` is visible there) and are served solely by the scoped case-file read `GET /v1/orders/{id}/evidence` to the two participants and configured moderators, with moderator reads audited append-only in `dispute_evidence_reads` | ADR-0019 lists order evidence as service-owned private data, and §8 directs operator queries to role-scoped, deliberately redacted views; without a scoped read path the moderator required by `dispute.resolve` could never see the case they are deciding. |
+| Dispute adjudication reads | none (no moderator read surface existed) | `GET /v1/disputes` (moderator-only queue) and moderator access to disputed-order projections, scoped in SQL to `dispute IS NOT NULL` | The deciding moderator needs the dispute reason and the order revision that `dispute.resolve` enforces; without a read surface the moderator-only resolve command was structurally unusable. |
 | Dispute close | `dispute.resolve` was the terminal action | same — resolution **is** the close (`open → resolved`); no separate close command | Neither the prototype nor the client contracts have a distinct close; inventing one would add unspecified surface. |
 | Dispute moderator | hardcoded `MARKETPLACE_SANDBOX_MODERATOR` | configured `MODERATOR_PUBKYS`, the same role as `trust.decide` | Task 3.5 precedent: no hardcoded roles. |
 | Conversations | client `conversationSchema` + sandbox `GET /v1/conversations` | no endpoint | No durable conversation/message tables exist; `message.*` commands are not ported. |
