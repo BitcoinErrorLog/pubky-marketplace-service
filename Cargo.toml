@@ -15,10 +15,12 @@ axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 http-body-util = "0.1"
-# Pinned: the authoritative Pubky AuthToken implementation. The wire format
-# changed between minor versions (signature encoding), so this must stay in
-# lockstep with the @synonymdev/pubky SDK version used by clients (also
-# 0.11.0, built from the same pubky/pubky-homeserver repository).
+# Pinned: the authoritative Pubky AuthToken implementation, from the same
+# pubky/pubky-homeserver repository the @synonymdev/pubky SDK is built from.
+# The signature encoding was refactored between minor versions, but tokens
+# were measured to round-trip between 0.8.0 and 0.11.0 in both directions, so
+# clients on an older SDK still verify here. The exact pin is kept so a future
+# format change surfaces as a deliberate upgrade rather than a silent break.
 pubky-common = "=0.11.0"
 rand = "0.8"
 regex = "1"

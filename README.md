@@ -127,10 +127,18 @@ secret key. The challenge endpoint has been removed.
    `POST /v1/auth/sessions`.
 2. The service verifies the bytes with the
    [`pubky-common`](https://crates.io/crates/pubky-common) crate (pinned at
-   0.11.0 — the same version and repository as the `@synonymdev/pubky` SDK,
-   so client and server share one implementation of the token format). The
-   token's public key becomes the authenticated actor; its capabilities are
-   recorded as the session's granted scope.
+   0.11.0), built from the same `pubky/pubky-homeserver` repository as the
+   `@synonymdev/pubky` SDK, so client and server share one implementation of
+   the token format. The token's public key becomes the authenticated actor;
+   its capabilities are recorded as the session's granted scope.
+
+   Client and server do **not** have to be on the same version. The signature
+   encoding was refactored between minor versions, so this was measured rather
+   than assumed: a token signed with 0.8.0 verifies under 0.11.0, and a token
+   signed with 0.11.0 verifies under the 0.8.0 SDK. Both directions round-trip.
+   Reproduce by signing with `AuthToken::sign` under each version and
+   cross-verifying with `AuthToken::verify` and the SDK's `AuthToken.verify`.
+   This matters in practice because `pubky-app` currently ships SDK 0.8.0.
 3. Replay protection is enforced by the service, not assumed from the
    token: the token's `(public key, timestamp)` identity is recorded in
    `auth_token_uses`, so each token is single-use; its signing timestamp
