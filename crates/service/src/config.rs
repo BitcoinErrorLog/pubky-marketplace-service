@@ -19,6 +19,15 @@ pub struct Config {
     pub session_ttl_seconds: i64,
     pub worker_interval_seconds: u64,
     pub worker_lease_seconds: i64,
+    /// Marketplace payment window for Locks-correlated payments: a payment
+    /// still awaiting entitlement this long after its correlation was
+    /// registered moves to `expired` on server time. Deliberately separate
+    /// from upstream failure — Locks v1 leaves transport/status failures
+    /// pending (ADR-0019 §7).
+    pub locks_payment_window_seconds: i64,
+    /// Minimum seconds between lifecycle lookups for one pending
+    /// correlation.
+    pub locks_poll_seconds: i64,
     /// Pubkys holding the moderator role (`MODERATOR_PUBKYS`, comma
     /// separated). Validated as z-base-32 at startup. The role is scoped to
     /// moderation (reading all reports, deciding reports, and adjudicating
@@ -48,6 +57,14 @@ impl Config {
         let session_ttl_seconds = env_i64("AUTH_SESSION_TTL_SECONDS", 86_400)?;
         let worker_interval_seconds = env_i64("WORKER_INTERVAL_SECONDS", 10)?.try_into()?;
         let worker_lease_seconds = env_i64("WORKER_LEASE_SECONDS", 30)?;
+        let locks_payment_window_seconds = env_i64("LOCKS_PAYMENT_WINDOW_SECONDS", 3_600)?;
+        if locks_payment_window_seconds < 60 {
+            anyhow::bail!("LOCKS_PAYMENT_WINDOW_SECONDS must be at least 60");
+        }
+        let locks_poll_seconds = env_i64("LOCKS_POLL_SECONDS", 30)?;
+        if locks_poll_seconds < 1 {
+            anyhow::bail!("LOCKS_POLL_SECONDS must be at least 1");
+        }
         let moderator_pubkys =
             parse_moderator_pubkys(&std::env::var("MODERATOR_PUBKYS").unwrap_or_default())?;
         Ok(Self {
@@ -58,6 +75,8 @@ impl Config {
             session_ttl_seconds,
             worker_interval_seconds,
             worker_lease_seconds,
+            locks_payment_window_seconds,
+            locks_poll_seconds,
             moderator_pubkys,
         })
     }
@@ -76,6 +95,8 @@ impl Config {
             session_ttl_seconds: 86_400,
             worker_interval_seconds: 3_600,
             worker_lease_seconds: 30,
+            locks_payment_window_seconds: 3_600,
+            locks_poll_seconds: 30,
             moderator_pubkys: Vec::new(),
         }
     }

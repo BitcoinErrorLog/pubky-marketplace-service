@@ -448,7 +448,6 @@ pub async fn close_locked_auction(
             adapter: "sandbox".to_string(),
             state: "awaiting_entitlement".to_string(),
             confirmations: 0,
-            locks_bundle_id: Uuid::new_v4(),
             amount_minor: total_minor,
             currency: final_price.currency.clone(),
             exponent: final_price.exponent,
@@ -457,9 +456,8 @@ pub async fn close_locked_auction(
         };
         sqlx::query(
             "INSERT INTO payments (id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
-             state, confirmations, locks_bundle_id, amount_minor, currency, exponent, \
-             created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)",
+             state, confirmations, amount_minor, currency, exponent, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)",
         )
         .bind(payment.id)
         .bind(payment.order_id)
@@ -469,7 +467,6 @@ pub async fn close_locked_auction(
         .bind(&payment.adapter)
         .bind(&payment.state)
         .bind(payment.confirmations)
-        .bind(payment.locks_bundle_id)
         .bind(payment.amount_minor)
         .bind(&payment.currency)
         .bind(payment.exponent)

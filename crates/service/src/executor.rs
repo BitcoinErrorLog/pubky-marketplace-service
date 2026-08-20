@@ -162,6 +162,18 @@ async fn dispatch(
         CommandPayload::AdvanceSandboxPayment(payload) => {
             crate::handlers::payment::advance(tx, actor, command, payload, now).await
         }
+        CommandPayload::RegisterLocks(payload) => {
+            crate::handlers::locks::register(
+                tx,
+                actor,
+                command,
+                payload,
+                state.locks.as_deref(),
+                state.config.locks_payment_window_seconds,
+                now,
+            )
+            .await
+        }
         CommandPayload::RequestCancellation(payload) => {
             crate::handlers::cancellation::request(tx, actor, command, payload, now).await
         }

@@ -402,7 +402,6 @@ pub struct PaymentRow {
     pub adapter: String,
     pub state: String,
     pub confirmations: i32,
-    pub locks_bundle_id: Uuid,
     pub amount_minor: i64,
     pub currency: String,
     pub exponent: i32,
@@ -411,18 +410,12 @@ pub struct PaymentRow {
 }
 
 impl PaymentRow {
-    /// The participant-facing read projection: [`Self::view`] minus the
-    /// Locks bundle correlation id, which ADR-0019 §8 forbids in exposed
-    /// records (`access credentials or bundle_id`).
+    /// The participant-facing payment projection. The Locks bundle
+    /// correlation, which ADR-0019 §8 forbids in exposed records (`access
+    /// credentials or bundle_id`), no longer exists on the payment row at
+    /// all: it lives encrypted in `payment_locks_correlations` and has no
+    /// serialization path.
     pub fn projection(&self) -> Value {
-        let mut view = self.view();
-        view.as_object_mut()
-            .expect("payment view is an object")
-            .remove("locks_bundle_id");
-        view
-    }
-
-    pub fn view(&self) -> Value {
         json!({
             "id": self.id,
             "order_id": self.order_id,
@@ -432,12 +425,39 @@ impl PaymentRow {
             "adapter": self.adapter,
             "state": self.state,
             "confirmations": self.confirmations,
-            "locks_bundle_id": self.locks_bundle_id,
             "amount": money_json(self.amount_minor, &self.currency, self.exponent),
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
         })
     }
+}
+
+/// The encrypted correlation between a payment/order and a Locks
+/// verification lifecycle (ADR-0019 §7). This row is internal state: it has
+/// no `view()`/`projection()` on purpose — no read projection, command
+/// result, log, or metric serializes it, and the bundle id exists only as
+/// `bundle_id_ciphertext`.
+#[derive(Debug, Clone, FromRow)]
+pub struct LocksCorrelationRow {
+    pub id: Uuid,
+    pub payment_id: Uuid,
+    pub order_id: Uuid,
+    pub buyer_pubky: String,
+    pub creator_pubky: String,
+    pub lock_resource_hash: String,
+    pub amount_minor: i64,
+    pub asset: String,
+    pub exponent: i32,
+    pub policy_version: i32,
+    pub bundle_id_ciphertext: Vec<u8>,
+    pub bundle_lookup_token: Vec<u8>,
+    pub verification_state: String,
+    pub window_expires_at: DateTime<Utc>,
+    pub last_checked_at: Option<DateTime<Utc>>,
+    pub last_observed_status: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// A delivered notification (outbox consumer row). Notifications are

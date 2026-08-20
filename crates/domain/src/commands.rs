@@ -64,6 +64,7 @@ pub enum CommandPayload {
     PlaceBid(PlaceBidPayload),
     CloseAuction(CloseAuctionPayload),
     AdvanceSandboxPayment(AdvanceSandboxPaymentPayload),
+    RegisterLocks(RegisterLocksPayload),
     RequestCancellation(RequestCancellationPayload),
     ApproveCancellation(OrderActionPayload),
     ShipOrder(ShipOrderPayload),
@@ -95,6 +96,7 @@ impl Command {
             CommandPayload::PlaceBid(_) => "auction.place_bid",
             CommandPayload::CloseAuction(_) => "auction.close",
             CommandPayload::AdvanceSandboxPayment(_) => "payment.sandbox_advance",
+            CommandPayload::RegisterLocks(_) => "payment.register_locks",
             CommandPayload::RequestCancellation(_) => "order.cancel_request",
             CommandPayload::ApproveCancellation(_) => "order.cancel_approve",
             CommandPayload::ShipOrder(_) => "fulfillment.ship",
@@ -129,6 +131,7 @@ impl Command {
             CommandPayload::PlaceBid(p) => serde_json::to_value(p),
             CommandPayload::CloseAuction(p) => serde_json::to_value(p),
             CommandPayload::AdvanceSandboxPayment(p) => serde_json::to_value(p),
+            CommandPayload::RegisterLocks(p) => serde_json::to_value(p),
             CommandPayload::RequestCancellation(p) => serde_json::to_value(p),
             CommandPayload::ShipOrder(p) => serde_json::to_value(p),
             CommandPayload::ConfirmDelivery(p)
@@ -310,6 +313,56 @@ pub struct AdvanceSandboxPaymentPayload {
     pub payment_id: Uuid,
     pub target: SandboxPaymentTarget,
     pub confirmations: i64,
+}
+
+/// Registers the Locks lifecycle correlation for a payment
+/// (`payment.register_locks`, buyer only). The bundle id is the buyer's
+/// cryptographically random lifecycle handle, a bearer secret: the service
+/// encrypts it at rest, never returns it in any response, and uses it only
+/// to independently verify the Locks lifecycle server-side. Registration
+/// never advances the payment — only verified Locks completion does.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterLocksPayload {
+    pub payment_id: Uuid,
+    /// Canonical 26-character uppercase Crockford-base32 encoding of the
+    /// 128-bit viewer-generated bundle identity (the Locks `BundleId` wire
+    /// form).
+    pub bundle_id: String,
+    /// The addressed public lock resource,
+    /// `<creator>/pub/locks.app/<lock_id>.json`, whose creator must be the
+    /// order's seller.
+    pub pubky_lock_resource: String,
+}
+
+/// The bundle id is a bearer secret and the lock resource is correlation
+/// material (ADR-0019 §8): neither may reach logs through a derived Debug.
+impl std::fmt::Debug for RegisterLocksPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterLocksPayload")
+            .field("payment_id", &self.payment_id)
+            .field("bundle_id", &"<redacted>")
+            .field("pubky_lock_resource", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The Locks content-lock path prefix inside a pubky lock resource.
+pub const LOCKS_CONTENT_LOCK_PREFIX: &str = "/pub/locks.app/";
+
+/// Splits an addressed lock resource into `(creator, lock_id)` when it has
+/// the canonical form `<z-base-32 creator>/pub/locks.app/<lock_id>.json`
+/// with a 52-character canonical Crockford lock id.
+pub fn parse_lock_resource(resource: &str) -> Option<(&str, &str)> {
+    let (creator, path) = resource.split_at(resource.find(LOCKS_CONTENT_LOCK_PREFIX)?);
+    let lock_id = path
+        .strip_prefix(LOCKS_CONTENT_LOCK_PREFIX)?
+        .strip_suffix(".json")?;
+    if is_valid_pubky(creator) && crockford_id_regex_52().is_match(lock_id) {
+        Some((creator, lock_id))
+    } else {
+        None
+    }
 }
 
 /// Payload shared by the order commands that carry only the order id
@@ -512,6 +565,21 @@ fn country_code_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[A-Z]{2}$").expect("valid regex"))
 }
 
+/// Canonical uppercase Crockford base32 (no I, L, O, U), 26 characters: the
+/// Locks `BundleId` wire encoding of 16 bytes. Only the canonical form is
+/// accepted so one bundle identity cannot alias two lookup tokens.
+fn crockford_bundle_id_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{26}$").expect("valid regex"))
+}
+
+/// Canonical uppercase Crockford base32, 52 characters: the Locks `LockId`
+/// wire encoding of a 32-byte lock hash.
+fn crockford_id_regex_52() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{52}$").expect("valid regex"))
+}
+
 /// Validates the actor value supplied by the authentication layer.
 pub fn validate_actor(actor: &str) -> Result<(), Vec<ValidationIssue>> {
     if is_valid_pubky(actor) {
@@ -568,6 +636,9 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         "auction.close" => parse_payload(&envelope.payload).map(CommandPayload::CloseAuction)?,
         "payment.sandbox_advance" => {
             parse_payload(&envelope.payload).and_then(validate_advance_sandbox_payment)?
+        }
+        "payment.register_locks" => {
+            parse_payload(&envelope.payload).and_then(validate_register_locks)?
         }
         "order.cancel_request" => {
             parse_payload(&envelope.payload).and_then(validate_request_cancellation)?
@@ -864,6 +935,33 @@ fn validate_advance_sandbox_payment(
     }
     if issues.is_empty() {
         Ok(CommandPayload::AdvanceSandboxPayment(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+/// Issues never echo payload values; for this payload that rule protects
+/// bearer material (the bundle id), so messages describe only the expected
+/// shape.
+fn validate_register_locks(
+    payload: RegisterLocksPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if !crockford_bundle_id_regex().is_match(&payload.bundle_id) {
+        issues.push(issue(
+            "payload.bundle_id",
+            "Expected a canonical 26-character Crockford-base32 bundle id",
+        ));
+    }
+    if parse_lock_resource(&payload.pubky_lock_resource).is_none() {
+        issues.push(issue(
+            "payload.pubky_lock_resource",
+            "Expected <creator>/pub/locks.app/<lock_id>.json with a z-base-32 \
+             creator and a canonical 52-character Crockford lock id",
+        ));
+    }
+    if issues.is_empty() {
+        Ok(CommandPayload::RegisterLocks(payload))
     } else {
         Err(issues)
     }
@@ -1486,6 +1584,77 @@ mod tests {
             json!({ "order_id": order_id, "reason": "r", "requested_remedy": "escrow" }),
         );
         parse_command(&bad_remedy).expect_err("unknown remedy invalid");
+    }
+
+    const TEST_BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
+    const TEST_LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
+
+    fn register_locks_command_json() -> Value {
+        order_command_json(
+            "payment.register_locks",
+            json!({
+                "payment_id": "00000000-0000-4000-8000-00000000bbbb",
+                "bundle_id": TEST_BUNDLE_ID,
+                "pubky_lock_resource":
+                    format!("{}/pub/locks.app/{TEST_LOCK_ID}.json", "y".repeat(52)),
+            }),
+        )
+    }
+
+    #[test]
+    fn parses_a_valid_locks_registration() {
+        let command = parse_command(&register_locks_command_json()).expect("valid registration");
+        assert_eq!(command.kind(), "payment.register_locks");
+        let CommandPayload::RegisterLocks(payload) = &command.payload else {
+            panic!("expected register-locks payload");
+        };
+        let (creator, lock_id) =
+            parse_lock_resource(&payload.pubky_lock_resource).expect("resource parses");
+        assert_eq!(creator, "y".repeat(52));
+        assert_eq!(lock_id, TEST_LOCK_ID);
+    }
+
+    #[test]
+    fn rejects_non_canonical_locks_identifiers_without_echoing_them() {
+        for bundle in [
+            "",
+            "short",
+            &TEST_BUNDLE_ID.to_lowercase(), // lowercase is non-canonical
+            &format!("{}L", &TEST_BUNDLE_ID[..25]), // L is not Crockford
+            &format!("{}X", TEST_BUNDLE_ID), // wrong length
+        ] {
+            let mut raw = register_locks_command_json();
+            raw["payload"]["bundle_id"] = json!(bundle);
+            let issues = parse_command(&raw).expect_err("non-canonical bundle id invalid");
+            assert!(issues.iter().any(|i| i.path == "payload.bundle_id"));
+            let serialized = serde_json::to_string(&issues).expect("issues serialize");
+            assert!(!serialized.contains(TEST_BUNDLE_ID));
+        }
+
+        for resource in [
+            "",
+            "not-a-resource",
+            &format!("{}/pub/other.app/{TEST_LOCK_ID}.json", "y".repeat(52)),
+            &format!("{}/pub/locks.app/{TEST_LOCK_ID}", "y".repeat(52)),
+            &format!("{}/pub/locks.app/short.json", "y".repeat(52)),
+            &format!("UPPER/pub/locks.app/{TEST_LOCK_ID}.json"),
+        ] {
+            let mut raw = register_locks_command_json();
+            raw["payload"]["pubky_lock_resource"] = json!(resource);
+            let issues = parse_command(&raw).expect_err("malformed lock resource invalid");
+            assert!(issues
+                .iter()
+                .any(|i| i.path == "payload.pubky_lock_resource"));
+        }
+    }
+
+    #[test]
+    fn register_locks_debug_redacts_bearer_material() {
+        let command = parse_command(&register_locks_command_json()).expect("valid registration");
+        let debug = format!("{:?}", command.payload);
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(TEST_BUNDLE_ID));
+        assert!(!debug.contains(TEST_LOCK_ID));
     }
 
     #[test]

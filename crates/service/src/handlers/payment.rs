@@ -52,6 +52,15 @@ pub async fn advance(
             "Only the buyer may advance a sandbox payment.",
         )));
     }
+    // A payment correlated to a Locks lifecycle is advanced exclusively by
+    // server-side verification (ADR-0019 §7): no client claim — including
+    // this explicitly sandbox-only command — may advance it.
+    if payment.adapter != "sandbox" {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "A Locks-correlated payment advances only by server-side verification.",
+        )));
+    }
     if command.aggregate_id != ids::payment_aggregate_id(payment.id) {
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidCommand,
@@ -117,7 +126,7 @@ pub async fn advance(
 
     let (updated_order, receipt) = if payload.target == SandboxPaymentTarget::Confirmed {
         let (order, receipt, receipt_event_id) =
-            match confirm_order(tx, actor, command, &payment, order, now).await? {
+            match confirm_order(tx, actor, command.command_id, &payment, order, now).await? {
                 Ok(confirmed) => confirmed,
                 Err(failure) => return Ok(Err(failure)),
             };
@@ -153,11 +162,13 @@ pub async fn advance(
 /// Applies the confirmation effects: the order moves to `paid` with its
 /// receipt issued exactly once, the held inventory converts from reserved
 /// to sold, and the winning auction reservation (when one exists) is marked
-/// converted.
-async fn confirm_order(
+/// converted. Shared by the sandbox command and the worker's Locks
+/// verification (`command_id` is the sandbox command id or the correlation
+/// id, for event traceability).
+pub(crate) async fn confirm_order(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
-    command: &Command,
+    command_id: Uuid,
     payment: &PaymentRow,
     order: OrderRow,
     now: DateTime<Utc>,
@@ -281,7 +292,7 @@ async fn confirm_order(
     .await?;
     let receipt_event_id = insert_event(
         tx,
-        command.command_id,
+        command_id,
         &ids::order_aggregate_id(order.id),
         updated_order.revision,
         actor,

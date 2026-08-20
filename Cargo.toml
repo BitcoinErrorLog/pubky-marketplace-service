@@ -16,7 +16,12 @@ base64 = "0.22"
 # Receipt content hashes use BLAKE3, the same function the prototype engine
 # and the client attachment hashing use (@noble/hashes/blake3).
 blake3 = "1"
+# Bundle ids are bearer secrets encrypted at rest (ADR-0019 §8) with
+# XChaCha20-Poly1305; the extended nonce makes random nonces safe per key.
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+hex = "0.4"
+hmac = "0.12"
 http-body-util = "0.1"
 # Pinned: the authoritative Pubky AuthToken implementation, from the same
 # pubky/pubky-homeserver repository the @synonymdev/pubky SDK is built from.
@@ -27,6 +32,8 @@ http-body-util = "0.1"
 pubky-common = "=0.11.0"
 rand = "0.8"
 regex = "1"
+# Lock Server lifecycle lookups (POST /verification-task-lookups).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"

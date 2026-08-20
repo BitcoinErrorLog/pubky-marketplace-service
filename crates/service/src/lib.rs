@@ -11,6 +11,7 @@ pub mod executor;
 pub mod expiry;
 pub mod handlers;
 pub mod http;
+pub mod locks;
 pub mod model;
 pub mod queries;
 pub mod result;
@@ -22,12 +23,17 @@ use sqlx::PgPool;
 
 use crate::clock::Clock;
 use crate::config::Config;
+use crate::locks::LocksRuntime;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub clock: Arc<dyn Clock>,
     pub config: Arc<Config>,
+    /// Locks verification keys and lifecycle client. `None` on sandbox-only
+    /// deployments: `payment.register_locks` is refused and the lifecycle
+    /// poller is not scheduled (fail closed; see [`locks::runtime_from_env`]).
+    pub locks: Option<Arc<LocksRuntime>>,
 }
 
 impl AppState {
@@ -36,6 +42,12 @@ impl AppState {
             pool,
             clock,
             config: Arc::new(config),
+            locks: None,
         }
+    }
+
+    pub fn with_locks(mut self, locks: Option<Arc<LocksRuntime>>) -> Self {
+        self.locks = locks;
+        self
     }
 }

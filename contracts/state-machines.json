@@ -347,6 +347,10 @@
             {
               "trigger": "command",
               "name": "payment.sandbox_advance"
+            },
+            {
+              "trigger": "server",
+              "name": "payment_confirmation"
             }
           ]
         },
@@ -631,6 +635,10 @@
             {
               "trigger": "command",
               "name": "payment.sandbox_advance"
+            },
+            {
+              "trigger": "server",
+              "name": "locks_verification"
             }
           ]
         },
@@ -655,6 +663,10 @@
             {
               "trigger": "command",
               "name": "payment.sandbox_advance"
+            },
+            {
+              "trigger": "server",
+              "name": "locks_verification"
             }
           ]
         },
@@ -677,10 +689,21 @@
               "name": "payment.sandbox_advance"
             }
           ]
+        },
+        {
+          "from": "expired",
+          "to": "manual_review",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "locks_late_completion"
+            }
+          ]
         }
       ],
       "commands": [
-        "payment.sandbox_advance"
+        "payment.sandbox_advance",
+        "payment.register_locks"
       ],
       "unreachable_states": []
     },

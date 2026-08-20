@@ -214,7 +214,10 @@ pub fn order_machine() -> AggregateMachine {
             t(
                 "pending_payment",
                 "paid",
-                vec![Command("payment.sandbox_advance")],
+                vec![
+                    Command("payment.sandbox_advance"),
+                    Server("payment_confirmation"),
+                ],
             ),
             t(
                 "pending_payment",
@@ -357,6 +360,13 @@ pub fn dispute_machine() -> AggregateMachine {
     }
 }
 
+/// The payment machine. Locks-correlated payments are advanced exclusively
+/// by server-side verification of the Locks lifecycle (ADR-0019 §7):
+/// `locks_verification` confirms a payment on an independently verified
+/// completed result, `payment_window` expires one whose marketplace window
+/// elapsed while the lifecycle stayed pending, and `locks_late_completion`
+/// routes a completion verified after that expiry to `manual_review` — it is
+/// never silently discarded. No client claim drives any of these edges.
 pub fn payment_machine() -> AggregateMachine {
     AggregateMachine {
         aggregate: "payment",
@@ -377,7 +387,10 @@ pub fn payment_machine() -> AggregateMachine {
             t(
                 "awaiting_entitlement",
                 "confirmed",
-                vec![Command("payment.sandbox_advance")],
+                vec![
+                    Command("payment.sandbox_advance"),
+                    Server("locks_verification"),
+                ],
             ),
             t(
                 "awaiting_entitlement",
@@ -387,7 +400,10 @@ pub fn payment_machine() -> AggregateMachine {
             t(
                 "awaiting_entitlement",
                 "manual_review",
-                vec![Command("payment.sandbox_advance")],
+                vec![
+                    Command("payment.sandbox_advance"),
+                    Server("locks_verification"),
+                ],
             ),
             t(
                 "detected",
@@ -399,8 +415,13 @@ pub fn payment_machine() -> AggregateMachine {
                 "manual_review",
                 vec![Command("payment.sandbox_advance")],
             ),
+            t(
+                "expired",
+                "manual_review",
+                vec![Server("locks_late_completion")],
+            ),
         ],
-        commands: vec!["payment.sandbox_advance"],
+        commands: vec!["payment.sandbox_advance", "payment.register_locks"],
         unreachable_states: vec![],
     }
 }

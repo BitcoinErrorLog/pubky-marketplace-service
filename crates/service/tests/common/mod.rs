@@ -17,9 +17,17 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::util::ServiceExt;
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Mutex;
+
 use marketplace_service::clock::{AdjustableClock, Clock};
 use marketplace_service::config::Config;
 use marketplace_service::http::build_router;
+use marketplace_service::locks::{
+    LocksKeys, LocksLifecycleClient, LocksLookupOutcome, LocksRuntime,
+};
 use marketplace_service::AppState;
 
 /// The fixed test instant used by the TypeScript prototype suite.
@@ -52,6 +60,151 @@ pub async fn test_app_with_config(pool: PgPool, config: Config) -> TestApp {
         pool,
         clock,
         state,
+    }
+}
+
+/// Deterministic test keys for the Locks correlation store (distinct
+/// encryption and HMAC keys, as production requires).
+pub const TEST_LOCKS_ENCRYPTION_KEY: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+pub const TEST_LOCKS_HMAC_KEY: &str =
+    "2222222222222222222222222222222222222222222222222222222222222222";
+
+/// A canonical Locks bundle id (26-character Crockford base32 of 16 bytes).
+pub const TEST_BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
+/// A canonical Locks lock id (52-character Crockford base32).
+pub const TEST_LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
+
+pub fn test_locks_keys() -> LocksKeys {
+    LocksKeys::from_hex(TEST_LOCKS_ENCRYPTION_KEY, TEST_LOCKS_HMAC_KEY)
+        .expect("test locks keys parse")
+}
+
+/// Programmable Lock Server lifecycle double for tests. Outcomes are keyed
+/// by bundle id; a lifecycle the test never announced is `NotFound`, exactly
+/// what the real route reports for an unsubmitted bundle. This type exists
+/// only in the test harness — production constructs the HTTP client alone.
+#[derive(Default)]
+pub struct FakeLocksClient {
+    outcomes: Mutex<HashMap<String, LocksLookupOutcome>>,
+    lookups: Mutex<Vec<(String, String)>>,
+}
+
+impl FakeLocksClient {
+    pub fn set_outcome(&self, bundle_id: &str, outcome: LocksLookupOutcome) {
+        self.outcomes
+            .lock()
+            .expect("fake outcomes lock")
+            .insert(bundle_id.to_string(), outcome);
+    }
+
+    pub fn lookup_count(&self) -> usize {
+        self.lookups.lock().expect("fake lookups lock").len()
+    }
+
+    /// The `(creator, bundle_id)` pairs the service actually sent upstream.
+    pub fn lookups(&self) -> Vec<(String, String)> {
+        self.lookups.lock().expect("fake lookups lock").clone()
+    }
+}
+
+impl LocksLifecycleClient for FakeLocksClient {
+    fn lookup<'a>(
+        &'a self,
+        creator: &'a str,
+        bundle_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = LocksLookupOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.lookups
+                .lock()
+                .expect("fake lookups lock")
+                .push((creator.to_string(), bundle_id.to_string()));
+            *self
+                .outcomes
+                .lock()
+                .expect("fake outcomes lock")
+                .get(bundle_id)
+                .unwrap_or(&LocksLookupOutcome::NotFound)
+        })
+    }
+}
+
+/// A test app with Locks verification enabled, driven by the programmable
+/// fake lifecycle client.
+pub async fn test_app_with_locks(pool: PgPool) -> (TestApp, Arc<FakeLocksClient>) {
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let fake = Arc::new(FakeLocksClient::default());
+    let runtime = Arc::new(LocksRuntime {
+        keys: test_locks_keys(),
+        client: fake.clone(),
+    });
+    let state =
+        AppState::new(pool.clone(), clock.clone(), Config::for_tests()).with_locks(Some(runtime));
+    (
+        TestApp {
+            router: build_router(state.clone()),
+            pool,
+            clock,
+            state,
+        },
+        fake,
+    )
+}
+
+/// The canonical addressed lock resource for a seller's test lock.
+pub fn lock_resource_for(seller_pubky: &str) -> String {
+    format!("{seller_pubky}/pub/locks.app/{TEST_LOCK_ID}.json")
+}
+
+/// The `payment.register_locks` envelope (buyer-authored).
+pub fn register_locks_command(
+    payment_id: &str,
+    expected_revision: i64,
+    bundle_id: &str,
+    pubky_lock_resource: &str,
+    command_number: u64,
+) -> Value {
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x8002, command_number),
+        "aggregate_id": format!("payment:{payment_id}"),
+        "expected_revision": expected_revision,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "payment.register_locks",
+        "payload": {
+            "payment_id": payment_id,
+            "bundle_id": bundle_id,
+            "pubky_lock_resource": pubky_lock_resource,
+        },
+    })
+}
+
+pub struct PendingOrder {
+    pub order_id: String,
+    pub payment_id: String,
+}
+
+/// Registers one unit and checks out as the buyer, leaving the order in
+/// `pending_payment` with its payment awaiting entitlement at revision 1.
+pub async fn create_pending_order(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+) -> PendingOrder {
+    let (status, body) = execute(app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
+    let (status, body) = execute(app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
+    PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id present")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id present")
+            .to_string(),
     }
 }
 

@@ -16,8 +16,11 @@ crates/domain      Canonical contracts: command envelope + payload validation,
                    emit-contracts binary.
 crates/service     axum HTTP service: Postgres schema (sqlx migrations),
                    Pubky AuthToken auth, command executor with
-                   idempotency, command handlers, background worker runtime
-                   (expiry, auction close, outbox delivery with leases).
+                   idempotency, command handlers, Locks lifecycle
+                   verification (encrypted correlations, HMAC lookup
+                   tokens, Lock Server client), background worker runtime
+                   (expiry, auction close, outbox delivery, Locks
+                   verification, payment window — all with leases).
 contracts/         state-machines.json — the machine-readable state machine
                    contract emitted from crates/domain.
 docker-compose.yml Dev/test PostgreSQL 17 on port 55432.
@@ -52,6 +55,18 @@ Migrations in `crates/service/migrations/` are applied automatically at boot
 | `WORKER_INTERVAL_SECONDS` | `10` | background worker pass interval |
 | `WORKER_LEASE_SECONDS` | `30` | worker task/outbox lease duration |
 | `MODERATOR_PUBKYS` | empty | comma-separated moderator pubkys, validated as z-base-32 at startup |
+| `LOCKS_SERVER_URL` | unset | Lock Server base URL; setting it enables Locks verification |
+| `LOCKS_BUNDLE_ENCRYPTION_KEY` | unset | 32-byte hex key encrypting bundle ids at rest (XChaCha20-Poly1305) |
+| `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
+| `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | marketplace payment window for Locks-correlated payments (≥ 60) |
+| `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation |
+
+The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
+closed at startup** on a partial configuration (a URL without keys, or keys
+without a URL), rather than running with verification silently disabled or
+bearer material unprotected. With none of them set the deployment is
+sandbox-only: `payment.register_locks` is refused and the lifecycle poller
+is not scheduled.
 
 Endpoints: `GET /health`, `GET /ready` (checks the database),
 `POST /v1/auth/sessions`,
@@ -111,7 +126,8 @@ envelope; unknown fields and unsupported versions are rejected
 Commands implemented: `listing.register`, `inventory.reserve`,
 `checkout.create`, `offer.create`, `offer.counter`, `offer.accept`,
 `offer.reject`, `offer.withdraw`, `auction.place_bid`, `auction.close`,
-`payment.sandbox_advance`, `order.cancel_request`, `order.cancel_approve`,
+`payment.sandbox_advance`, `payment.register_locks`,
+`order.cancel_request`, `order.cancel_approve`,
 `fulfillment.ship`,
 `fulfillment.confirm_delivery`, `return.request`, `return.approve`,
 `return.receive`, `refund.record_external`, `dispute.open`,
@@ -143,7 +159,10 @@ and refund branches) exactly as the prototype engine did:
   (`INVALID_STATE`) rather than overselling. (The pubky-app client
   currently refuses to send `payment.sandbox_advance` to the durable
   service as a matter of client policy; the command exists here so the
-  post-purchase lifecycle is real and testable end to end.)
+  post-purchase lifecycle is real and testable end to end.) Real payments
+  are advanced only by server-side verification of the Locks lifecycle —
+  see "Locks verification" below; the same confirmation transition (receipt,
+  inventory conversion, notification) is shared by both paths.
 - **Cancellation.** `order.cancel_request` (buyer only, from
   `pending_payment`/`paid`/`processing`): an unpaid order cancels
   immediately and its held stock returns to the listing; a paid order moves
@@ -204,6 +223,75 @@ request, to the buyer on approval — `order_shipped`, `order_delivered`,
 `refund_recorded`, `dispute_updated` to both parties on resolution,
 `review_received`). `dispute.evidence` and `review.update` emit none — the
 prototype had no counterpart to copy.
+
+## Locks verification (task 4.5)
+
+Real (non-sandbox) payments are settled outside this service: the buyer
+submits a proof bundle to a Lock Server, Locks obtains an invoice from
+Paykit Server, Bitcoin is observed, and the Locks verification lifecycle
+completes. This service **independently verifies that completion** against
+the Lock Server before advancing the order — a client claim can never
+advance a payment (ADR-0019 §7).
+
+- **Registration.** `payment.register_locks` (buyer only, payment in
+  `awaiting_entitlement`) stores the encrypted correlation between the
+  payment/order and the Locks lifecycle identity `{creator, bundle_id}`.
+  The bundle id is the buyer's cryptographically random lifecycle handle —
+  a bearer secret — and the lock resource's creator must equal the order's
+  seller. The correlation binds order id, buyer, creator, BLAKE3 lock
+  resource hash, amount, asset, and guarantee policy version
+  (upstream-integration "Transaction-service correlation"). Registration
+  flips the payment to the `locks` adapter, which permanently refuses
+  `payment.sandbox_advance`, and does **not** advance the payment state.
+- **Correlation secrecy.** The bundle id is stored only as
+  XChaCha20-Poly1305 ciphertext (random 24-byte nonce, payment id as
+  associated data, so ciphertexts cannot be transplanted between rows);
+  queries and uniqueness use an HMAC-SHA256 lookup token, never the raw
+  value. The unique token also means one lifecycle identity can never
+  correlate two orders. Nothing serializes the correlation row: no read
+  projection, command result, event, outbox intent, log, or error carries
+  the bundle id or lock resource
+  (`bundle_and_lock_resource_never_leave_the_correlation_store` asserts
+  this across every surface).
+- **Verification.** The worker's `locks_verification` task claims due
+  pending correlations (bounded batches, one lookup per correlation per
+  `LOCKS_POLL_SECONDS`), decrypts the bundle id, and performs a real
+  `POST /verification-task-lookups` against the configured Lock Server
+  (pinned contract commit `ba49a777`; tests drive the same code path
+  through a fake lifecycle client — production only ever constructs the
+  HTTP client). Verification is a pure function of what Locks reports:
+  - `completed` → the payment advances `awaiting_entitlement → confirmed`
+    **exactly once**, enforced by the payment-state compare-and-swap plus
+    the `events_one_payment_confirmed` unique index rather than
+    application logic; the confirmation applies the same effects as the
+    sandbox path (order `paid`, receipt issued, inventory converted,
+    `payment_confirmed` outbox intent). Duplicate or reordered completions
+    are harmless no-ops.
+  - `pending` / `in_progress` / not-found / transport or status failure →
+    the payment stays untouched and the correlation stays pending (Locks
+    v1 leaves transport/status failures pending and exposes no terminal
+    payment failure to the viewer).
+  - `failed` / `expired` (the Locks task aged out) → recorded as an
+    upstream fact and polling stops; the payment is **not** expired by it.
+- **Expiry vs late completion.** The `payment_window` task moves a payment
+  still `awaiting_entitlement` to `expired` once the marketplace window
+  (`LOCKS_PAYMENT_WINDOW_SECONDS`, stamped at registration) elapses on
+  server time — deliberately separate from upstream failure. The
+  correlation keeps polling after the window (bounded by the Lock Server's
+  own task ageing), so a completion verified **after** marketplace expiry
+  moves the payment `expired → manual_review` and is retained — never a
+  confirmation of a dead order, never silently discarded. A verified
+  completion whose order can no longer be confirmed (e.g. cancelled while
+  pending, or a lapsed auction hold) also goes to `manual_review`.
+- **History.** Every observed upstream status change and every marketplace
+  action on it is appended to `payment_locks_observations` (append-only by
+  trigger, statuses only — no bearer material), so late-completion and
+  reconciliation history is durable.
+- **Crash safety.** A verification claim only stamps `last_checked_at`;
+  every effect commits in its own guarded transaction. A holder that dies
+  between lookup and effect leaves the correlation pending, and any
+  instance resumes it after the poll interval — bounded, abortable,
+  resumable, with the same lease discipline as every other worker task.
 
 ## Authentication (task 3.2)
 
@@ -290,11 +378,15 @@ the whole convention.
   it back once, in the checkout command result they authored; read
   projections and every post-purchase command result omit it for both
   participants.
-- `payments.locks_bundle_id` — the Locks correlation id (`access
-  credentials or bundle_id` in ADR-0019 §8). Withheld from **command
-  results as well as read projections**: it is bearer material, nothing
-  client-side consumes it, and leaving it in one response shape but not
-  the other would put it in logs and telemetry for no benefit.
+- **The Locks bundle id and lock resource** (`access credentials or
+  bundle_id` in ADR-0019 §8). The former plaintext
+  `payments.locks_bundle_id` column has been **removed entirely**: the
+  bundle id now exists only as XChaCha20-Poly1305 ciphertext in
+  `payment_locks_correlations`, is queried only through an HMAC lookup
+  token, and has no serialization path — no command result, read
+  projection, event, outbox intent, notification, log, or error carries it
+  (asserted by the redaction test in `tests/locks_test.rs`). The lock
+  resource is stored only as a BLAKE3 hash.
 - **Dispute evidence bodies** — private order evidence (ADR-0019 §8).
   Stored append-only in `dispute_evidence`; never served by any general
   read projection or command result, not even back to the submitter, and
@@ -340,10 +432,11 @@ Not served, deliberately (no fabricated or empty-by-default reads):
 - **Notification preferences** — the `notification.*` commands have not
   been ported.
 
-## Background workers (task 3.4)
+## Background workers (tasks 3.4, 4.5)
 
-One worker runtime (`crates/service/src/workers.rs`) drains four server-time
-tasks: reservation expiry, offer expiry, auction close, and the outbox.
+One worker runtime (`crates/service/src/workers.rs`) drains six server-time
+tasks: reservation expiry, offer expiry, auction close, the outbox, Locks
+lifecycle verification, and the marketplace payment window.
 
 - **Leases.** Each task has a row in `worker_leases`; an instance takes (or
   renews) it with a conditional upsert and holds it for
@@ -364,6 +457,12 @@ tasks: reservation expiry, offer expiry, auction close, and the outbox.
   `auction.close` command; the `active` status guard plus the partial unique
   index `orders_one_winner_per_auction` make the close exactly-once even
   when the command and the worker race.
+- **Locks verification and payment window.** See "Locks verification"
+  above: the verification task runs only when the deployment has Locks
+  configured; the window sweep always runs, so correlations registered
+  before a configuration change still expire on schedule. Both hold the
+  same leases and carry the same crash-safety and at-most-once effect
+  properties as the other tasks (payment CAS + unique event index).
 
 ## Moderation (task 3.5)
 
@@ -438,6 +537,20 @@ cancellation port added one listing edge (`sold → available` via
 `order.cancel_approve`), so re-vendoring for it also requires the client's
 listing transition table to accept that edge.
 
+The Locks verification port (task 4.5) changes the artifact again — the
+client must re-vendor and its transition tables change (no state enums or
+aggregate sets change):
+
+- payment `awaiting_entitlement → confirmed` and
+  `awaiting_entitlement → manual_review` gain the server trigger
+  `locks_verification`;
+- payment gains a new edge `expired → manual_review` via the server trigger
+  `locks_late_completion`;
+- order `pending_payment → paid` gains the server trigger
+  `payment_confirmation` (the trigger the listing and reservation machines
+  already declared);
+- the payment aggregate's command list gains `payment.register_locks`.
+
 ## Resolved contract divergences
 
 The prototype service enums and the client-side TypeScript contracts
@@ -459,7 +572,9 @@ This service is canonical and resolves them as follows:
 | Report decisions | none (reports stayed `open` forever) | `trust.decide` (moderator-only) records append-only decisions; report states `open/dismissed/actioned` | Task 3.5 requires moderator decisions recorded append-only. |
 | Notifications | synchronous in-memory append inside the command | outbox intents delivered at least once by the worker, deduped by `(event_id, recipient)` | ADR-0019 §4: side effects leave the command transaction only through the outbox. Notification preferences belong to the not-yet-ported `notification.*` commands. |
 | Auth handshake | ed25519 challenge–response: the service issued a nonce for the client to sign | Pubky AuthToken verified with `pubky-common`; challenge endpoint removed | A browser client cannot sign — the secret key lives in the user's signer (Pubky Ring), and the SDK `Keypair` exposes no signing method. The AuthToken is the mechanism Pubky provides for exactly this proof; the service adds single-use and acceptance-window enforcement. |
-| Payment projection | client `paymentSchema` requires `locks_bundle_id` | omitted from every response, reads and command results alike | ADR-0019 §8 forbids exposing `access credentials or bundle_id`. The client has made the field optional, so the sandbox may still send it. |
+| Payment projection | client `paymentSchema` requires `locks_bundle_id` | the field no longer exists: the bundle id lives only encrypted in `payment_locks_correlations` and is never serialized | ADR-0019 §8 forbids exposing `access credentials or bundle_id`. The client has made the field optional; it will never be sent. |
+| Payment adapter | sandbox only (`adapter = 'sandbox'`) | `sandbox` or `locks`; `payment.register_locks` flips a payment to `locks`, which permanently refuses `payment.sandbox_advance` | ADR-0019 §7: a Locks-correlated payment advances only by independent server-side verification of a completed Locks result — never by a client claim. |
+| Real payment advancement | none (the prototype had only the buyer-driven sandbox command) | server-driven: the worker verifies the Locks lifecycle (`POST /verification-task-lookups`) and confirms exactly once; the marketplace payment window expires on server time; a late completion goes to `manual_review` | ADR-0019 §7 and the upstream integration contract; Locks v1 leaves transport/status failures pending, so upstream trouble never expires a payment by itself. |
 | Order delivery address | prototype order views carried the address | omitted from read projections (the client `orderSchema` never wanted it) | ADR-0019 §8: no private delivery details in exposed records. |
 | Receipts | client `receiptSchema` + sandbox `GET /v1/receipts/{id}` | durable `receipts` table (append-only), issued exactly once on payment confirmation; `GET /v1/receipts/{id}` for issuer and recipient | The table and issuing transition now exist, so the endpoint serves real rows; `orders.receipt_id` is populated on confirmation. |
 | Inventory after payment confirmation | prototype left the sold quantity in `reservedQuantity` forever | confirmation moves the order's line quantities reserved → sold and marks the winning auction reservation `converted` | The contract already declared listing `reserved → sold` and reservation `active → converted` under `payment_confirmation`; a durable ledger cannot hold quantities in a hold state forever. |

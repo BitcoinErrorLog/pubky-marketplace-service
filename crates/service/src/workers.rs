@@ -1,7 +1,8 @@
-//! Background worker runtime (plan task 3.4).
+//! Background worker runtime (plan tasks 3.4 and 4.5).
 //!
-//! One runtime drains four server-time tasks: (a) reservation expiry,
-//! (b) offer expiry, (c) auction close, and (d) the outbox. Each task is
+//! One runtime drains six server-time tasks: (a) reservation expiry,
+//! (b) offer expiry, (c) auction close, (d) the outbox, (e) Locks lifecycle
+//! verification, and (f) the marketplace payment window. Each task is
 //! guarded by a lease row in `worker_leases`, so two service instances never
 //! drain the same task concurrently; a holder that dies mid-lease is
 //! recovered by any instance once the lease lapses. Within a task, due rows
@@ -15,23 +16,43 @@
 //! but undelivered — it is redelivered after the lease lapses. The consumer
 //! side dedups by (event id, recipient), so redelivery never duplicates the
 //! effect.
+//!
+//! Locks verification semantics (ADR-0019 §7): the service independently
+//! verifies each pending correlation against the Lock Server's lifecycle
+//! lookup and advances the payment on a completed result exactly once — the
+//! payment-state compare-and-swap plus the `events_one_payment_confirmed`
+//! unique index enforce the once, not application logic. A claim only stamps
+//! `last_checked_at`, so a crash between the lookup and the effect leaves
+//! the correlation pending and it is re-verified after the poll interval:
+//! bounded, abortable, and resumable across restarts. Marketplace
+//! payment-window expiry is a separate server-time transition — Locks v1
+//! leaves transport/status failures pending, so upstream trouble never
+//! expires a payment by itself — and a completion verified after the window
+//! goes to `manual_review`, never silently discarded.
 
 use chrono::{DateTime, Utc};
+use marketplace_domain::ids;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::handlers::auction::{close_locked_auction, parse_auction};
-use crate::handlers::LISTING_COLUMNS;
-use crate::model::ListingRow;
+use crate::handlers::payment::confirm_order;
+use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
+use crate::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
+use crate::model::{ListingRow, PaymentRow};
+use crate::queries::PAYMENT_COLUMNS;
 use crate::{expiry, AppState};
 
 pub const TASK_RESERVATION_EXPIRY: &str = "reservation_expiry";
 pub const TASK_OFFER_EXPIRY: &str = "offer_expiry";
 pub const TASK_AUCTION_CLOSE: &str = "auction_close";
 pub const TASK_OUTBOX: &str = "outbox";
+pub const TASK_LOCKS_VERIFICATION: &str = "locks_verification";
+pub const TASK_PAYMENT_WINDOW: &str = "payment_window";
 
 const OUTBOX_BATCH_SIZE: i64 = 100;
+const LOCKS_VERIFY_BATCH_SIZE: i64 = 25;
 
 /// Takes (or renews) the lease for one task. Returns false when another
 /// live holder owns it.
@@ -244,12 +265,408 @@ pub async fn drain_outbox(
     deliver_claimed(pool, &claimed, now).await
 }
 
+/// One claimed pending correlation. The bundle id leaves this struct only
+/// as ciphertext; a derived Debug would print bytes, not the secret.
+#[derive(Debug, sqlx::FromRow)]
+struct ClaimedCorrelation {
+    id: Uuid,
+    payment_id: Uuid,
+    creator_pubky: String,
+    bundle_id_ciphertext: Vec<u8>,
+    last_observed_status: Option<String>,
+}
+
+/// Claims a batch of pending correlations due for a lifecycle lookup by
+/// stamping `last_checked_at`. The stamp is the only pre-effect write, so a
+/// holder that dies after claiming loses nothing: the row stays `pending`
+/// and is re-verified once the poll interval elapses.
+async fn claim_due_correlations(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    poll_seconds: i64,
+) -> Result<Vec<ClaimedCorrelation>, sqlx::Error> {
+    sqlx::query_as(
+        "UPDATE payment_locks_correlations SET last_checked_at = $1, updated_at = $1 \
+         WHERE id IN (\
+             SELECT id FROM payment_locks_correlations \
+             WHERE verification_state = 'pending' \
+             AND (last_checked_at IS NULL OR last_checked_at <= $2) \
+             ORDER BY last_checked_at ASC NULLS FIRST LIMIT $3 FOR UPDATE SKIP LOCKED\
+         ) RETURNING id, payment_id, creator_pubky, bundle_id_ciphertext, last_observed_status",
+    )
+    .bind(now)
+    .bind(now - chrono::Duration::seconds(poll_seconds))
+    .bind(LOCKS_VERIFY_BATCH_SIZE)
+    .fetch_all(pool)
+    .await
+}
+
+/// Appends one reconciliation-history row (append-only by trigger).
+async fn insert_observation(
+    tx: &mut Transaction<'_, Postgres>,
+    correlation_id: Uuid,
+    observed_status: &str,
+    outcome: &str,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO payment_locks_observations (correlation_id, observed_status, outcome, \
+         observed_at) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(correlation_id)
+    .bind(observed_status)
+    .bind(outcome)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Records a non-terminal upstream status (pending / in_progress /
+/// not_found). History rows are appended only on change, so steady polling
+/// does not grow the table.
+async fn record_status_observation(
+    pool: &PgPool,
+    row: &ClaimedCorrelation,
+    observed_status: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    if row.last_observed_status.as_deref() == Some(observed_status) {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE payment_locks_correlations SET last_observed_status = $2, updated_at = $3 \
+         WHERE id = $1",
+    )
+    .bind(row.id)
+    .bind(observed_status)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    insert_observation(&mut tx, row.id, observed_status, "none", now).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Records a terminal upstream failure (`failed`/`expired` from Locks) and
+/// stops polling the lifecycle. The payment is deliberately untouched: an
+/// upstream failure is not a marketplace expiry (ADR-0019 §7) — the payment
+/// window moves the payment to `expired` on its own schedule.
+async fn record_upstream_terminal(
+    pool: &PgPool,
+    row: &ClaimedCorrelation,
+    observed_status: &str,
+    verification_state: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    let flipped = sqlx::query(
+        "UPDATE payment_locks_correlations SET verification_state = $2, \
+         last_observed_status = $3, updated_at = $4 \
+         WHERE id = $1 AND verification_state = 'pending'",
+    )
+    .bind(row.id)
+    .bind(verification_state)
+    .bind(observed_status)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    if flipped.rows_affected() == 1 {
+        insert_observation(&mut tx, row.id, observed_status, "none", now).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Marks the correlation completed inside the caller's effect transaction.
+async fn mark_correlation_completed(
+    tx: &mut Transaction<'_, Postgres>,
+    correlation_id: Uuid,
+    outcome: &str,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let flipped = sqlx::query(
+        "UPDATE payment_locks_correlations SET verification_state = 'completed', \
+         last_observed_status = 'completed', completed_at = $2, updated_at = $2 \
+         WHERE id = $1 AND verification_state = 'pending'",
+    )
+    .bind(correlation_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    if flipped.rows_affected() == 1 {
+        insert_observation(tx, correlation_id, "completed", outcome, now).await?;
+    }
+    Ok(())
+}
+
+/// Moves the payment to `manual_review` from `from_state` (a completion that
+/// can no longer confirm the order: verified after the marketplace window,
+/// or refused by the confirmation invariants). The compare-and-swap makes a
+/// redelivered completion harmless, and the correlation plus its observation
+/// row retain the history — a late completion is never silently discarded.
+async fn apply_manual_review(
+    pool: &PgPool,
+    row: &ClaimedCorrelation,
+    from_state: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let updated: Option<(i64, String)> = sqlx::query_as(
+        "UPDATE payments SET state = 'manual_review', revision = revision + 1, updated_at = $3 \
+         WHERE id = $1 AND state = $2 RETURNING revision, buyer_pubky",
+    )
+    .bind(row.payment_id)
+    .bind(from_state)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let applied = match updated {
+        Some((revision, buyer_pubky)) => {
+            crate::executor::insert_event(
+                &mut tx,
+                row.id,
+                &ids::payment_aggregate_id(row.payment_id),
+                revision,
+                &buyer_pubky,
+                "payment.manual_review",
+                now,
+            )
+            .await?;
+            mark_correlation_completed(&mut tx, row.id, "manual_review", now).await?;
+            true
+        }
+        None => {
+            // The payment moved concurrently; keep the completed fact.
+            mark_correlation_completed(&mut tx, row.id, "none", now).await?;
+            false
+        }
+    };
+    tx.commit().await?;
+    Ok(applied)
+}
+
+/// Applies one independently verified completed Locks result. Advances
+/// `awaiting_entitlement → confirmed` exactly once (payment CAS + the
+/// `events_one_payment_confirmed` unique index); routes a completion that
+/// arrives after marketplace expiry — or one whose order can no longer be
+/// confirmed — to `manual_review`; treats an already-advanced payment as a
+/// harmless duplicate.
+async fn apply_completed_lifecycle(
+    pool: &PgPool,
+    row: &ClaimedCorrelation,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let payment: Option<PaymentRow> = sqlx::query_as(&format!(
+        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(row.payment_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(payment) = payment else {
+        anyhow::bail!("correlation {} references a missing payment", row.id);
+    };
+
+    match payment.state.as_str() {
+        "awaiting_entitlement" => {
+            let Some(order) = fetch_order_for_update(&mut tx, payment.order_id).await? else {
+                anyhow::bail!("correlation {} references a missing order", row.id);
+            };
+            match confirm_order(&mut tx, &payment.buyer_pubky, row.id, &payment, order, now).await?
+            {
+                Ok((order, _receipt, _receipt_event_id)) => {
+                    let (revision,): (i64,) = sqlx::query_as(
+                        "UPDATE payments SET state = 'confirmed', revision = revision + 1, \
+                         updated_at = $2 WHERE id = $1 RETURNING revision",
+                    )
+                    .bind(payment.id)
+                    .bind(now)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let event_id = crate::executor::insert_event(
+                        &mut tx,
+                        row.id,
+                        &ids::payment_aggregate_id(payment.id),
+                        revision,
+                        &payment.buyer_pubky,
+                        "payment.confirmed",
+                        now,
+                    )
+                    .await?;
+                    insert_notification_intent(
+                        &mut tx,
+                        event_id,
+                        "payment_confirmed",
+                        &order.seller_pubky,
+                        &payment.buyer_pubky,
+                        &ids::order_aggregate_id(order.id),
+                        now,
+                    )
+                    .await?;
+                    mark_correlation_completed(&mut tx, row.id, "payment_confirmed", now).await?;
+                    tx.commit().await?;
+                    tracing::info!(
+                        payment_id = %payment.id,
+                        correlation_id = %row.id,
+                        "confirmed payment on verified locks completion"
+                    );
+                    Ok(true)
+                }
+                Err(failure) => {
+                    // The entitlement is real but the order can no longer be
+                    // confirmed (e.g. a lapsed auction hold). Roll back the
+                    // partial confirmation effects, then retain the fact
+                    // under manual review.
+                    tx.rollback().await?;
+                    tracing::warn!(
+                        payment_id = %payment.id,
+                        correlation_id = %row.id,
+                        code = ?failure.code,
+                        "verified locks completion could not confirm the order; routing to manual review"
+                    );
+                    apply_manual_review(pool, row, "awaiting_entitlement", now).await
+                }
+            }
+        }
+        "expired" => {
+            tx.rollback().await?;
+            tracing::info!(
+                payment_id = %payment.id,
+                correlation_id = %row.id,
+                "verified locks completion arrived after the payment window; routing to manual review"
+            );
+            apply_manual_review(pool, row, "expired", now).await
+        }
+        _ => {
+            // Already confirmed or under review: a duplicate or reordered
+            // completion has no further effect.
+            mark_correlation_completed(&mut tx, row.id, "none", now).await?;
+            tx.commit().await?;
+            Ok(false)
+        }
+    }
+}
+
+/// One Locks verification pass: claims due pending correlations, performs
+/// the independent lifecycle lookup for each, and applies the outcome.
+/// Returns the number of payments advanced (confirmed or manual review).
+pub async fn verify_due_locks_lifecycles(
+    state: &AppState,
+    locks: &LocksRuntime,
+    now: DateTime<Utc>,
+) -> anyhow::Result<u64> {
+    let claimed = claim_due_correlations(&state.pool, now, state.config.locks_poll_seconds).await?;
+    let mut applied = 0u64;
+    for row in &claimed {
+        let bundle_id = locks
+            .keys
+            .decrypt_bundle_id(row.payment_id, &row.bundle_id_ciphertext)
+            .map_err(|error| {
+                anyhow::anyhow!("correlation {} cannot be decrypted: {error}", row.id)
+            })?;
+        let outcome = locks.client.lookup(&row.creator_pubky, &bundle_id).await;
+        match outcome {
+            LocksLookupOutcome::Status(LocksTaskStatus::Completed) => {
+                if apply_completed_lifecycle(&state.pool, row, now).await? {
+                    applied += 1;
+                }
+            }
+            LocksLookupOutcome::Status(LocksTaskStatus::Failed) => {
+                record_upstream_terminal(&state.pool, row, "failed", "upstream_failed", now)
+                    .await?;
+            }
+            LocksLookupOutcome::Status(LocksTaskStatus::Expired) => {
+                record_upstream_terminal(&state.pool, row, "expired", "upstream_expired", now)
+                    .await?;
+            }
+            LocksLookupOutcome::Status(LocksTaskStatus::Pending) => {
+                record_status_observation(&state.pool, row, "pending", now).await?;
+            }
+            LocksLookupOutcome::Status(LocksTaskStatus::InProgress) => {
+                record_status_observation(&state.pool, row, "in_progress", now).await?;
+            }
+            LocksLookupOutcome::NotFound => {
+                record_status_observation(&state.pool, row, "not_found", now).await?;
+            }
+            LocksLookupOutcome::Unavailable => {
+                // Transport/status trouble stays pending and retryable
+                // (Locks v1 has no terminal payment failure); the claim
+                // stamp already deferred the next attempt.
+            }
+        }
+    }
+    Ok(applied)
+}
+
+/// Expires Locks-correlated payments whose marketplace payment window has
+/// elapsed on server time while the payment still awaits entitlement. This
+/// is a marketplace policy transition, independent of upstream state; the
+/// correlation keeps polling (bounded by the Lock Server's own task ageing),
+/// so a completion verified later still surfaces as `manual_review`.
+pub async fn expire_due_payment_windows(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let due: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "SELECT c.id, c.payment_id, p.buyer_pubky \
+         FROM payment_locks_correlations c JOIN payments p ON p.id = c.payment_id \
+         WHERE c.window_expires_at <= $1 AND p.state = 'awaiting_entitlement' \
+         ORDER BY c.window_expires_at FOR UPDATE OF c, p SKIP LOCKED",
+    )
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut expired = 0u64;
+    for (correlation_id, payment_id, buyer_pubky) in due {
+        let updated: Option<(i64,)> = sqlx::query_as(
+            "UPDATE payments SET state = 'expired', revision = revision + 1, updated_at = $2 \
+             WHERE id = $1 AND state = 'awaiting_entitlement' RETURNING revision",
+        )
+        .bind(payment_id)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((revision,)) = updated else {
+            continue;
+        };
+        crate::executor::insert_event(
+            &mut tx,
+            correlation_id,
+            &ids::payment_aggregate_id(payment_id),
+            revision,
+            &buyer_pubky,
+            "payment.expired",
+            now,
+        )
+        .await?;
+        insert_observation(
+            &mut tx,
+            correlation_id,
+            "window_elapsed",
+            "payment_expired",
+            now,
+        )
+        .await?;
+        tracing::info!(
+            payment_id = %payment_id,
+            correlation_id = %correlation_id,
+            "expired payment on marketplace payment window"
+        );
+        expired += 1;
+    }
+    tx.commit().await?;
+    Ok(expired)
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct WorkerSummary {
     pub reservations_expired: u64,
     pub offers_expired: u64,
     pub auctions_closed: u64,
     pub outbox_delivered: u64,
+    pub locks_completions_applied: u64,
+    pub payment_windows_expired: u64,
 }
 
 /// One worker pass: for each task, take the lease, drain, release. Tasks
@@ -286,6 +703,28 @@ pub async fn run_once(
         summary.outbox_delivered = drain_outbox(&state.pool, now, lease_seconds).await?;
         release_lease(&state.pool, TASK_OUTBOX, holder, now).await?;
     }
+    // Verification runs only when the deployment has Locks configured (fail
+    // closed); the window sweep is a marketplace-time transition and always
+    // runs, so correlations registered before a config change still expire.
+    if let Some(locks) = &state.locks {
+        if try_acquire_lease(
+            &state.pool,
+            TASK_LOCKS_VERIFICATION,
+            holder,
+            now,
+            lease_seconds,
+        )
+        .await?
+        {
+            summary.locks_completions_applied =
+                verify_due_locks_lifecycles(state, locks, now).await?;
+            release_lease(&state.pool, TASK_LOCKS_VERIFICATION, holder, now).await?;
+        }
+    }
+    if try_acquire_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now, lease_seconds).await? {
+        summary.payment_windows_expired = expire_due_payment_windows(&state.pool, now).await?;
+        release_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now).await?;
+    }
     Ok(summary)
 }
 
@@ -307,6 +746,8 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             offers_expired = summary.offers_expired,
                             auctions_closed = summary.auctions_closed,
                             outbox_delivered = summary.outbox_delivered,
+                            locks_completions_applied = summary.locks_completions_applied,
+                            payment_windows_expired = summary.payment_windows_expired,
                             "worker pass completed"
                         );
                     }

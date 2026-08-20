@@ -3,6 +3,7 @@ pub mod cancellation;
 pub mod checkout;
 pub mod disputes;
 pub mod fulfillment;
+pub mod locks;
 pub mod offers;
 pub mod payment;
 pub mod register_listing;

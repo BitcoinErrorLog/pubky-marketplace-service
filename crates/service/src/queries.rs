@@ -8,8 +8,9 @@
 //! non-participant rows, so they do not reveal whether an aggregate exists.
 //!
 //! Redaction (ADR-0019 §8): projections never carry private delivery
-//! details (`orders.delivery_address`) or Locks bundle correlation ids
-//! (`payments.locks_bundle_id`); see [`crate::model::OrderRow::projection`]
+//! details (`orders.delivery_address`) or the Locks bundle correlation,
+//! which exists only encrypted in `payment_locks_correlations` and has no
+//! serialization path at all; see [`crate::model::OrderRow::projection`]
 //! and [`crate::model::PaymentRow::projection`]. Offer messages are
 //! negotiation content between exactly the two offer participants, and the
 //! projection is readable by exactly those two participants — the same
@@ -55,8 +56,7 @@ pub const ORDER_COLUMNS: &str = "id, auction_aggregate_id, buyer_pubky, seller_p
      shipment, return_request, dispute, external_refund, created_at, updated_at";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
-     state, confirmations, locks_bundle_id, amount_minor, currency, exponent, created_at, \
-     updated_at";
+     state, confirmations, amount_minor, currency, exponent, created_at, updated_at";
 
 pub const NOTIFICATION_COLUMNS: &str =
     "id, recipient_pubky, actor_pubky, type, aggregate_id, created_at, read_at";
