@@ -291,6 +291,7 @@ pub async fn resolve(
             recipient,
             actor,
             &order_aggregate_id,
+            None,
             now,
         )
         .await?;

@@ -322,16 +322,27 @@ async fn worker_delivers_offer_and_auction_notifications(pool: PgPool) {
     // offer_received (seller) + outbid (first bidder).
     assert_eq!(summary.outbox_delivered, 2);
 
-    let types: Vec<(String, String)> =
-        sqlx::query_as("SELECT type, recipient_pubky FROM notifications ORDER BY type")
+    // Both notifications carry monetary context the recipient already sees
+    // in projections: the offer amount, and the visible price the displaced
+    // leader must now beat (12_000 capped to 10_000 + 500 increment).
+    let types: Vec<(String, String, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT type, recipient_pubky, amount FROM notifications ORDER BY type")
             .fetch_all(&app.pool)
             .await
             .expect("notifications listed");
     assert_eq!(
         types,
         vec![
-            ("offer_received".to_string(), seller.pubky.clone()),
-            ("outbid".to_string(), buyer.pubky.clone()),
+            (
+                "offer_received".to_string(),
+                seller.pubky.clone(),
+                Some(json!({ "amount_minor": 10_000, "currency": "USD", "exponent": 2 })),
+            ),
+            (
+                "outbid".to_string(),
+                buyer.pubky.clone(),
+                Some(json!({ "amount_minor": 10_500, "currency": "USD", "exponent": 2 })),
+            ),
         ]
     );
 }

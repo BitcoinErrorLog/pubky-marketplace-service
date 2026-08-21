@@ -471,6 +471,11 @@ pub struct NotificationRow {
     #[sqlx(rename = "type")]
     pub notification_type: String,
     pub aggregate_id: String,
+    /// Optional monetary context in the projections' money JSON shape,
+    /// present only where the recipient already sees the figure in a
+    /// role-scoped projection (ADR-0019 §8). NULL on rows delivered before
+    /// amounts existed.
+    pub amount: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub read_at: Option<DateTime<Utc>>,
 }
@@ -483,6 +488,7 @@ impl NotificationRow {
             "actor_pubky": self.actor_pubky,
             "type": self.notification_type,
             "aggregate_id": self.aggregate_id,
+            "amount": self.amount,
             "created_at": format_timestamp(self.created_at),
             "read_at": self.read_at.map(format_timestamp),
         })

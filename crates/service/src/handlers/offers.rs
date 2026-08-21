@@ -136,6 +136,8 @@ pub async fn create(
         now,
     )
     .await?;
+    // Offer notifications carry the offer amount: both participants read the
+    // full offer projection, so the figure is already theirs (ADR-0019 §8).
     insert_notification_intent(
         tx,
         event_id,
@@ -143,6 +145,7 @@ pub async fn create(
         &offer.seller_pubky,
         actor,
         &aggregate_id,
+        Some(&amount_json),
         now,
     )
     .await?;
@@ -250,6 +253,7 @@ pub async fn counter(
         other_participant(&updated, actor),
         actor,
         &offer.aggregate_id,
+        Some(&amount_json),
         now,
     )
     .await?;
@@ -379,6 +383,7 @@ pub async fn accept(
         other_participant(&accepted, actor),
         actor,
         &offer.aggregate_id,
+        Some(&accepted.amount_json()),
         now,
     )
     .await?;
@@ -439,6 +444,7 @@ pub async fn reject(
         other_participant(&updated, actor),
         actor,
         &offer.aggregate_id,
+        Some(&updated.amount_json()),
         now,
     )
     .await?;

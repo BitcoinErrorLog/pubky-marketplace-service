@@ -22,7 +22,9 @@ use crate::handlers::{
     fetch_listing_for_update, insert_notification_intent, sandbox_tax_minor, LISTING_COLUMNS,
     SHIPPING_MINOR,
 };
-use crate::model::{AuctionState, BidRow, ListingRow, OrderRow, PaymentRow, ReservationRow};
+use crate::model::{
+    money_json, AuctionState, BidRow, ListingRow, OrderRow, PaymentRow, ReservationRow,
+};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 /// The auction winner's inventory hold, as in the prototype engine.
@@ -182,6 +184,8 @@ pub async fn place_bid(
     .await?;
     if let Some(previous_leader) = previous_leader {
         if previous_leader != leader.bidder_pubky && previous_leader != actor {
+            // The amount is the new visible price — the figure the displaced
+            // leader must beat, already on the auction projection they read.
             insert_notification_intent(
                 tx,
                 event_id,
@@ -189,6 +193,11 @@ pub async fn place_bid(
                 &previous_leader,
                 actor,
                 &listing.aggregate_id,
+                Some(&money_json(
+                    visible_amount,
+                    &listing.unit_price_currency,
+                    listing.unit_price_exponent,
+                )),
                 now,
             )
             .await?;
@@ -337,6 +346,14 @@ pub async fn close_locked_auction(
     )
     .await?;
     let mut event_ids = vec![close_event_id];
+
+    // The closing visible price, carried by the close notifications
+    // (auction_won to the winner, auction_ended to every other bidder).
+    let final_price_json = money_json(
+        closed_auction.current_price.amount_minor,
+        &closed_auction.current_price.currency,
+        closed_auction.current_price.exponent,
+    );
 
     let (reservation, order, payment) = if let Some(winner_pubky) = &winner {
         let expires_at = now + chrono::Duration::seconds(AUCTION_HOLD_SECONDS);
@@ -492,6 +509,7 @@ pub async fn close_locked_auction(
             winner_pubky,
             actor,
             &listing.aggregate_id,
+            Some(&final_price_json),
             now,
         )
         .await?;
@@ -500,6 +518,37 @@ pub async fn close_locked_auction(
     } else {
         (None, None, None)
     };
+
+    // Every distinct bidder except the winner learns the auction closed
+    // (`auction_ended`), sold or unsold — previously only the winner
+    // (`auction_won`) and the displaced leader at bid time (`outbid`) heard
+    // anything. The payload carries the aggregate ref and the closing
+    // visible price, both already on the listing projection every bidder
+    // reads (ADR-0019 §8). All intents share the one close event, so the
+    // (event id, recipient) dedup makes redelivery harmless.
+    let bidders: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT bidder_pubky FROM bids WHERE listing_aggregate_id = $1 \
+         ORDER BY bidder_pubky",
+    )
+    .bind(&listing.aggregate_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for (bidder_pubky,) in &bidders {
+        if winner.as_deref() == Some(bidder_pubky.as_str()) {
+            continue;
+        }
+        insert_notification_intent(
+            tx,
+            close_event_id,
+            "auction_ended",
+            bidder_pubky,
+            actor,
+            &listing.aggregate_id,
+            Some(&final_price_json),
+            now,
+        )
+        .await?;
+    }
 
     Ok(AuctionCloseOutcome {
         sold,

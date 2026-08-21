@@ -138,6 +138,7 @@ pub async fn advance(
             &order.seller_pubky,
             actor,
             &ids::order_aggregate_id(order.id),
+            None,
             now,
         )
         .await?;

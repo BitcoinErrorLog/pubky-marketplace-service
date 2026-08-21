@@ -201,7 +201,9 @@ and refund branches) exactly as the prototype engine did:
   subsequent payment, fulfillment, return, dispute, and cancellation
   command.
 - **Fulfillment.** `fulfillment.ship` (seller, with carrier and tracking
-  number) and `fulfillment.confirm_delivery` (buyer) drive
+  number — both trimmed printable strings, deliberately not enums; the soft
+  carrier vocabulary the reference client writes is documented on
+  `ShipOrderPayload.carrier`) and `fulfillment.confirm_delivery` (buyer) drive
   `paid/processing → shipped → delivered`. There is no separate
   seller-marks-delivered command: the buyer's confirmation is the delivery
   transition, as in the prototype. `delivered → completed` is reached
@@ -378,7 +380,7 @@ orders, and payments).
 | `GET /v1/disputes` | configured moderators only; everyone else is refused 403, never handed `[]` | `{ "disputes": [...] }` — the adjudication queue: the order projection of every order under (or previously under) dispute |
 | `GET /v1/payments/{id}` | participants only | one payment projection |
 | `GET /v1/receipts/{id}` | issuer (seller) and recipient (buyer) only | one receipt: ids, participants, `total`, `content_hash`, `issued_at` (client `receiptSchema` shape) |
-| `GET /v1/notifications` | the recipient only | `{ "notifications": [...] }` |
+| `GET /v1/notifications` | the recipient only | `{ "notifications": [...] }` — each with an optional `amount` (money JSON, null on rows delivered before amounts existed): present only where the recipient already sees the figure in a role-scoped projection — the offer amount on offer notifications, the auction's visible price on `outbid`/`auction_won`/`auction_ended` |
 
 Object-level participation is enforced in the SQL `WHERE` clause, exactly
 like `GET /v1/reports`: the authenticated actor is bound as a query
@@ -433,6 +435,12 @@ Participant-visible by decision (ambiguities resolved and documented):
 
 - **Shipment carrier and tracking numbers** — participants need them to
   follow the shipment; they identify a parcel, not a person or address.
+- **Notification amounts** — an optional money JSON on a delivered
+  notification, carried only where the recipient already reads that exact
+  figure in a role-scoped projection: the offer amount (both offer
+  participants fetch the offer projection) and the auction's visible price
+  (every bidder fetches the listing projection). Nothing address- or
+  payment-bearing ever rides a notification payload.
 - **Dispute `reason`/`rationale`, return `reason`, and cancellation
   `reason`** — like offer messages, they are content exchanged between
   exactly the participants (plus the deciding moderator for disputes),

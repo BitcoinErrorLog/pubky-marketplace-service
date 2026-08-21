@@ -101,7 +101,7 @@ pub async fn handle(
             .iter()
             .map(|&index| {
                 let (line, listing) = &resolved[index];
-                json!({
+                let mut line_json = json!({
                     "listing_aggregate_id": listing.aggregate_id,
                     "listing_revision": listing.listing_revision,
                     "content_hash": listing.content_hash,
@@ -113,7 +113,20 @@ pub async fn handle(
                         &listing.unit_price_currency,
                         listing.unit_price_exponent,
                     ),
-                })
+                });
+                // The buyer's variant snapshot rides the order line so
+                // packing slips and order rows can show which variant was
+                // bought. It is display data validated for shape only:
+                // registration carries no variant inventory, so the service
+                // cannot check it against the owner-signed listing content.
+                if let Some(variant_id) = &line.variant_id {
+                    line_json["variant_id"] = json!(variant_id);
+                }
+                if let Some(options) = &line.variant_options {
+                    line_json["variant_options"] = serde_json::to_value(options)
+                        .expect("variant options serialize infallibly");
+                }
+                line_json
             })
             .collect();
         let subtotal_minor: i64 = indices
@@ -238,6 +251,7 @@ pub async fn handle(
             seller_pubky,
             actor,
             &order_aggregate_id,
+            None,
             now,
         )
         .await?;

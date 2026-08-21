@@ -298,3 +298,55 @@ async fn replays_offer_commands_idempotently(pool: PgPool) {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], json!("IDEMPOTENCY_CONFLICT"));
 }
+
+// Offer notifications carry the offer amount (ADR-0019 §8: both parties
+// already read it on the offer projection). The counter carries the
+// countered amount; the acceptance carries the amount that was accepted.
+#[sqlx::test]
+async fn offer_notifications_carry_the_offer_amount(pool: PgPool) {
+    use marketplace_service::clock::Clock;
+    use marketplace_service::workers::drain_outbox;
+
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 2)).await;
+    execute(&app, &buyer.token, &create_offer_command(&seller.pubky, 1)).await;
+    execute(&app, &seller.token, &counter_offer_command(1)).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &offer_action("offer.accept", 2, "00000000-0000-4000-8000-000000000509"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "accept failed: {body}");
+
+    drain_outbox(&app.pool, app.clock.now(), 50)
+        .await
+        .expect("outbox drains");
+    let delivered: Vec<(String, String, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT type, recipient_pubky, amount FROM notifications ORDER BY type")
+            .fetch_all(&app.pool)
+            .await
+            .expect("notifications listed");
+    assert_eq!(
+        delivered,
+        vec![
+            (
+                "offer_accepted".to_string(),
+                seller.pubky.clone(),
+                Some(json!({ "amount_minor": 11_000, "currency": "USD", "exponent": 2 })),
+            ),
+            (
+                "offer_countered".to_string(),
+                buyer.pubky.clone(),
+                Some(json!({ "amount_minor": 11_000, "currency": "USD", "exponent": 2 })),
+            ),
+            (
+                "offer_received".to_string(),
+                seller.pubky.clone(),
+                Some(json!({ "amount_minor": 10_000, "currency": "USD", "exponent": 2 })),
+            ),
+        ]
+    );
+}

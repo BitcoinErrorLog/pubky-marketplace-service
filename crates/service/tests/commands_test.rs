@@ -474,3 +474,53 @@ async fn released_inventory_is_purchasable_after_expiry(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["result"]["kind"], json!("checkout"));
 }
+
+// Additive contract change: a checkout line may snapshot the buyer's chosen
+// variant (id + at most three option dimensions) for fulfillment display.
+// The order line echoes it verbatim; variant-less checkouts stay
+// byte-identical to before the field existed.
+#[sqlx::test]
+async fn checkout_snapshots_the_variant_onto_the_order_line(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 2)).await;
+
+    let mut command = checkout_command(&seller.pubky);
+    command["payload"]["lines"][0]["variant_id"] = json!("variant_forest_m");
+    command["payload"]["lines"][0]["variant_options"] = json!([
+        { "name": "Size", "value": "M" },
+        { "name": "Color", "value": "Forest green" },
+    ]);
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "variant checkout failed: {body}");
+    let line = &body["result"]["orders"][0]["lines"][0];
+    assert_eq!(line["variant_id"], json!("variant_forest_m"));
+    assert_eq!(
+        line["variant_options"],
+        json!([
+            { "name": "Size", "value": "M" },
+            { "name": "Color", "value": "Forest green" },
+        ])
+    );
+
+    // The stored order row serves the same snapshot on later reads.
+    let (lines,): (serde_json::Value,) =
+        sqlx::query_as("SELECT lines FROM orders ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(&app.pool)
+            .await
+            .expect("order row exists");
+    assert_eq!(lines[0]["variant_id"], json!("variant_forest_m"));
+
+    // A variant-less checkout line carries no variant keys at all.
+    let plain =
+        common::checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001099");
+    let mut plain = plain;
+    plain["expected_revision"] = json!(0);
+    plain["payload"]["lines"][0]["expected_revision"] = json!(2);
+    let (status, body) = execute(&app, &buyer.token, &plain).await;
+    assert_eq!(status, StatusCode::OK, "plain checkout failed: {body}");
+    let plain_line = &body["result"]["orders"][0]["lines"][0];
+    assert!(plain_line.get("variant_id").is_none());
+    assert!(plain_line.get("variant_options").is_none());
+}

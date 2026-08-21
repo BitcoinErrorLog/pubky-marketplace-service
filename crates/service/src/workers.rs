@@ -228,11 +228,17 @@ pub async fn deliver_claimed(
         let recipient = payload_str(&row.payload, "recipient_pubky", row.id)?;
         let actor = payload_str(&row.payload, "actor_pubky", row.id)?;
         let aggregate_id = payload_str(&row.payload, "aggregate_id", row.id)?;
+        // Optional monetary context; intents written before amounts existed
+        // have no key and deliver as NULL.
+        let amount = match &row.payload["amount"] {
+            Value::Null => None,
+            value => Some(value.clone()),
+        };
 
         let mut tx = pool.begin().await?;
         sqlx::query(
             "INSERT INTO notifications (id, event_id, recipient_pubky, actor_pubky, type, \
-             aggregate_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             aggregate_id, amount, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (event_id, recipient_pubky) DO NOTHING",
         )
         .bind(Uuid::new_v4())
@@ -241,6 +247,7 @@ pub async fn deliver_claimed(
         .bind(actor)
         .bind(notification_type)
         .bind(aggregate_id)
+        .bind(amount)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -508,6 +515,7 @@ async fn apply_completed_lifecycle(
                         &order.seller_pubky,
                         &payment.buyer_pubky,
                         &ids::order_aggregate_id(order.id),
+                        None,
                         now,
                     )
                     .await?;

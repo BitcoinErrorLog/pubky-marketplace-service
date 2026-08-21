@@ -12,8 +12,27 @@ use sqlx::PgPool;
 
 use common::{
     close_auction_command, count, execute, listing_aggregate, new_actor, place_bid_command,
-    register_auction_command, register_command, test_app,
+    register_auction_command, register_command, test_app, TestApp,
 };
+use marketplace_service::clock::Clock;
+use marketplace_service::workers::drain_outbox;
+
+/// Delivered notifications as (type, recipient, amount JSON) after draining
+/// the outbox, ordered for stable assertions.
+async fn delivered_notifications(app: &TestApp) -> Vec<(String, String, serde_json::Value)> {
+    drain_outbox(&app.pool, app.clock.now(), 50)
+        .await
+        .expect("outbox drains");
+    sqlx::query_as::<_, (String, String, Option<serde_json::Value>)>(
+        "SELECT type, recipient_pubky, amount FROM notifications ORDER BY type, recipient_pubky",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .expect("notifications listed")
+    .into_iter()
+    .map(|(kind, recipient, amount)| (kind, recipient, amount.unwrap_or(json!(null))))
+    .collect()
+}
 
 // TS case: "applies deterministic proxy bidding and reserve status"
 #[sqlx::test]
@@ -400,5 +419,143 @@ async fn rejects_closing_an_auction_before_its_end_time(pool: PgPool) {
     assert_eq!(
         body["error"]["message"],
         json!("The auction has not ended yet.")
+    );
+}
+
+// Service gap closed: every distinct bidder (not just the winner and the
+// displaced leader) learns the auction closed, with the closing visible
+// price riding the payload per ADR-0019 §8 (the figure is already on the
+// listing projection every bidder reads).
+#[sqlx::test]
+async fn close_notifies_every_bidder_except_the_winner(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let winner = new_actor(&app).await;
+    let runner_up = new_actor(&app).await;
+    let early_bidder = new_actor(&app).await;
+    execute(
+        &app,
+        &seller.token,
+        &register_auction_command(&seller.pubky),
+    )
+    .await;
+    execute(
+        &app,
+        &early_bidder.token,
+        &place_bid_command(&seller.pubky, 30, 7_000, 1),
+    )
+    .await;
+    execute(
+        &app,
+        &runner_up.token,
+        &place_bid_command(&seller.pubky, 31, 8_000, 2),
+    )
+    .await;
+    let (status, body) = execute(
+        &app,
+        &winner.token,
+        &place_bid_command(&seller.pubky, 32, 10_000, 3),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "third bid failed: {body}");
+    app.clock.advance_seconds(11 * 60);
+
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &close_auction_command(&seller.pubky, 4, 954),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "close failed: {body}");
+    assert_eq!(body["result"]["outcome"], json!("sold"));
+
+    // Final visible price: winner max 10_000 capped at runner-up 8_000 +
+    // 500 increment = 8_500.
+    let final_price = json!({ "amount_minor": 8_500, "currency": "USD", "exponent": 2 });
+    let mut expected = vec![
+        (
+            "auction_ended".to_string(),
+            early_bidder.pubky.clone(),
+            final_price.clone(),
+        ),
+        (
+            "auction_ended".to_string(),
+            runner_up.pubky.clone(),
+            final_price.clone(),
+        ),
+        (
+            "auction_won".to_string(),
+            winner.pubky.clone(),
+            final_price.clone(),
+        ),
+        (
+            "outbid".to_string(),
+            early_bidder.pubky.clone(),
+            json!({ "amount_minor": 7_500, "currency": "USD", "exponent": 2 }),
+        ),
+        (
+            "outbid".to_string(),
+            runner_up.pubky.clone(),
+            final_price.clone(),
+        ),
+    ];
+    expected.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let mut delivered = delivered_notifications(&app).await;
+    delivered.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    assert_eq!(delivered, expected);
+
+    // Every close notification references the auction listing aggregate.
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM notifications WHERE type IN ('auction_ended', 'auction_won') \
+             AND aggregate_id LIKE 'listing:%'"
+        )
+        .await,
+        3
+    );
+}
+
+// An unsold close (reserve never met) still tells the bidders the auction
+// is over — nobody "wins" silence.
+#[sqlx::test]
+async fn unsold_close_notifies_the_bidders(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let bidder = new_actor(&app).await;
+    execute(
+        &app,
+        &seller.token,
+        &register_auction_command(&seller.pubky),
+    )
+    .await;
+    // Below the 6_000 reserve: the bid leads but never satisfies it.
+    let (status, body) = execute(
+        &app,
+        &bidder.token,
+        &place_bid_command(&seller.pubky, 33, 5_000, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bid failed: {body}");
+    app.clock.advance_seconds(11 * 60);
+
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &close_auction_command(&seller.pubky, 2, 955),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "close failed: {body}");
+    assert_eq!(body["result"]["outcome"], json!("unsold"));
+
+    let delivered = delivered_notifications(&app).await;
+    assert_eq!(
+        delivered,
+        vec![(
+            "auction_ended".to_string(),
+            bidder.pubky.clone(),
+            // A sole bid keeps the visible price at the starting price.
+            json!({ "amount_minor": 4_500, "currency": "USD", "exponent": 2 }),
+        )]
     );
 }

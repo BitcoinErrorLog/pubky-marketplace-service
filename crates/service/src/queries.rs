@@ -59,7 +59,7 @@ pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revi
      state, confirmations, amount_minor, currency, exponent, created_at, updated_at";
 
 pub const NOTIFICATION_COLUMNS: &str =
-    "id, recipient_pubky, actor_pubky, type, aggregate_id, created_at, read_at";
+    "id, recipient_pubky, actor_pubky, type, aggregate_id, amount, created_at, read_at";
 
 pub const RECEIPT_COLUMNS: &str = "id, order_id, payment_id, issuer_pubky, recipient_pubky, \
      total_minor, currency, exponent, content_hash, issued_at";

@@ -181,6 +181,7 @@ pub async fn finish_order_action(
         notification_recipient,
         actor,
         &order_aggregate_id,
+        None,
         now,
     )
     .await?;
@@ -198,6 +199,17 @@ pub async fn finish_order_action(
 /// Writes a complete notification intent to the outbox in the same
 /// transaction as the command (ADR-0019 §4). The worker delivers intents at
 /// least once; the notifications table dedups by (event id, recipient).
+///
+/// `amount` is optional monetary context (`money_json` shape) rendered in
+/// notification copy. ADR-0019 §8 compatibility: an amount may ride a
+/// notification only when its recipient already sees that exact figure in a
+/// role-scoped projection they can read — the offer amount is on the offer
+/// projection both parties fetch, and an auction's visible price is on the
+/// listing projection every bidder fetches. Never pass anything address- or
+/// payment-bearing here (no addresses, correlations, or payment ids).
+// Eight positional facts of one insert; a params struct would only rename
+// the call sites without reducing what each caller must supply.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_notification_intent(
     tx: &mut Transaction<'_, Postgres>,
     event_id: Uuid,
@@ -205,17 +217,24 @@ pub async fn insert_notification_intent(
     recipient_pubky: &str,
     actor_pubky: &str,
     aggregate_id: &str,
+    amount: Option<&Value>,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
+    let mut payload = json!({
+        "event_id": event_id,
+        "recipient_pubky": recipient_pubky,
+        "actor_pubky": actor_pubky,
+        "aggregate_id": aggregate_id,
+    });
+    // Additive payload evolution: rows written before amounts existed have
+    // no `amount` key, and the delivery worker treats absence as null.
+    if let Some(amount) = amount {
+        payload["amount"] = amount.clone();
+    }
     sqlx::query("INSERT INTO outbox (event_id, kind, payload, created_at) VALUES ($1, $2, $3, $4)")
         .bind(event_id)
         .bind(format!("notification.{notification_type}"))
-        .bind(json!({
-            "event_id": event_id,
-            "recipient_pubky": recipient_pubky,
-            "actor_pubky": actor_pubky,
-            "aggregate_id": aggregate_id,
-        }))
+        .bind(payload)
         .bind(now)
         .execute(&mut **tx)
         .await?;

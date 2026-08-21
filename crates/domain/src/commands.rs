@@ -224,12 +224,36 @@ pub struct ReserveInventoryPayload {
     pub reservation_ttl_seconds: i64,
 }
 
+/// One `name → value` pair of a chosen listing variant, carried as an
+/// ordered array over the wire (never an open-keyed map: option names are
+/// display data, and the reference client's wire-casing layer converts
+/// object KEYS between snake_case and camelCase — free-form keys would be
+/// mangled in transit).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VariantOption {
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutLine {
     pub listing_aggregate_id: String,
     pub expected_revision: i64,
     pub quantity: i64,
+    /// The buyer's chosen variant of the listing, snapshotted onto the order
+    /// line for fulfillment display (packing slips, order rows). Optional
+    /// and additive: listing registration carries no variant inventory, so
+    /// the service stores this as the buyer's claim about the owner-signed
+    /// listing content — like `quantity`, the seller sees it on the order
+    /// and can refuse to fulfill a claim the listing never offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    /// Display snapshot of the chosen variant's option dimensions (at most
+    /// three, matching the listing record contract). Requires `variant_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_options: Option<Vec<VariantOption>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -395,6 +419,15 @@ pub struct RequestCancellationPayload {
 #[serde(deny_unknown_fields)]
 pub struct ShipOrderPayload {
     pub order_id: Uuid,
+    /// The shipping carrier as a trimmed display string (1–100 printable
+    /// characters, no control characters). Deliberately NOT an enum: foreign
+    /// clients may ship with carriers this service has never heard of, and
+    /// locking a vocabulary server-side would reject them for no integrity
+    /// gain. The soft vocabulary — the canonical names the reference client
+    /// writes and resolves back to tracking links — is: `USPS`, `UPS`,
+    /// `FedEx`, `DHL`, `Royal Mail`, `DPD`, `Evri`, `PostNL`, `Correos`,
+    /// `La Poste`, `An Post`, `Deutsche Post`, plus free text for anything
+    /// else (rendered as plain text, no tracking link).
     pub carrier: String,
     pub tracking_number: String,
 }
@@ -767,6 +800,15 @@ fn validate_trimmed(
     }
 }
 
+/// Rejects control characters (including embedded newlines and tabs) in
+/// fields that render as single-line display strings. International text
+/// stays valid — this is a charset floor, not a vocabulary lock.
+fn validate_printable(path: &str, value: &str, issues: &mut Vec<ValidationIssue>) {
+    if value.chars().any(char::is_control) {
+        issues.push(issue(path, "Expected printable characters only"));
+    }
+}
+
 fn validate_register_listing(
     mut payload: RegisterListingPayload,
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
@@ -1020,11 +1062,17 @@ fn validate_ship_order(
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
     let mut issues = Vec::new();
     validate_trimmed("payload.carrier", &mut payload.carrier, 1, 100, &mut issues);
+    validate_printable("payload.carrier", &payload.carrier, &mut issues);
     validate_trimmed(
         "payload.tracking_number",
         &mut payload.tracking_number,
         1,
         200,
+        &mut issues,
+    );
+    validate_printable(
+        "payload.tracking_number",
+        &payload.tracking_number,
         &mut issues,
     );
     if issues.is_empty() {
@@ -1201,7 +1249,7 @@ fn validate_create_checkout(
         ));
     }
     let mut seen = std::collections::HashSet::new();
-    for (index, line) in payload.lines.iter().enumerate() {
+    for (index, line) in payload.lines.iter_mut().enumerate() {
         if !aggregate_id_regex().is_match(&line.listing_aggregate_id) {
             issues.push(issue(
                 &format!("payload.lines.{index}.listing_aggregate_id"),
@@ -1219,6 +1267,49 @@ fn validate_create_checkout(
                 &format!("payload.lines.{index}.quantity"),
                 "Expected a quantity between 1 and 1000000",
             ));
+        }
+        if let Some(variant_id) = &line.variant_id {
+            if !entity_id_regex().is_match(variant_id) {
+                issues.push(issue(
+                    &format!("payload.lines.{index}.variant_id"),
+                    "Expected a path-safe commerce identifier",
+                ));
+            }
+        }
+        if let Some(options) = &mut line.variant_options {
+            if line.variant_id.is_none() {
+                issues.push(issue(
+                    &format!("payload.lines.{index}.variant_options"),
+                    "Variant options require a variant id",
+                ));
+            }
+            // The listing record contract allows at most three option
+            // dimensions with 40-char names and 80-char values.
+            if options.is_empty() || options.len() > 3 {
+                issues.push(issue(
+                    &format!("payload.lines.{index}.variant_options"),
+                    "Expected between 1 and 3 variant options",
+                ));
+            }
+            for (option_index, option) in options.iter_mut().enumerate() {
+                let path = format!("payload.lines.{index}.variant_options.{option_index}");
+                validate_trimmed(
+                    &format!("{path}.name"),
+                    &mut option.name,
+                    1,
+                    40,
+                    &mut issues,
+                );
+                validate_trimmed(
+                    &format!("{path}.value"),
+                    &mut option.value,
+                    1,
+                    80,
+                    &mut issues,
+                );
+                validate_printable(&format!("{path}.name"), &option.name, &mut issues);
+                validate_printable(&format!("{path}.value"), &option.value, &mut issues);
+            }
         }
         if !seen.insert(line.listing_aggregate_id.clone()) {
             issues.push(issue(
@@ -1703,6 +1794,141 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains(TEST_BUNDLE_ID));
         assert!(!debug.contains(TEST_LOCK_ID));
+    }
+
+    fn checkout_command_json() -> Value {
+        json!({
+            "version": 1,
+            "command_id": "00000000-0000-4000-8000-000000002001",
+            "aggregate_id": "checkout:00000000-0000-4000-8000-000000002001",
+            "expected_revision": 0,
+            "issued_at": "2026-08-19T22:00:00.000Z",
+            "kind": "checkout.create",
+            "payload": {
+                "lines": [{
+                    "listing_aggregate_id": format!("listing:{}_boots_01", "y".repeat(52)),
+                    "expected_revision": 1,
+                    "quantity": 1,
+                }],
+                "delivery_address": {
+                    "name": "Buyer",
+                    "line1": "1 Test Street",
+                    "line2": "",
+                    "city": "Testville",
+                    "region": "TS",
+                    "postal_code": "12345",
+                    "country_code": "US",
+                },
+                "guarantee_policy_version": 1,
+            },
+        })
+    }
+
+    #[test]
+    fn parses_checkout_lines_with_variant_snapshots() {
+        let mut raw = checkout_command_json();
+        raw["payload"]["lines"][0]["variant_id"] = json!("variant_01");
+        raw["payload"]["lines"][0]["variant_options"] = json!([
+            { "name": "Size", "value": " M " },
+            { "name": "Color", "value": "Forest green" },
+        ]);
+        let command = parse_command(&raw).expect("valid variant snapshot");
+        let CommandPayload::CreateCheckout(payload) = &command.payload else {
+            panic!("expected checkout payload");
+        };
+        let options = payload.lines[0]
+            .variant_options
+            .as_ref()
+            .expect("options present");
+        assert_eq!(payload.lines[0].variant_id.as_deref(), Some("variant_01"));
+        assert_eq!(options[0].value, "M");
+        assert_eq!(options[1].name, "Color");
+    }
+
+    #[test]
+    fn canonical_json_omits_absent_variant_fields() {
+        // Old clients that never send variant fields must keep producing
+        // byte-identical canonical JSON (the idempotency hash input).
+        let command = parse_command(&checkout_command_json()).expect("valid checkout");
+        let serialized =
+            serde_json::to_string(&command.canonical_json()).expect("canonical JSON serializes");
+        assert!(!serialized.contains("variant_id"));
+        assert!(!serialized.contains("variant_options"));
+    }
+
+    #[test]
+    fn rejects_malformed_variant_snapshots() {
+        let mut bad_id = checkout_command_json();
+        bad_id["payload"]["lines"][0]["variant_id"] = json!("not a path-safe id!");
+        let issues = parse_command(&bad_id).expect_err("malformed variant id invalid");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.lines.0.variant_id"));
+
+        let mut orphan_options = checkout_command_json();
+        orphan_options["payload"]["lines"][0]["variant_options"] =
+            json!([{ "name": "Size", "value": "M" }]);
+        let issues = parse_command(&orphan_options).expect_err("options without an id invalid");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.lines.0.variant_options"));
+
+        let mut too_many = checkout_command_json();
+        too_many["payload"]["lines"][0]["variant_id"] = json!("variant_01");
+        too_many["payload"]["lines"][0]["variant_options"] = json!([
+            { "name": "A", "value": "1" },
+            { "name": "B", "value": "2" },
+            { "name": "C", "value": "3" },
+            { "name": "D", "value": "4" },
+        ]);
+        let issues = parse_command(&too_many).expect_err("four option dimensions invalid");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.lines.0.variant_options"));
+
+        let mut oversized = checkout_command_json();
+        oversized["payload"]["lines"][0]["variant_id"] = json!("variant_01");
+        oversized["payload"]["lines"][0]["variant_options"] =
+            json!([{ "name": "Size", "value": "x".repeat(81) }]);
+        let issues = parse_command(&oversized).expect_err("81-char option value invalid");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.lines.0.variant_options.0.value"));
+
+        let mut control = checkout_command_json();
+        control["payload"]["lines"][0]["variant_id"] = json!("variant_01");
+        control["payload"]["lines"][0]["variant_options"] =
+            json!([{ "name": "Size", "value": "M\u{0007}L" }]);
+        let issues = parse_command(&control).expect_err("control character invalid");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.lines.0.variant_options.0.value"));
+    }
+
+    #[test]
+    fn rejects_control_characters_in_carrier_and_tracking() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let with_newline = order_command_json(
+            "fulfillment.ship",
+            json!({
+                "order_id": order_id,
+                "carrier": "Sandbox\nPost",
+                "tracking_number": "TRACK-123",
+            }),
+        );
+        let issues = parse_command(&with_newline).expect_err("embedded newline invalid");
+        assert!(issues.iter().any(|i| i.path == "payload.carrier"));
+
+        let with_tab_tracking = order_command_json(
+            "fulfillment.ship",
+            json!({
+                "order_id": order_id,
+                "carrier": "Correos España",
+                "tracking_number": "TRACK\t123",
+            }),
+        );
+        let issues = parse_command(&with_tab_tracking).expect_err("embedded tab invalid");
+        assert!(issues.iter().any(|i| i.path == "payload.tracking_number"));
     }
 
     #[test]
