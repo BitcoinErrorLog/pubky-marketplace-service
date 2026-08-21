@@ -4,6 +4,7 @@
 //! checkout/orders, and payments per ADR-0019, implemented in Rust per
 //! ADR-0022 with PostgreSQL as the persistence boundary.
 
+pub mod attestor;
 pub mod auth;
 pub mod clock;
 pub mod config;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
+use crate::attestor::Attestor;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::locks::LocksRuntime;
@@ -34,6 +36,12 @@ pub struct AppState {
     /// deployments: `payment.register_locks` is refused and the lifecycle
     /// poller is not scheduled (fail closed; see [`locks::runtime_from_env`]).
     pub locks: Option<Arc<LocksRuntime>>,
+    /// The attestor signing identity (ADR 0024). `None` when the deployment
+    /// carries no attestor key: reviews still work but no purchase
+    /// attestations are issued, no annotations are recorded, the weekly stat
+    /// job does not run, and `attestation.disavow` is refused (fail closed;
+    /// see [`attestor::Attestor::from_env`]).
+    pub attestor: Option<Arc<Attestor>>,
 }
 
 impl AppState {
@@ -43,11 +51,17 @@ impl AppState {
             clock,
             config: Arc::new(config),
             locks: None,
+            attestor: None,
         }
     }
 
     pub fn with_locks(mut self, locks: Option<Arc<LocksRuntime>>) -> Self {
         self.locks = locks;
+        self
+    }
+
+    pub fn with_attestor(mut self, attestor: Option<Arc<Attestor>>) -> Self {
+        self.attestor = attestor;
         self
     }
 }

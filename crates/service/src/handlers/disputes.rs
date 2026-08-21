@@ -194,6 +194,7 @@ pub async fn resolve(
     command: &Command,
     payload: &ResolveDisputePayload,
     moderator_pubkys: &[String],
+    attestor: Option<&crate::attestor::Attestor>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
@@ -254,6 +255,22 @@ pub async fn resolve(
     .bind(now)
     .fetch_one(&mut **tx)
     .await?;
+
+    // Attestor annotation (ADR 0024 §5): outcomes annotate the order_ref,
+    // never revoke the attestation — a dispute lost by the seller
+    // strengthens the buyer's review. Stored with the winning side; the
+    // Phase 3 publisher maps it to reviewer-relative vocabulary.
+    if let Some(attestor) = attestor {
+        let outcome = if payload.resolution.favors_buyer() {
+            "dispute_resolved_for_buyer"
+        } else {
+            "dispute_resolved_for_seller"
+        };
+        crate::handlers::attestation::insert_annotation(
+            tx, attestor, updated.id, outcome, None, now,
+        )
+        .await?;
+    }
 
     let order_aggregate_id = ids::order_aggregate_id(updated.id);
     let event_id = insert_event(

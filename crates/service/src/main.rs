@@ -28,6 +28,17 @@ async fn main() -> anyhow::Result<()> {
         },
         "locks verification mode resolved"
     );
+    // Fail closed likewise for the attestor: a partial configuration (key
+    // without salt, or salt without key) refuses to start rather than
+    // issuing attestations with unlinkable order refs.
+    let attestor = marketplace_service::attestor::Attestor::from_env()?;
+    match &attestor {
+        Some(attestor) => tracing::info!(
+            attestor_pubky = attestor.pubky(),
+            "attestation issuance enabled"
+        ),
+        None => tracing::info!("attestation issuance disabled (no attestor key configured)"),
+    }
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .connect(&config.database_url)
@@ -36,7 +47,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("database migrations applied");
 
     let bind_addr = config.bind_addr;
-    let state = AppState::new(pool, Arc::new(SystemClock), config).with_locks(locks);
+    let state = AppState::new(pool, Arc::new(SystemClock), config)
+        .with_locks(locks)
+        .with_attestor(attestor);
     workers::spawn(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

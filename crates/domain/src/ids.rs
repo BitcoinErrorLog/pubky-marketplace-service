@@ -23,3 +23,8 @@ pub fn offer_aggregate_id(offer_id: Uuid) -> String {
 pub fn report_aggregate_id(report_id: Uuid) -> String {
     format!("report:{report_id}")
 }
+
+/// Aggregate for a seller's own marketplace settings (band consent).
+pub fn seller_settings_aggregate_id(seller_pubky: &str) -> String {
+    format!("seller_settings:{seller_pubky}")
+}

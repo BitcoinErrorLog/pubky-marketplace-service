@@ -20,6 +20,9 @@ blake3 = "1"
 # XChaCha20-Poly1305; the extended nonce makes random nonces safe per key.
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# Attestor signing identity (ADR 0024): purchase and stat attestations are
+# compact JWS with EdDSA; the attestor pubky is the z-base-32 public key.
+ed25519-dalek = "2"
 hex = "0.4"
 hmac = "0.12"
 http-body-util = "0.1"

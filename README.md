@@ -60,6 +60,8 @@ Migrations in `crates/service/migrations/` are applied automatically at boot
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
 | `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | marketplace payment window for Locks-correlated payments (≥ 60) |
 | `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation |
+| `ATTESTOR_SECRET_KEY` | unset | 32-byte hex Ed25519 secret of the attestor identity (ADR 0024); its z-base-32 public key is the attestor pubky |
+| `ATTESTOR_ORDER_SALT` | unset | 32-byte hex salt for `order_ref` hashing; must stay stable for the attestor identity's lifetime |
 
 The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
 closed at startup** on a partial configuration (a URL without keys, or keys
@@ -67,6 +69,24 @@ without a URL), rather than running with verification silently disabled or
 bearer material unprotected. With none of them set the deployment is
 sandbox-only: `payment.register_locks` is refused and the lifecycle poller
 is not scheduled.
+
+The two `ATTESTOR_*` secrets are likewise all-or-nothing (fail closed at
+startup on a partial pair). With neither set, reviews still work but no
+purchase attestations are issued (`review.create` results carry no
+`attestation`), no attestor annotations are recorded, the weekly seller
+stat-attestation job does not run, and `attestation.disavow` is refused.
+With both set, `review.create` issues a durable compact-JWS purchase
+attestation inside the review transaction (re-fetchable via
+`GET /v1/orders/{id}/review-attestation`, participant-scoped, idempotent),
+the D2 amount-band consent gate applies (`attestation.set_band_consent`
+command + `GET /v1/sellers/{pubky}/band-consent` read), dispute resolutions
+and external refunds append `attestation_annotations` rows keyed by the
+salted `order_ref`, and the worker signs weekly per-seller stat attestations
+into `seller_stat_attestations`. Publication of annotations and stat
+attestations to the attestor's homeserver is Phase 3 of the trust &
+reputation plan (pubky-app `docs/ecommerce/trust-reputation-plan.md`) and is
+not part of this service yet — the rows accumulate here as the publisher's
+ground truth.
 
 Endpoints: `GET /health`, `GET /ready` (checks the database),
 `POST /v1/auth/sessions`,

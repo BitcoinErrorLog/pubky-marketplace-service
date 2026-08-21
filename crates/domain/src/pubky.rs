@@ -6,9 +6,42 @@ pub fn is_valid_pubky(value: &str) -> bool {
     value.len() == 52 && value.chars().all(|c| Z_BASE_32_ALPHABET.contains(c))
 }
 
+/// Encodes a 32-byte ed25519 public key as its 52-character z-base-32 pubky.
+pub fn encode_pubky(key: &[u8; 32]) -> String {
+    let alphabet = Z_BASE_32_ALPHABET.as_bytes();
+    let mut accumulator: u64 = 0;
+    let mut bit_count: u32 = 0;
+    let mut output = String::with_capacity(52);
+    for &byte in key {
+        accumulator = (accumulator << 8) | u64::from(byte);
+        bit_count += 8;
+        while bit_count >= 5 {
+            bit_count -= 5;
+            output.push(alphabet[((accumulator >> bit_count) & 31) as usize] as char);
+        }
+    }
+    // 256 bits leave a 1-bit remainder, padded low to a final 5-bit group.
+    output.push(alphabet[((accumulator << (5 - bit_count)) & 31) as usize] as char);
+    output
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_valid_pubky;
+    use super::{encode_pubky, is_valid_pubky};
+
+    #[test]
+    fn encodes_keys_as_valid_pubkys() {
+        assert!(is_valid_pubky(&encode_pubky(&[0u8; 32])));
+        assert!(is_valid_pubky(&encode_pubky(&[0xFF; 32])));
+        assert_eq!(encode_pubky(&[0u8; 32]), "y".repeat(52));
+        let mut counting = [0u8; 32];
+        for (index, byte) in counting.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let encoded = encode_pubky(&counting);
+        assert_eq!(encoded.len(), 52);
+        assert!(is_valid_pubky(&encoded));
+    }
 
     #[test]
     fn accepts_z_base_32_pubkys() {

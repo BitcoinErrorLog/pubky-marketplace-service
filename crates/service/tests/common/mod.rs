@@ -22,6 +22,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 
+use marketplace_service::attestor::Attestor;
 use marketplace_service::clock::{AdjustableClock, Clock};
 use marketplace_service::config::Config;
 use marketplace_service::http::build_router;
@@ -52,9 +53,41 @@ pub async fn test_app_with_moderators(pool: PgPool, moderator_pubkys: Vec<String
 }
 
 pub async fn test_app_with_config(pool: PgPool, config: Config) -> TestApp {
+    test_app_full(pool, config, None).await
+}
+
+/// Deterministic attestor identity for tests (secret and order salt as the
+/// production env vars would carry them, hex).
+pub const TEST_ATTESTOR_SECRET: &str =
+    "0707070707070707070707070707070707070707070707070707070707070707";
+pub const TEST_ATTESTOR_SALT: &str =
+    "4242424242424242424242424242424242424242424242424242424242424242";
+
+pub fn test_attestor() -> Arc<Attestor> {
+    Arc::new(Attestor::from_hex(TEST_ATTESTOR_SECRET, TEST_ATTESTOR_SALT).expect("test attestor"))
+}
+
+pub async fn test_app_with_attestor(pool: PgPool) -> TestApp {
+    test_app_full(pool, Config::for_tests(), Some(test_attestor())).await
+}
+
+pub async fn test_app_with_attestor_and_moderators(
+    pool: PgPool,
+    moderator_pubkys: Vec<String>,
+) -> TestApp {
+    let mut config = Config::for_tests();
+    config.moderator_pubkys = moderator_pubkys;
+    test_app_full(pool, config, Some(test_attestor())).await
+}
+
+pub async fn test_app_full(
+    pool: PgPool,
+    config: Config,
+    attestor: Option<Arc<Attestor>>,
+) -> TestApp {
     let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
-    let state = AppState::new(pool.clone(), clock.clone(), config);
+    let state = AppState::new(pool.clone(), clock.clone(), config).with_attestor(attestor);
     TestApp {
         router: build_router(state.clone()),
         pool,

@@ -123,6 +123,69 @@ fn internal_error(context: &str, error: &sqlx::Error) -> Response {
         .into_response()
 }
 
+/// `GET /v1/orders/{id}/review-attestation`: the actor's own stored purchase
+/// attestation for the order (ADR 0024 §4). Issuance is deterministic per
+/// (order, reviewer), so this re-fetch is idempotent — no consumption
+/// semantics. 404 covers absent orders, foreign orders, and orders the
+/// actor has not reviewed, indistinguishably.
+pub async fn get_review_attestation(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let row: Result<Option<(String, Value)>, sqlx::Error> = sqlx::query_as(
+        "SELECT a.jws, a.claims FROM review_attestations a \
+         JOIN orders o ON o.id = a.order_id \
+         WHERE a.order_id = $1 AND a.reviewer_pubky = $2 \
+           AND (o.buyer_pubky = $2 OR o.seller_pubky = $2)",
+    )
+    .bind(id)
+    .bind(&actor.0)
+    .fetch_optional(&state.pool)
+    .await;
+    match row {
+        Ok(Some((jws, claims))) => (
+            StatusCode::OK,
+            Json(json!({ "attestation": { "jws": jws, "claims": claims } })),
+        )
+            .into_response(),
+        Ok(None) => query_error(ErrorCode::NotFound, "The review attestation was not found."),
+        Err(error) => internal_error("review attestation", &error),
+    }
+}
+
+/// `GET /v1/sellers/{pubky}/band-consent`: the seller's standing amount-band
+/// preference (ratified D2). Readable by any authenticated user — it is a
+/// disclosure preference, not private order data — so the buyer's client can
+/// honestly decide whether to surface the per-review band opt-in. Absent row
+/// means "not consented".
+pub async fn get_band_consent(
+    State(state): State<AppState>,
+    Extension(_actor): Extension<Actor>,
+    Path(seller_pubky): Path<String>,
+) -> Response {
+    if !marketplace_domain::pubky::is_valid_pubky(&seller_pubky) {
+        return query_error(ErrorCode::InvalidCommand, "The seller pubky is invalid.");
+    }
+    let row: Result<Option<(bool,)>, sqlx::Error> = sqlx::query_as(
+        "SELECT allows_amount_band FROM attestation_band_consents WHERE seller_pubky = $1",
+    )
+    .bind(&seller_pubky)
+    .fetch_optional(&state.pool)
+    .await;
+    match row {
+        Ok(row) => (
+            StatusCode::OK,
+            Json(json!({
+                "seller_pubky": seller_pubky,
+                "allows_amount_band": row.map(|(allows,)| allows).unwrap_or(false),
+            })),
+        )
+            .into_response(),
+        Err(error) => internal_error("band consent", &error),
+    }
+}
+
 /// `GET /v1/listings/{aggregate_id}`: the listing/inventory projection,
 /// readable by any authenticated user (public catalog data). Exposes no
 /// buyer identity beyond the auction's current leader, which the auction

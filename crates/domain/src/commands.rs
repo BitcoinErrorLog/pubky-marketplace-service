@@ -80,6 +80,8 @@ pub enum CommandPayload {
     UpdateReview(ReviewTermsPayload),
     CreateReport(CreateReportPayload),
     DecideReport(DecideReportPayload),
+    SetBandConsent(SetBandConsentPayload),
+    DisavowAttestation(DisavowAttestationPayload),
 }
 
 impl Command {
@@ -112,6 +114,8 @@ impl Command {
             CommandPayload::UpdateReview(_) => "review.update",
             CommandPayload::CreateReport(_) => "trust.report",
             CommandPayload::DecideReport(_) => "trust.decide",
+            CommandPayload::SetBandConsent(_) => "attestation.set_band_consent",
+            CommandPayload::DisavowAttestation(_) => "attestation.disavow",
         }
     }
 
@@ -148,6 +152,8 @@ impl Command {
             }
             CommandPayload::CreateReport(p) => serde_json::to_value(p),
             CommandPayload::DecideReport(p) => serde_json::to_value(p),
+            CommandPayload::SetBandConsent(p) => serde_json::to_value(p),
+            CommandPayload::DisavowAttestation(p) => serde_json::to_value(p),
         }
         .expect("command payloads serialize infallibly");
         json!({
@@ -481,6 +487,30 @@ pub struct ReviewTermsPayload {
     pub order_id: Uuid,
     pub rating: i64,
     pub text: String,
+    /// Buyer-side amount-band opt-in (ratified D2, ADR 0024): the purchase
+    /// attestation carries an amount band only when this is true AND the
+    /// seller's standing band-consent preference allows it. Defaults to
+    /// false; ignored by `review.update` (the attestation is immutable).
+    #[serde(default)]
+    pub allow_amount_band: bool,
+}
+
+/// Seller's standing amount-band consent (ratified D2): whether purchase
+/// attestations for this seller's orders may carry a log-decade amount band.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetBandConsentPayload {
+    pub allows_amount_band: bool,
+}
+
+/// Moderator-only disavowal of an order's purchase attestation (fraud or
+/// collusion detected after the fact). The reason stays internal; only the
+/// outcome is ever published as an attestor annotation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisavowAttestationPayload {
+    pub order_id: Uuid,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -667,6 +697,12 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
             .and_then(|payload| validate_review_terms(payload, CommandPayload::UpdateReview))?,
         "trust.report" => parse_payload(&envelope.payload).and_then(validate_create_report)?,
         "trust.decide" => parse_payload(&envelope.payload).and_then(validate_decide_report)?,
+        "attestation.set_band_consent" => {
+            parse_payload(&envelope.payload).map(CommandPayload::SetBandConsent)?
+        }
+        "attestation.disavow" => {
+            parse_payload(&envelope.payload).and_then(validate_disavow_attestation)?
+        }
         _ => return Err(vec![issue("kind", "Unsupported command kind")]),
     };
 
@@ -1079,6 +1115,18 @@ fn validate_resolve_dispute(
     );
     if issues.is_empty() {
         Ok(CommandPayload::ResolveDispute(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_disavow_attestation(
+    mut payload: DisavowAttestationPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed("payload.reason", &mut payload.reason, 1, 2_000, &mut issues);
+    if issues.is_empty() {
+        Ok(CommandPayload::DisavowAttestation(payload))
     } else {
         Err(issues)
     }

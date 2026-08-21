@@ -1,3 +1,4 @@
+pub mod attestation;
 pub mod auction;
 pub mod cancellation;
 pub mod checkout;

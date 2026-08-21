@@ -50,9 +50,15 @@ pub const TASK_AUCTION_CLOSE: &str = "auction_close";
 pub const TASK_OUTBOX: &str = "outbox";
 pub const TASK_LOCKS_VERIFICATION: &str = "locks_verification";
 pub const TASK_PAYMENT_WINDOW: &str = "payment_window";
+pub const TASK_STAT_ATTESTATIONS: &str = "stat_attestations";
 
 const OUTBOX_BATCH_SIZE: i64 = 100;
 const LOCKS_VERIFY_BATCH_SIZE: i64 = 25;
+
+/// Stat attestation cadence (ratified D3: weekly) and window (trailing 90
+/// days, matching the design's period example).
+const STAT_ATTESTATION_INTERVAL_DAYS: i64 = 7;
+const STAT_ATTESTATION_WINDOW_DAYS: i64 = 90;
 
 /// Takes (or renews) the lease for one task. Returns false when another
 /// live holder owns it.
@@ -667,6 +673,7 @@ pub struct WorkerSummary {
     pub outbox_delivered: u64,
     pub locks_completions_applied: u64,
     pub payment_windows_expired: u64,
+    pub stat_attestations_signed: u64,
 }
 
 /// One worker pass: for each task, take the lease, drain, release. Tasks
@@ -725,7 +732,167 @@ pub async fn run_once(
         summary.payment_windows_expired = expire_due_payment_windows(&state.pool, now).await?;
         release_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now).await?;
     }
+    // Weekly seller stat attestations (ratified D3) run only when the
+    // deployment holds the attestor key: unsigned stats would be worthless.
+    if let Some(attestor) = &state.attestor {
+        if try_acquire_lease(
+            &state.pool,
+            TASK_STAT_ATTESTATIONS,
+            holder,
+            now,
+            lease_seconds,
+        )
+        .await?
+        {
+            summary.stat_attestations_signed =
+                generate_due_stat_attestations(&state.pool, attestor, now).await?;
+            release_lease(&state.pool, TASK_STAT_ATTESTATIONS, holder, now).await?;
+        }
+    }
     Ok(summary)
+}
+
+/// One row of the per-order event aggregate the stat computation reads.
+#[derive(Debug, sqlx::FromRow)]
+struct SellerOrderStats {
+    paid_at: Option<DateTime<Utc>>,
+    shipped_at: Option<DateTime<Utc>>,
+    delivered_at: Option<DateTime<Utc>>,
+    disputed: Option<bool>,
+    cancelled: Option<bool>,
+    refunded: Option<bool>,
+}
+
+/// Computes and signs the weekly per-seller stat attestations (ratified D3:
+/// median time-to-ship, dispute rate, completion rate — banded and
+/// per-mille, never raw amounts). A seller is due when they have at least
+/// one delivered order in the trailing window and no attestation newer than
+/// the weekly cadence. Rows are stored for the Phase 3 attestor-homeserver
+/// publisher; nothing is public yet.
+pub async fn generate_due_stat_attestations(
+    pool: &PgPool,
+    attestor: &crate::attestor::Attestor,
+    now: DateTime<Utc>,
+) -> anyhow::Result<u64> {
+    let window_start = now - chrono::Duration::days(STAT_ATTESTATION_WINDOW_DAYS);
+    let stale_before = now - chrono::Duration::days(STAT_ATTESTATION_INTERVAL_DAYS);
+
+    let due_sellers: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT o.seller_pubky \
+         FROM events e JOIN orders o ON e.aggregate_id = 'order:' || o.id::text \
+         WHERE e.kind = 'fulfillment.delivered' AND e.occurred_at >= $1 AND e.occurred_at <= $2 \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM seller_stat_attestations s \
+             WHERE s.seller_pubky = o.seller_pubky AND s.created_at > $3)",
+    )
+    .bind(window_start)
+    .bind(now)
+    .bind(stale_before)
+    .fetch_all(pool)
+    .await?;
+
+    let mut signed = 0u64;
+    for (seller_pubky,) in due_sellers {
+        // `receipt.issued` is the paid marker on the ORDER aggregate: it is
+        // written in the same transaction as the payment confirmation,
+        // exactly once per order (payment.confirmed lives on the payment
+        // aggregate and is not visible in this per-order join).
+        let per_order: Vec<SellerOrderStats> = sqlx::query_as(
+            "SELECT \
+               MIN(CASE WHEN e.kind = 'receipt.issued' THEN e.occurred_at END) AS paid_at, \
+               MIN(CASE WHEN e.kind = 'fulfillment.shipped' THEN e.occurred_at END) AS shipped_at, \
+               MIN(CASE WHEN e.kind = 'fulfillment.delivered' THEN e.occurred_at END) AS delivered_at, \
+               BOOL_OR(e.kind = 'dispute.opened') AS disputed, \
+               BOOL_OR(e.kind = 'order.cancelled') AS cancelled, \
+               BOOL_OR(e.kind = 'refund.recorded_external') AS refunded \
+             FROM orders o JOIN events e ON e.aggregate_id = 'order:' || o.id::text \
+             WHERE o.seller_pubky = $1 AND e.occurred_at >= $2 AND e.occurred_at <= $3 \
+             GROUP BY o.id",
+        )
+        .bind(&seller_pubky)
+        .bind(window_start)
+        .bind(now)
+        .fetch_all(pool)
+        .await?;
+
+        let completed = per_order
+            .iter()
+            .filter(|order| order.delivered_at.is_some())
+            .count() as i64;
+        if completed < 1 {
+            continue;
+        }
+        let disputed = per_order
+            .iter()
+            .filter(|order| order.disputed.unwrap_or(false))
+            .count() as i64;
+        let terminated_badly = per_order
+            .iter()
+            .filter(|order| order.cancelled.unwrap_or(false) || order.refunded.unwrap_or(false))
+            .count() as i64;
+        let mut ship_hours: Vec<i64> = per_order
+            .iter()
+            .filter_map(|order| match (order.paid_at, order.shipped_at) {
+                (Some(paid), Some(shipped)) if shipped >= paid => {
+                    Some((shipped - paid).num_hours())
+                }
+                _ => None,
+            })
+            .collect();
+        ship_hours.sort_unstable();
+        let median_ship_hours = median(&ship_hours);
+
+        let dispute_rate_permille = disputed * 1_000 / completed;
+        let completion_rate_permille = completed * 1_000 / (completed + terminated_badly);
+        let period_from = window_start.format("%Y-%m-%d").to_string();
+        let period_to = now.format("%Y-%m-%d").to_string();
+
+        // Banded count and per-mille rates, never raw counts or amounts
+        // (design §7.2): exact GMV/volume stays private while remaining
+        // rankable.
+        let body = serde_json::json!({
+            "v": 1,
+            "attestor": attestor.pubky(),
+            "seller": seller_pubky,
+            "period": { "from": period_from, "to": period_to },
+            "ordersCompletedBand": completed.ilog10().to_string(),
+            "medianTimeToShipHours": median_ship_hours,
+            "disputeRatePermille": dispute_rate_permille,
+            "completionRatePermille": completion_rate_permille,
+        });
+        let jws = attestor.sign_seller_stats(&body);
+        let inserted = sqlx::query(
+            "INSERT INTO seller_stat_attestations \
+             (id, seller_pubky, period_from, period_to, body, jws, created_at) \
+             VALUES ($1, $2, $3::date, $4::date, $5, $6, $7) \
+             ON CONFLICT (seller_pubky, period_to) DO NOTHING",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&seller_pubky)
+        .bind(&period_from)
+        .bind(&period_to)
+        .bind(&body)
+        .bind(&jws)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        signed += inserted.rows_affected();
+    }
+    Ok(signed)
+}
+
+/// Median of a sorted slice, `None` when empty (an honest absence beats a
+/// fabricated zero).
+fn median(sorted: &[i64]) -> Option<i64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let middle = sorted.len() / 2;
+    Some(if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] + sorted[middle]) / 2
+    } else {
+        sorted[middle]
+    })
 }
 
 /// Spawns the periodic worker runtime used by the production binary. Each
@@ -748,6 +915,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             outbox_delivered = summary.outbox_delivered,
                             locks_completions_applied = summary.locks_completions_applied,
                             payment_windows_expired = summary.payment_windows_expired,
+                            stat_attestations_signed = summary.stat_attestations_signed,
                             "worker pass completed"
                         );
                     }

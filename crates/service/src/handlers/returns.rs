@@ -232,6 +232,7 @@ pub async fn record_external_refund(
     actor: &str,
     command: &Command,
     payload: &RecordExternalRefundPayload,
+    attestor: Option<&crate::attestor::Attestor>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
@@ -288,6 +289,15 @@ pub async fn record_external_refund(
     .bind(now)
     .fetch_one(&mut **tx)
     .await?;
+
+    // Attestor annotation (ADR 0024 §5): the refund annotates the
+    // order_ref; the attestation itself is never revoked.
+    if let Some(attestor) = attestor {
+        crate::handlers::attestation::insert_annotation(
+            tx, attestor, updated.id, "refunded", None, now,
+        )
+        .await?;
+    }
 
     let recipient = updated.buyer_pubky.clone();
     finish_order_action(

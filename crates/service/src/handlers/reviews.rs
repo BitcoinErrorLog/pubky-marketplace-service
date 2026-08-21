@@ -11,9 +11,11 @@ use chrono::{DateTime, Utc};
 use marketplace_domain::commands::ReviewTermsPayload;
 use marketplace_domain::state_machines::{can_transition, order_machine};
 use marketplace_domain::{ids, Command, ErrorCode};
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
+use uuid::Uuid;
 
+use crate::attestor::{amount_band, claim_role, Attestor};
 use crate::executor::insert_event;
 use crate::handlers::{
     fetch_order, fetch_order_for_update, fetch_order_reviews, guard_order_action,
@@ -36,6 +38,7 @@ pub async fn create(
     actor: &str,
     command: &Command,
     payload: &ReviewTermsPayload,
+    attestor: Option<&Attestor>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     // Deliberately no FOR UPDATE: the review insert happens before the
@@ -90,6 +93,26 @@ pub async fn create(
     .fetch_one(&mut **tx)
     .await?;
 
+    // Purchase attestation (ADR 0024): issued inside this same transaction,
+    // stored append-only for idempotent re-fetch, and returned in the
+    // command result for the client to embed in the published record.
+    let attestation = match attestor {
+        Some(attestor) => Some(
+            issue_attestation(
+                tx,
+                attestor,
+                &order,
+                actor,
+                &subject,
+                role,
+                payload.allow_amount_band,
+                now,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
     let new_state = if order.state == "delivered" {
         "completed"
     } else {
@@ -140,15 +163,124 @@ pub async fn create(
     )
     .await?;
     let reviews = fetch_order_reviews(tx, updated.id).await?;
+    let mut result = json!({
+        "kind": "review",
+        "order": order_json_with_reviews(&updated, &reviews),
+        "review": review.view(),
+    });
+    if let Some(attestation) = attestation {
+        result["attestation"] = attestation;
+    }
     Ok(Ok(HandlerSuccess {
         revision: updated.revision,
         event_ids: vec![event_id],
-        result: json!({
-            "kind": "review",
-            "order": order_json_with_reviews(&updated, &reviews),
-            "review": review.view(),
-        }),
+        result,
     }))
+}
+
+/// Issues and stores the purchase attestation for one (order, reviewer)
+/// pair, applying the D2 both-sides amount-band consent gate. Returns the
+/// `{ jws, claims }` object the command result carries.
+#[allow(clippy::too_many_arguments)]
+async fn issue_attestation(
+    tx: &mut Transaction<'_, Postgres>,
+    attestor: &Attestor,
+    order: &OrderRow,
+    reviewer: &str,
+    subject: &str,
+    role: &str,
+    reviewer_allows_band: bool,
+    now: DateTime<Utc>,
+) -> Result<Value, sqlx::Error> {
+    let listing_uri = listing_uri_from_order(order);
+
+    // Day-granularity completion date: the delivery confirmation when the
+    // order was delivered, otherwise the issuance day (orders completed via
+    // dispute resolution never carry a delivery event).
+    let delivered: Option<(DateTime<Utc>,)> = sqlx::query_as(
+        "SELECT occurred_at FROM events WHERE aggregate_id = $1 AND kind = 'fulfillment.delivered' \
+         ORDER BY occurred_at DESC LIMIT 1",
+    )
+    .bind(ids::order_aggregate_id(order.id))
+    .fetch_optional(&mut **tx)
+    .await?;
+    let completed_on = delivered
+        .map(|(occurred_at,)| occurred_at)
+        .unwrap_or(now)
+        .format("%Y-%m-%d")
+        .to_string();
+
+    // D2 both-sides consent: the band is included only when the seller's
+    // standing preference allows it AND the reviewer opted in.
+    let seller_allows: Option<(bool,)> = sqlx::query_as(
+        "SELECT allows_amount_band FROM attestation_band_consents WHERE seller_pubky = $1",
+    )
+    .bind(&order.seller_pubky)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let band = if reviewer_allows_band && seller_allows.map(|(allows,)| allows).unwrap_or(false) {
+        amount_band(&order.currency, order.total_minor)
+    } else {
+        None
+    };
+
+    let issued = attestor.issue_purchase_attestation(
+        order.id,
+        reviewer,
+        subject,
+        claim_role(role),
+        &listing_uri,
+        &completed_on,
+        band,
+        now,
+    );
+    sqlx::query(
+        "INSERT INTO review_attestations (order_id, reviewer_pubky, order_ref, jws, claims, issued_at) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(order.id)
+    .bind(reviewer)
+    .bind(&issued.order_ref)
+    .bind(&issued.jws)
+    .bind(&issued.claims)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(json!({ "jws": issued.jws, "claims": issued.claims }))
+}
+
+/// The canonical public listing URI for the order's (single-listing) line
+/// set: every order row carries `lines[0].listing_aggregate_id` in the
+/// `listing:{seller}_{listing_id}` format, and the seller is the order's
+/// seller by construction (checkout groups lines per seller).
+fn listing_uri_from_order(order: &OrderRow) -> String {
+    let aggregate_id = order.lines[0]["listing_aggregate_id"]
+        .as_str()
+        .expect("order lines always carry a listing aggregate id");
+    let listing_id = aggregate_id
+        .strip_prefix(&format!("listing:{}_", order.seller_pubky))
+        .expect("listing aggregate ids follow the listing:{seller}_{id} format");
+    format!(
+        "pubky://{}/pub/pubky.app/marketplace/v1/listings/{}",
+        order.seller_pubky, listing_id
+    )
+}
+
+/// Fetches the stored attestation for one (order, reviewer) pair as the
+/// `{ jws, claims }` result object, if one was issued.
+pub async fn fetch_attestation_json(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+    reviewer_pubky: &str,
+) -> Result<Option<Value>, sqlx::Error> {
+    let row: Option<(String, Value)> = sqlx::query_as(
+        "SELECT jws, claims FROM review_attestations WHERE order_id = $1 AND reviewer_pubky = $2",
+    )
+    .bind(order_id)
+    .bind(reviewer_pubky)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.map(|(jws, claims)| json!({ "jws": jws, "claims": claims })))
 }
 
 pub async fn update(
@@ -219,14 +351,22 @@ pub async fn update(
     )
     .await?;
     let reviews = fetch_order_reviews(tx, updated.id).await?;
+    // The attestation is unchanged by edits (it attests the purchase, not
+    // the text); it is echoed back so the client can republish the revised
+    // record without a second read.
+    let attestation = fetch_attestation_json(tx, updated.id, actor).await?;
+    let mut result = json!({
+        "kind": "review",
+        "order": order_json_with_reviews(&updated, &reviews),
+        "review": updated_review.view(),
+    });
+    if let Some(attestation) = attestation {
+        result["attestation"] = attestation;
+    }
     // No notification: the prototype emitted none (it had no review edits).
     Ok(Ok(HandlerSuccess {
         revision: updated.revision,
         event_ids: vec![event_id],
-        result: json!({
-            "kind": "review",
-            "order": order_json_with_reviews(&updated, &reviews),
-            "review": updated_review.view(),
-        }),
+        result,
     }))
 }

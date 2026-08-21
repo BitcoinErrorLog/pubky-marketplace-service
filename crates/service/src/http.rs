@@ -25,6 +25,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/orders", get(queries::list_orders))
         .route("/v1/orders/{id}", get(queries::get_order))
         .route("/v1/orders/{id}/evidence", get(queries::list_evidence))
+        .route(
+            "/v1/orders/{id}/review-attestation",
+            get(queries::get_review_attestation),
+        )
+        .route(
+            "/v1/sellers/{pubky}/band-consent",
+            get(queries::get_band_consent),
+        )
         .route("/v1/disputes", get(queries::list_disputes))
         .route("/v1/payments/{id}", get(queries::get_payment))
         .route("/v1/receipts/{id}", get(queries::get_receipt))

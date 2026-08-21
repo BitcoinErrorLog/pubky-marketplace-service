@@ -196,7 +196,15 @@ async fn dispatch(
             crate::handlers::returns::receive(tx, actor, command, payload, now).await
         }
         CommandPayload::RecordExternalRefund(payload) => {
-            crate::handlers::returns::record_external_refund(tx, actor, command, payload, now).await
+            crate::handlers::returns::record_external_refund(
+                tx,
+                actor,
+                command,
+                payload,
+                state.attestor.as_deref(),
+                now,
+            )
+            .await
         }
         CommandPayload::OpenDispute(payload) => {
             crate::handlers::disputes::open(tx, actor, command, payload, now).await
@@ -211,12 +219,21 @@ async fn dispatch(
                 command,
                 payload,
                 &state.config.moderator_pubkys,
+                state.attestor.as_deref(),
                 now,
             )
             .await
         }
         CommandPayload::CreateReview(payload) => {
-            crate::handlers::reviews::create(tx, actor, command, payload, now).await
+            crate::handlers::reviews::create(
+                tx,
+                actor,
+                command,
+                payload,
+                state.attestor.as_deref(),
+                now,
+            )
+            .await
         }
         CommandPayload::UpdateReview(payload) => {
             crate::handlers::reviews::update(tx, actor, command, payload, now).await
@@ -230,6 +247,21 @@ async fn dispatch(
                 actor,
                 command,
                 payload,
+                &state.config.moderator_pubkys,
+                now,
+            )
+            .await
+        }
+        CommandPayload::SetBandConsent(payload) => {
+            crate::handlers::attestation::set_band_consent(tx, actor, command, payload, now).await
+        }
+        CommandPayload::DisavowAttestation(payload) => {
+            crate::handlers::attestation::disavow(
+                tx,
+                actor,
+                command,
+                payload,
+                state.attestor.as_deref(),
                 &state.config.moderator_pubkys,
                 now,
             )
