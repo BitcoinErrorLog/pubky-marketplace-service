@@ -2,9 +2,12 @@
 
 Server-authoritative Rust service for marketplace inventory, reservations,
 checkout/orders, and payments, per
-[ADR-0019](https://github.com/pubky) (Marketplace Transaction Authority) and
-ADR-0022 (Rust implementation). The TypeScript prototype engine
-(`services/marketplace/src/transaction-service.ts` in `pubky-app-marketplace`)
+[ADR-0019](https://github.com/BitcoinErrorLog/pubky-app/blob/marketplace/pr25-ux/docs/adr/0019-marketplace-transaction-authority.md)
+(Marketplace Transaction Authority) and
+[ADR-0022](https://github.com/BitcoinErrorLog/pubky-app/blob/marketplace/pr25-ux/docs/adr/0022-marketplace-transaction-service-rust.md)
+(Rust implementation). The TypeScript prototype engine
+(`services/marketplace/src/transaction-service.ts` in
+[`BitcoinErrorLog/pubky-app`](https://github.com/BitcoinErrorLog/pubky-app))
 is the executable specification; its test cases are ported command by command
 before each command is enabled here.
 
