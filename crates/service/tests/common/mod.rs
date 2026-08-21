@@ -25,6 +25,7 @@ use std::sync::Mutex;
 use marketplace_service::attestor::Attestor;
 use marketplace_service::clock::{AdjustableClock, Clock};
 use marketplace_service::config::Config;
+use marketplace_service::homeserver::{HomeserverListingClient, HttpHomeserverClient};
 use marketplace_service::http::build_router;
 use marketplace_service::locks::{
     LocksKeys, LocksLifecycleClient, LocksLookupOutcome, LocksRuntime,
@@ -188,6 +189,118 @@ pub async fn test_app_with_locks(pool: PgPool) -> (TestApp, Arc<FakeLocksClient>
 /// The canonical addressed lock resource for a seller's test lock.
 pub fn lock_resource_for(seller_pubky: &str) -> String {
     format!("{seller_pubky}/pub/locks.app/{TEST_LOCK_ID}.json")
+}
+
+type HomeserverRecordMap = Arc<Mutex<HashMap<(String, String), Value>>>;
+
+/// A minimal local homeserver double: a real axum listener serving canonical
+/// camelCase listing records at the production path, keyed by the
+/// `pubky-host` header and listing id — exactly how the real homeserver
+/// addresses seller-owned records. Tests reach it through the REAL
+/// [`HttpHomeserverClient`], so header handling, status mapping, and JSON
+/// parsing are exercised end to end.
+pub struct FakeHomeserver {
+    records: HomeserverRecordMap,
+    pub base_url: String,
+}
+
+impl FakeHomeserver {
+    pub fn put_record(&self, seller_pubky: &str, listing_id: &str, record: Value) {
+        self.records
+            .lock()
+            .expect("fake homeserver records lock")
+            .insert((seller_pubky.to_string(), listing_id.to_string()), record);
+    }
+
+    pub fn client(&self) -> Arc<dyn HomeserverListingClient> {
+        Arc::new(HttpHomeserverClient::new(&self.base_url).expect("fake homeserver client builds"))
+    }
+}
+
+async fn serve_homeserver_record(
+    axum::extract::State(records): axum::extract::State<HomeserverRecordMap>,
+    axum::extract::Path(listing_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let seller = headers
+        .get("pubky-host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let stored = records
+        .lock()
+        .expect("fake homeserver records lock")
+        .get(&(seller, listing_id))
+        .cloned();
+    match stored {
+        Some(record) => (StatusCode::OK, axum::Json(record)).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+pub async fn spawn_fake_homeserver() -> FakeHomeserver {
+    let records: HomeserverRecordMap = Arc::default();
+    let router = Router::new()
+        .route(
+            "/pub/pubky.app/marketplace/v1/listings/{listing_id}",
+            axum::routing::get(serve_homeserver_record),
+        )
+        .with_state(records.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake homeserver binds");
+    let addr = listener.local_addr().expect("fake homeserver address");
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("fake homeserver serves");
+    });
+    FakeHomeserver {
+        records,
+        base_url: format!("http://{addr}"),
+    }
+}
+
+/// A test app whose `listing.sync` fetches from the given homeserver client.
+pub async fn test_app_with_homeserver_client(
+    pool: PgPool,
+    homeserver: Arc<dyn HomeserverListingClient>,
+) -> TestApp {
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
+        .with_homeserver(Some(homeserver));
+    TestApp {
+        router: build_router(state.clone()),
+        pool,
+        clock,
+        state,
+    }
+}
+
+/// A test app wired to a freshly spawned fake homeserver.
+pub async fn test_app_with_homeserver(pool: PgPool) -> (TestApp, FakeHomeserver) {
+    let homeserver = spawn_fake_homeserver().await;
+    let app = test_app_with_homeserver_client(pool, homeserver.client()).await;
+    (app, homeserver)
+}
+
+/// The `listing.sync` envelope: any authenticated actor, `expected_revision`
+/// always 0 (sync is convergent — the caller never knows the revision).
+pub fn sync_command(seller_pubky: &str, listing_id: &str, command_number: u64) -> Value {
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x8003, command_number),
+        "aggregate_id": format!("listing:{seller_pubky}_{listing_id}"),
+        "expected_revision": 0,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "listing.sync",
+        "payload": {
+            "seller_pubky": seller_pubky,
+            "listing_id": listing_id,
+        },
+    })
 }
 
 /// The `payment.register_locks` envelope (buyer-authored).

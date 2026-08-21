@@ -94,6 +94,7 @@ pub fn listing_machine() -> AggregateMachine {
         ],
         commands: vec![
             "listing.register",
+            "listing.sync",
             "inventory.reserve",
             "checkout.create",
             "offer.accept",

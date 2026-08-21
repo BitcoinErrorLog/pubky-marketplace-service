@@ -12,6 +12,7 @@ pub mod report;
 pub mod reserve_inventory;
 pub mod returns;
 pub mod reviews;
+pub mod sync_listing;
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::{ids, Command, ErrorCode};

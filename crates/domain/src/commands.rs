@@ -54,6 +54,7 @@ pub struct Command {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandPayload {
     RegisterListing(RegisterListingPayload),
+    SyncListing(SyncListingPayload),
     ReserveInventory(ReserveInventoryPayload),
     CreateCheckout(CreateCheckoutPayload),
     CreateOffer(OfferTermsPayload),
@@ -88,6 +89,7 @@ impl Command {
     pub fn kind(&self) -> &'static str {
         match self.payload {
             CommandPayload::RegisterListing(_) => "listing.register",
+            CommandPayload::SyncListing(_) => "listing.sync",
             CommandPayload::ReserveInventory(_) => "inventory.reserve",
             CommandPayload::CreateCheckout(_) => "checkout.create",
             CommandPayload::CreateOffer(_) => "offer.create",
@@ -125,6 +127,7 @@ impl Command {
     pub fn canonical_json(&self) -> Value {
         let payload = match &self.payload {
             CommandPayload::RegisterListing(p) => serde_json::to_value(p),
+            CommandPayload::SyncListing(p) => serde_json::to_value(p),
             CommandPayload::ReserveInventory(p) => serde_json::to_value(p),
             CommandPayload::CreateCheckout(p) => serde_json::to_value(p),
             CommandPayload::CreateOffer(p) => serde_json::to_value(p),
@@ -215,6 +218,19 @@ pub struct RegisterListingPayload {
     pub sale_format: SaleFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auction_terms: Option<AuctionTerms>,
+}
+
+/// `listing.sync` (any authenticated actor): asks the service to fetch the
+/// canonical seller-signed listing record from the seller's homeserver and
+/// register (or refresh) the inventory aggregate from it. Provenance comes
+/// from the homeserver fetch — the record lives on a seller-owned path — so
+/// the actor is deliberately NOT required to be the seller: any buyer can
+/// heal a listing that was published before registration existed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncListingPayload {
+    pub seller_pubky: String,
+    pub listing_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -686,6 +702,7 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         "listing.register" => {
             parse_payload(&envelope.payload).and_then(validate_register_listing)?
         }
+        "listing.sync" => parse_payload(&envelope.payload).and_then(validate_sync_listing)?,
         "inventory.reserve" => {
             parse_payload(&envelope.payload).and_then(validate_reserve_inventory)?
         }
@@ -810,8 +827,40 @@ fn validate_printable(path: &str, value: &str, issues: &mut Vec<ValidationIssue>
 }
 
 fn validate_register_listing(
-    mut payload: RegisterListingPayload,
+    payload: RegisterListingPayload,
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    validate_register_listing_payload(payload).map(CommandPayload::RegisterListing)
+}
+
+fn validate_sync_listing(
+    payload: SyncListingPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if !is_valid_pubky(&payload.seller_pubky) {
+        issues.push(issue(
+            "payload.seller_pubky",
+            "Expected a 52-character z-base-32 Pubky",
+        ));
+    }
+    if !entity_id_regex().is_match(&payload.listing_id) {
+        issues.push(issue(
+            "payload.listing_id",
+            "Expected a path-safe commerce identifier",
+        ));
+    }
+    if issues.is_empty() {
+        Ok(CommandPayload::SyncListing(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+/// Validates and normalizes a registration payload. Public because the
+/// `listing.sync` handler derives one from the fetched homeserver record and
+/// must hold it to exactly the invariants `listing.register` enforces.
+pub fn validate_register_listing_payload(
+    mut payload: RegisterListingPayload,
+) -> Result<RegisterListingPayload, Vec<ValidationIssue>> {
     let mut issues = Vec::new();
     if !is_valid_pubky(&payload.seller_pubky) {
         issues.push(issue(
@@ -896,7 +945,7 @@ fn validate_register_listing(
     }
 
     if issues.is_empty() {
-        Ok(CommandPayload::RegisterListing(payload))
+        Ok(payload)
     } else {
         Err(issues)
     }

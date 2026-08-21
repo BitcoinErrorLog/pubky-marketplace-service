@@ -132,6 +132,17 @@ async fn dispatch(
         CommandPayload::RegisterListing(payload) => {
             crate::handlers::register_listing::handle(tx, actor, command, payload, now).await
         }
+        CommandPayload::SyncListing(payload) => {
+            crate::handlers::sync_listing::handle(
+                tx,
+                actor,
+                command,
+                payload,
+                state.homeserver.as_deref(),
+                now,
+            )
+            .await
+        }
         CommandPayload::ReserveInventory(payload) => {
             crate::handlers::reserve_inventory::handle(tx, actor, command, payload, now).await
         }

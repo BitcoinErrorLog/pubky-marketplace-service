@@ -11,6 +11,7 @@ pub mod config;
 pub mod executor;
 pub mod expiry;
 pub mod handlers;
+pub mod homeserver;
 pub mod http;
 pub mod locks;
 pub mod model;
@@ -25,6 +26,7 @@ use sqlx::PgPool;
 use crate::attestor::Attestor;
 use crate::clock::Clock;
 use crate::config::Config;
+use crate::homeserver::HomeserverListingClient;
 use crate::locks::LocksRuntime;
 
 #[derive(Clone)]
@@ -42,6 +44,10 @@ pub struct AppState {
     /// job does not run, and `attestation.disavow` is refused (fail closed;
     /// see [`attestor::Attestor::from_env`]).
     pub attestor: Option<Arc<Attestor>>,
+    /// The homeserver listing-record fetch backing `listing.sync`. Required
+    /// in production (`HOMESERVER_URL`); `None` only in tests that do not
+    /// exercise sync, where the command is refused (fail closed).
+    pub homeserver: Option<Arc<dyn HomeserverListingClient>>,
 }
 
 impl AppState {
@@ -52,6 +58,7 @@ impl AppState {
             config: Arc::new(config),
             locks: None,
             attestor: None,
+            homeserver: None,
         }
     }
 
@@ -62,6 +69,11 @@ impl AppState {
 
     pub fn with_attestor(mut self, attestor: Option<Arc<Attestor>>) -> Self {
         self.attestor = attestor;
+        self
+    }
+
+    pub fn with_homeserver(mut self, homeserver: Option<Arc<dyn HomeserverListingClient>>) -> Self {
+        self.homeserver = homeserver;
         self
     }
 }

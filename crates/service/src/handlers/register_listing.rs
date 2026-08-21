@@ -3,11 +3,12 @@ use marketplace_domain::commands::{Command, RegisterListingPayload, SaleFormat};
 use marketplace_domain::{ids, ErrorCode};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
+use uuid::Uuid;
 
 use crate::clock::format_timestamp;
 use crate::executor::insert_event;
 use crate::handlers::{current_listing_revision, fetch_listing, fetch_listing_for_update};
-use crate::model::money_json;
+use crate::model::{money_json, ListingRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 pub async fn handle(
@@ -51,6 +52,38 @@ pub async fn handle(
         }
     }
 
+    apply_registration(
+        tx,
+        actor,
+        command.command_id,
+        &command.aggregate_id,
+        payload,
+        current.as_ref(),
+        "listing.registered",
+        now,
+    )
+    .await
+}
+
+/// Writes (or refreshes) the listing aggregate from a validated registration
+/// payload: the shared tail of `listing.register` and `listing.sync`. The
+/// caller has already taken the row lock (`current` comes from
+/// `fetch_listing_for_update`) and made its own authority and revision
+/// decisions; this enforces only the inventory invariant that survives both
+/// paths — quantity can never fall below committed (reserved + sold) stock.
+// Eight positional facts of one write; both callers must supply all of them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_registration(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    command_id: Uuid,
+    aggregate_id: &str,
+    payload: &RegisterListingPayload,
+    current: Option<&ListingRow>,
+    event_kind: &str,
+    now: DateTime<Utc>,
+) -> Result<HandlerResult, sqlx::Error> {
+    let current_revision = current.as_ref().map(|c| c.server_revision).unwrap_or(0);
     let reserved = current.as_ref().map(|c| c.reserved_quantity).unwrap_or(0);
     let sold = current.as_ref().map(|c| c.sold_quantity).unwrap_or(0);
     let committed = reserved + sold;
@@ -94,7 +127,7 @@ pub async fn handle(
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
              ON CONFLICT (aggregate_id) DO NOTHING",
         )
-        .bind(&command.aggregate_id)
+        .bind(aggregate_id)
         .bind(&payload.seller_pubky)
         .bind(&payload.listing_id)
         .bind(&payload.title)
@@ -123,8 +156,8 @@ pub async fn handle(
              sale_format = $13, auction = $14, updated_at = $15 \
              WHERE aggregate_id = $1 AND server_revision = $2",
         )
-        .bind(&command.aggregate_id)
-        .bind(command.expected_revision)
+        .bind(aggregate_id)
+        .bind(current_revision)
         .bind(&payload.title)
         .bind(payload.listing_revision)
         .bind(&payload.content_hash)
@@ -143,7 +176,7 @@ pub async fn handle(
         updated.rows_affected() == 1
     };
     if !written {
-        let latest = current_listing_revision(tx, &command.aggregate_id).await?;
+        let latest = current_listing_revision(tx, aggregate_id).await?;
         return Ok(Err(CommandFailure::with_revision(
             ErrorCode::RevisionConflict,
             "The listing revision is stale.",
@@ -153,16 +186,16 @@ pub async fn handle(
 
     let event_id = insert_event(
         tx,
-        command.command_id,
-        &command.aggregate_id,
+        command_id,
+        aggregate_id,
         new_revision,
         actor,
-        "listing.registered",
+        event_kind,
         now,
     )
     .await?;
 
-    let listing = fetch_listing(tx, &command.aggregate_id)
+    let listing = fetch_listing(tx, aggregate_id)
         .await?
         .expect("listing was just written in this transaction");
     Ok(Ok(HandlerSuccess {

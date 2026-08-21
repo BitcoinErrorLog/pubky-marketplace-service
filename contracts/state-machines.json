@@ -78,6 +78,7 @@
       ],
       "commands": [
         "listing.register",
+        "listing.sync",
         "inventory.reserve",
         "checkout.create",
         "offer.accept",

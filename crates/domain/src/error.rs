@@ -15,6 +15,10 @@ pub enum ErrorCode {
     InvalidState,
     AuctionClosed,
     BidTooLow,
+    /// An upstream dependency (the seller's homeserver) could not be
+    /// reached or answered unusably. Retriable: the command may succeed
+    /// once the upstream recovers, so it maps to 503 rather than a 4xx.
+    UpstreamUnavailable,
 }
 
 impl ErrorCode {
@@ -33,6 +37,7 @@ impl ErrorCode {
             | ErrorCode::InvalidState
             | ErrorCode::AuctionClosed
             | ErrorCode::BidTooLow => 409,
+            ErrorCode::UpstreamUnavailable => 503,
         }
     }
 }
