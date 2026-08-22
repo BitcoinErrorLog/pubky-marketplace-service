@@ -39,7 +39,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/notifications", get(queries::list_notifications))
         .route(
             "/v0/sellers/me/payment-config",
-            put(crate::payment_methods::put_payment_config),
+            put(crate::payment_methods::put_payment_config)
+                .get(crate::payment_methods::get_own_payment_config),
         )
         .route(
             "/v0/orders/{id}/payment-method",

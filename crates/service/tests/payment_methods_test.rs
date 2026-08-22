@@ -25,6 +25,17 @@ async fn put_config(app: &TestApp, token: &str, body: &Value) -> (StatusCode, Va
     .await
 }
 
+async fn get_own_config(app: &TestApp, token: Option<&str>) -> (StatusCode, Value) {
+    send(
+        app.router.clone(),
+        "GET",
+        "/v0/sellers/me/payment-config",
+        token,
+        &Value::Null,
+    )
+    .await
+}
+
 async fn get_public_config(app: &TestApp, seller_pubky: &str) -> (StatusCode, Value) {
     send(
         app.router.clone(),
@@ -248,6 +259,65 @@ async fn public_config_reports_bitcoin_availability_from_paykit(pool: PgPool) {
     let (status, body) = get_public_config(&app, "not-a-pubky").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["error"]["reason"], json!("invalid_pubky"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn own_config_returns_the_stored_row_verbatim(pool: PgPool) {
+    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let seller = new_actor(&app).await;
+
+    let (status, put_body) = put_config(&app, &seller.token, &full_config_body()).await;
+    assert_eq!(status, StatusCode::OK, "config put failed: {put_body}");
+
+    // The seller has NOT claimed a watch-only account on paykit-server, yet
+    // the own view still reports bitcoin_enabled as stored: this endpoint is
+    // the raw row, not availability, and performs no paykit lookup.
+    let (status, body) = get_own_config(&app, Some(&seller.token)).await;
+    assert_eq!(status, StatusCode::OK, "own config read failed: {body}");
+    assert_eq!(body["payment_config"], put_body["payment_config"]);
+    let config = &body["payment_config"];
+    assert_eq!(config["bitcoin_enabled"], json!(true));
+    assert_eq!(
+        config["stripe_payment_link"],
+        json!("https://buy.stripe.com/test_abc123")
+    );
+    assert_eq!(
+        config["paypal_merchant_email"],
+        json!("merchant@example.com")
+    );
+    assert_eq!(config["stripe_restricted_key_set"], json!(true));
+    assert!(
+        config["updated_at"].as_str().is_some(),
+        "updated_at must be present: {config}"
+    );
+    assert!(
+        !body.to_string().contains(RESTRICTED_KEY),
+        "the restricted key must never appear in a response"
+    );
+
+    // The row is scoped to the session identity: another seller sees nothing.
+    let stranger = new_actor(&app).await;
+    let (status, body) = get_own_config(&app, Some(&stranger.token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["payment_config"], Value::Null);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn own_config_is_null_before_the_first_save(pool: PgPool) {
+    // Deliberately without the payments runtime: reading the stored row must
+    // not be gated on payment rails being configured.
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let (status, body) = get_own_config(&app, Some(&seller.token)).await;
+    assert_eq!(status, StatusCode::OK, "own config read failed: {body}");
+    assert_eq!(body, json!({ "payment_config": Value::Null }));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn own_config_requires_a_session(pool: PgPool) {
+    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (status, _) = get_own_config(&app, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[sqlx::test(migrations = "./migrations")]

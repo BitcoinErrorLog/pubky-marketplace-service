@@ -241,6 +241,38 @@ pub async fn put_payment_config(
     }
 }
 
+/// `GET /v0/sellers/me/payment-config` (seller session): the seller's own
+/// stored configuration, exactly as the PUT returns it. This is the raw row
+/// (`bitcoin_enabled` as stored, no paykit availability lookup) so the
+/// settings page can load state on mount. The restricted key is never
+/// returned, only `stripe_restricted_key_set`.
+pub async fn get_own_payment_config(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+) -> Response {
+    match load_config(&state.pool, &actor.0).await {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            Json(json!({
+                "payment_config": config_view(
+                    row.bitcoin_enabled,
+                    &row.stripe_payment_link,
+                    &row.paypal_merchant_email,
+                    row.stripe_restricted_key_ciphertext.is_some(),
+                    row.updated_at,
+                ),
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(json!({ "payment_config": Value::Null })),
+        )
+            .into_response(),
+        Err(error) => internal("payment config read", &error),
+    }
+}
+
 /// `GET /v0/sellers/{pubky}/payment-config` (public): the buyer-facing rail
 /// availability. `bitcoin_available` is true only when the seller enabled it
 /// AND their watch-only account is actually claimed on paykit-server; a
