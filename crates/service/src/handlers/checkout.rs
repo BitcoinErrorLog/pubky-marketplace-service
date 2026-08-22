@@ -164,6 +164,13 @@ pub async fn handle(
             return_request: None,
             dispute: None,
             external_refund: None,
+            payment_method: None,
+            fiat_checkout_url: None,
+            payment_reported_at: None,
+            fiat_transaction_ref: None,
+            paykit_request_reference: None,
+            paykit_request_state: None,
+            paykit_last_checked_at: None,
             created_at: now,
             updated_at: now,
         };

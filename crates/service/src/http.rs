@@ -2,7 +2,7 @@ use axum::extract::State;
 use axum::http::{header, Method, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
@@ -14,7 +14,7 @@ use crate::{executor, queries, AppState};
 pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(state.config.allowed_origins.clone())
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::PUT])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let protected = Router::new()
@@ -37,6 +37,26 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/payments/{id}", get(queries::get_payment))
         .route("/v1/receipts/{id}", get(queries::get_receipt))
         .route("/v1/notifications", get(queries::list_notifications))
+        .route(
+            "/v0/sellers/me/payment-config",
+            put(crate::payment_methods::put_payment_config),
+        )
+        .route(
+            "/v0/orders/{id}/payment-method",
+            post(crate::payment_methods::bind_payment_method),
+        )
+        .route(
+            "/v0/orders/{id}/fiat/verify",
+            post(crate::payment_methods::verify_fiat_payment),
+        )
+        .route(
+            "/v0/orders/{id}/fiat/mark-paid",
+            post(crate::payment_methods::mark_fiat_paid),
+        )
+        .route(
+            "/v0/orders/{id}/fiat/confirm-received",
+            post(crate::payment_methods::confirm_fiat_received),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,
@@ -46,6 +66,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/v1/auth/sessions", post(auth::create_session))
+        // Public: buyers read a seller's available rails before checkout.
+        .route(
+            "/v0/sellers/{pubky}/payment-config",
+            get(crate::payment_methods::get_payment_config),
+        )
         .merge(protected)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

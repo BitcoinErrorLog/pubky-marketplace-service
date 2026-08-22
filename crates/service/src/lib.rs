@@ -15,6 +15,8 @@ pub mod homeserver;
 pub mod http;
 pub mod locks;
 pub mod model;
+pub mod payment_methods;
+pub mod payments;
 pub mod queries;
 pub mod result;
 pub mod workers;
@@ -28,6 +30,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::homeserver::HomeserverListingClient;
 use crate::locks::LocksRuntime;
+use crate::payments::PaymentsRuntime;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -48,6 +51,11 @@ pub struct AppState {
     /// in production (`HOMESERVER_URL`); `None` only in tests that do not
     /// exercise sync, where the command is refused (fail closed).
     pub homeserver: Option<Arc<dyn HomeserverListingClient>>,
+    /// Seller payment-method rails: Stripe key sealing/verification and the
+    /// signed Paykit client. `None` when `STRIPE_KEY_ENCRYPTION_KEY` is
+    /// unset: the whole `/v0` payment-methods surface is refused (fail
+    /// closed; see [`payments::payments_runtime_from_env`]).
+    pub payments: Option<Arc<PaymentsRuntime>>,
 }
 
 impl AppState {
@@ -59,6 +67,7 @@ impl AppState {
             locks: None,
             attestor: None,
             homeserver: None,
+            payments: None,
         }
     }
 
@@ -74,6 +83,11 @@ impl AppState {
 
     pub fn with_homeserver(mut self, homeserver: Option<Arc<dyn HomeserverListingClient>>) -> Self {
         self.homeserver = homeserver;
+        self
+    }
+
+    pub fn with_payments(mut self, payments: Option<Arc<PaymentsRuntime>>) -> Self {
+        self.payments = payments;
         self
     }
 }

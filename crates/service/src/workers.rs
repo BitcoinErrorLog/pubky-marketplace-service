@@ -41,6 +41,7 @@ use crate::handlers::payment::confirm_order;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
 use crate::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
 use crate::model::{ListingRow, PaymentRow};
+use crate::payments::{PaykitStatusOutcome, PaykitStatusSource};
 use crate::queries::PAYMENT_COLUMNS;
 use crate::{expiry, AppState};
 
@@ -49,11 +50,13 @@ pub const TASK_OFFER_EXPIRY: &str = "offer_expiry";
 pub const TASK_AUCTION_CLOSE: &str = "auction_close";
 pub const TASK_OUTBOX: &str = "outbox";
 pub const TASK_LOCKS_VERIFICATION: &str = "locks_verification";
+pub const TASK_PAYKIT_VERIFICATION: &str = "paykit_verification";
 pub const TASK_PAYMENT_WINDOW: &str = "payment_window";
 pub const TASK_STAT_ATTESTATIONS: &str = "stat_attestations";
 
 const OUTBOX_BATCH_SIZE: i64 = 100;
 const LOCKS_VERIFY_BATCH_SIZE: i64 = 25;
+const PAYKIT_VERIFY_BATCH_SIZE: i64 = 25;
 
 /// Stat attestation cadence (ratified D3: weekly) and window (trailing 90
 /// days, matching the design's period example).
@@ -614,6 +617,239 @@ pub async fn verify_due_locks_lifecycles(
     Ok(applied)
 }
 
+/// One claimed pending paykit-verified bitcoin order.
+#[derive(Debug, sqlx::FromRow)]
+struct ClaimedPaykitOrder {
+    id: Uuid,
+    payment_id: Uuid,
+    buyer_pubky: String,
+    seller_pubky: String,
+    paykit_request_reference: String,
+    paykit_request_state: String,
+}
+
+/// Claims a batch of bitcoin orders due for a paykit status poll by stamping
+/// `paykit_last_checked_at` — the only pre-effect write, so a crashed holder
+/// loses nothing.
+async fn claim_due_paykit_orders(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    poll_seconds: i64,
+) -> Result<Vec<ClaimedPaykitOrder>, sqlx::Error> {
+    sqlx::query_as(
+        "UPDATE orders SET paykit_last_checked_at = $1, updated_at = updated_at \
+         WHERE id IN (\
+             SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
+             WHERE p.adapter = 'paykit' AND p.state = 'awaiting_entitlement' \
+             AND o.paykit_request_state IN ('pending', 'detected') \
+             AND o.paykit_request_reference IS NOT NULL \
+             AND (o.paykit_last_checked_at IS NULL OR o.paykit_last_checked_at <= $2) \
+             ORDER BY o.paykit_last_checked_at ASC NULLS FIRST LIMIT $3 \
+             FOR UPDATE OF o SKIP LOCKED\
+         ) RETURNING id, payment_id, buyer_pubky, seller_pubky, \
+         paykit_request_reference, paykit_request_state",
+    )
+    .bind(now)
+    .bind(now - chrono::Duration::seconds(poll_seconds))
+    .bind(PAYKIT_VERIFY_BATCH_SIZE)
+    .fetch_all(pool)
+    .await
+}
+
+/// Applies one confirmed paykit payment: `awaiting_entitlement → confirmed`
+/// exactly once via the shared confirmation effects; a confirmation the
+/// order can no longer accept (or an amount mismatch paykit observed) routes
+/// the payment to `manual_review`.
+async fn apply_confirmed_paykit_payment(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    amount_matched: bool,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let payment: Option<PaymentRow> = sqlx::query_as(&format!(
+        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(row.payment_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(payment) = payment else {
+        anyhow::bail!("paykit order {} references a missing payment", row.id);
+    };
+    if payment.state != "awaiting_entitlement" {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    if !amount_matched {
+        // Money arrived but not the required amount: never silently confirm.
+        let (revision,): (i64,) = sqlx::query_as(
+            "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+             updated_at = $2 WHERE id = $1 RETURNING revision",
+        )
+        .bind(payment.id)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        crate::executor::insert_event(
+            &mut tx,
+            row.id,
+            &ids::payment_aggregate_id(payment.id),
+            revision,
+            &row.buyer_pubky,
+            "payment.manual_review",
+            now,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE orders SET paykit_request_state = 'confirmed', updated_at = $2 WHERE id = $1",
+        )
+        .bind(row.id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::warn!(
+            order_id = %row.id,
+            "confirmed paykit payment did not match the required amount; routing to manual review"
+        );
+        return Ok(true);
+    }
+    let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
+        anyhow::bail!("paykit order {} is missing", row.id);
+    };
+    match confirm_order(&mut tx, &row.buyer_pubky, row.id, &payment, order, now).await? {
+        Ok((order, _receipt, _receipt_event_id)) => {
+            let (revision,): (i64,) = sqlx::query_as(
+                "UPDATE payments SET state = 'confirmed', revision = revision + 1, \
+                 updated_at = $2 WHERE id = $1 RETURNING revision",
+            )
+            .bind(payment.id)
+            .bind(now)
+            .fetch_one(&mut *tx)
+            .await?;
+            let event_id = crate::executor::insert_event(
+                &mut tx,
+                row.id,
+                &ids::payment_aggregate_id(payment.id),
+                revision,
+                &row.buyer_pubky,
+                "payment.confirmed",
+                now,
+            )
+            .await?;
+            insert_notification_intent(
+                &mut tx,
+                event_id,
+                "payment_confirmed",
+                &order.seller_pubky,
+                &row.buyer_pubky,
+                &ids::order_aggregate_id(order.id),
+                None,
+                now,
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE orders SET paykit_request_state = 'confirmed', updated_at = $2 \
+                 WHERE id = $1",
+            )
+            .bind(row.id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            tracing::info!(
+                order_id = %row.id,
+                "confirmed payment on observed paykit settlement"
+            );
+            Ok(true)
+        }
+        Err(failure) => {
+            tx.rollback().await?;
+            tracing::warn!(
+                order_id = %row.id,
+                code = ?failure.code,
+                "confirmed paykit payment could not confirm the order; routing to manual review"
+            );
+            let mut tx = pool.begin().await?;
+            let updated: Option<(i64,)> = sqlx::query_as(
+                "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+                 updated_at = $2 WHERE id = $1 AND state = 'awaiting_entitlement' \
+                 RETURNING revision",
+            )
+            .bind(payment.id)
+            .bind(now)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((revision,)) = updated {
+                crate::executor::insert_event(
+                    &mut tx,
+                    row.id,
+                    &ids::payment_aggregate_id(payment.id),
+                    revision,
+                    &row.buyer_pubky,
+                    "payment.manual_review",
+                    now,
+                )
+                .await?;
+            }
+            sqlx::query(
+                "UPDATE orders SET paykit_request_state = 'confirmed', updated_at = $2 \
+                 WHERE id = $1",
+            )
+            .bind(row.id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(updated.is_some())
+        }
+    }
+}
+
+/// One paykit verification pass: claims due bitcoin orders, polls the
+/// paykit-server status for each, and applies the outcome. Returns the
+/// number of payments advanced (confirmed or manual review).
+pub async fn verify_due_paykit_payments(
+    state: &AppState,
+    source: &dyn PaykitStatusSource,
+    now: DateTime<Utc>,
+) -> anyhow::Result<u64> {
+    let claimed =
+        claim_due_paykit_orders(&state.pool, now, state.config.paykit_poll_seconds).await?;
+    let mut applied = 0u64;
+    for row in &claimed {
+        match source
+            .status(&row.seller_pubky, &row.paykit_request_reference)
+            .await
+        {
+            PaykitStatusOutcome::Confirmed { amount_matched } => {
+                if apply_confirmed_paykit_payment(&state.pool, row, amount_matched, now).await? {
+                    applied += 1;
+                }
+            }
+            PaykitStatusOutcome::Detected => {
+                if row.paykit_request_state != "detected" {
+                    sqlx::query(
+                        "UPDATE orders SET paykit_request_state = 'detected', updated_at = $2 \
+                         WHERE id = $1 AND paykit_request_state = 'pending'",
+                    )
+                    .bind(row.id)
+                    .bind(now)
+                    .execute(&state.pool)
+                    .await?;
+                }
+            }
+            // Not yet visible, or the request never reached paykit-server
+            // (NotFound stays retryable: creation is idempotent and the
+            // binding transaction only commits after a successful create).
+            PaykitStatusOutcome::Undetected
+            | PaykitStatusOutcome::NotFound
+            | PaykitStatusOutcome::Unavailable => {}
+        }
+    }
+    Ok(applied)
+}
+
 /// Expires Locks-correlated payments whose marketplace payment window has
 /// elapsed on server time while the payment still awaits entitlement. This
 /// is a marketplace policy transition, independent of upstream state; the
@@ -680,6 +916,7 @@ pub struct WorkerSummary {
     pub auctions_closed: u64,
     pub outbox_delivered: u64,
     pub locks_completions_applied: u64,
+    pub paykit_payments_applied: u64,
     pub payment_windows_expired: u64,
     pub stat_attestations_signed: u64,
 }
@@ -734,6 +971,27 @@ pub async fn run_once(
             summary.locks_completions_applied =
                 verify_due_locks_lifecycles(state, locks, now).await?;
             release_lease(&state.pool, TASK_LOCKS_VERIFICATION, holder, now).await?;
+        }
+    }
+    // Paykit verification runs only when the deployment carries the signed
+    // Paykit client (fail closed).
+    if let Some(paykit) = state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
+    {
+        if try_acquire_lease(
+            &state.pool,
+            TASK_PAYKIT_VERIFICATION,
+            holder,
+            now,
+            lease_seconds,
+        )
+        .await?
+        {
+            summary.paykit_payments_applied =
+                verify_due_paykit_payments(state, paykit, now).await?;
+            release_lease(&state.pool, TASK_PAYKIT_VERIFICATION, holder, now).await?;
         }
     }
     if try_acquire_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now, lease_seconds).await? {
@@ -922,6 +1180,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             auctions_closed = summary.auctions_closed,
                             outbox_delivered = summary.outbox_delivered,
                             locks_completions_applied = summary.locks_completions_applied,
+                            paykit_payments_applied = summary.paykit_payments_applied,
                             payment_windows_expired = summary.payment_windows_expired,
                             stat_attestations_signed = summary.stat_attestations_signed,
                             "worker pass completed"

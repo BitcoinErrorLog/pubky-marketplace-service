@@ -32,6 +32,21 @@ async fn main() -> anyhow::Result<()> {
     // without salt, or salt without key) refuses to start rather than
     // issuing attestations with unlinkable order refs.
     let attestor = marketplace_service::attestor::Attestor::from_env()?;
+    // Fail closed for payment methods: STRIPE_KEY_ENCRYPTION_KEY enables the
+    // surface, and the Paykit pair (server URL + signing key) is
+    // all-or-nothing within it.
+    let payments = marketplace_service::payments::payments_runtime_from_env()?;
+    match &payments {
+        Some(payments) => tracing::info!(
+            paykit = if payments.paykit.is_some() {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            "payment methods enabled"
+        ),
+        None => tracing::info!("payment methods disabled (no Stripe key encryption key)"),
+    }
     // HOMESERVER_URL is required: `listing.sync` fetches canonical
     // seller-signed records from it, and running without the sync path would
     // silently re-open the unregistered-listing dead-end it exists to fix.
@@ -55,7 +70,8 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(pool, Arc::new(SystemClock), config)
         .with_locks(locks)
         .with_attestor(attestor)
-        .with_homeserver(Some(homeserver));
+        .with_homeserver(Some(homeserver))
+        .with_payments(payments);
     workers::spawn(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

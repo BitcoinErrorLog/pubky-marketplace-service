@@ -28,6 +28,9 @@ pub struct Config {
     /// Minimum seconds between lifecycle lookups for one pending
     /// correlation.
     pub locks_poll_seconds: i64,
+    /// Minimum seconds between paykit-server status polls for one pending
+    /// bitcoin order.
+    pub paykit_poll_seconds: i64,
     /// Pubkys holding the moderator role (`MODERATOR_PUBKYS`, comma
     /// separated). Validated as z-base-32 at startup. The role is scoped to
     /// moderation (reading all reports, deciding reports, and adjudicating
@@ -65,6 +68,10 @@ impl Config {
         if locks_poll_seconds < 1 {
             anyhow::bail!("LOCKS_POLL_SECONDS must be at least 1");
         }
+        let paykit_poll_seconds = env_i64("PAYKIT_POLL_SECONDS", 15)?;
+        if paykit_poll_seconds < 1 {
+            anyhow::bail!("PAYKIT_POLL_SECONDS must be at least 1");
+        }
         let moderator_pubkys =
             parse_moderator_pubkys(&std::env::var("MODERATOR_PUBKYS").unwrap_or_default())?;
         Ok(Self {
@@ -77,6 +84,7 @@ impl Config {
             worker_lease_seconds,
             locks_payment_window_seconds,
             locks_poll_seconds,
+            paykit_poll_seconds,
             moderator_pubkys,
         })
     }
@@ -97,6 +105,7 @@ impl Config {
             worker_lease_seconds: 30,
             locks_payment_window_seconds: 3_600,
             locks_poll_seconds: 30,
+            paykit_poll_seconds: 15,
             moderator_pubkys: Vec::new(),
         }
     }

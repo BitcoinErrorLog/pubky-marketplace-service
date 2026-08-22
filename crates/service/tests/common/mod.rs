@@ -30,6 +30,10 @@ use marketplace_service::http::build_router;
 use marketplace_service::locks::{
     LocksKeys, LocksLifecycleClient, LocksLookupOutcome, LocksRuntime,
 };
+use marketplace_service::payments::{
+    PaykitClient, PaykitStatusOutcome, PaykitStatusSource, PaymentsRuntime, StripeClient,
+    StripeKeyCipher,
+};
 use marketplace_service::AppState;
 
 /// The fixed test instant used by the TypeScript prototype suite.
@@ -785,4 +789,354 @@ pub async fn count(pool: &PgPool, sql: &str) -> i64 {
         .await
         .expect("count query succeeds");
     value
+}
+
+/// Deterministic key sealing Stripe restricted keys in tests (production:
+/// `STRIPE_KEY_ENCRYPTION_KEY`).
+pub const TEST_STRIPE_ENCRYPTION_KEY: &str =
+    "5555555555555555555555555555555555555555555555555555555555555555";
+/// Deterministic ed25519 seed for the signed Paykit client (production:
+/// `PAYKIT_REQUEST_SIGNING_KEY`).
+pub const TEST_PAYKIT_SIGNING_SEED: &str =
+    "6666666666666666666666666666666666666666666666666666666666666666";
+
+/// One recorded Stripe Checkout Session served by [`FakeStripe`].
+#[derive(Clone)]
+pub struct FakeStripeSession {
+    pub id: String,
+    pub client_reference_id: String,
+    pub payment_status: String,
+    pub amount_total: i64,
+    pub currency: String,
+}
+
+#[derive(Default)]
+struct FakeStripeState {
+    /// Restricted keys accepted as valid bearers; anything else is 401.
+    valid_keys: Vec<String>,
+    sessions: Vec<FakeStripeSession>,
+    requests: Vec<String>,
+}
+
+/// A local Stripe API double serving `GET /v1/checkout/sessions` exactly as
+/// tests configure it, reached through the REAL [`StripeClient`], so bearer
+/// auth, pagination parameters, and status mapping are exercised end to end.
+pub struct FakeStripe {
+    state: Arc<Mutex<FakeStripeState>>,
+    pub base_url: String,
+}
+
+impl FakeStripe {
+    pub fn accept_key(&self, key: &str) {
+        self.state
+            .lock()
+            .expect("fake stripe lock")
+            .valid_keys
+            .push(key.to_string());
+    }
+
+    pub fn add_session(&self, session: FakeStripeSession) {
+        self.state
+            .lock()
+            .expect("fake stripe lock")
+            .sessions
+            .push(session);
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.state.lock().expect("fake stripe lock").requests.len()
+    }
+}
+
+async fn serve_stripe_sessions(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakeStripeState>>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .to_string();
+    let mut guard = state.lock().expect("fake stripe lock");
+    guard.requests.push(bearer.clone());
+    if !guard.valid_keys.iter().any(|key| key == &bearer) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({ "error": { "type": "invalid_request_error" } })),
+        )
+            .into_response();
+    }
+    let data: Vec<Value> = guard
+        .sessions
+        .iter()
+        .map(|session| {
+            json!({
+                "id": session.id,
+                "client_reference_id": session.client_reference_id,
+                "payment_status": session.payment_status,
+                "amount_total": session.amount_total,
+                "currency": session.currency,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "object": "list", "data": data, "has_more": false })),
+    )
+        .into_response()
+}
+
+pub async fn spawn_fake_stripe() -> FakeStripe {
+    let state: Arc<Mutex<FakeStripeState>> = Arc::default();
+    let router = Router::new()
+        .route(
+            "/v1/checkout/sessions",
+            axum::routing::get(serve_stripe_sessions),
+        )
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake stripe binds");
+    let addr = listener.local_addr().expect("fake stripe address");
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("fake stripe serves");
+    });
+    FakeStripe {
+        state,
+        base_url: format!("http://{addr}"),
+    }
+}
+
+/// One payment-request the fake paykit-server accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakePaykitRequest {
+    pub creator: String,
+    pub reader: String,
+    pub reference: String,
+    pub amount_sats: u64,
+}
+
+#[derive(Default)]
+struct FakePaykitState {
+    /// Sellers (bare z32) with claimed watch-only accounts.
+    claimed: Vec<String>,
+    /// Error code returned for payment-request creation, when forced.
+    create_error: Option<String>,
+    requests: Vec<FakePaykitRequest>,
+}
+
+/// A local paykit-server double serving the fork's marketplace surface
+/// (`GET /v0/accounts/{creator}`, signed `POST /v0/payment-requests`). The
+/// signature of every payment request is verified against the test signing
+/// key — exactly what the deployed server does — so the client's canonical
+/// JSON and header handling are covered end to end.
+pub struct FakePaykit {
+    state: Arc<Mutex<FakePaykitState>>,
+    pub base_url: String,
+}
+
+impl FakePaykit {
+    pub fn set_claimed(&self, seller_pubky: &str) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .claimed
+            .push(seller_pubky.to_string());
+    }
+
+    /// Force payment-request creation to fail with a paykit error code
+    /// (e.g. `creator_session_invalid`).
+    pub fn fail_creation_with(&self, code: &str) {
+        self.state.lock().expect("fake paykit lock").create_error = Some(code.to_string());
+    }
+
+    pub fn clear_creation_failure(&self) {
+        self.state.lock().expect("fake paykit lock").create_error = None;
+    }
+
+    pub fn requests(&self) -> Vec<FakePaykitRequest> {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .requests
+            .clone()
+    }
+}
+
+fn paykit_test_verifying_key() -> ed25519_dalek::VerifyingKey {
+    let seed: [u8; 32] = hex::decode(TEST_PAYKIT_SIGNING_SEED)
+        .expect("test seed decodes")
+        .try_into()
+        .expect("test seed is 32 bytes");
+    ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key()
+}
+
+async fn serve_paykit_account(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    axum::extract::Path(creator): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let claimed = state
+        .lock()
+        .expect("fake paykit lock")
+        .claimed
+        .iter()
+        .any(|seller| format!("pubky{seller}") == creator);
+    (StatusCode::OK, axum::Json(json!({ "claimed": claimed }))).into_response()
+}
+
+async fn serve_paykit_payment_request(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use ed25519_dalek::Verifier;
+    let unauthorized = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({ "error": { "code": "invalid_signature" } })),
+        )
+            .into_response()
+    };
+    let Some(signature) = headers
+        .get("x-paykit-signature")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, value).ok()
+        })
+        .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
+    else {
+        return unauthorized();
+    };
+    if paykit_test_verifying_key()
+        .verify(&body, &ed25519_dalek::Signature::from_bytes(&signature))
+        .is_err()
+    {
+        return unauthorized();
+    }
+    let Ok(parsed) = serde_json::from_slice::<Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "error": { "code": "invalid_request" } })),
+        )
+            .into_response();
+    };
+    let mut guard = state.lock().expect("fake paykit lock");
+    if let Some(code) = guard.create_error.clone() {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(json!({ "error": { "code": code } })),
+        )
+            .into_response();
+    }
+    guard.requests.push(FakePaykitRequest {
+        creator: parsed["creator"].as_str().unwrap_or_default().to_string(),
+        reader: parsed["reader"].as_str().unwrap_or_default().to_string(),
+        reference: parsed["reference"].as_str().unwrap_or_default().to_string(),
+        amount_sats: parsed["amount_sats"].as_u64().unwrap_or_default(),
+    });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+pub async fn spawn_fake_paykit() -> FakePaykit {
+    let state: Arc<Mutex<FakePaykitState>> = Arc::default();
+    let router = Router::new()
+        .route(
+            "/v0/accounts/{creator}",
+            axum::routing::get(serve_paykit_account),
+        )
+        .route(
+            "/v0/payment-requests",
+            axum::routing::post(serve_paykit_payment_request),
+        )
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake paykit binds");
+    let addr = listener.local_addr().expect("fake paykit address");
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("fake paykit serves");
+    });
+    FakePaykit {
+        state,
+        base_url: format!("http://{addr}"),
+    }
+}
+
+/// Programmable paykit status source for worker tests, keyed by reference.
+#[derive(Default)]
+pub struct FakePaykitStatus {
+    outcomes: Mutex<HashMap<String, PaykitStatusOutcome>>,
+}
+
+impl FakePaykitStatus {
+    pub fn set_outcome(&self, reference: &str, outcome: PaykitStatusOutcome) {
+        self.outcomes
+            .lock()
+            .expect("fake paykit status lock")
+            .insert(reference.to_string(), outcome);
+    }
+}
+
+impl PaykitStatusSource for FakePaykitStatus {
+    fn status<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        reference: &'a str,
+    ) -> Pin<Box<dyn Future<Output = PaykitStatusOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            *self
+                .outcomes
+                .lock()
+                .expect("fake paykit status lock")
+                .get(reference)
+                .unwrap_or(&PaykitStatusOutcome::NotFound)
+        })
+    }
+}
+
+/// A test app with the payment-methods runtime enabled, wired to fresh
+/// Stripe and paykit-server doubles through the real HTTP clients.
+pub async fn test_app_with_payments(pool: PgPool) -> (TestApp, FakeStripe, FakePaykit) {
+    let stripe = spawn_fake_stripe().await;
+    let paykit = spawn_fake_paykit().await;
+    let runtime = Arc::new(PaymentsRuntime {
+        stripe_key_cipher: StripeKeyCipher::from_hex(TEST_STRIPE_ENCRYPTION_KEY)
+            .expect("test stripe key parses"),
+        stripe: StripeClient::new(&stripe.base_url).expect("fake stripe client builds"),
+        paykit: Some(
+            PaykitClient::new(&paykit.base_url, TEST_PAYKIT_SIGNING_SEED)
+                .expect("fake paykit client builds"),
+        ),
+    });
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
+        .with_payments(Some(runtime));
+    (
+        TestApp {
+            router: build_router(state.clone()),
+            pool,
+            clock,
+            state,
+        },
+        stripe,
+        paykit,
+    )
+}
+
+/// A SAT-denominated register command so bitcoin binding has a
+/// satoshi-priced order to work with.
+pub fn register_sat_command(seller_pubky: &str, quantity: i64) -> Value {
+    let mut command = register_command(seller_pubky, quantity);
+    command["payload"]["unit_price"] =
+        json!({ "amount_minor": 50_000, "currency": "SAT", "exponent": 0 });
+    command
 }

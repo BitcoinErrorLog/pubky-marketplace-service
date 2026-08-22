@@ -263,6 +263,22 @@ pub struct OrderRow {
     pub return_request: Option<Value>,
     pub dispute: Option<Value>,
     pub external_refund: Option<Value>,
+    /// The buyer-bound payment method (`bitcoin` | `stripe` | `paypal`),
+    /// NULL until bound.
+    pub payment_method: Option<String>,
+    /// Snapshot of the fiat checkout URL taken at binding time.
+    pub fiat_checkout_url: Option<String>,
+    /// When the buyer reported an out-of-band fiat payment (PayPal leg).
+    pub payment_reported_at: Option<DateTime<Utc>>,
+    /// Optional processor/transaction reference: the buyer-supplied PayPal
+    /// transaction id, or the matched Stripe Checkout Session id.
+    pub fiat_transaction_ref: Option<String>,
+    /// Paykit payment-request reference for physical bitcoin orders
+    /// (Crockford base32 of the order UUID; the status-lookup bundle id).
+    pub paykit_request_reference: Option<String>,
+    pub paykit_request_state: Option<String>,
+    /// Poll stamp for the paykit verification worker; never serialized.
+    pub paykit_last_checked_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -278,6 +294,18 @@ impl OrderRow {
             .expect("order view is an object")
             .remove("delivery_address");
         view
+    }
+
+    /// How the bound fiat method is verified: `processor` (Stripe, via the
+    /// seller's restricted key against the Stripe API) or `seller-attested`
+    /// (PayPal, buyer reports + seller confirms). This asymmetry is
+    /// deliberate and must stay visible to both parties.
+    pub fn fiat_verification(&self) -> Value {
+        match self.payment_method.as_deref() {
+            Some("stripe") => json!("processor"),
+            Some("paypal") => json!("seller-attested"),
+            _ => Value::Null,
+        }
     }
 
     pub fn view(&self) -> Value {
@@ -301,6 +329,13 @@ impl OrderRow {
             "return_request": self.return_request.clone().unwrap_or(Value::Null),
             "dispute": self.dispute.clone().unwrap_or(Value::Null),
             "external_refund": self.external_refund.clone().unwrap_or(Value::Null),
+            "payment_method": self.payment_method,
+            "fiat_checkout_url": self.fiat_checkout_url,
+            "fiat_verification": self.fiat_verification(),
+            "payment_reported_at": self.payment_reported_at.map(format_timestamp),
+            "fiat_transaction_ref": self.fiat_transaction_ref,
+            "paykit_request_reference": self.paykit_request_reference,
+            "paykit_request_state": self.paykit_request_state,
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
         })

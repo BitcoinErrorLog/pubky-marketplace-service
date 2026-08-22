@@ -65,6 +65,11 @@ Migrations in `crates/service/migrations/` are applied automatically at boot
 | `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation |
 | `ATTESTOR_SECRET_KEY` | unset | 32-byte hex Ed25519 secret of the attestor identity (ADR 0024); its z-base-32 public key is the attestor pubky |
 | `ATTESTOR_ORDER_SALT` | unset | 32-byte hex salt for `order_ref` hashing; must stay stable for the attestor identity's lifetime |
+| `STRIPE_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing seller Stripe restricted keys at rest; setting it enables the `/v0` payment-methods surface |
+| `STRIPE_API_BASE` | `https://api.stripe.com` | Stripe API base URL (overridden only by tests) |
+| `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
+| `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests; its pubky-formatted public key is paykit-server's `marketplace.trusted_public_key` |
+| `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
 
 The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
 closed at startup** on a partial configuration (a URL without keys, or keys

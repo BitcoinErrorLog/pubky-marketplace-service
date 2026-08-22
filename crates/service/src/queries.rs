@@ -53,7 +53,9 @@ pub const MAX_LIMIT: i64 = 200;
 pub const ORDER_COLUMNS: &str = "id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
      state, lines, delivery_address, subtotal_minor, shipping_minor, tax_minor, total_minor, \
      currency, exponent, guarantee_policy_version, payment_id, receipt_id, cancellation_reason, \
-     shipment, return_request, dispute, external_refund, created_at, updated_at";
+     shipment, return_request, dispute, external_refund, payment_method, fiat_checkout_url, \
+     payment_reported_at, fiat_transaction_ref, paykit_request_reference, paykit_request_state, \
+     paykit_last_checked_at, created_at, updated_at";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
      state, confirmations, amount_minor, currency, exponent, created_at, updated_at";
