@@ -2,8 +2,8 @@
 //! issuance inside `review.create`, D2 both-sides amount-band consent,
 //! claim shape, offline signature verifiability against the attestor pubky,
 //! the idempotent participant-scoped re-fetch, dispute/refund annotations,
-//! the moderator disavowal escape hatch, and the weekly stat-attestation
-//! job.
+//! the moderator disavowal escape hatch, the weekly stat-attestation job,
+//! and the deterministic receipt and drop-edition attestation endpoints.
 
 mod common;
 
@@ -15,8 +15,10 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use common::{
-    count, create_paid_order, execute, indexed_command_id, new_actor, order_command, send,
-    test_app, test_app_with_attestor, test_app_with_attestor_and_moderators, test_attestor,
+    checkout_command, count, create_paid_order, drop_record_json, execute, indexed_command_id,
+    new_actor, order_command, payment_command, register_command, send, sync_drop_command, test_app,
+    test_app_with_attestor, test_app_with_attestor_and_moderators, test_app_with_homeserver,
+    test_app_with_homeserver_and_attestor, test_attestor, ts_after, FakeHomeserver, PaidOrder,
     TestActor, TestApp,
 };
 use marketplace_service::clock::Clock;
@@ -642,6 +644,410 @@ async fn attestation_disavowal_is_moderator_only_and_annotates(pool: PgPool) {
         )
         .await,
         1
+    );
+}
+
+#[sqlx::test]
+async fn receipt_attestation_is_verifiable_and_binds_the_paid_order_facts(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let paid = create_paid_order(&app, &seller, &buyer).await;
+
+    let (status, body) = get(
+        &app,
+        &format!("/v1/receipts/{}/attestation", paid.receipt_id),
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fetch failed: {body}");
+    let jws = body["receipt_attestation"]["jws"]
+        .as_str()
+        .expect("receipt attestation jws present");
+
+    // Compact JWS: exactly three base64url segments, and the protected
+    // header is byte-exact (the specs-fork verifier contract).
+    let parts: Vec<&str> = jws.split('.').collect();
+    assert_eq!(parts.len(), 3, "compact JWS has three segments");
+    assert_eq!(
+        String::from_utf8(URL_SAFE_NO_PAD.decode(parts[0]).expect("header b64")).expect("utf8"),
+        r#"{"alg":"EdDSA","typ":"pubky-order-receipt+v1"}"#
+    );
+
+    // Third-party recipe: the signature verifies against the iss pubky
+    // alone, and iss is this deployment's attestor.
+    let claims = verify_jws(jws);
+    assert_eq!(claims, body["receipt_attestation"]["claims"]);
+    assert_eq!(claims["iss"], json!(test_attestor().pubky()));
+
+    // Exact claim shape and order (closed world).
+    let keys: Vec<&str> = claims
+        .as_object()
+        .expect("claims are an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "v",
+            "iss",
+            "buyer",
+            "seller",
+            "order",
+            "receipt",
+            "total_minor",
+            "currency",
+            "exponent",
+            "paid_at",
+            "iat"
+        ]
+    );
+    assert_eq!(claims["v"], json!(1));
+    assert_eq!(claims["buyer"], json!(buyer.pubky));
+    assert_eq!(claims["seller"], json!(seller.pubky));
+    assert_eq!(claims["order"], json!(paid.order_id));
+    assert_eq!(claims["receipt"], json!(paid.receipt_id));
+    assert_eq!(claims["total_minor"], json!(paid.total_minor));
+    assert_eq!(claims["currency"], json!("USD"));
+    assert_eq!(claims["exponent"], json!(2));
+    // The receipt was issued at the fixed test instant.
+    assert_eq!(claims["paid_at"], json!("2026-08-19T22:00:00.000Z"));
+    assert_eq!(claims["iat"], json!(app.clock.now().timestamp()));
+}
+
+#[sqlx::test]
+async fn receipt_attestation_is_byte_identical_across_calls_and_participants(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let paid = create_paid_order(&app, &seller, &buyer).await;
+    let uri = format!("/v1/receipts/{}/attestation", paid.receipt_id);
+
+    let (status, first) = get(&app, &uri, &buyer.token).await;
+    assert_eq!(status, StatusCode::OK, "buyer fetch failed: {first}");
+
+    // Advancing the clock changes nothing: the claims derive entirely from
+    // stored rows, never from `now`.
+    app.clock.advance_seconds(86_400);
+    let (status, second) = get(&app, &uri, &buyer.token).await;
+    assert_eq!(status, StatusCode::OK, "repeat fetch failed: {second}");
+    assert_eq!(
+        first["receipt_attestation"]["jws"],
+        second["receipt_attestation"]["jws"]
+    );
+
+    let (status, sellers) = get(&app, &uri, &seller.token).await;
+    assert_eq!(status, StatusCode::OK, "seller fetch failed: {sellers}");
+    assert_eq!(
+        first["receipt_attestation"]["jws"],
+        sellers["receipt_attestation"]["jws"]
+    );
+    assert_eq!(
+        first["receipt_attestation"]["claims"],
+        sellers["receipt_attestation"]["claims"]
+    );
+}
+
+#[sqlx::test]
+async fn receipt_attestation_is_participant_scoped(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let stranger = new_actor(&app).await;
+    let paid = create_paid_order(&app, &seller, &buyer).await;
+
+    let (status, foreign) = get(
+        &app,
+        &format!("/v1/receipts/{}/attestation", paid.receipt_id),
+        &stranger.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {foreign}");
+
+    // Indistinguishable from a receipt that does not exist.
+    let (status, missing) = get(
+        &app,
+        "/v1/receipts/00000000-0000-4000-8000-0000000000ff/attestation",
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {missing}");
+    assert_eq!(foreign, missing);
+}
+
+#[sqlx::test]
+async fn receipt_attestation_for_an_unknown_receipt_is_not_found(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let buyer = new_actor(&app).await;
+
+    let (status, body) = get(
+        &app,
+        "/v1/receipts/00000000-0000-4000-8000-0000000000ff/attestation",
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {body}");
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
+}
+
+#[sqlx::test]
+async fn receipt_attestation_without_an_attestor_is_not_found(pool: PgPool) {
+    // Mirrors the review-attestation re-fetch on an attestor-less
+    // deployment: a participant's fetch for a real receipt is 404.
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let paid = create_paid_order(&app, &seller, &buyer).await;
+
+    let (status, body) = get(
+        &app,
+        &format!("/v1/receipts/{}/attestation", paid.receipt_id),
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {body}");
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
+}
+
+#[sqlx::test]
+async fn receipt_attestation_paid_at_matches_the_receipt_projection(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let paid = create_paid_order(&app, &seller, &buyer).await;
+
+    let (status, receipt) = get(
+        &app,
+        &format!("/v1/receipts/{}", paid.receipt_id),
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "receipt fetch failed: {receipt}");
+    let (status, attested) = get(
+        &app,
+        &format!("/v1/receipts/{}/attestation", paid.receipt_id),
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "attestation fetch failed: {attested}"
+    );
+
+    // The claim and the projection compare equal string-to-string, so the
+    // published record and the attested claims never drift.
+    assert_eq!(
+        attested["receipt_attestation"]["claims"]["paid_at"],
+        receipt["issued_at"]
+    );
+    assert!(receipt["issued_at"].is_string());
+}
+
+/// Registers one listing, publishes + syncs a `total`-unit drop over it,
+/// checks out one unit as the buyer, and confirms the sandbox payment: a
+/// paid DROP order holding edition 1 of `total`.
+async fn drop_paid_order(
+    app: &TestApp,
+    homeserver: &FakeHomeserver,
+    seller: &TestActor,
+    buyer: &TestActor,
+    total: i64,
+) -> PaidOrder {
+    let (status, body) = execute(app, &seller.token, &register_command(&seller.pubky, total)).await;
+    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
+    homeserver.put_drop_record(
+        &seller.pubky,
+        "winter_drop",
+        drop_record_json(
+            &seller.pubky,
+            "winter_drop",
+            1,
+            &["boots_01"],
+            &ts_after(0),
+            None,
+            total,
+            1,
+        ),
+    );
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &sync_drop_command(&seller.pubky, "winter_drop", 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "drop sync fixture failed: {body}");
+    let (status, body) = execute(app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id present")
+        .to_string();
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id present")
+        .to_string();
+    let total_minor = body["result"]["orders"][0]["total"]["amount_minor"]
+        .as_i64()
+        .expect("order total present");
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &payment_command(&payment_id, 1, "confirmed", 1, 1_050),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment fixture failed: {body}");
+    let receipt_id = body["result"]["receipt"]["id"]
+        .as_str()
+        .expect("receipt id present")
+        .to_string();
+    PaidOrder {
+        order_id,
+        payment_id,
+        receipt_id,
+        total_minor,
+    }
+}
+
+#[sqlx::test]
+async fn edition_attestation_is_verifiable_and_binds_the_drop_order_facts(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver_and_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let stranger = new_actor(&app).await;
+    let paid = drop_paid_order(&app, &homeserver, &seller, &buyer, 3).await;
+    let uri = format!("/v1/receipts/{}/edition-attestation", paid.receipt_id);
+
+    let (status, body) = get(&app, &uri, &buyer.token).await;
+    assert_eq!(status, StatusCode::OK, "fetch failed: {body}");
+    let jws = body["edition_attestation"]["jws"]
+        .as_str()
+        .expect("edition attestation jws present");
+
+    // Compact JWS: exactly three base64url segments, and the protected
+    // header is byte-exact (the specs-fork verifier contract for
+    // `pubky-drop-edition+v1`).
+    let parts: Vec<&str> = jws.split('.').collect();
+    assert_eq!(parts.len(), 3, "compact JWS has three segments");
+    assert_eq!(
+        String::from_utf8(URL_SAFE_NO_PAD.decode(parts[0]).expect("header b64")).expect("utf8"),
+        r#"{"alg":"EdDSA","typ":"pubky-drop-edition+v1"}"#
+    );
+
+    // Third-party recipe: the signature verifies against the iss pubky
+    // alone, and iss is this deployment's attestor.
+    let claims = verify_jws(jws);
+    assert_eq!(claims, body["edition_attestation"]["claims"]);
+    assert_eq!(claims["iss"], json!(test_attestor().pubky()));
+
+    // Exact claim shape and order (closed world). `drop` is the DROP ID,
+    // never the aggregate id; `iat` is the receipt's stored creation
+    // instant, never wall clock.
+    let keys: Vec<&str> = claims
+        .as_object()
+        .expect("claims are an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["v", "iss", "buyer", "seller", "drop", "edition", "of", "receipt", "iat"]
+    );
+    assert_eq!(claims["v"], json!(1));
+    assert_eq!(claims["buyer"], json!(buyer.pubky));
+    assert_eq!(claims["seller"], json!(seller.pubky));
+    assert_eq!(claims["drop"], json!("winter_drop"));
+    assert_eq!(claims["edition"], json!(1));
+    assert_eq!(claims["of"], json!(3));
+    assert_eq!(claims["receipt"], json!(paid.receipt_id));
+    assert_eq!(claims["iat"], json!(app.clock.now().timestamp()));
+
+    // Buyer and seller fetch the byte-identical JWS, and advancing the
+    // clock changes nothing: every claim derives from stored rows.
+    let (status, sellers) = get(&app, &uri, &seller.token).await;
+    assert_eq!(status, StatusCode::OK, "seller fetch failed: {sellers}");
+    assert_eq!(sellers["edition_attestation"]["jws"], json!(jws));
+    assert_eq!(sellers["edition_attestation"]["claims"], claims);
+    app.clock.advance_seconds(86_400);
+    let (status, later) = get(&app, &uri, &buyer.token).await;
+    assert_eq!(status, StatusCode::OK, "repeat fetch failed: {later}");
+    assert_eq!(later["edition_attestation"]["jws"], json!(jws));
+
+    // A stranger's fetch is 404, indistinguishable from a receipt that
+    // does not exist — and both carry the receipt read's body.
+    let (status, foreign) = get(&app, &uri, &stranger.token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {foreign}");
+    let (status, missing) = get(
+        &app,
+        "/v1/receipts/00000000-0000-4000-8000-0000000000ff/edition-attestation",
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {missing}");
+    assert_eq!(foreign, missing);
+    assert_eq!(
+        foreign["error"]["message"],
+        json!("The receipt was not found.")
+    );
+}
+
+#[sqlx::test]
+async fn edition_attestation_for_a_non_drop_order_is_not_found(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let paid = create_paid_order(&app, &seller, &buyer).await;
+
+    // The receipt itself reads fine...
+    let (status, body) = get(
+        &app,
+        &format!("/v1/receipts/{}", paid.receipt_id),
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "receipt read failed: {body}");
+
+    // ...but a non-drop order has no edition to attest: 404 with the
+    // receipt read's body.
+    let (status, body) = get(
+        &app,
+        &format!("/v1/receipts/{}/edition-attestation", paid.receipt_id),
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {body}");
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The receipt was not found.")
+    );
+}
+
+#[sqlx::test]
+async fn edition_attestation_without_an_attestor_is_not_found(pool: PgPool) {
+    // A real paid drop order on an attestor-less deployment: the fetch is
+    // 404 with the receipt read's body, like the other attestation reads.
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let paid = drop_paid_order(&app, &homeserver, &seller, &buyer, 3).await;
+
+    let (status, body) = get(
+        &app,
+        &format!("/v1/receipts/{}/edition-attestation", paid.receipt_id),
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {body}");
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The receipt was not found.")
     );
 }
 

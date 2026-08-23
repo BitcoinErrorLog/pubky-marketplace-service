@@ -110,6 +110,54 @@ impl ListingRow {
     }
 }
 
+/// A drop aggregate (ADR-0026): one timed, limited release synced from the
+/// seller-signed homeserver record. `record_revision` tracks the record for
+/// `drop.sync` convergence; `revision` is the server aggregate revision.
+#[derive(Debug, Clone, FromRow)]
+pub struct DropRow {
+    pub aggregate_id: String,
+    pub seller_pubky: String,
+    pub drop_id: String,
+    pub record_revision: i64,
+    pub revision: i64,
+    pub state: String,
+    pub format: String,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: Option<DateTime<Utc>>,
+    pub total_quantity: i64,
+    pub per_buyer_limit: i64,
+    pub remaining_quantity: i64,
+    pub paid_quantity: i64,
+    pub stock_display: String,
+    pub listing_ids: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl DropRow {
+    pub fn view(&self) -> Value {
+        json!({
+            "aggregate_id": self.aggregate_id,
+            "seller_pubky": self.seller_pubky,
+            "drop_id": self.drop_id,
+            "record_revision": self.record_revision,
+            "revision": self.revision,
+            "state": self.state,
+            "format": self.format,
+            "starts_at": format_timestamp(self.starts_at),
+            "ends_at": self.ends_at.map(format_timestamp),
+            "total_quantity": self.total_quantity,
+            "per_buyer_limit": self.per_buyer_limit,
+            "remaining_quantity": self.remaining_quantity,
+            "paid_quantity": self.paid_quantity,
+            "stock_display": self.stock_display,
+            "listing_ids": self.listing_ids,
+            "created_at": format_timestamp(self.created_at),
+            "updated_at": format_timestamp(self.updated_at),
+        })
+    }
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct ReservationRow {
     pub id: Uuid,
@@ -243,6 +291,11 @@ pub struct OrderRow {
     pub id: Uuid,
     /// Internal correlation to the winning auction, never serialized.
     pub auction_aggregate_id: Option<String>,
+    /// Correlation to the drop this order's units were debited from (`NULL`
+    /// for non-drop orders); the release paths credit exactly this drop.
+    /// Serialized on order views/projections so both participants can tie
+    /// the order to its drop.
+    pub drop_aggregate_id: Option<String>,
     pub buyer_pubky: String,
     pub seller_pubky: String,
     pub revision: i64,
@@ -258,6 +311,11 @@ pub struct OrderRow {
     pub guarantee_policy_version: i32,
     pub payment_id: Uuid,
     pub receipt_id: Option<Uuid>,
+    /// The order's edition inside its drop (ADR-0026 layer 2): the value
+    /// `paid_quantity` reached when this order's payment confirmed, assigned
+    /// exactly once under the drop row lock. 1-based and gapless over paid
+    /// orders; `NULL` for non-drop orders and for drop orders not yet paid.
+    pub edition: Option<i32>,
     pub cancellation_reason: Option<String>,
     pub shipment: Option<Value>,
     pub return_request: Option<Value>,
@@ -324,6 +382,8 @@ impl OrderRow {
             "guarantee_policy_version": self.guarantee_policy_version,
             "payment_id": self.payment_id,
             "receipt_id": self.receipt_id,
+            "edition": self.edition,
+            "drop_aggregate_id": self.drop_aggregate_id,
             "cancellation_reason": self.cancellation_reason,
             "shipment": self.shipment.clone().unwrap_or(Value::Null),
             "return_request": self.return_request.clone().unwrap_or(Value::Null),

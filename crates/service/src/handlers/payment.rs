@@ -162,10 +162,11 @@ pub async fn advance(
 
 /// Applies the confirmation effects: the order moves to `paid` with its
 /// receipt issued exactly once, the held inventory converts from reserved
-/// to sold, and the winning auction reservation (when one exists) is marked
-/// converted. Shared by the sandbox command and the worker's Locks
-/// verification (`command_id` is the sandbox command id or the correlation
-/// id, for event traceability).
+/// to sold, the winning auction reservation (when one exists) is marked
+/// converted, and a drop-stamped order receives its edition under the drop
+/// row lock (ADR-0026 layer 2). Shared by the sandbox command and the
+/// worker's Locks/paykit verification (`command_id` is the sandbox command
+/// id or the correlation id, for event traceability).
 pub(crate) async fn confirm_order(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
@@ -201,6 +202,32 @@ pub(crate) async fn confirm_order(
             )));
         }
     }
+
+    // Editions (ADR-0026 layer 2): the drop row lock is taken BEFORE the
+    // listing row locks below (the shared lock order). The new paid count
+    // is this order's edition — assigned only here, under the drop lock,
+    // exactly once per order, so editions are 1-based and gapless over paid
+    // orders. Reaching the total ends the drop sold out and notifies the
+    // seller.
+    let edition = match &order.drop_aggregate_id {
+        Some(drop_aggregate_id) => {
+            match crate::handlers::drops::record_paid_unit(
+                tx,
+                drop_aggregate_id,
+                actor,
+                command_id,
+                now,
+            )
+            .await?
+            {
+                Ok(edition) => {
+                    Some(i32::try_from(edition).expect("drop totals are at most 1000000"))
+                }
+                Err(failure) => return Ok(Err(failure)),
+            }
+        }
+        None => None,
+    };
 
     // Move each line's quantity from reserved to sold under the quantity
     // balance constraint; the listing machine declares reserved -> sold for
@@ -284,10 +311,11 @@ pub(crate) async fn confirm_order(
 
     let updated_order: OrderRow = sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, state = 'paid', receipt_id = $2, \
-         updated_at = $3 WHERE id = $1 RETURNING {ORDER_COLUMNS}"
+         edition = $3, updated_at = $4 WHERE id = $1 RETURNING {ORDER_COLUMNS}"
     ))
     .bind(order.id)
     .bind(receipt_id)
+    .bind(edition)
     .bind(now)
     .fetch_one(&mut **tx)
     .await?;

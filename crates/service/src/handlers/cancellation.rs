@@ -11,6 +11,13 @@
 //! confirmed with its receipt intact, and the only money path out of a
 //! cancelled order is the externally evidenced `refund.record_external`
 //! (ADR-0019 §7 — the service never claims to move funds).
+//!
+//! Drop-stamped orders (ADR-0026): both release paths — the immediate
+//! cancel of an unpaid order and the seller's approval of a paid one — also
+//! credit the stamped drop's counters, in the same transaction and with the
+//! drop row locked BEFORE any listing row (the shared lock order). The
+//! credit restocks a live drop; an ended drop keeps honest books but
+//! nothing reopens.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{OrderActionPayload, RequestCancellationPayload};
@@ -67,6 +74,9 @@ pub async fn request(
     };
     debug_assert!(can_transition(&order_machine(), &order.state, to_state));
     if immediate {
+        if let Err(failure) = credit_order_drop(tx, &order, now).await? {
+            return Ok(Err(failure));
+        }
         if let Err(failure) = release_reserved_hold(tx, &order, now).await? {
             return Ok(Err(failure));
         }
@@ -132,6 +142,9 @@ pub async fn approve(
     // reversal returns them sold -> available (the listing machine declares
     // this transition for order.cancel_approve). The payment and receipt
     // stay untouched: the refund path is refund.record_external.
+    if let Err(failure) = credit_order_drop(tx, &order, now).await? {
+        return Ok(Err(failure));
+    }
     if let Err(failure) = release_lines(tx, &order, HeldQuantity::Sold, now).await? {
         return Ok(Err(failure));
     }
@@ -157,6 +170,47 @@ pub async fn approve(
         now,
     )
     .await
+}
+
+/// Credits a drop-stamped order's units back to its drop before the listing
+/// releases below run (drop lock before listing locks). A no-op for orders
+/// without a drop stamp — including auction and offer orders, which never
+/// debited a drop.
+async fn credit_order_drop(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &OrderRow,
+    now: DateTime<Utc>,
+) -> Result<Result<(), CommandFailure>, sqlx::Error> {
+    let Some(drop_aggregate_id) = &order.drop_aggregate_id else {
+        return Ok(Ok(()));
+    };
+    let units: i64 = order
+        .lines
+        .as_array()
+        .expect("order lines are an array")
+        .iter()
+        .map(|line| {
+            line["quantity"]
+                .as_i64()
+                .expect("order line carries its quantity")
+        })
+        .sum();
+    if crate::handlers::drops::credit_drop_release(
+        tx,
+        drop_aggregate_id,
+        &order.buyer_pubky,
+        units,
+        now,
+    )
+    .await?
+    {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(CommandFailure::new(
+            ErrorCode::InvariantViolation,
+            "The drop units held by this order are no longer accounted to its drop.",
+        )))
+    }
 }
 
 /// Returns an immediately cancelled unpaid order's held stock to its

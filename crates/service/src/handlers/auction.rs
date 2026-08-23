@@ -407,6 +407,7 @@ pub async fn close_locked_auction(
         let order = OrderRow {
             id: order_id,
             auction_aggregate_id: Some(listing.aggregate_id.clone()),
+            drop_aggregate_id: None,
             buyer_pubky: winner_pubky.clone(),
             seller_pubky: listing.seller_pubky.clone(),
             revision: 1,
@@ -422,6 +423,7 @@ pub async fn close_locked_auction(
             guarantee_policy_version: 1,
             payment_id,
             receipt_id: None,
+            edition: None,
             cancellation_reason: None,
             shipment: None,
             return_request: None,

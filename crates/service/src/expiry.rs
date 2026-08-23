@@ -16,6 +16,7 @@ struct DueReservation {
     listing_aggregate_id: String,
     buyer_pubky: String,
     quantity: i64,
+    drop_aggregate_id: Option<String>,
 }
 
 /// Expires every active reservation due at `now`. Returns the number of
@@ -25,7 +26,8 @@ struct DueReservation {
 pub async fn expire_due_reservations(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
     let mut tx = pool.begin().await?;
     let due: Vec<DueReservation> = sqlx::query_as(
-        "SELECT id, listing_aggregate_id, buyer_pubky, quantity FROM reservations \
+        "SELECT id, listing_aggregate_id, buyer_pubky, quantity, drop_aggregate_id \
+         FROM reservations \
          WHERE status = 'active' AND expires_at <= $1 \
          ORDER BY expires_at FOR UPDATE SKIP LOCKED",
     )
@@ -45,6 +47,26 @@ pub async fn expire_due_reservations(pool: &PgPool, now: DateTime<Utc>) -> anyho
         .await?;
         if flipped.rows_affected() != 1 {
             continue;
+        }
+
+        // A drop-stamped hold credits its drop first (drop lock before the
+        // listing lock, the shared order): while live the unit restocks; an
+        // ended drop keeps honest books but nothing reopens.
+        if let Some(drop_aggregate_id) = &reservation.drop_aggregate_id {
+            if !crate::handlers::drops::credit_drop_release(
+                &mut tx,
+                drop_aggregate_id,
+                &reservation.buyer_pubky,
+                reservation.quantity,
+                now,
+            )
+            .await?
+            {
+                anyhow::bail!(
+                    "expired reservation {} could not credit drop {drop_aggregate_id}",
+                    reservation.id
+                );
+            }
         }
 
         let new_revision: (i64,) = sqlx::query_as(

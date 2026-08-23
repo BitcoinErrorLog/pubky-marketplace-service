@@ -21,6 +21,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/commands", post(execute_command))
         .route("/v1/reports", get(list_reports))
         .route("/v1/listings/{aggregate_id}", get(queries::get_listing))
+        .route("/v1/drops/{aggregate_id}", get(queries::get_drop))
+        .route(
+            "/v1/drops/{aggregate_id}/me",
+            get(queries::get_drop_ready_check),
+        )
         .route("/v1/offers", get(queries::list_offers))
         .route("/v1/orders", get(queries::list_orders))
         .route("/v1/orders/{id}", get(queries::get_order))
@@ -36,6 +41,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/disputes", get(queries::list_disputes))
         .route("/v1/payments/{id}", get(queries::get_payment))
         .route("/v1/receipts/{id}", get(queries::get_receipt))
+        .route(
+            "/v1/receipts/{id}/attestation",
+            get(queries::get_receipt_attestation),
+        )
+        .route(
+            "/v1/receipts/{id}/edition-attestation",
+            get(queries::get_edition_attestation),
+        )
         .route("/v1/notifications", get(queries::list_notifications))
         .route(
             "/v0/sellers/me/payment-config",
@@ -71,6 +84,12 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v0/sellers/{pubky}/payment-config",
             get(crate::payment_methods::get_payment_config),
+        )
+        // Public: anyone reads a drop's schedule and redacted stock; clients
+        // correct countdowns from the projection's server_time.
+        .route(
+            "/v0/drops/{seller_pubky}/{drop_id}",
+            get(queries::get_public_drop),
         )
         .merge(protected)
         .layer(cors)

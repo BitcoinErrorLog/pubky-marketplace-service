@@ -19,6 +19,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{AuctionTerms, RegisterListingPayload, SaleFormat};
 use marketplace_domain::money::Money;
+use marketplace_domain::ValidationIssue;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -40,14 +41,24 @@ pub enum HomeserverFetchOutcome {
     Unavailable,
 }
 
-/// The homeserver listing-record fetch. The trait exists so integration
-/// tests can stand in a local listener; production only ever constructs
-/// [`HttpHomeserverClient`].
+/// The homeserver record fetch (listings and drops). The trait exists so
+/// integration tests can stand in a local listener; production only ever
+/// constructs [`HttpHomeserverClient`].
 pub trait HomeserverListingClient: Send + Sync + 'static {
     fn fetch_listing<'a>(
         &'a self,
         seller_pubky: &'a str,
         listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>>;
+
+    /// Fetches the seller-signed drop record at
+    /// `/pub/pubky.app/marketplace/v1/drops/{drop_id}` — the same path
+    /// ownership doctrine as listings: only the seller can write it, so the
+    /// record's provenance substitutes for a seller actor check.
+    fn fetch_drop<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        drop_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>>;
 }
 
@@ -69,11 +80,8 @@ impl HttpHomeserverClient {
         Ok(Self { base_url, http })
     }
 
-    async fn fetch_inner(&self, seller_pubky: &str, listing_id: &str) -> HomeserverFetchOutcome {
-        let url = format!(
-            "{}/pub/pubky.app/marketplace/v1/listings/{listing_id}",
-            self.base_url
-        );
+    async fn fetch_inner(&self, seller_pubky: &str, path: &str) -> HomeserverFetchOutcome {
+        let url = format!("{}{path}", self.base_url);
         let response = self
             .http
             .get(url)
@@ -83,7 +91,7 @@ impl HttpHomeserverClient {
         let response = match response {
             Ok(response) => response,
             Err(_) => {
-                tracing::warn!("homeserver listing fetch transport failure");
+                tracing::warn!("homeserver record fetch transport failure");
                 return HomeserverFetchOutcome::Unavailable;
             }
         };
@@ -92,13 +100,13 @@ impl HttpHomeserverClient {
             return HomeserverFetchOutcome::NotFound;
         }
         if !status.is_success() {
-            tracing::warn!(status = %status, "homeserver listing fetch rejected");
+            tracing::warn!(status = %status, "homeserver record fetch rejected");
             return HomeserverFetchOutcome::Unavailable;
         }
         match response.json::<Value>().await {
             Ok(record) => HomeserverFetchOutcome::Found(record),
             Err(_) => {
-                tracing::warn!("homeserver listing fetch returned a non-JSON body");
+                tracing::warn!("homeserver record fetch returned a non-JSON body");
                 HomeserverFetchOutcome::Unavailable
             }
         }
@@ -111,7 +119,27 @@ impl HomeserverListingClient for HttpHomeserverClient {
         seller_pubky: &'a str,
         listing_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        Box::pin(self.fetch_inner(seller_pubky, listing_id))
+        Box::pin(async move {
+            self.fetch_inner(
+                seller_pubky,
+                &format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}"),
+            )
+            .await
+        })
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.fetch_inner(
+                seller_pubky,
+                &format!("/pub/pubky.app/marketplace/v1/drops/{drop_id}"),
+            )
+            .await
+        })
     }
 }
 
@@ -245,6 +273,172 @@ pub fn registration_payload_from_record(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Drop record parsing. Unlike listing records (parsed leniently), the drop
+// record contract is fixed (ADR-0026): unknown fields are REJECTED so a
+// record from a newer, incompatible schema can never be half-interpreted
+// into enforcement terms the seller did not sign.
+// ---------------------------------------------------------------------------
+
+/// The seller-signed drop record at
+/// `/pub/pubky.app/marketplace/v1/drops/{drop_id}` (camelCase on the wire).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DropRecord {
+    pub schema_version: i64,
+    pub record_type: String,
+    pub owner_pubky: String,
+    pub revision: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub drop_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    /// Display media, opaque to this service; only the count is bounded.
+    #[serde(default)]
+    pub media: Vec<Value>,
+    pub format: String,
+    pub starts_at: DateTime<Utc>,
+    #[serde(default)]
+    pub ends_at: Option<DateTime<Utc>>,
+    pub listing_ids: Vec<String>,
+    pub total_quantity: i64,
+    pub per_buyer_limit: i64,
+    pub stock_display: String,
+}
+
+fn record_issue(path: &str, message: &str) -> ValidationIssue {
+    ValidationIssue {
+        path: path.to_string(),
+        message: message.to_string(),
+    }
+}
+
+/// Parses and validates a fetched drop record against the fixed ADR-0026
+/// contract. `None`-style interpretation failures (not a drop record at all,
+/// unknown fields, missing required fields) surface as a parse issue;
+/// field-level violations are reported individually. Issues never echo
+/// record values.
+pub fn validated_drop_record(
+    seller_pubky: &str,
+    drop_id: &str,
+    record: &Value,
+) -> Result<DropRecord, Vec<ValidationIssue>> {
+    let record: DropRecord = serde_json::from_value(record.clone()).map_err(|_| {
+        vec![record_issue(
+            "record",
+            "Expected a schema-version-1 drop record with no unknown fields",
+        )]
+    })?;
+
+    let mut issues = Vec::new();
+    if record.schema_version != 1 {
+        issues.push(record_issue("record.schemaVersion", "Expected version 1"));
+    }
+    if record.record_type != "drop" {
+        issues.push(record_issue("record.recordType", "Expected \"drop\""));
+    }
+    if record.owner_pubky != seller_pubky {
+        issues.push(record_issue(
+            "record.ownerPubky",
+            "Expected the seller the record was fetched from",
+        ));
+    }
+    if record.drop_id != drop_id {
+        issues.push(record_issue(
+            "record.dropId",
+            "Expected the drop id the record was fetched for",
+        ));
+    }
+    if record.revision < 1 {
+        issues.push(record_issue(
+            "record.revision",
+            "Expected a positive record revision",
+        ));
+    }
+    let title_chars = record.title.trim().chars().count();
+    if !(1..=120).contains(&title_chars) {
+        issues.push(record_issue(
+            "record.title",
+            "Expected between 1 and 120 characters",
+        ));
+    }
+    if record.description.chars().count() > 2_000 {
+        issues.push(record_issue(
+            "record.description",
+            "Expected at most 2000 characters",
+        ));
+    }
+    if record.media.len() > 10 {
+        issues.push(record_issue(
+            "record.media",
+            "Expected at most 10 media entries",
+        ));
+    }
+    if record.format != "fcfs" {
+        issues.push(record_issue("record.format", "Expected \"fcfs\""));
+    }
+    if let Some(ends_at) = record.ends_at {
+        if ends_at <= record.starts_at {
+            issues.push(record_issue(
+                "record.endsAt",
+                "Expected the drop end to follow its start",
+            ));
+        }
+    }
+    if record.listing_ids.is_empty() || record.listing_ids.len() > 20 {
+        issues.push(record_issue(
+            "record.listingIds",
+            "Expected between 1 and 20 listing ids",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (index, listing_id) in record.listing_ids.iter().enumerate() {
+        if !marketplace_domain::commands::is_valid_entity_id(listing_id) {
+            issues.push(record_issue(
+                &format!("record.listingIds.{index}"),
+                "Expected a path-safe commerce identifier",
+            ));
+        }
+        if !seen.insert(listing_id.clone()) {
+            issues.push(record_issue(
+                "record.listingIds",
+                "Listing ids must be unique",
+            ));
+        }
+    }
+    if !(1..=1_000_000).contains(&record.total_quantity) {
+        issues.push(record_issue(
+            "record.totalQuantity",
+            "Expected a quantity between 1 and 1000000",
+        ));
+    }
+    if !(1..=100).contains(&record.per_buyer_limit) {
+        issues.push(record_issue(
+            "record.perBuyerLimit",
+            "Expected a limit between 1 and 100",
+        ));
+    } else if record.per_buyer_limit > record.total_quantity {
+        issues.push(record_issue(
+            "record.perBuyerLimit",
+            "Expected a limit no greater than the total quantity",
+        ));
+    }
+    if !matches!(record.stock_display.as_str(), "exact" | "bands" | "hidden") {
+        issues.push(record_issue(
+            "record.stockDisplay",
+            "Expected exact, bands, or hidden",
+        ));
+    }
+
+    if issues.is_empty() {
+        Ok(record)
+    } else {
+        Err(issues)
+    }
+}
+
 /// Builds the production client from the environment. `HOMESERVER_URL` is
 /// required: `listing.sync` cannot work without it, and running without the
 /// sync path would silently re-open the dead-end this command exists to fix.
@@ -346,6 +540,86 @@ mod tests {
             registration_payload_from_record(&"y".repeat(52), "l", &auction_without_terms)
                 .is_none()
         );
+    }
+
+    fn drop_record_json(seller: &str) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "recordType": "drop",
+            "ownerPubky": seller,
+            "revision": 1,
+            "createdAt": "2026-08-19T21:00:00.000Z",
+            "updatedAt": "2026-08-19T21:00:00.000Z",
+            "dropId": "winter_drop",
+            "title": "Winter capsule",
+            "description": "Ten pairs, first come first served.",
+            "media": [{ "id": "m1", "contentHash": "f".repeat(64) }],
+            "format": "fcfs",
+            "startsAt": "2026-08-19T22:10:00.000Z",
+            "endsAt": "2026-08-19T23:10:00.000Z",
+            "listingIds": ["boots_01", "boots_02"],
+            "totalQuantity": 10,
+            "perBuyerLimit": 2,
+            "stockDisplay": "exact",
+        })
+    }
+
+    #[test]
+    fn validates_a_canonical_drop_record() {
+        let seller = "y".repeat(52);
+        let record = validated_drop_record(&seller, "winter_drop", &drop_record_json(&seller))
+            .expect("canonical record validates");
+        assert_eq!(record.revision, 1);
+        assert_eq!(record.listing_ids, vec!["boots_01", "boots_02"]);
+        assert_eq!(record.total_quantity, 10);
+        assert_eq!(record.per_buyer_limit, 2);
+    }
+
+    #[test]
+    fn drop_records_reject_unknown_fields_and_field_violations() {
+        let seller = "y".repeat(52);
+
+        let mut unknown = drop_record_json(&seller);
+        unknown["someFutureField"] = json!(true);
+        let issues =
+            validated_drop_record(&seller, "winter_drop", &unknown).expect_err("unknown rejected");
+        assert_eq!(issues[0].path, "record");
+
+        let mut wrong_owner = drop_record_json(&seller);
+        wrong_owner["ownerPubky"] = json!("o".repeat(52));
+        let issues = validated_drop_record(&seller, "winter_drop", &wrong_owner)
+            .expect_err("wrong owner rejected");
+        assert!(issues.iter().any(|i| i.path == "record.ownerPubky"));
+
+        let mut ends_before_start = drop_record_json(&seller);
+        ends_before_start["endsAt"] = json!("2026-08-19T22:00:00.000Z");
+        let issues = validated_drop_record(&seller, "winter_drop", &ends_before_start)
+            .expect_err("inverted schedule rejected");
+        assert!(issues.iter().any(|i| i.path == "record.endsAt"));
+
+        let mut over_limit = drop_record_json(&seller);
+        over_limit["totalQuantity"] = json!(1);
+        let issues = validated_drop_record(&seller, "winter_drop", &over_limit)
+            .expect_err("limit above total rejected");
+        assert!(issues.iter().any(|i| i.path == "record.perBuyerLimit"));
+
+        let mut duplicate_listings = drop_record_json(&seller);
+        duplicate_listings["listingIds"] = json!(["boots_01", "boots_01"]);
+        let issues = validated_drop_record(&seller, "winter_drop", &duplicate_listings)
+            .expect_err("duplicate listing ids rejected");
+        assert!(issues.iter().any(|i| i.path == "record.listingIds"));
+
+        let mut bad_display = drop_record_json(&seller);
+        bad_display["stockDisplay"] = json!("teaser");
+        let issues = validated_drop_record(&seller, "winter_drop", &bad_display)
+            .expect_err("unknown stock display rejected");
+        assert!(issues.iter().any(|i| i.path == "record.stockDisplay"));
+
+        // An open-ended schedule (no endsAt) is valid.
+        let mut open_ended = drop_record_json(&seller);
+        open_ended.as_object_mut().unwrap().remove("endsAt");
+        validated_drop_record(&seller, "winter_drop", &open_ended)
+            .expect("open-ended schedule validates");
     }
 
     #[test]

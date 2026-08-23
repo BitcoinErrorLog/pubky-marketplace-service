@@ -143,6 +143,23 @@ async fn dispatch(
             )
             .await
         }
+        CommandPayload::SyncDrop(payload) => {
+            crate::handlers::drops::sync(
+                tx,
+                actor,
+                command,
+                payload,
+                state.homeserver.as_deref(),
+                now,
+            )
+            .await
+        }
+        CommandPayload::CancelDrop(payload) => {
+            crate::handlers::drops::cancel(tx, actor, command, payload, now).await
+        }
+        CommandPayload::ReleaseDropListings(payload) => {
+            crate::handlers::drops::release_listings(tx, actor, command, payload, now).await
+        }
         CommandPayload::ReserveInventory(payload) => {
             crate::handlers::reserve_inventory::handle(tx, actor, command, payload, now).await
         }
@@ -171,6 +188,15 @@ async fn dispatch(
             crate::handlers::auction::close(tx, actor, command, payload, now).await
         }
         CommandPayload::AdvanceSandboxPayment(payload) => {
+            // Deployment boundary, not client courtesy: on a durable
+            // deployment the buyer must never be able to drive a payment to
+            // `paid` by command (ADR-0019 §7).
+            if !state.config.sandbox_payments_enabled {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::InvalidCommand,
+                    "Sandbox payment commands are disabled on this deployment.",
+                )));
+            }
             crate::handlers::payment::advance(tx, actor, command, payload, now).await
         }
         CommandPayload::RegisterLocks(payload) => {

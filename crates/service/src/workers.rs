@@ -46,6 +46,7 @@ use crate::queries::PAYMENT_COLUMNS;
 use crate::{expiry, AppState};
 
 pub const TASK_RESERVATION_EXPIRY: &str = "reservation_expiry";
+pub const TASK_DROP_TRANSITIONS: &str = "drop_transitions";
 pub const TASK_OFFER_EXPIRY: &str = "offer_expiry";
 pub const TASK_AUCTION_CLOSE: &str = "auction_close";
 pub const TASK_OUTBOX: &str = "outbox";
@@ -148,6 +149,44 @@ pub async fn expire_due_offers(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Res
     }
     tx.commit().await?;
     Ok(expired)
+}
+
+/// Applies the server-time drop transitions for drops no command has
+/// touched — announced → live at `starts_at`, live (or a fully elapsed
+/// announced window) → ended_closed at `ends_at` — through the same shared
+/// transition path gating uses, so projections and gating agree without
+/// traffic. Due rows are locked with `FOR UPDATE SKIP LOCKED`.
+pub async fn transition_due_drops(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let due: Vec<crate::model::DropRow> = sqlx::query_as(&format!(
+        "SELECT {columns} FROM drops \
+         WHERE (state = 'announced' AND starts_at <= $1) \
+         OR (state = 'live' AND ends_at IS NOT NULL AND ends_at <= $1) \
+         ORDER BY aggregate_id FOR UPDATE SKIP LOCKED",
+        columns = crate::handlers::drops::DROP_COLUMNS
+    ))
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut transitioned = 0u64;
+    for drop in due {
+        let from = drop.state.clone();
+        let after =
+            crate::handlers::drops::apply_time_transitions(&mut tx, drop, Uuid::new_v4(), now)
+                .await?;
+        if after.state != from {
+            tracing::info!(
+                aggregate_id = %after.aggregate_id,
+                from = %from,
+                to = %after.state,
+                "transitioned drop on server time"
+            );
+            transitioned += 1;
+        }
+    }
+    tx.commit().await?;
+    Ok(transitioned)
 }
 
 /// Authoritatively closes active auctions whose end time has passed on
@@ -912,6 +951,7 @@ pub async fn expire_due_payment_windows(pool: &PgPool, now: DateTime<Utc>) -> an
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct WorkerSummary {
     pub reservations_expired: u64,
+    pub drops_transitioned: u64,
     pub offers_expired: u64,
     pub auctions_closed: u64,
     pub outbox_delivered: u64,
@@ -942,6 +982,18 @@ pub async fn run_once(
     {
         summary.reservations_expired = expiry::expire_due_reservations(&state.pool, now).await?;
         release_lease(&state.pool, TASK_RESERVATION_EXPIRY, holder, now).await?;
+    }
+    if try_acquire_lease(
+        &state.pool,
+        TASK_DROP_TRANSITIONS,
+        holder,
+        now,
+        lease_seconds,
+    )
+    .await?
+    {
+        summary.drops_transitioned = transition_due_drops(&state.pool, now).await?;
+        release_lease(&state.pool, TASK_DROP_TRANSITIONS, holder, now).await?;
     }
     if try_acquire_lease(&state.pool, TASK_OFFER_EXPIRY, holder, now, lease_seconds).await? {
         summary.offers_expired = expire_due_offers(&state.pool, now).await?;
@@ -1176,6 +1228,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                     if summary != WorkerSummary::default() {
                         tracing::info!(
                             reservations_expired = summary.reservations_expired,
+                            drops_transitioned = summary.drops_transitioned,
                             offers_expired = summary.offers_expired,
                             auctions_closed = summary.auctions_closed,
                             outbox_delivered = summary.outbox_delivered,

@@ -427,6 +427,63 @@ pub fn payment_machine() -> AggregateMachine {
     }
 }
 
+/// Timed, limited releases (ADR-0026). The drop's state always derives from
+/// server time plus `paid_quantity`, never from the seller's record: gating
+/// commands apply lazy server-time transitions inside their own transaction,
+/// the sweep worker applies them for untouched drops, and `drop.cancel` is
+/// the seller's only direct state command. The `live → ended_sold_out`
+/// transition fires inside payment confirmation when `paid_quantity`
+/// reaches the total; every ended state refuses new holds and is terminal.
+/// `drop.release_listings` changes no drop state — it removes the ended
+/// drop's listing bindings from gating consideration.
+pub fn drop_machine() -> AggregateMachine {
+    AggregateMachine {
+        aggregate: "drop",
+        states: vec![
+            "announced",
+            "live",
+            "ended_sold_out",
+            "ended_closed",
+            "ended_cancelled",
+        ],
+        initial: "announced",
+        transitions: vec![
+            t(
+                "announced",
+                "live",
+                vec![
+                    Command("inventory.reserve"),
+                    Command("checkout.create"),
+                    Server("drop_start"),
+                ],
+            ),
+            // A drop whose whole window elapsed while it sat announced
+            // closes directly; the sweep worker never fabricates the
+            // intermediate live state.
+            t("announced", "ended_closed", vec![Server("drop_end")]),
+            t("live", "ended_closed", vec![Server("drop_end")]),
+            t(
+                "live",
+                "ended_sold_out",
+                vec![
+                    Command("payment.sandbox_advance"),
+                    Server("payment_confirmation"),
+                ],
+            ),
+            t("announced", "ended_cancelled", vec![Command("drop.cancel")]),
+            t("live", "ended_cancelled", vec![Command("drop.cancel")]),
+        ],
+        commands: vec![
+            "drop.sync",
+            "drop.cancel",
+            "drop.release_listings",
+            "inventory.reserve",
+            "checkout.create",
+        ],
+        unreachable_states: vec![],
+    }
+}
+
 /// Trust reports (task 3.5). Reports are created by any authenticated user;
 /// decisions are moderator-only and recorded append-only. The prototype
 /// engine stored reports with a single `open` state and no decisions; the
@@ -456,6 +513,7 @@ pub fn all_machines() -> Vec<AggregateMachine> {
         return_machine(),
         dispute_machine(),
         report_machine(),
+        drop_machine(),
     ]
 }
 
@@ -564,8 +622,71 @@ mod tests {
                 .as_array()
                 .expect("aggregates array")
                 .len(),
-            9
+            10
         );
+    }
+
+    #[test]
+    fn drop_machine_enforces_the_release_lifecycle() {
+        let machine = drop_machine();
+        assert!(can_transition(&machine, "announced", "live"));
+        assert!(can_transition(&machine, "announced", "ended_closed"));
+        assert!(can_transition(&machine, "announced", "ended_cancelled"));
+        assert!(can_transition(&machine, "live", "ended_closed"));
+        assert!(can_transition(&machine, "live", "ended_sold_out"));
+        assert!(can_transition(&machine, "live", "ended_cancelled"));
+        // Every ended state is terminal: a lapsed hold restocks the counters
+        // but nothing reopens the drop.
+        for ended in ["ended_sold_out", "ended_closed", "ended_cancelled"] {
+            assert!(!can_transition(&machine, ended, "live"), "{ended}");
+            assert!(!can_transition(&machine, ended, "announced"), "{ended}");
+        }
+        assert!(!can_transition(&machine, "announced", "ended_sold_out"));
+        assert!(!can_transition(&machine, "live", "announced"));
+    }
+
+    /// Walks the vendored contract JSON on disk and holds every declared
+    /// drop transition against `can_transition`, so the artifact the client
+    /// pins and the Rust table the service enforces cannot drift apart.
+    #[test]
+    fn contract_json_drop_transitions_match_can_transition() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/state-machines.json"
+        );
+        let on_disk: Value = serde_json::from_str(
+            &std::fs::read_to_string(path).expect("contracts/state-machines.json is readable"),
+        )
+        .expect("contract JSON parses");
+        let aggregates = on_disk["aggregates"].as_array().expect("aggregates array");
+        let drop = aggregates
+            .iter()
+            .find(|aggregate| aggregate["aggregate"] == "drop")
+            .expect("the drop aggregate is in the contract");
+        let machine = drop_machine();
+        assert_eq!(drop["initial"], "announced");
+        let transitions = drop["transitions"].as_array().expect("transitions array");
+        assert_eq!(transitions.len(), machine.transitions.len());
+        for transition in transitions {
+            let from = transition["from"].as_str().expect("from state");
+            let to = transition["to"].as_str().expect("to state");
+            assert!(
+                can_transition(&machine, from, to),
+                "contract declares {from} -> {to} but the Rust table refuses it"
+            );
+        }
+        // And the reverse: every Rust transition is in the JSON.
+        for transition in &machine.transitions {
+            assert!(
+                transitions
+                    .iter()
+                    .any(|declared| declared["from"] == transition.from
+                        && declared["to"] == transition.to),
+                "Rust table declares {} -> {} but the contract omits it",
+                transition.from,
+                transition.to
+            );
+        }
     }
 
     /// Fails when `contracts/state-machines.json` is stale. Regenerate with:

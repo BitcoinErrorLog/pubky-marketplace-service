@@ -37,6 +37,14 @@ pub struct Config {
     /// disputes: the dispute queue, disputed-order projections, and audited
     /// evidence reads) — it grants no other authority.
     pub moderator_pubkys: Vec<String>,
+    /// Whether `payment.sandbox_advance` is accepted at all
+    /// (`SANDBOX_PAYMENTS_ENABLED`, default false). The sandbox adapter lets
+    /// the buyer drive payment transitions by explicit command; on a
+    /// deployment handling real orders that is a self-serve path to `paid`
+    /// without money moving, so it must be opt-in per deployment. The
+    /// client-side transport allowlist is a UX courtesy, not a boundary —
+    /// this flag is the boundary.
+    pub sandbox_payments_enabled: bool,
 }
 
 impl Config {
@@ -74,6 +82,7 @@ impl Config {
         }
         let moderator_pubkys =
             parse_moderator_pubkys(&std::env::var("MODERATOR_PUBKYS").unwrap_or_default())?;
+        let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         Ok(Self {
             bind_addr,
             database_url,
@@ -86,6 +95,7 @@ impl Config {
             locks_poll_seconds,
             paykit_poll_seconds,
             moderator_pubkys,
+            sandbox_payments_enabled,
         })
     }
 
@@ -107,6 +117,7 @@ impl Config {
             locks_poll_seconds: 30,
             paykit_poll_seconds: 15,
             moderator_pubkys: Vec::new(),
+            sandbox_payments_enabled: true,
         }
     }
 }
@@ -134,6 +145,17 @@ fn env_i64(name: &str, default: i64) -> anyhow::Result<i64> {
         Ok(value) => value
             .parse()
             .map_err(|_| anyhow::anyhow!("{name} must be an integer")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => match value.trim() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(anyhow::anyhow!("{name} must be true, false, 1, or 0")),
+        },
         Err(_) => Ok(default),
     }
 }

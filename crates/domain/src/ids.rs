@@ -4,6 +4,10 @@ pub fn listing_aggregate_id(seller_pubky: &str, listing_id: &str) -> String {
     format!("listing:{seller_pubky}_{listing_id}")
 }
 
+pub fn drop_aggregate_id(seller_pubky: &str, drop_id: &str) -> String {
+    format!("drop:{seller_pubky}_{drop_id}")
+}
+
 pub fn checkout_aggregate_id(command_id: Uuid) -> String {
     format!("checkout:{command_id}")
 }

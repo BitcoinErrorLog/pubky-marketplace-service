@@ -524,3 +524,48 @@ async fn checkout_snapshots_the_variant_onto_the_order_line(pool: PgPool) {
     assert!(plain_line.get("variant_id").is_none());
     assert!(plain_line.get("variant_options").is_none());
 }
+
+// Deployment boundary: `payment.sandbox_advance` must be rejected outright
+// when SANDBOX_PAYMENTS_ENABLED is off (the production default). The
+// client-side transport allowlist is not a security boundary; this is.
+#[sqlx::test]
+async fn rejects_sandbox_advance_when_sandbox_payments_disabled(pool: PgPool) {
+    let mut config = marketplace_service::config::Config::for_tests();
+    config.sandbox_payments_enabled = false;
+    let app = common::test_app_with_config(pool, config).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "register failed: {body}");
+    let (status, body) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id present")
+        .to_string();
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::payment_command(&payment_id, 1, "confirmed", 1, 1_050),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("Sandbox payment commands are disabled on this deployment.")
+    );
+
+    // Nothing advanced: the payment is untouched and no receipt exists.
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM payments WHERE id = $1::uuid")
+        .bind(&payment_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("payment row exists");
+    assert_eq!(state, "awaiting_entitlement");
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
+}

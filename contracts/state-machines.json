@@ -818,6 +818,99 @@
         "trust.decide"
       ],
       "unreachable_states": []
+    },
+    {
+      "aggregate": "drop",
+      "states": [
+        "announced",
+        "live",
+        "ended_sold_out",
+        "ended_closed",
+        "ended_cancelled"
+      ],
+      "initial": "announced",
+      "transitions": [
+        {
+          "from": "announced",
+          "to": "live",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "inventory.reserve"
+            },
+            {
+              "trigger": "command",
+              "name": "checkout.create"
+            },
+            {
+              "trigger": "server",
+              "name": "drop_start"
+            }
+          ]
+        },
+        {
+          "from": "announced",
+          "to": "ended_closed",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "drop_end"
+            }
+          ]
+        },
+        {
+          "from": "live",
+          "to": "ended_closed",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "drop_end"
+            }
+          ]
+        },
+        {
+          "from": "live",
+          "to": "ended_sold_out",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "payment.sandbox_advance"
+            },
+            {
+              "trigger": "server",
+              "name": "payment_confirmation"
+            }
+          ]
+        },
+        {
+          "from": "announced",
+          "to": "ended_cancelled",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "drop.cancel"
+            }
+          ]
+        },
+        {
+          "from": "live",
+          "to": "ended_cancelled",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "drop.cancel"
+            }
+          ]
+        }
+      ],
+      "commands": [
+        "drop.sync",
+        "drop.cancel",
+        "drop.release_listings",
+        "inventory.reserve",
+        "checkout.create"
+      ],
+      "unreachable_states": []
     }
   ]
 }

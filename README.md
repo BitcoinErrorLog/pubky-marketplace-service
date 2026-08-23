@@ -70,6 +70,7 @@ Migrations in `crates/service/migrations/` are applied automatically at boot
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests; its pubky-formatted public key is paykit-server's `marketplace.trusted_public_key` |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
+| `SANDBOX_PAYMENTS_ENABLED` | `false` | accept `payment.sandbox_advance` at all; must stay `false` on any deployment handling real orders |
 
 The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
 closed at startup** on a partial configuration (a URL without keys, or keys
@@ -77,6 +78,16 @@ without a URL), rather than running with verification silently disabled or
 bearer material unprotected. With none of them set the deployment is
 sandbox-only: `payment.register_locks` is refused and the lifecycle poller
 is not scheduled.
+
+`SANDBOX_PAYMENTS_ENABLED` is the server-side boundary for the sandbox
+payment adapter. Every checkout starts on the `sandbox` adapter until a real
+method is bound, and `payment.sandbox_advance` lets the buyer drive that
+payment to `paid` by command — which on a durable deployment would be a
+self-serve paid state with no money moving. The client's transport
+allowlist refuses to send the command to the durable service, but that is a
+UX courtesy, not a boundary; with the flag at its default the service
+rejects the command outright (`INVALID_COMMAND`, 422) regardless of what
+any client sends.
 
 The two `ATTESTOR_*` secrets are likewise all-or-nothing (fail closed at
 startup on a partial pair). With neither set, reviews still work but no
@@ -96,12 +107,74 @@ reputation plan (pubky-app `docs/ecommerce/trust-reputation-plan.md`) and is
 not part of this service yet — the rows accumulate here as the publisher's
 ground truth.
 
+With an attestor configured, participants can also fetch a **receipt
+attestation** (`GET /v1/receipts/{receipt_id}/attestation`,
+participant-scoped exactly like `GET /v1/receipts/{id}`; without an
+attestor the fetch is 404, like the review-attestation re-fetch): a compact
+JWS (`alg: EdDSA`, `typ: pubky-order-receipt+v1`) signed by the attestor,
+attesting the paid order's facts so the portable receipt document a buyer
+or seller publishes on their own homeserver stays verifiable after this
+operator disappears ("credible exit for orders"). The response is
+`{ "receipt_attestation": { "jws", "claims" } }`. Claims, in normative
+order:
+
+| Claim | Value |
+| --- | --- |
+| `v` | `1` |
+| `iss` | the attestor pubky (z-base-32; decodes to the Ed25519 verification key) |
+| `buyer` | the order's buyer pubky |
+| `seller` | the order's seller pubky |
+| `order` | the order UUID, lowercase hyphenated |
+| `receipt` | the receipt UUID, lowercase hyphenated |
+| `total_minor` | the order's total in minor units |
+| `currency` | the order's currency |
+| `exponent` | the order's currency exponent |
+| `paid_at` | the receipt's stored creation instant as the canonical wire timestamp (RFC 3339, milliseconds, `Z`) — string-equal to `issued_at` on `GET /v1/receipts/{id}` |
+| `iat` | the receipt's stored creation instant as epoch seconds |
+
+Every claim derives from stored rows (the receipt's creation instant, the
+order's totals) — never from the current time — so the JWS is
+deterministic: repeated fetches by either participant return the
+byte-identical token, and nothing is stored; the endpoint re-signs on
+demand.
+
+Participants in a paid DROP order (see Drops below) can additionally fetch
+an **edition attestation**
+(`GET /v1/receipts/{receipt_id}/edition-attestation`): a compact JWS
+(`alg: EdDSA`, `typ: pubky-drop-edition+v1`) attesting which numbered
+edition of the drop the order received. The response is
+`{ "edition_attestation": { "jws", "claims" } }`. Absent receipts, foreign
+receipts, non-drop orders (no `drop_aggregate_id`/`edition` on the order),
+and attestor-less deployments are all 404 with the same body as
+`GET /v1/receipts/{id}`, indistinguishably. Claims, in normative order (the
+specs-fork verifier for `pubky-drop-edition+v1` checks the serialized
+payload byte-for-byte, so the order is the wire contract):
+
+| Claim | Value |
+| --- | --- |
+| `v` | `1` |
+| `iss` | the attestor pubky (z-base-32; decodes to the Ed25519 verification key) |
+| `buyer` | the order's buyer pubky |
+| `seller` | the drop owner's pubky (the order's seller) |
+| `drop` | the DROP ID (the seller's record identifier, parsed from the aggregate id's `drop:{seller}_{drop_id}` shape) — never the aggregate id |
+| `edition` | the order's edition, 1-based |
+| `of` | the drop's `total_quantity` |
+| `receipt` | the receipt UUID, lowercase hyphenated |
+| `iat` | the receipt's stored creation instant as epoch seconds — deterministic, never wall clock |
+
+Like the receipt attestation, every claim derives from stored rows, so
+repeated fetches by either participant return the byte-identical token and
+nothing is stored.
+
 Endpoints: `GET /health`, `GET /ready` (checks the database),
 `POST /v1/auth/sessions`,
 `POST /v1/commands` (Bearer session required), `GET /v1/reports`
-(Bearer session required; role-scoped — see Moderation below), and the
-role-scoped read projections (Bearer session required — see Read
-projections below): `GET /v1/listings/{aggregate_id}`, `GET /v1/offers`,
+(Bearer session required; role-scoped — see Moderation below),
+the public drop projection `GET /v0/drops/{seller_pubky}/{drop_id}`
+(no session — see Drops below), and the role-scoped read projections
+(Bearer session required — see Read projections below):
+`GET /v1/listings/{aggregate_id}`, `GET /v1/drops/{aggregate_id}`,
+`GET /v1/drops/{aggregate_id}/me`, `GET /v1/offers`,
 `GET /v1/orders`, `GET /v1/orders/{id}`, `GET /v1/orders/{id}/evidence`,
 `GET /v1/disputes`, `GET /v1/payments/{id}`, `GET /v1/receipts/{id}`, and
 `GET /v1/notifications`.
@@ -151,7 +224,8 @@ envelope; unknown fields and unsupported versions are rejected
 - Failures are not stored: retrying a rejected command re-executes it
   (matching the prototype engine).
 
-Commands implemented: `listing.register`, `inventory.reserve`,
+Commands implemented: `listing.register`, `drop.sync`, `drop.cancel`,
+`drop.release_listings` (see Drops), `inventory.reserve`,
 `checkout.create`, `offer.create`, `offer.counter`, `offer.accept`,
 `offer.reject`, `offer.withdraw`, `auction.place_bid`, `auction.close`,
 `payment.sandbox_advance`, `payment.register_locks`,
@@ -253,6 +327,65 @@ request, to the buyer on approval — `order_shipped`, `order_delivered`,
 `refund_recorded`, `dispute_updated` to both parties on resolution,
 `review_received`). `dispute.evidence` and `review.update` emit none — the
 prototype had no counterpart to copy.
+
+## Drops (ADR-0026)
+
+Timed, limited releases. A drop is registered by the convergent `drop.sync`
+command from the seller-signed homeserver record, gates `inventory.reserve`
+and `checkout.create` on its bound listings (schedule, remaining stock, and
+the per-buyer cap, all inside the hold's transaction), and always derives
+its state from server time plus the paid count: `announced` → `live` →
+`ended_closed` / `ended_sold_out` / `ended_cancelled` (all ends terminal).
+
+**Single-line drop checkout.** Editions map one order to one unit, so a
+checkout containing a drop-bound line must contain EXACTLY that one line
+with quantity 1. Anything else is refused with 422 `INVALID_COMMAND` and
+the pinned copy `A drop order is one unit of one listing per checkout.`
+
+**Editions.** The exactly-once payment confirmation path (sandbox command,
+Locks worker, fiat verify all converge there) increments the drop's
+`paid_quantity` under the drop row lock; the new value IS the order's
+edition — 1-based and gapless over paid orders, stored on
+`orders.edition` and serialized on order projections alongside
+`drop_aggregate_id`. When `paid_quantity` reaches `total_quantity` the drop
+transitions to the terminal `ended_sold_out` and the seller receives a
+`drop_sold_out` notification. Participants can fetch the signed edition
+attestation for the order's receipt (see the claim table above).
+
+**`drop.release_listings`** (seller only, `expected_revision`
+compare-and-swap): allowed only from the three ended states; from
+`announced`/`live` it is refused with 409 `INVALID_STATE` and the pinned
+copy `Listings release only after the drop ends.` Releasing removes the
+drop's listing bindings from gating consideration entirely
+(`drop_listings.released`), so the listings sell again as ordinary open
+inventory — until then an ended binding keeps refusing checkout so a
+concluded drop's listing never quietly falls back to open sale.
+
+**Public projection** — `GET /v0/drops/{seller_pubky}/{drop_id}`, no
+session: `{ "drop": { seller_pubky, drop_id, aggregate_id, state, format,
+starts_at, ends_at, stock_display, total_quantity, per_buyer_limit,
+remaining, remaining_band, revision, server_time } }`. `server_time` is the
+service clock now, in the canonical wire timestamp format — clients correct
+countdowns from it. The read applies the same lazy server-time transitions
+gating uses (inside a transaction with the drop row locked), so a public
+read never shows `announced` after `startsAt`. Stock-display redaction is
+SERVER-side; an exact count never leaves the service under bands/hidden:
+
+| `stock_display` | `remaining` | `remaining_band` |
+| --- | --- | --- |
+| `exact` | the exact remaining count | `null` |
+| `bands` | `null` | `plenty` (> 25% of total), `low` (≤ 25%), `last_few` (≤ 5%, minimum threshold one unit) |
+| `hidden` | `null` | `null` |
+
+**Seller projection** — `GET /v1/drops/{aggregate_id}` (Bearer session):
+the seller only; absent and foreign drops are both 404. Full facts: exact
+remaining, `paid_quantity`, distinct buyer count, state, schedule, caps,
+`stock_display`, listing ids, revision, `server_time`.
+
+**Buyer ready-check** — `GET /v1/drops/{aggregate_id}/me` (Bearer session):
+any authenticated user reads their own per-drop counters:
+`{ "purchased", "per_buyer_limit", "remaining_allowance" }` from
+`drop_purchases` (purchased is zero without a counter row).
 
 ## Locks verification (task 4.5)
 
@@ -381,6 +514,8 @@ orders, and payments).
 | Endpoint | Scope | Body |
 | --- | --- | --- |
 | `GET /v1/listings/{aggregate_id}` | any authenticated user (public catalog data) | the listing/inventory projection: quantities, state, `server_revision`, unit price, sale format, and the auction state when present |
+| `GET /v1/drops/{aggregate_id}` | the drop's seller only; absent and foreign drops are both 404 | the seller's full drop facts: exact remaining, `paid_quantity`, distinct buyer count, state, schedule, caps, `stock_display`, listing ids, revision, `server_time` |
+| `GET /v1/drops/{aggregate_id}/me` | any authenticated user (their own counters only) | `{ "purchased", "per_buyer_limit", "remaining_allowance" }` from the caller's per-drop purchase row (zeros without one) |
 | `GET /v1/offers` | offers where the caller is buyer or seller | `{ "offers": [...] }` |
 | `GET /v1/orders` | orders where the caller is buyer or seller | `{ "orders": [...] }`, each order with its embedded `payment` projection plus the `shipment`, `return_request`, `dispute`, `external_refund`, and `reviews` sub-objects (client `orderSchema` field names) |
 | `GET /v1/orders/{id}` | participants; also configured moderators, but only when the order is under (or was previously under) dispute | one order with the same embedded projections |

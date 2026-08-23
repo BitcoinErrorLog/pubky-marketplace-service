@@ -79,6 +79,37 @@ pub async fn handle(
     let currency = first.unit_price_currency.clone();
     let exponent = first.unit_price_exponent;
 
+    // Drop gating (ADR-0026). Bindings are looked up — and the bound drop
+    // row-locked — BEFORE any listing row lock or order insert, the lock
+    // order every gating and release path shares. Cart shape: editions map
+    // one order to one unit, so a checkout containing a drop-bound line
+    // must be exactly that one line, holding one unit.
+    let mut bound_drop: Option<crate::model::DropRow> = None;
+    for (_, listing) in &resolved {
+        if let Some(drop) =
+            crate::handlers::drops::lock_bound_drop(tx, &listing.seller_pubky, &listing.listing_id)
+                .await?
+        {
+            bound_drop = Some(drop);
+            break;
+        }
+    }
+    let mut drop_aggregate_id: Option<String> = None;
+    if let Some(drop) = bound_drop {
+        if resolved.len() != 1 || resolved[0].0.quantity != 1 {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidCommand,
+                crate::handlers::drops::DROP_SINGLE_LINE,
+            )));
+        }
+        match crate::handlers::drops::enforce_drop_gate(tx, drop, actor, 1, command.command_id, now)
+            .await?
+        {
+            Ok(drop) => drop_aggregate_id = Some(drop.aggregate_id),
+            Err(failure) => return Ok(Err(failure)),
+        }
+    }
+
     // Group checkout lines by seller, preserving line order.
     let mut seller_groups: Vec<(String, Vec<usize>)> = Vec::new();
     for (index, (_, listing)) in resolved.iter().enumerate() {
@@ -144,6 +175,7 @@ pub async fn handle(
         let order = OrderRow {
             id: order_id,
             auction_aggregate_id: None,
+            drop_aggregate_id: drop_aggregate_id.clone(),
             buyer_pubky: actor.to_string(),
             seller_pubky: seller_pubky.clone(),
             revision: 1,
@@ -159,6 +191,7 @@ pub async fn handle(
             guarantee_policy_version: payload.guarantee_policy_version as i32,
             payment_id,
             receipt_id: None,
+            edition: None,
             cancellation_reason: None,
             shipment: None,
             return_request: None,
@@ -175,14 +208,16 @@ pub async fn handle(
             updated_at: now,
         };
         sqlx::query(
-            "INSERT INTO orders (id, checkout_command_id, buyer_pubky, seller_pubky, revision, \
-             state, lines, delivery_address, subtotal_minor, shipping_minor, tax_minor, \
-             total_minor, currency, exponent, guarantee_policy_version, payment_id, \
-             created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17)",
+            "INSERT INTO orders (id, checkout_command_id, drop_aggregate_id, buyer_pubky, \
+             seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
+             shipping_minor, tax_minor, total_minor, currency, exponent, \
+             guarantee_policy_version, payment_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
+             $18, $18)",
         )
         .bind(order.id)
         .bind(command.command_id)
+        .bind(&order.drop_aggregate_id)
         .bind(&order.buyer_pubky)
         .bind(&order.seller_pubky)
         .bind(order.revision)

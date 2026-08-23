@@ -34,25 +34,31 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use chrono::{DateTime, Utc};
 use marketplace_domain::ErrorCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::auth::Actor;
-use crate::handlers::{offers::OFFER_COLUMNS, LISTING_COLUMNS, REVIEW_COLUMNS};
+use crate::clock::format_timestamp;
+use crate::handlers::{
+    drops::DROP_COLUMNS, offers::OFFER_COLUMNS, LISTING_COLUMNS, REVIEW_COLUMNS,
+};
 use crate::model::{
-    DisputeEvidenceRow, ListingRow, NotificationRow, OfferRow, OrderRow, PaymentRow, ReceiptRow,
-    ReviewRow,
+    DisputeEvidenceRow, DropRow, ListingRow, NotificationRow, OfferRow, OrderRow, PaymentRow,
+    ReceiptRow, ReviewRow,
 };
 use crate::AppState;
 
 pub const DEFAULT_LIMIT: i64 = 50;
 pub const MAX_LIMIT: i64 = 200;
 
-pub const ORDER_COLUMNS: &str = "id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
+pub const ORDER_COLUMNS: &str =
+    "id, auction_aggregate_id, drop_aggregate_id, buyer_pubky, seller_pubky, revision, \
      state, lines, delivery_address, subtotal_minor, shipping_minor, tax_minor, total_minor, \
-     currency, exponent, guarantee_policy_version, payment_id, receipt_id, cancellation_reason, \
+     currency, exponent, guarantee_policy_version, payment_id, receipt_id, edition, \
+     cancellation_reason, \
      shipment, return_request, dispute, external_refund, payment_method, fiat_checkout_url, \
      payment_reported_at, fiat_transaction_ref, paykit_request_reference, paykit_request_state, \
      paykit_last_checked_at, created_at, updated_at";
@@ -380,6 +386,306 @@ pub async fn get_receipt(
         Ok(Some(receipt)) => (StatusCode::OK, Json(receipt.view())).into_response(),
         Ok(None) => query_error(ErrorCode::NotFound, "The receipt was not found."),
         Err(error) => internal_error("receipt", &error),
+    }
+}
+
+/// One row loaded for receipt attestation issuance: the receipt's identity
+/// and stored creation instant plus its order's participants and totals —
+/// every input the claims derive from.
+type ReceiptAttestationRow = (Uuid, Uuid, DateTime<Utc>, String, String, i64, String, i32);
+
+/// `GET /v1/receipts/{id}/attestation`: a compact JWS signed by the
+/// attestor, attesting the receipt's facts (participants, order and receipt
+/// ids, totals, `paid_at`) so the portable receipt document a buyer or
+/// seller publishes on their own homeserver stays verifiable after this
+/// operator disappears ("credible exit for orders"). Readable by exactly
+/// the order's buyer and seller; absent and foreign receipts are both 404,
+/// exactly like `GET /v1/receipts/{id}`.
+///
+/// Every claim derives from stored rows (the receipt's creation instant,
+/// the order's totals) — never from the current time — so the JWS is
+/// deterministic: repeated calls return the byte-identical token and
+/// nothing is stored. Without a configured attestor the fetch is 404, the
+/// same observable outcome the review-attestation re-fetch has on an
+/// attestor-less deployment.
+pub async fn get_receipt_attestation(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let row: Result<Option<ReceiptAttestationRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT r.id, r.order_id, r.issued_at, o.buyer_pubky, o.seller_pubky, \
+         o.total_minor, o.currency, o.exponent \
+         FROM receipts r JOIN orders o ON o.id = r.order_id \
+         WHERE r.id = $1 AND (o.buyer_pubky = $2 OR o.seller_pubky = $2)",
+    )
+    .bind(id)
+    .bind(&actor.0)
+    .fetch_optional(&state.pool)
+    .await;
+    let (receipt_id, order_id, issued_at, buyer, seller, total_minor, currency, exponent) =
+        match row {
+            Ok(Some(row)) => row,
+            Ok(None) => return query_error(ErrorCode::NotFound, "The receipt was not found."),
+            Err(error) => return internal_error("receipt attestation", &error),
+        };
+    let Some(attestor) = state.attestor.as_ref() else {
+        return query_error(
+            ErrorCode::NotFound,
+            "The receipt attestation was not found.",
+        );
+    };
+    let issued = attestor.issue_receipt_attestation(
+        order_id,
+        receipt_id,
+        &buyer,
+        &seller,
+        total_minor,
+        &currency,
+        i64::from(exponent),
+        issued_at,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "receipt_attestation": { "jws": issued.jws, "claims": issued.claims },
+        })),
+    )
+        .into_response()
+}
+
+/// One row loaded for drop edition attestation issuance: the receipt's
+/// identity and stored creation instant, the order's participants and
+/// edition, and the drop's aggregate id and total — every input the claims
+/// derive from. The `drops` join means only drop-stamped orders match.
+type EditionAttestationRow = (Uuid, DateTime<Utc>, String, String, i32, String, i64);
+
+/// `GET /v1/receipts/{id}/edition-attestation`: a compact JWS signed by the
+/// attestor, attesting which numbered edition of a drop this paid order
+/// received (`edition` of `of`). Mirrors `GET /v1/receipts/{id}/attestation`
+/// exactly: readable by the order's buyer and seller only, and every claim
+/// derives from stored rows (the receipt's creation instant, the order's
+/// edition, the drop's total) — never from the current time — so the JWS is
+/// deterministic and nothing is stored.
+///
+/// Absent receipts, foreign receipts, non-drop orders (no
+/// `drop_aggregate_id`/`edition`), and attestor-less deployments are all
+/// 404 with the same body as `GET /v1/receipts/{id}`, indistinguishably.
+pub async fn get_edition_attestation(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let row: Result<Option<EditionAttestationRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT r.id, r.issued_at, o.buyer_pubky, o.seller_pubky, o.edition, \
+         o.drop_aggregate_id, d.total_quantity \
+         FROM receipts r \
+         JOIN orders o ON o.id = r.order_id \
+         JOIN drops d ON d.aggregate_id = o.drop_aggregate_id \
+         WHERE r.id = $1 AND (o.buyer_pubky = $2 OR o.seller_pubky = $2) \
+           AND o.edition IS NOT NULL",
+    )
+    .bind(id)
+    .bind(&actor.0)
+    .fetch_optional(&state.pool)
+    .await;
+    let (receipt_id, issued_at, buyer, seller, edition, drop_aggregate_id, total_quantity) =
+        match row {
+            Ok(Some(row)) => row,
+            Ok(None) => return query_error(ErrorCode::NotFound, "The receipt was not found."),
+            Err(error) => return internal_error("edition attestation", &error),
+        };
+    let Some(attestor) = state.attestor.as_ref() else {
+        return query_error(ErrorCode::NotFound, "The receipt was not found.");
+    };
+    // The claim carries the DROP ID (the seller's record identifier), parsed
+    // from the aggregate id's `drop:{seller}_{drop_id}` shape; the seller in
+    // that shape is the drop owner, which is the order's seller.
+    let drop_id = drop_aggregate_id
+        .strip_prefix(&format!("drop:{seller}_"))
+        .expect("drop aggregate ids have the drop:{seller}_{drop_id} shape");
+    let issued = attestor.issue_drop_edition_attestation(
+        receipt_id,
+        &buyer,
+        &seller,
+        drop_id,
+        i64::from(edition),
+        total_quantity,
+        issued_at,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "edition_attestation": { "jws": issued.jws, "claims": issued.claims },
+        })),
+    )
+        .into_response()
+}
+
+/// The banded remaining-stock disclosure for `stock_display = 'bands'`:
+/// `last_few` at or below 5% of the total (with a minimum threshold of one
+/// unit, so small drops still reach the band), `low` at or below 25%, and
+/// `plenty` above that. Exact integer comparisons — no floating point.
+fn remaining_band(remaining: i64, total: i64) -> &'static str {
+    if remaining <= (total / 20).max(1) {
+        "last_few"
+    } else if remaining * 4 <= total {
+        "low"
+    } else {
+        "plenty"
+    }
+}
+
+/// `GET /v0/drops/{seller_pubky}/{drop_id}`: the public drop projection —
+/// no session, like the public seller payment-config route. Stock-display
+/// redaction is applied SERVER-side: `exact` exposes `remaining`, `bands`
+/// exposes only `remaining_band` ([`remaining_band`]), `hidden` exposes
+/// neither — an exact count never leaves the service under bands/hidden.
+///
+/// The read applies the same lazy server-time transitions gating uses,
+/// inside a transaction with the drop row locked, so a public read never
+/// shows `announced` after `starts_at`. `server_time` is the service clock
+/// now, in the canonical wire timestamp format — clients correct their
+/// countdowns from it instead of trusting local clocks.
+pub async fn get_public_drop(
+    State(state): State<AppState>,
+    Path((seller_pubky, drop_id)): Path<(String, String)>,
+) -> Response {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => return internal_error("public drop", &error),
+    };
+    let drop: Option<DropRow> = match sqlx::query_as(&format!(
+        "SELECT {DROP_COLUMNS} FROM drops \
+         WHERE seller_pubky = $1 AND drop_id = $2 FOR UPDATE"
+    ))
+    .bind(&seller_pubky)
+    .bind(&drop_id)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(drop) => drop,
+        Err(error) => return internal_error("public drop", &error),
+    };
+    let Some(drop) = drop else {
+        return query_error(ErrorCode::NotFound, "The drop was not found.");
+    };
+    let now = state.clock.now();
+    let drop =
+        match crate::handlers::drops::apply_time_transitions(&mut tx, drop, Uuid::new_v4(), now)
+            .await
+        {
+            Ok(drop) => drop,
+            Err(error) => return internal_error("public drop", &error),
+        };
+    if let Err(error) = tx.commit().await {
+        return internal_error("public drop", &error);
+    }
+
+    let (remaining, band) = match drop.stock_display.as_str() {
+        "exact" => (json!(drop.remaining_quantity), Value::Null),
+        "bands" => (
+            Value::Null,
+            json!(remaining_band(drop.remaining_quantity, drop.total_quantity)),
+        ),
+        _ => (Value::Null, Value::Null),
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "drop": {
+                "seller_pubky": drop.seller_pubky,
+                "drop_id": drop.drop_id,
+                "aggregate_id": drop.aggregate_id,
+                "state": drop.state,
+                "format": drop.format,
+                "starts_at": format_timestamp(drop.starts_at),
+                "ends_at": drop.ends_at.map(format_timestamp),
+                "stock_display": drop.stock_display,
+                "total_quantity": drop.total_quantity,
+                "per_buyer_limit": drop.per_buyer_limit,
+                "remaining": remaining,
+                "remaining_band": band,
+                "revision": drop.revision,
+                "server_time": format_timestamp(now),
+            },
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /v1/drops/{aggregate_id}`: the seller's own drop projection — the
+/// full facts (exact remaining, paid count, distinct buyer count, schedule,
+/// caps, listing ids, revision) plus `server_time`. Scoped to exactly the
+/// seller: absent and foreign drops are both 404, like the other
+/// single-object endpoints, so the read does not reveal whether an
+/// aggregate exists.
+pub async fn get_drop(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(aggregate_id): Path<String>,
+) -> Response {
+    let drop: Result<Option<DropRow>, sqlx::Error> = sqlx::query_as(&format!(
+        "SELECT {DROP_COLUMNS} FROM drops WHERE aggregate_id = $1 AND seller_pubky = $2"
+    ))
+    .bind(&aggregate_id)
+    .bind(&actor.0)
+    .fetch_optional(&state.pool)
+    .await;
+    let drop = match drop {
+        Ok(Some(drop)) => drop,
+        Ok(None) => return query_error(ErrorCode::NotFound, "The drop was not found."),
+        Err(error) => return internal_error("drop", &error),
+    };
+    // Buyers currently accounted at least one held or paid unit; a buyer
+    // whose holds all lapsed no longer counts.
+    let buyer_count: Result<(i64,), sqlx::Error> = sqlx::query_as(
+        "SELECT COUNT(*) FROM drop_purchases WHERE drop_aggregate_id = $1 AND quantity > 0",
+    )
+    .bind(&aggregate_id)
+    .fetch_one(&state.pool)
+    .await;
+    let (buyer_count,) = match buyer_count {
+        Ok(count) => count,
+        Err(error) => return internal_error("drop buyers", &error),
+    };
+    let mut view = drop.view();
+    view["buyer_count"] = json!(buyer_count);
+    view["server_time"] = json!(format_timestamp(state.clock.now()));
+    (StatusCode::OK, Json(json!({ "drop": view }))).into_response()
+}
+
+/// `GET /v1/drops/{aggregate_id}/me`: the buyer ready-check — any
+/// authenticated user reads their own per-drop counters: units currently
+/// held or paid (`purchased`), the drop's per-buyer limit, and the
+/// allowance left. Zeros purchased when the buyer has no counter row.
+pub async fn get_drop_ready_check(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(aggregate_id): Path<String>,
+) -> Response {
+    let row: Result<Option<(i64, i64)>, sqlx::Error> = sqlx::query_as(
+        "SELECT d.per_buyer_limit, COALESCE(p.quantity, 0)::BIGINT FROM drops d \
+         LEFT JOIN drop_purchases p \
+           ON p.drop_aggregate_id = d.aggregate_id AND p.buyer_pubky = $2 \
+         WHERE d.aggregate_id = $1",
+    )
+    .bind(&aggregate_id)
+    .bind(&actor.0)
+    .fetch_optional(&state.pool)
+    .await;
+    match row {
+        Ok(Some((per_buyer_limit, purchased))) => (
+            StatusCode::OK,
+            Json(json!({
+                "purchased": purchased,
+                "per_buyer_limit": per_buyer_limit,
+                "remaining_allowance": per_buyer_limit - purchased,
+            })),
+        )
+            .into_response(),
+        Ok(None) => query_error(ErrorCode::NotFound, "The drop was not found."),
+        Err(error) => internal_error("drop ready-check", &error),
     }
 }
 

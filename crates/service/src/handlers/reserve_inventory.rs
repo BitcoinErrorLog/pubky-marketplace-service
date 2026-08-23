@@ -44,6 +44,36 @@ pub async fn handle(
         )));
     }
 
+    // Drop gating: the drop row lock is taken before the listing row lock
+    // (the CAS below), the same order every gating and release path uses.
+    let mut drop_aggregate_id: Option<String> = None;
+    if let Some(bound) =
+        crate::handlers::drops::lock_bound_drop(tx, &listing.seller_pubky, &listing.listing_id)
+            .await?
+    {
+        // A reserve against a drop-bound listing holds exactly one unit,
+        // the same v1 shape rule checkout enforces per line.
+        if payload.quantity != 1 {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidCommand,
+                "A drop-bound listing can be reserved one unit at a time.",
+            )));
+        }
+        match crate::handlers::drops::enforce_drop_gate(
+            tx,
+            bound,
+            actor,
+            1,
+            command.command_id,
+            now,
+        )
+        .await?
+        {
+            Ok(drop) => drop_aggregate_id = Some(drop.aggregate_id),
+            Err(failure) => return Ok(Err(failure)),
+        }
+    }
+
     let new_state = if listing.available_quantity == payload.quantity {
         "reserved"
     } else {
@@ -85,7 +115,8 @@ pub async fn handle(
     let expires_at = now + chrono::Duration::seconds(payload.reservation_ttl_seconds);
     sqlx::query(
         "INSERT INTO reservations (id, listing_aggregate_id, buyer_pubky, quantity, status, \
-         expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, 'active', $5, $6, $6)",
+         expires_at, created_at, updated_at, drop_aggregate_id) \
+         VALUES ($1, $2, $3, $4, 'active', $5, $6, $6, $7)",
     )
     .bind(command.command_id)
     .bind(&command.aggregate_id)
@@ -93,6 +124,7 @@ pub async fn handle(
     .bind(payload.quantity)
     .bind(expires_at)
     .bind(now)
+    .bind(&drop_aggregate_id)
     .execute(&mut **tx)
     .await?;
     let reservation = ReservationRow {

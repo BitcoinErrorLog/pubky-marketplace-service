@@ -198,13 +198,14 @@ pub fn lock_resource_for(seller_pubky: &str) -> String {
 type HomeserverRecordMap = Arc<Mutex<HashMap<(String, String), Value>>>;
 
 /// A minimal local homeserver double: a real axum listener serving canonical
-/// camelCase listing records at the production path, keyed by the
-/// `pubky-host` header and listing id — exactly how the real homeserver
+/// camelCase listing and drop records at the production paths, keyed by the
+/// `pubky-host` header and record id — exactly how the real homeserver
 /// addresses seller-owned records. Tests reach it through the REAL
 /// [`HttpHomeserverClient`], so header handling, status mapping, and JSON
 /// parsing are exercised end to end.
 pub struct FakeHomeserver {
     records: HomeserverRecordMap,
+    drop_records: HomeserverRecordMap,
     pub base_url: String,
 }
 
@@ -214,6 +215,13 @@ impl FakeHomeserver {
             .lock()
             .expect("fake homeserver records lock")
             .insert((seller_pubky.to_string(), listing_id.to_string()), record);
+    }
+
+    pub fn put_drop_record(&self, seller_pubky: &str, drop_id: &str, record: Value) {
+        self.drop_records
+            .lock()
+            .expect("fake homeserver drop records lock")
+            .insert((seller_pubky.to_string(), drop_id.to_string()), record);
     }
 
     pub fn client(&self) -> Arc<dyn HomeserverListingClient> {
@@ -245,12 +253,21 @@ async fn serve_homeserver_record(
 
 pub async fn spawn_fake_homeserver() -> FakeHomeserver {
     let records: HomeserverRecordMap = Arc::default();
+    let drop_records: HomeserverRecordMap = Arc::default();
     let router = Router::new()
         .route(
             "/pub/pubky.app/marketplace/v1/listings/{listing_id}",
             axum::routing::get(serve_homeserver_record),
         )
-        .with_state(records.clone());
+        .with_state(records.clone())
+        .merge(
+            Router::new()
+                .route(
+                    "/pub/pubky.app/marketplace/v1/drops/{drop_id}",
+                    axum::routing::get(serve_homeserver_record),
+                )
+                .with_state(drop_records.clone()),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fake homeserver binds");
@@ -262,6 +279,7 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
     });
     FakeHomeserver {
         records,
+        drop_records,
         base_url: format!("http://{addr}"),
     }
 }
@@ -290,6 +308,26 @@ pub async fn test_app_with_homeserver(pool: PgPool) -> (TestApp, FakeHomeserver)
     (app, homeserver)
 }
 
+/// A test app wired to a fresh fake homeserver AND the deterministic test
+/// attestor (drop fixtures that need edition attestations).
+pub async fn test_app_with_homeserver_and_attestor(pool: PgPool) -> (TestApp, FakeHomeserver) {
+    let homeserver = spawn_fake_homeserver().await;
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
+        .with_homeserver(Some(homeserver.client()))
+        .with_attestor(Some(test_attestor()));
+    (
+        TestApp {
+            router: build_router(state.clone()),
+            pool,
+            clock,
+            state,
+        },
+        homeserver,
+    )
+}
+
 /// The `listing.sync` envelope: any authenticated actor, `expected_revision`
 /// always 0 (sync is convergent — the caller never knows the revision).
 pub fn sync_command(seller_pubky: &str, listing_id: &str, command_number: u64) -> Value {
@@ -305,6 +343,118 @@ pub fn sync_command(seller_pubky: &str, listing_id: &str, command_number: u64) -
             "listing_id": listing_id,
         },
     })
+}
+
+/// A wire timestamp `seconds` after the fixed test instant [`NOW`].
+pub fn ts_after(seconds: i64) -> String {
+    let base: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    marketplace_service::clock::format_timestamp(base + chrono::Duration::seconds(seconds))
+}
+
+pub fn drop_aggregate(seller_pubky: &str, drop_id: &str) -> String {
+    format!("drop:{seller_pubky}_{drop_id}")
+}
+
+/// A canonical camelCase homeserver drop record (ADR-0026 shape).
+// Eight fixture knobs the drop tests all need to steer independently.
+#[allow(clippy::too_many_arguments)]
+pub fn drop_record_json(
+    seller_pubky: &str,
+    drop_id: &str,
+    revision: i64,
+    listing_ids: &[&str],
+    starts_at: &str,
+    ends_at: Option<&str>,
+    total_quantity: i64,
+    per_buyer_limit: i64,
+) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "recordType": "drop",
+        "ownerPubky": seller_pubky,
+        "revision": revision,
+        "createdAt": "2026-08-19T21:00:00.000Z",
+        "updatedAt": "2026-08-19T21:00:00.000Z",
+        "dropId": drop_id,
+        "title": "Winter capsule drop",
+        "description": "Limited winter release, first come first served.",
+        "media": [{ "id": "m1", "contentHash": "f".repeat(64) }],
+        "format": "fcfs",
+        "startsAt": starts_at,
+        "endsAt": ends_at,
+        "listingIds": listing_ids,
+        "totalQuantity": total_quantity,
+        "perBuyerLimit": per_buyer_limit,
+        "stockDisplay": "exact",
+    })
+}
+
+/// The `drop.sync` envelope: any authenticated actor, `expected_revision`
+/// always 0 (sync is convergent — the caller never knows the revision).
+pub fn sync_drop_command(seller_pubky: &str, drop_id: &str, command_number: u64) -> Value {
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x8005, command_number),
+        "aggregate_id": drop_aggregate(seller_pubky, drop_id),
+        "expected_revision": 0,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "drop.sync",
+        "payload": {
+            "seller_pubky": seller_pubky,
+            "drop_id": drop_id,
+        },
+    })
+}
+
+/// The `drop.cancel` envelope (seller-authored, revision CAS).
+pub fn cancel_drop_command(
+    seller_pubky: &str,
+    drop_id: &str,
+    expected_revision: i64,
+    command_number: u64,
+) -> Value {
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x8006, command_number),
+        "aggregate_id": drop_aggregate(seller_pubky, drop_id),
+        "expected_revision": expected_revision,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "drop.cancel",
+        "payload": {},
+    })
+}
+
+/// The `drop.release_listings` envelope (seller-authored, revision CAS).
+pub fn release_drop_command(
+    seller_pubky: &str,
+    drop_id: &str,
+    expected_revision: i64,
+    command_number: u64,
+) -> Value {
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x8008, command_number),
+        "aggregate_id": drop_aggregate(seller_pubky, drop_id),
+        "expected_revision": expected_revision,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "drop.release_listings",
+        "payload": {},
+    })
+}
+
+/// A `listing.register` envelope for an arbitrary listing id (the shared
+/// [`register_command`] fixture is pinned to `boots_01`).
+pub fn register_listing_command(
+    seller_pubky: &str,
+    listing_id: &str,
+    quantity: i64,
+    command_number: u64,
+) -> Value {
+    let mut command = register_command(seller_pubky, quantity);
+    command["command_id"] = json!(indexed_command_id(0x8007, command_number));
+    command["aggregate_id"] = json!(format!("listing:{seller_pubky}_{listing_id}"));
+    command["payload"]["listing_id"] = json!(listing_id);
+    command
 }
 
 /// The `payment.register_locks` envelope (buyer-authored).

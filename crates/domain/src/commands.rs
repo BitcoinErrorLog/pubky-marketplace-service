@@ -55,6 +55,9 @@ pub struct Command {
 pub enum CommandPayload {
     RegisterListing(RegisterListingPayload),
     SyncListing(SyncListingPayload),
+    SyncDrop(SyncDropPayload),
+    CancelDrop(CancelDropPayload),
+    ReleaseDropListings(ReleaseDropListingsPayload),
     ReserveInventory(ReserveInventoryPayload),
     CreateCheckout(CreateCheckoutPayload),
     CreateOffer(OfferTermsPayload),
@@ -90,6 +93,9 @@ impl Command {
         match self.payload {
             CommandPayload::RegisterListing(_) => "listing.register",
             CommandPayload::SyncListing(_) => "listing.sync",
+            CommandPayload::SyncDrop(_) => "drop.sync",
+            CommandPayload::CancelDrop(_) => "drop.cancel",
+            CommandPayload::ReleaseDropListings(_) => "drop.release_listings",
             CommandPayload::ReserveInventory(_) => "inventory.reserve",
             CommandPayload::CreateCheckout(_) => "checkout.create",
             CommandPayload::CreateOffer(_) => "offer.create",
@@ -128,6 +134,9 @@ impl Command {
         let payload = match &self.payload {
             CommandPayload::RegisterListing(p) => serde_json::to_value(p),
             CommandPayload::SyncListing(p) => serde_json::to_value(p),
+            CommandPayload::SyncDrop(p) => serde_json::to_value(p),
+            CommandPayload::CancelDrop(p) => serde_json::to_value(p),
+            CommandPayload::ReleaseDropListings(p) => serde_json::to_value(p),
             CommandPayload::ReserveInventory(p) => serde_json::to_value(p),
             CommandPayload::CreateCheckout(p) => serde_json::to_value(p),
             CommandPayload::CreateOffer(p) => serde_json::to_value(p),
@@ -232,6 +241,40 @@ pub struct SyncListingPayload {
     pub seller_pubky: String,
     pub listing_id: String,
 }
+
+/// `drop.sync` (any authenticated actor): asks the service to fetch the
+/// canonical seller-signed drop record from the seller's homeserver and
+/// register (or refresh) the drop aggregate from it. Like `listing.sync`,
+/// provenance comes from the homeserver fetch — the record lives on a
+/// seller-owned path — so the actor is deliberately NOT required to be the
+/// seller, and the command is convergent (`expected_revision` 0 semantics).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncDropPayload {
+    pub seller_pubky: String,
+    pub drop_id: String,
+}
+
+/// `drop.cancel` (seller only, aggregate-targeted with an
+/// `expected_revision` compare-and-swap): moves an announced or live drop to
+/// the terminal `ended_cancelled` state. The command releases nothing by
+/// itself — outstanding holds lapse through their own lifecycle — but new
+/// holds are refused. The payload is empty; the envelope's aggregate id
+/// names the drop. Unknown fields are rejected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelDropPayload {}
+
+/// `drop.release_listings` (seller only, aggregate-targeted with an
+/// `expected_revision` compare-and-swap): once the drop has ended (any of
+/// its three terminal states), removes the drop's listing bindings from
+/// gating consideration entirely, so the listings sell again as ordinary
+/// open inventory. Refused while the drop is announced or live. The payload
+/// is empty; the envelope's aggregate id names the drop. Unknown fields are
+/// rejected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseDropListingsPayload {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -629,6 +672,13 @@ fn entity_id_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9_-]{1,128}$").expect("valid regex"))
 }
 
+/// Whether `value` is a path-safe commerce entity identifier (listing ids,
+/// drop ids). Public so the service can hold homeserver-record fields to the
+/// same charset the command payloads enforce.
+pub fn is_valid_entity_id(value: &str) -> bool {
+    entity_id_regex().is_match(value)
+}
+
 fn content_hash_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[a-f0-9]{64}$").expect("valid regex"))
@@ -703,6 +753,11 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
             parse_payload(&envelope.payload).and_then(validate_register_listing)?
         }
         "listing.sync" => parse_payload(&envelope.payload).and_then(validate_sync_listing)?,
+        "drop.sync" => parse_payload(&envelope.payload).and_then(validate_sync_drop)?,
+        "drop.cancel" => parse_payload(&envelope.payload).map(CommandPayload::CancelDrop)?,
+        "drop.release_listings" => {
+            parse_payload(&envelope.payload).map(CommandPayload::ReleaseDropListings)?
+        }
         "inventory.reserve" => {
             parse_payload(&envelope.payload).and_then(validate_reserve_inventory)?
         }
@@ -850,6 +905,27 @@ fn validate_sync_listing(
     }
     if issues.is_empty() {
         Ok(CommandPayload::SyncListing(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_sync_drop(payload: SyncDropPayload) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if !is_valid_pubky(&payload.seller_pubky) {
+        issues.push(issue(
+            "payload.seller_pubky",
+            "Expected a 52-character z-base-32 Pubky",
+        ));
+    }
+    if !entity_id_regex().is_match(&payload.drop_id) {
+        issues.push(issue(
+            "payload.drop_id",
+            "Expected a path-safe commerce identifier",
+        ));
+    }
+    if issues.is_empty() {
+        Ok(CommandPayload::SyncDrop(payload))
     } else {
         Err(issues)
     }
@@ -1522,6 +1598,59 @@ mod tests {
         changed_raw["payload"]["quantity"] = json!(2);
         let changed = parse_command(&changed_raw).expect("valid");
         assert_ne!(original.request_hash(), changed.request_hash());
+    }
+
+    #[test]
+    fn parses_drop_sync_and_cancel_commands() {
+        let seller = "y".repeat(52);
+        let sync = json!({
+            "version": 1,
+            "command_id": "00000000-0000-4000-8000-000000000700",
+            "aggregate_id": format!("drop:{seller}_winter_drop"),
+            "expected_revision": 0,
+            "issued_at": "2026-08-19T22:00:00.000Z",
+            "kind": "drop.sync",
+            "payload": { "seller_pubky": seller, "drop_id": "winter_drop" },
+        });
+        assert_eq!(
+            parse_command(&sync).expect("valid drop.sync").kind(),
+            "drop.sync"
+        );
+
+        let mut bad_id = sync.clone();
+        bad_id["payload"]["drop_id"] = json!("not a path-safe id!");
+        let issues = parse_command(&bad_id).expect_err("malformed drop id invalid");
+        assert!(issues.iter().any(|i| i.path == "payload.drop_id"));
+
+        let mut cancel = sync.clone();
+        cancel["kind"] = json!("drop.cancel");
+        cancel["expected_revision"] = json!(1);
+        cancel["payload"] = json!({});
+        assert_eq!(
+            parse_command(&cancel).expect("valid drop.cancel").kind(),
+            "drop.cancel"
+        );
+
+        let mut cancel_extra = cancel.clone();
+        cancel_extra["payload"] = json!({ "private_address": "secret-address" });
+        let issues = parse_command(&cancel_extra).expect_err("cancel payload must be empty");
+        let serialized = serde_json::to_string(&issues).expect("issues serialize");
+        assert!(!serialized.contains("secret-address"));
+
+        let mut release = cancel.clone();
+        release["kind"] = json!("drop.release_listings");
+        assert_eq!(
+            parse_command(&release)
+                .expect("valid drop.release_listings")
+                .kind(),
+            "drop.release_listings"
+        );
+
+        let mut release_extra = release.clone();
+        release_extra["payload"] = json!({ "private_address": "secret-address" });
+        let issues = parse_command(&release_extra).expect_err("release payload must be empty");
+        let serialized = serde_json::to_string(&issues).expect("issues serialize");
+        assert!(!serialized.contains("secret-address"));
     }
 
     fn offer_command_json() -> Value {
