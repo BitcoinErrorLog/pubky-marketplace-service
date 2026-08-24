@@ -1198,9 +1198,10 @@ async fn replays_each_post_purchase_command_idempotently(pool: PgPool) {
         .as_str()
         .expect("payment id present")
         .to_string();
-    let mut second_checkout =
+    // Checkout moves no inventory, so the second checkout still sees the
+    // listing at revision 1.
+    let second_checkout =
         common::checkout_command_with_id(&seller.pubky, &indexed_command_id(0x8000, 1_279));
-    second_checkout["payload"]["lines"][0]["expected_revision"] = json!(2);
     let (status, body) = execute(&app, &buyer.token, &second_checkout).await;
     assert_eq!(status, StatusCode::OK, "second checkout failed: {body}");
     let dispute_order_id = body["result"]["orders"][0]["id"]

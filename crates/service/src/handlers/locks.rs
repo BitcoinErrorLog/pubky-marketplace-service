@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::clock::format_timestamp;
 use crate::executor::insert_event;
+use crate::handlers::{fetch_order_for_update, holds};
 use crate::locks::LocksRuntime;
 use crate::model::PaymentRow;
 use crate::queries::PAYMENT_COLUMNS;
@@ -108,6 +109,22 @@ pub async fn register(
             ErrorCode::InvalidCommand,
             "The lock resource creator must be the order's seller.",
         )));
+    }
+
+    // The payment lock point: registering the correlation is the payment
+    // start, so it acquires the order's inventory hold and arms the payment
+    // window — the correlation window IS the hold window (one window
+    // concept, not two).
+    let Some(order) = fetch_order_for_update(tx, payment.order_id).await? else {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvariantViolation,
+            "Payment order is missing.",
+        )));
+    };
+    if let Err(failure) =
+        holds::acquire_payment_hold(tx, order, payment_window_seconds, now).await?
+    {
+        return Ok(Err(failure));
     }
 
     let correlation_id = Uuid::new_v4();

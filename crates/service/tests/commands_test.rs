@@ -255,9 +255,11 @@ async fn rejects_unsupported_versions_and_unported_kinds(pool: PgPool) {
     assert_eq!(body["error"]["issues"][0]["path"], json!("kind"));
 }
 
-// TS case: "creates an immutable checkout snapshot, reservation, order, and
-// sandbox payment" (sandbox payment advancement is covered in
-// post_purchase_test.rs).
+// TS case ported, updated for "only a payment locks an item": checkout
+// creates the immutable snapshot, order, and sandbox payment but moves NO
+// inventory — the listing stays untouched at revision 1 (sandbox payment
+// advancement, where the hold is acquired, is covered in
+// post_purchase_test.rs and payment_holds_test.rs).
 #[sqlx::test]
 async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgPool) {
     let app = test_app(pool).await;
@@ -287,6 +289,9 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
     assert_eq!(payment["state"], json!("awaiting_entitlement"));
     assert_eq!(payment["adapter"], json!("sandbox"));
     assert_eq!(payment["amount"]["amount_minor"], json!(14_796));
+    // The order starts with NO hold and no armed window.
+    assert_eq!(order["stock_held"], json!(false));
+    assert_eq!(order["hold_expires_at"], json!(null));
 
     let (available, reserved, revision, state): (i64, i64, i64, String) = sqlx::query_as(
         "SELECT available_quantity, reserved_quantity, server_revision, state \
@@ -298,7 +303,8 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
     .expect("listing row exists");
     assert_eq!(
         (available, reserved, revision, state.as_str()),
-        (0, 1, 2, "reserved")
+        (1, 0, 1, "available"),
+        "checkout no longer moves inventory"
     );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 1);
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM payments").await, 1);
@@ -512,12 +518,12 @@ async fn checkout_snapshots_the_variant_onto_the_order_line(pool: PgPool) {
             .expect("order row exists");
     assert_eq!(lines[0]["variant_id"], json!("variant_forest_m"));
 
-    // A variant-less checkout line carries no variant keys at all.
+    // A variant-less checkout line carries no variant keys at all. The
+    // first checkout moved nothing, so the listing is still at revision 1.
     let plain =
         common::checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001099");
     let mut plain = plain;
     plain["expected_revision"] = json!(0);
-    plain["payload"]["lines"][0]["expected_revision"] = json!(2);
     let (status, body) = execute(&app, &buyer.token, &plain).await;
     assert_eq!(status, StatusCode::OK, "plain checkout failed: {body}");
     let plain_line = &body["result"]["orders"][0]["lines"][0];

@@ -19,12 +19,27 @@ pub struct Config {
     pub session_ttl_seconds: i64,
     pub worker_interval_seconds: u64,
     pub worker_lease_seconds: i64,
-    /// Marketplace payment window for Locks-correlated payments: a payment
-    /// still awaiting entitlement this long after its correlation was
-    /// registered moves to `expired` on server time. Deliberately separate
-    /// from upstream failure — Locks v1 leaves transport/status failures
-    /// pending (ADR-0019 §7).
+    /// Marketplace payment window armed by `payment.register_locks`: the
+    /// lock point acquires the order's inventory hold and this window bounds
+    /// it — the correlation window IS the hold window. A payment still
+    /// awaiting entitlement when it elapses moves to `expired`, the order is
+    /// cancelled, and the hold restocks. Deliberately separate from upstream
+    /// failure — Locks v1 leaves transport/status failures pending
+    /// (ADR-0019 §7).
     pub locks_payment_window_seconds: i64,
+    /// Hold window armed by the payment-method bind
+    /// (`POST /v0/orders/{id}/payment-method`), which is the lock point for
+    /// the fiat and bitcoin rails (`FIAT_PAYMENT_WINDOW_SECONDS`, default
+    /// 3600, minimum 60).
+    pub fiat_payment_window_seconds: i64,
+    /// Hold window armed by `payment.sandbox_advance`'s first transition
+    /// out of `awaiting_entitlement`, the sandbox lock point
+    /// (`SANDBOX_PAYMENT_WINDOW_SECONDS`, default 900, minimum 60).
+    pub sandbox_payment_window_seconds: i64,
+    /// Hold window armed at checkout for drop-bound orders, which keep
+    /// lock-at-claim (`DROP_CLAIM_WINDOW_SECONDS`, default 600, minimum
+    /// 60). A payment lock point re-arms the window to its own span.
+    pub drop_claim_window_seconds: i64,
     /// Minimum seconds between lifecycle lookups for one pending
     /// correlation.
     pub locks_poll_seconds: i64,
@@ -72,6 +87,18 @@ impl Config {
         if locks_payment_window_seconds < 60 {
             anyhow::bail!("LOCKS_PAYMENT_WINDOW_SECONDS must be at least 60");
         }
+        let fiat_payment_window_seconds = env_i64("FIAT_PAYMENT_WINDOW_SECONDS", 3_600)?;
+        if fiat_payment_window_seconds < 60 {
+            anyhow::bail!("FIAT_PAYMENT_WINDOW_SECONDS must be at least 60");
+        }
+        let sandbox_payment_window_seconds = env_i64("SANDBOX_PAYMENT_WINDOW_SECONDS", 900)?;
+        if sandbox_payment_window_seconds < 60 {
+            anyhow::bail!("SANDBOX_PAYMENT_WINDOW_SECONDS must be at least 60");
+        }
+        let drop_claim_window_seconds = env_i64("DROP_CLAIM_WINDOW_SECONDS", 600)?;
+        if drop_claim_window_seconds < 60 {
+            anyhow::bail!("DROP_CLAIM_WINDOW_SECONDS must be at least 60");
+        }
         let locks_poll_seconds = env_i64("LOCKS_POLL_SECONDS", 30)?;
         if locks_poll_seconds < 1 {
             anyhow::bail!("LOCKS_POLL_SECONDS must be at least 1");
@@ -92,6 +119,9 @@ impl Config {
             worker_interval_seconds,
             worker_lease_seconds,
             locks_payment_window_seconds,
+            fiat_payment_window_seconds,
+            sandbox_payment_window_seconds,
+            drop_claim_window_seconds,
             locks_poll_seconds,
             paykit_poll_seconds,
             moderator_pubkys,
@@ -114,6 +144,9 @@ impl Config {
             worker_interval_seconds: 3_600,
             worker_lease_seconds: 30,
             locks_payment_window_seconds: 3_600,
+            fiat_payment_window_seconds: 3_600,
+            sandbox_payment_window_seconds: 900,
+            drop_claim_window_seconds: 600,
             locks_poll_seconds: 30,
             paykit_poll_seconds: 15,
             moderator_pubkys: Vec::new(),

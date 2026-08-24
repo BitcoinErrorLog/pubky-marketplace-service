@@ -5,6 +5,7 @@ pub mod checkout;
 pub mod disputes;
 pub mod drops;
 pub mod fulfillment;
+pub mod holds;
 pub mod locks;
 pub mod offers;
 pub mod payment;

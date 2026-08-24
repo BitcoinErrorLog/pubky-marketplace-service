@@ -25,10 +25,12 @@
 //! `last_checked_at`, so a crash between the lookup and the effect leaves
 //! the correlation pending and it is re-verified after the poll interval:
 //! bounded, abortable, and resumable across restarts. Marketplace
-//! payment-window expiry is a separate server-time transition — Locks v1
-//! leaves transport/status failures pending, so upstream trouble never
-//! expires a payment by itself — and a completion verified after the window
-//! goes to `manual_review`, never silently discarded.
+//! payment-window expiry is a separate server-time transition over the
+//! ORDER's armed inventory-hold window ("only a payment locks an item"):
+//! a lapsed hold restocks, the payment expires, and the order cancels.
+//! Locks v1 leaves transport/status failures pending, so upstream trouble
+//! never expires a payment by itself — and a completion verified after the
+//! window goes to `manual_review`, never silently discarded.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::ids;
@@ -675,12 +677,18 @@ async fn claim_due_paykit_orders(
     now: DateTime<Utc>,
     poll_seconds: i64,
 ) -> Result<Vec<ClaimedPaykitOrder>, sqlx::Error> {
+    // Expired payments keep polling only while money was already DETECTED
+    // on-chain: a settlement confirmed after the hold window elapsed must
+    // surface as manual_review, never vanish. An expired order that never
+    // saw a detection stops polling.
     sqlx::query_as(
         "UPDATE orders SET paykit_last_checked_at = $1, updated_at = updated_at \
          WHERE id IN (\
              SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
-             WHERE p.adapter = 'paykit' AND p.state = 'awaiting_entitlement' \
-             AND o.paykit_request_state IN ('pending', 'detected') \
+             WHERE p.adapter = 'paykit' \
+             AND ((p.state = 'awaiting_entitlement' \
+                   AND o.paykit_request_state IN ('pending', 'detected')) \
+                  OR (p.state = 'expired' AND o.paykit_request_state = 'detected')) \
              AND o.paykit_request_reference IS NOT NULL \
              AND (o.paykit_last_checked_at IS NULL OR o.paykit_last_checked_at <= $2) \
              ORDER BY o.paykit_last_checked_at ASC NULLS FIRST LIMIT $3 \
@@ -715,6 +723,42 @@ async fn apply_confirmed_paykit_payment(
     let Some(payment) = payment else {
         anyhow::bail!("paykit order {} references a missing payment", row.id);
     };
+    if payment.state == "expired" {
+        // The settlement is real but the hold window already elapsed (the
+        // sweep released the stock and cancelled the order): retain the
+        // fact under manual review, exactly like a late Locks completion.
+        let (revision,): (i64,) = sqlx::query_as(
+            "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+             updated_at = $2 WHERE id = $1 RETURNING revision",
+        )
+        .bind(payment.id)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        crate::executor::insert_event(
+            &mut tx,
+            row.id,
+            &ids::payment_aggregate_id(payment.id),
+            revision,
+            &row.buyer_pubky,
+            "payment.manual_review",
+            now,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE orders SET paykit_request_state = 'confirmed', updated_at = $2 WHERE id = $1",
+        )
+        .bind(row.id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::warn!(
+            order_id = %row.id,
+            "paykit settlement confirmed after the hold window; routing to manual review"
+        );
+        return Ok(true);
+    }
     if payment.state != "awaiting_entitlement" {
         tx.rollback().await?;
         return Ok(false);
@@ -889,58 +933,153 @@ pub async fn verify_due_paykit_payments(
     Ok(applied)
 }
 
-/// Expires Locks-correlated payments whose marketplace payment window has
-/// elapsed on server time while the payment still awaits entitlement. This
-/// is a marketplace policy transition, independent of upstream state; the
-/// correlation keeps polling (bounded by the Lock Server's own task ageing),
-/// so a completion verified later still surfaces as `manual_review`.
+/// Expires pending orders whose armed inventory-hold window has elapsed on
+/// server time ("only a payment locks an item"): the hold releases
+/// (`reserved → available`, crediting a stamped drop first under the shared
+/// lock order), the payment moves to `expired` (the machine's
+/// `payment_window` edge from `awaiting_entitlement`), and the order is
+/// cancelled with the stored reason "payment window elapsed" — post-expiry
+/// the buyer simply checks out again.
+///
+/// This is a marketplace policy transition, independent of upstream state; a
+/// Locks correlation keeps polling (bounded by the Lock Server's own task
+/// ageing), so a completion verified later still surfaces as
+/// `manual_review`. Payments already under `manual_review` are deliberately
+/// NOT swept: a human decides those — their money may be real, so their
+/// hold is never auto-released. A sandbox payment the buyer drove to
+/// `detected` has no `detected → expired` edge; its lapsed order still
+/// cancels and restocks, and the payment record stays untouched exactly as
+/// buyer cancellation leaves it. Confirmed orders are `paid` and never
+/// match the sweep.
 pub async fn expire_due_payment_windows(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
     let mut tx = pool.begin().await?;
-    let due: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT c.id, c.payment_id, p.buyer_pubky \
-         FROM payment_locks_correlations c JOIN payments p ON p.id = c.payment_id \
-         WHERE c.window_expires_at <= $1 AND p.state = 'awaiting_entitlement' \
-         ORDER BY c.window_expires_at FOR UPDATE OF c, p SKIP LOCKED",
+    let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+        "SELECT o.id, p.id, p.state, o.buyer_pubky \
+         FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE o.state = 'pending_payment' AND o.stock_held AND o.hold_expires_at <= $1 \
+         AND p.state IN ('awaiting_entitlement', 'detected', 'expired') \
+         ORDER BY o.hold_expires_at FOR UPDATE OF o, p SKIP LOCKED",
     )
     .bind(now)
     .fetch_all(&mut *tx)
     .await?;
 
     let mut expired = 0u64;
-    for (correlation_id, payment_id, buyer_pubky) in due {
-        let updated: Option<(i64,)> = sqlx::query_as(
-            "UPDATE payments SET state = 'expired', revision = revision + 1, updated_at = $2 \
-             WHERE id = $1 AND state = 'awaiting_entitlement' RETURNING revision",
-        )
-        .bind(payment_id)
-        .bind(now)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((revision,)) = updated else {
+    for (order_id, payment_id, payment_state, buyer_pubky) in due {
+        let Some(order) = fetch_order_for_update(&mut tx, order_id).await? else {
             continue;
         };
+        // A Locks-correlated payment's expiry keeps its reconciliation
+        // trail: the correlation id is the traceable command id and the
+        // observation history records the window elapsing.
+        let correlation: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM payment_locks_correlations WHERE order_id = $1")
+                .bind(order_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let command_id = correlation
+            .map(|(id,)| id)
+            .unwrap_or_else(uuid::Uuid::new_v4);
+
+        if payment_state == "awaiting_entitlement" {
+            let (revision,): (i64,) = sqlx::query_as(
+                "UPDATE payments SET state = 'expired', revision = revision + 1, \
+                 updated_at = $2 WHERE id = $1 RETURNING revision",
+            )
+            .bind(payment_id)
+            .bind(now)
+            .fetch_one(&mut *tx)
+            .await?;
+            crate::executor::insert_event(
+                &mut tx,
+                command_id,
+                &ids::payment_aggregate_id(payment_id),
+                revision,
+                &buyer_pubky,
+                "payment.expired",
+                now,
+            )
+            .await?;
+            if let Some((correlation_id,)) = correlation {
+                insert_observation(
+                    &mut tx,
+                    correlation_id,
+                    "window_elapsed",
+                    "payment_expired",
+                    now,
+                )
+                .await?;
+            }
+        }
+
+        // A drop-stamped hold credits its drop first (drop lock before the
+        // listing lock, the shared order): while live the unit restocks and
+        // the buyer's per-drop cap frees; an ended drop keeps honest books
+        // but nothing reopens.
+        if let Some(drop_aggregate_id) = &order.drop_aggregate_id {
+            let units: i64 = order
+                .lines
+                .as_array()
+                .expect("order lines are an array")
+                .iter()
+                .map(|line| {
+                    line["quantity"]
+                        .as_i64()
+                        .expect("order line carries its quantity")
+                })
+                .sum();
+            if !crate::handlers::drops::credit_drop_release(
+                &mut tx,
+                drop_aggregate_id,
+                &order.buyer_pubky,
+                units,
+                now,
+            )
+            .await?
+            {
+                anyhow::bail!("expired order {order_id} could not credit drop {drop_aggregate_id}");
+            }
+        }
+        if let Err(failure) = crate::handlers::holds::release_lines(
+            &mut tx,
+            &order,
+            crate::handlers::holds::HeldQuantity::Reserved,
+            now,
+        )
+        .await?
+        {
+            anyhow::bail!("expired order {order_id} could not release its hold: {failure:?}");
+        }
+
+        debug_assert!(marketplace_domain::state_machines::can_transition(
+            &marketplace_domain::state_machines::order_machine(),
+            "pending_payment",
+            "cancelled"
+        ));
+        let (order_revision,): (i64,) = sqlx::query_as(
+            "UPDATE orders SET state = 'cancelled', revision = revision + 1, \
+             cancellation_reason = 'payment window elapsed', stock_held = false, \
+             hold_expires_at = NULL, updated_at = $2 WHERE id = $1 RETURNING revision",
+        )
+        .bind(order_id)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
         crate::executor::insert_event(
             &mut tx,
-            correlation_id,
-            &ids::payment_aggregate_id(payment_id),
-            revision,
+            command_id,
+            &ids::order_aggregate_id(order_id),
+            order_revision,
             &buyer_pubky,
-            "payment.expired",
+            "order.cancelled",
             now,
         )
         .await?;
-        insert_observation(
-            &mut tx,
-            correlation_id,
-            "window_elapsed",
-            "payment_expired",
-            now,
-        )
-        .await?;
+
         tracing::info!(
+            order_id = %order_id,
             payment_id = %payment_id,
-            correlation_id = %correlation_id,
-            "expired payment on marketplace payment window"
+            "expired hold window: released stock, expired payment, cancelled order"
         );
         expired += 1;
     }

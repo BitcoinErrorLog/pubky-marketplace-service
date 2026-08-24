@@ -425,6 +425,10 @@ pub async fn close_locked_auction(
             receipt_id: None,
             edition: None,
             cancellation_reason: None,
+            // The winner's hold lives in the reservation row above, swept
+            // by reservation expiry — never in the order's own hold flags.
+            stock_held: false,
+            hold_expires_at: None,
             shipment: None,
             return_request: None,
             dispute: None,

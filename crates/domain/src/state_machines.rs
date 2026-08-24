@@ -220,10 +220,13 @@ pub fn order_machine() -> AggregateMachine {
                     Server("payment_confirmation"),
                 ],
             ),
+            // `payment_window` is the server-time hold-window expiry ("only
+            // a payment locks an item"): a pending order whose armed
+            // inventory hold lapses is cancelled with its stock restocked.
             t(
                 "pending_payment",
                 "cancelled",
-                vec![Command("order.cancel_request")],
+                vec![Command("order.cancel_request"), Server("payment_window")],
             ),
             t("paid", "shipped", vec![Command("fulfillment.ship")]),
             t(

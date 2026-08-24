@@ -2,10 +2,13 @@
 //! `order.cancel_approve`), ported from the TypeScript prototype engine.
 //!
 //! The buyer requests cancellation: an unpaid order (`pending_payment`)
-//! cancels immediately and returns its held stock to the listing; a paid
-//! order moves to `cancel_requested` awaiting the seller. The seller's
-//! approval moves the order to `cancelled` and returns the sold quantities
-//! to available under the listings quantity-balance constraint.
+//! cancels immediately and returns its held stock to the listing — but ONLY
+//! when a hold exists ("only a payment locks an item": an ordinary pending
+//! order holds nothing until a payment lock point runs, so cancelling it
+//! releases nothing). A paid order moves to `cancel_requested` awaiting the
+//! seller. The seller's approval moves the order to `cancelled` and returns
+//! the sold quantities to available under the listings quantity-balance
+//! constraint.
 //!
 //! Cancellation never touches the payment record: a confirmed payment stays
 //! confirmed with its receipt intact, and the only money path out of a
@@ -21,13 +24,12 @@
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{OrderActionPayload, RequestCancellationPayload};
-use marketplace_domain::state_machines::{can_transition, listing_machine, order_machine};
+use marketplace_domain::state_machines::{can_transition, order_machine};
 use marketplace_domain::{Command, ErrorCode};
 use sqlx::{Postgres, Transaction};
 
-use crate::handlers::{
-    fetch_listing_for_update, fetch_order_for_update, finish_order_action, guard_order_action,
-};
+use crate::handlers::holds::{release_lines, HeldQuantity};
+use crate::handlers::{fetch_order_for_update, finish_order_action, guard_order_action};
 use crate::model::OrderRow;
 use crate::queries::ORDER_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult};
@@ -64,8 +66,11 @@ pub async fn request(
         )));
     }
 
-    // An unpaid order cancels immediately and releases its hold; a paid
-    // order awaits the seller's approval (prototype engine semantics).
+    // An unpaid order cancels immediately and releases its hold — when one
+    // exists; a paid order awaits the seller's approval (prototype engine
+    // semantics). Under "only a payment locks an item" an ordinary pending
+    // order holds nothing until a payment lock point runs, so cancelling it
+    // releases nothing.
     let immediate = order.state == "pending_payment";
     let (to_state, event_kind) = if immediate {
         ("cancelled", "order.cancelled")
@@ -74,16 +79,25 @@ pub async fn request(
     };
     debug_assert!(can_transition(&order_machine(), &order.state, to_state));
     if immediate {
-        if let Err(failure) = credit_order_drop(tx, &order, now).await? {
-            return Ok(Err(failure));
-        }
-        if let Err(failure) = release_reserved_hold(tx, &order, now).await? {
-            return Ok(Err(failure));
+        if order.auction_aggregate_id.is_some() {
+            // An auction winner's hold lives in the winning reservation and
+            // releases through its compare-and-swap.
+            if let Err(failure) = release_reserved_hold(tx, &order, now).await? {
+                return Ok(Err(failure));
+            }
+        } else if order.stock_held {
+            if let Err(failure) = credit_order_drop(tx, &order, now).await? {
+                return Ok(Err(failure));
+            }
+            if let Err(failure) = release_lines(tx, &order, HeldQuantity::Reserved, now).await? {
+                return Ok(Err(failure));
+            }
         }
     }
 
     let updated: OrderRow = sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, state = $3, cancellation_reason = $4, \
+         stock_held = false, hold_expires_at = NULL, \
          updated_at = $5 WHERE id = $1 AND revision = $2 RETURNING {ORDER_COLUMNS}"
     ))
     .bind(order.id)
@@ -213,10 +227,7 @@ async fn credit_order_drop(
     }
 }
 
-/// Returns an immediately cancelled unpaid order's held stock to its
-/// listings, mirroring the prototype's `releaseOrderInventory`.
-///
-/// An auction winner's hold is released through the reservation
+/// Returns a cancelled auction winner's held stock through the reservation
 /// compare-and-swap: only the transition that flips the reservation from
 /// `active` to `released` moves the quantities, so when the 30-minute hold
 /// already lapsed on server time (the expiry sweep returned the unit and
@@ -227,87 +238,21 @@ async fn release_reserved_hold(
     order: &OrderRow,
     now: DateTime<Utc>,
 ) -> Result<Result<(), CommandFailure>, sqlx::Error> {
-    if let Some(auction_aggregate_id) = &order.auction_aggregate_id {
-        let released = sqlx::query(
-            "UPDATE reservations SET status = 'released', updated_at = $3 \
-             WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active'",
-        )
-        .bind(auction_aggregate_id)
-        .bind(&order.buyer_pubky)
-        .bind(now)
-        .execute(&mut **tx)
-        .await?;
-        if released.rows_affected() == 0 {
-            return Ok(Ok(()));
-        }
+    let auction_aggregate_id = order
+        .auction_aggregate_id
+        .as_ref()
+        .expect("only auction orders release through the reservation");
+    let released = sqlx::query(
+        "UPDATE reservations SET status = 'released', updated_at = $3 \
+         WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active'",
+    )
+    .bind(auction_aggregate_id)
+    .bind(&order.buyer_pubky)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    if released.rows_affected() == 0 {
+        return Ok(Ok(()));
     }
     release_lines(tx, order, HeldQuantity::Reserved, now).await
-}
-
-/// Which listing quantity column an order's lines currently occupy:
-/// `reserved` before payment confirmation, `sold` after it.
-#[derive(Clone, Copy)]
-enum HeldQuantity {
-    Reserved,
-    Sold,
-}
-
-impl HeldQuantity {
-    fn column(self) -> &'static str {
-        match self {
-            HeldQuantity::Reserved => "reserved_quantity",
-            HeldQuantity::Sold => "sold_quantity",
-        }
-    }
-}
-
-/// Moves each order line's quantity from the held column back to available
-/// under the listings quantity-balance constraint. The held-quantity guard
-/// is a compare-and-swap against the ledger: nothing else can remove this
-/// order's contribution, so a shortfall is an invariant violation, not a
-/// race to tolerate.
-async fn release_lines(
-    tx: &mut Transaction<'_, Postgres>,
-    order: &OrderRow,
-    held: HeldQuantity,
-    now: DateTime<Utc>,
-) -> Result<Result<(), CommandFailure>, sqlx::Error> {
-    let column = held.column();
-    let lines = order.lines.as_array().expect("order lines are an array");
-    for line in lines {
-        let aggregate_id = line["listing_aggregate_id"]
-            .as_str()
-            .expect("order line carries its listing aggregate id");
-        let quantity = line["quantity"]
-            .as_i64()
-            .expect("order line carries its quantity");
-        let Some(listing) = fetch_listing_for_update(tx, aggregate_id).await? else {
-            return Ok(Err(CommandFailure::new(
-                ErrorCode::InvariantViolation,
-                "An order line's listing is missing.",
-            )));
-        };
-        debug_assert!(can_transition(
-            &listing_machine(),
-            &listing.state,
-            "available"
-        ));
-        let updated = sqlx::query(&format!(
-            "UPDATE listings SET server_revision = server_revision + 1, state = 'available', \
-             available_quantity = available_quantity + $2, {column} = {column} - $2, \
-             updated_at = $3 WHERE aggregate_id = $1 AND {column} >= $2",
-        ))
-        .bind(aggregate_id)
-        .bind(quantity)
-        .bind(now)
-        .execute(&mut **tx)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Ok(Err(CommandFailure::new(
-                ErrorCode::InvariantViolation,
-                "The inventory held by this order is no longer accounted to its listing.",
-            )));
-        }
-    }
-    Ok(Ok(()))
 }

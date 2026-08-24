@@ -362,6 +362,10 @@
             {
               "trigger": "command",
               "name": "order.cancel_request"
+            },
+            {
+              "trigger": "server",
+              "name": "payment_window"
             }
           ]
         },

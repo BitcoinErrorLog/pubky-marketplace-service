@@ -53,11 +53,11 @@ async fn notification_types(app: &TestApp, token: &str) -> Vec<String> {
         .collect()
 }
 
-// TS case: "cancels unpaid checkout immediately and releases reserved
-// inventory once" — the replay proves the "once": the stored result comes
-// back without re-executing the release.
+// "Only a payment locks an item": an unpaid order with no payment activity
+// holds nothing, so cancelling it releases nothing — the CHECK-constrained
+// quantity ledger never moves and never goes negative.
 #[sqlx::test]
-async fn cancels_unpaid_checkout_immediately_and_releases_reserved_inventory_once(pool: PgPool) {
+async fn cancelling_an_unheld_pending_order_releases_nothing(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -67,6 +67,56 @@ async fn cancels_unpaid_checkout_immediately_and_releases_reserved_inventory_onc
         .as_str()
         .expect("order id present")
         .to_string();
+    // Checkout moved nothing: the unit is still available to everyone.
+    assert_eq!(
+        listing_quantities(&app, &seller.pubky).await,
+        (1, 0, 0, "available".to_string())
+    );
+
+    let cancel = order_command(
+        "order.cancel_request",
+        &order_id,
+        1,
+        json!({ "reason": "Changed mind" }),
+        1_220,
+    );
+    let (status, cancelled) = execute(&app, &buyer.token, &cancel).await;
+    assert_eq!(status, StatusCode::OK, "cancel failed: {cancelled}");
+    assert_eq!(cancelled["result"]["order"]["state"], json!("cancelled"));
+    // Nothing was held, so nothing released: the ledger is untouched (the
+    // quantity CHECK constraints prove no negative movement happened).
+    assert_eq!(
+        listing_quantities(&app, &seller.pubky).await,
+        (1, 0, 0, "available".to_string())
+    );
+}
+
+// The held counterpart: a payment lock point (sandbox first advance)
+// acquired the hold, so the immediate cancel releases it exactly once — the
+// replay proves the "once": the stored result comes back without
+// re-executing the release.
+#[sqlx::test]
+async fn cancels_a_held_unpaid_order_and_releases_the_hold_once(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    let (_, body) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id present")
+        .to_string();
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id present")
+        .to_string();
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &payment_command(&payment_id, 1, "detected", 0, 1_219),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "lock point failed: {body}");
     assert_eq!(
         listing_quantities(&app, &seller.pubky).await,
         (0, 1, 0, "reserved".to_string())
@@ -480,7 +530,8 @@ async fn cancelled_order_refuses_payment_fulfillment_and_return_commands(pool: P
         assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
     }
 
-    // The released unit was never re-committed by the refused commands.
+    // The never-held unit was never committed by the refused commands: the
+    // cancelled order's refused payment can no longer grab a hold either.
     assert_eq!(
         listing_quantities(&app, &seller.pubky).await,
         (1, 0, 0, "available".to_string())

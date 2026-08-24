@@ -1692,3 +1692,176 @@ async fn release_listings_returns_ended_drop_listings_to_open_sale(pool: PgPool)
     let (state, _, remaining) = drop_state(&app.pool, &aggregate_id).await;
     assert_eq!((state.as_str(), remaining), ("ended_closed", 5));
 }
+
+// === 15. Claim windows: lock-at-claim is bounded by server time ==============
+
+// Drop checkout keeps lock-at-claim, but the claim is no longer forever: a
+// claimed-but-never-paid drop order expires through the payment-window
+// worker, restocking the drop AND the listing and freeing the buyer's
+// per-drop cap.
+#[sqlx::test]
+async fn a_lapsed_claim_window_restocks_the_drop_and_frees_the_buyer_cap(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let aggregate_id =
+        sync_drop_over_boots_01(&app, &homeserver, &seller, &buyer, 5, 0, None, 5, 1).await;
+
+    let checkout = checkout_lines_command(
+        &indexed_command_id(0x9d00, 1),
+        vec![line(&listing_aggregate(&seller.pubky), 1, 1)],
+    );
+    let (status, body) = execute(&app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id present")
+        .to_string();
+    // The claim armed the DROP_CLAIM_WINDOW_SECONDS (600 s) hold window at
+    // checkout — lock-at-claim, bounded.
+    assert_eq!(body["result"]["orders"][0]["stock_held"], json!(true));
+    assert_eq!(
+        body["result"]["orders"][0]["hold_expires_at"],
+        json!(common::ts_after(600))
+    );
+    let (_, _, remaining) = drop_state(&app.pool, &aggregate_id).await;
+    assert_eq!(remaining, 4);
+
+    // The buyer never starts a payment; the claim window elapses.
+    app.clock.advance_seconds(601);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 1);
+
+    let (order_state, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT state, cancellation_reason FROM orders WHERE id = $1::uuid")
+            .bind(&order_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("order row exists");
+    assert_eq!(order_state, "cancelled");
+    assert_eq!(reason.as_deref(), Some("payment window elapsed"));
+    let (state, _, remaining) = drop_state(&app.pool, &aggregate_id).await;
+    assert_eq!(
+        (state.as_str(), remaining),
+        ("live", 5),
+        "the lapsed claim restocked the drop"
+    );
+    assert_eq!(
+        buyer_purchases(&app.pool, &aggregate_id, &buyer.pubky).await,
+        0,
+        "the per-buyer cap freed"
+    );
+    let (available, reserved): (i64, i64) =
+        sqlx::query_as("SELECT available_quantity, reserved_quantity FROM listings")
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing row exists");
+    assert_eq!((available, reserved), (5, 0), "the listing restocked");
+
+    // The same buyer simply claims again (listing revision advanced: claim
+    // 2, release 3).
+    let retry = checkout_lines_command(
+        &indexed_command_id(0x9d00, 2),
+        vec![line(&listing_aggregate(&seller.pubky), 3, 1)],
+    );
+    let (status, body) = execute(&app, &buyer.token, &retry).await;
+    assert_eq!(status, StatusCode::OK, "re-claim failed: {body}");
+}
+
+// A claim whose payment started survives the claim window: the payment lock
+// point re-arms the hold window to its own (longer) span without a second
+// decrement, and the order confirms with an edition.
+#[sqlx::test]
+async fn a_claim_whose_payment_started_survives_the_claim_window_and_confirms(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let aggregate_id =
+        sync_drop_over_boots_01(&app, &homeserver, &seller, &buyer, 5, 0, None, 5, 1).await;
+
+    let checkout = checkout_lines_command(
+        &indexed_command_id(0x9e00, 1),
+        vec![line(&listing_aggregate(&seller.pubky), 1, 1)],
+    );
+    let (status, body) = execute(&app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id present")
+        .to_string();
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id present")
+        .to_string();
+    assert_eq!(
+        body["result"]["orders"][0]["hold_expires_at"],
+        json!(common::ts_after(600))
+    );
+
+    // The sandbox lock point (first transition out of awaiting_entitlement)
+    // re-arms the window to the sandbox payment window (900 s) and never
+    // double-decrements the drop or the listing.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::payment_command(&payment_id, 1, "detected", 0, 3_001),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment start failed: {body}");
+    let (hold_expires_at,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT hold_expires_at FROM orders WHERE id = $1::uuid")
+            .bind(&order_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("order row exists");
+    assert_eq!(
+        hold_expires_at.map(marketplace_service::clock::format_timestamp),
+        Some(common::ts_after(900)),
+        "the lock point re-armed the claim to the sandbox window"
+    );
+    let (_, _, remaining) = drop_state(&app.pool, &aggregate_id).await;
+    assert_eq!(remaining, 4, "no double-decrement");
+    let (available, reserved): (i64, i64) =
+        sqlx::query_as("SELECT available_quantity, reserved_quantity FROM listings")
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing row exists");
+    assert_eq!((available, reserved), (4, 1), "exactly one unit held");
+
+    // The claim window (600 s) elapses, but the re-armed window has not:
+    // the sweep leaves the order alone.
+    app.clock.advance_seconds(601);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 0);
+    let (order_state,): (String,) = sqlx::query_as("SELECT state FROM orders WHERE id = $1::uuid")
+        .bind(&order_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("order row exists");
+    assert_eq!(order_state, "pending_payment");
+
+    // The payment confirms inside the re-armed window: edition assigned,
+    // order paid.
+    let (status, confirmed) = execute(
+        &app,
+        &buyer.token,
+        &common::payment_command(&payment_id, 2, "confirmed", 1, 3_002),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "confirm failed: {confirmed}");
+    assert_eq!(confirmed["result"]["order"]["state"], json!("paid"));
+    assert_eq!(confirmed["result"]["order"]["edition"], json!(1));
+    assert_eq!(confirmed["result"]["order"]["stock_held"], json!(false));
+    let (available, reserved, sold): (i64, i64, i64) =
+        sqlx::query_as("SELECT available_quantity, reserved_quantity, sold_quantity FROM listings")
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing row exists");
+    assert_eq!((available, reserved, sold), (4, 0, 1));
+}

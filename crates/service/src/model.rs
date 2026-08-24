@@ -317,6 +317,16 @@ pub struct OrderRow {
     /// orders; `NULL` for non-drop orders and for drop orders not yet paid.
     pub edition: Option<i32>,
     pub cancellation_reason: Option<String>,
+    /// Whether this order currently holds `reserved` listing stock of its
+    /// own ("only a payment locks an item"): set by a payment lock point —
+    /// or at checkout for drop-bound orders (lock-at-claim) — cleared when
+    /// confirmation converts the hold to sold, when a cancellation releases
+    /// it, and when the hold window lapses. Auction orders never set it:
+    /// their hold is the winning `reservations` row.
+    pub stock_held: bool,
+    /// Server-time bound on the hold: elapsing while the order is still
+    /// pending cancels the order, expires the payment, and restocks.
+    pub hold_expires_at: Option<DateTime<Utc>>,
     pub shipment: Option<Value>,
     pub return_request: Option<Value>,
     pub dispute: Option<Value>,
@@ -385,6 +395,8 @@ impl OrderRow {
             "edition": self.edition,
             "drop_aggregate_id": self.drop_aggregate_id,
             "cancellation_reason": self.cancellation_reason,
+            "stock_held": self.stock_held,
+            "hold_expires_at": self.hold_expires_at.map(format_timestamp),
             "shipment": self.shipment.clone().unwrap_or(Value::Null),
             "return_request": self.return_request.clone().unwrap_or(Value::Null),
             "dispute": self.dispute.clone().unwrap_or(Value::Null),

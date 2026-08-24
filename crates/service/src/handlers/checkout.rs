@@ -16,6 +16,7 @@ pub async fn handle(
     actor: &str,
     command: &Command,
     payload: &CreateCheckoutPayload,
+    drop_claim_window_seconds: i64,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     if command.aggregate_id != ids::checkout_aggregate_id(command.command_id)
@@ -57,6 +58,9 @@ pub async fn handle(
                 listing.server_revision,
             )));
         }
+        // Advisory pre-check only ("only a payment locks an item"): the
+        // checkout refuses when the stock is not available at this instant
+        // but moves nothing — the hold is acquired at a payment lock point.
         if line.quantity > listing.available_quantity {
             return Ok(Err(CommandFailure::with_revision(
                 ErrorCode::InsufficientInventory,
@@ -172,6 +176,14 @@ pub async fn handle(
         let order_id = Uuid::new_v4();
         let payment_id = Uuid::new_v4();
 
+        // Ordinary orders start with NO hold; a drop-bound checkout keeps
+        // lock-at-claim (the gate above debited the drop; the listing moves
+        // below), so its claim window arms immediately.
+        let stock_held = drop_aggregate_id.is_some();
+        let hold_expires_at = drop_aggregate_id
+            .is_some()
+            .then(|| now + chrono::Duration::seconds(drop_claim_window_seconds));
+
         let order = OrderRow {
             id: order_id,
             auction_aggregate_id: None,
@@ -193,6 +205,8 @@ pub async fn handle(
             receipt_id: None,
             edition: None,
             cancellation_reason: None,
+            stock_held,
+            hold_expires_at,
             shipment: None,
             return_request: None,
             dispute: None,
@@ -211,9 +225,10 @@ pub async fn handle(
             "INSERT INTO orders (id, checkout_command_id, drop_aggregate_id, buyer_pubky, \
              seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
              shipping_minor, tax_minor, total_minor, currency, exponent, \
-             guarantee_policy_version, payment_id, created_at, updated_at) \
+             guarantee_policy_version, payment_id, stock_held, hold_expires_at, created_at, \
+             updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-             $18, $18)",
+             $18, $19, $20, $20)",
         )
         .bind(order.id)
         .bind(command.command_id)
@@ -232,6 +247,8 @@ pub async fn handle(
         .bind(order.exponent)
         .bind(order.guarantee_policy_version)
         .bind(order.payment_id)
+        .bind(order.stock_held)
+        .bind(order.hold_expires_at)
         .bind(now)
         .execute(&mut **tx)
         .await?;
@@ -305,41 +322,47 @@ pub async fn handle(
         payments.push(payment.projection());
     }
 
-    // Move the purchased quantity to reserved with a compare-and-swap on the
-    // validated line revision; any concurrent movement aborts the checkout.
-    for (line, listing) in &resolved {
-        let new_state = if listing.available_quantity == line.quantity {
-            "reserved"
-        } else {
-            "available"
-        };
-        if !can_transition(&listing_machine(), &listing.state, new_state) {
-            return Ok(Err(CommandFailure::with_revision(
-                ErrorCode::InvariantViolation,
-                "The listing cannot enter the reserved state.",
-                listing.server_revision,
-            )));
-        }
-        let updated = sqlx::query(
-            "UPDATE listings SET server_revision = server_revision + 1, state = $3, \
-             available_quantity = available_quantity - $4, \
-             reserved_quantity = reserved_quantity + $4, updated_at = $5 \
-             WHERE aggregate_id = $1 AND server_revision = $2 AND available_quantity >= $4",
-        )
-        .bind(&listing.aggregate_id)
-        .bind(line.expected_revision)
-        .bind(new_state)
-        .bind(line.quantity)
-        .bind(now)
-        .execute(&mut **tx)
-        .await?;
-        if updated.rows_affected() != 1 {
-            let latest = current_listing_revision(tx, &listing.aggregate_id).await?;
-            return Ok(Err(CommandFailure::with_revision(
-                ErrorCode::RevisionConflict,
-                "A checkout listing revision is stale.",
-                latest,
-            )));
+    // Drop-bound checkout keeps lock-at-claim (ADR-0026: the FCFS race IS
+    // the product): the purchased unit moves to reserved with a
+    // compare-and-swap on the validated line revision, in the same
+    // transaction as the drop debit above. Ordinary checkouts move NOTHING —
+    // the hold is acquired at a payment lock point
+    // (`handlers::holds::acquire_payment_hold`).
+    if drop_aggregate_id.is_some() {
+        for (line, listing) in &resolved {
+            let new_state = if listing.available_quantity == line.quantity {
+                "reserved"
+            } else {
+                "available"
+            };
+            if !can_transition(&listing_machine(), &listing.state, new_state) {
+                return Ok(Err(CommandFailure::with_revision(
+                    ErrorCode::InvariantViolation,
+                    "The listing cannot enter the reserved state.",
+                    listing.server_revision,
+                )));
+            }
+            let updated = sqlx::query(
+                "UPDATE listings SET server_revision = server_revision + 1, state = $3, \
+                 available_quantity = available_quantity - $4, \
+                 reserved_quantity = reserved_quantity + $4, updated_at = $5 \
+                 WHERE aggregate_id = $1 AND server_revision = $2 AND available_quantity >= $4",
+            )
+            .bind(&listing.aggregate_id)
+            .bind(line.expected_revision)
+            .bind(new_state)
+            .bind(line.quantity)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                let latest = current_listing_revision(tx, &listing.aggregate_id).await?;
+                return Ok(Err(CommandFailure::with_revision(
+                    ErrorCode::RevisionConflict,
+                    "A checkout listing revision is stale.",
+                    latest,
+                )));
+            }
         }
     }
 

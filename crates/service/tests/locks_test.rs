@@ -214,9 +214,9 @@ async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let mut second =
-        checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001001");
-    second["payload"]["lines"][0]["expected_revision"] = json!(2);
+    // Checkout moves no inventory, so the second checkout sees the listing
+    // still at revision 1.
+    let second = checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001001");
     let (status, second_checkout) = execute(&app, &buyer.token, &second).await;
     assert_eq!(status, StatusCode::OK, "{second_checkout}");
     let first_payment = first_checkout["result"]["payments"][0]["id"]
@@ -574,7 +574,10 @@ async fn late_completion_after_window_expiry_goes_to_manual_review(pool: PgPool)
         .await
         .expect("worker pass runs");
 
-    // The window (3600 s) elapses while the lifecycle is still pending.
+    // The window (3600 s) elapses while the lifecycle is still pending: the
+    // hold releases back to the listing, the payment expires, and the ORDER
+    // is cancelled with the stored server reason — the buyer simply checks
+    // out again.
     app.clock.advance_seconds(3_601);
     let summary = run_once(&app.state, holder, app.clock.now())
         .await
@@ -583,6 +586,21 @@ async fn late_completion_after_window_expiry_goes_to_manual_review(pool: PgPool)
     let (state, _, revision) = payment_state(&app.pool, &order.payment_id).await;
     assert_eq!(state, "expired");
     assert_eq!(revision, 3);
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    let (reason, stock_held): (Option<String>, bool) =
+        sqlx::query_as("SELECT cancellation_reason, stock_held FROM orders WHERE id = $1::uuid")
+            .bind(&order.order_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("order row exists");
+    assert_eq!(reason.as_deref(), Some("payment window elapsed"));
+    assert!(!stock_held);
+    let (available, reserved): (i64, i64) =
+        sqlx::query_as("SELECT available_quantity, reserved_quantity FROM listings")
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing row exists");
+    assert_eq!((available, reserved), (1, 0), "the lapsed hold restocked");
     let (verification_state,): (String,) =
         sqlx::query_as("SELECT verification_state FROM payment_locks_correlations")
             .fetch_one(&app.pool)
@@ -607,7 +625,8 @@ async fn late_completion_after_window_expiry_goes_to_manual_review(pool: PgPool)
     assert_eq!(state, "manual_review");
     assert_eq!(
         order_state(&app.pool, &order.order_id).await,
-        "pending_payment"
+        "cancelled",
+        "the window sweep already cancelled the order"
     );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
     assert_eq!(

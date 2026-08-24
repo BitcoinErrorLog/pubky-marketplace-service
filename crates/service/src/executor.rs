@@ -164,7 +164,15 @@ async fn dispatch(
             crate::handlers::reserve_inventory::handle(tx, actor, command, payload, now).await
         }
         CommandPayload::CreateCheckout(payload) => {
-            crate::handlers::checkout::handle(tx, actor, command, payload, now).await
+            crate::handlers::checkout::handle(
+                tx,
+                actor,
+                command,
+                payload,
+                state.config.drop_claim_window_seconds,
+                now,
+            )
+            .await
         }
         CommandPayload::CreateOffer(payload) => {
             crate::handlers::offers::create(tx, actor, command, payload, now).await
@@ -197,7 +205,15 @@ async fn dispatch(
                     "Sandbox payment commands are disabled on this deployment.",
                 )));
             }
-            crate::handlers::payment::advance(tx, actor, command, payload, now).await
+            crate::handlers::payment::advance(
+                tx,
+                actor,
+                command,
+                payload,
+                state.config.sandbox_payment_window_seconds,
+                now,
+            )
+            .await
         }
         CommandPayload::RegisterLocks(payload) => {
             crate::handlers::locks::register(

@@ -510,6 +510,30 @@ pub async fn bind_payment_method(
         Err(error) => return internal("payment config read", &error),
     };
 
+    // The bind lock point: choosing a real rail is the payment start, so it
+    // acquires the order's inventory hold and arms the fiat payment window
+    // (all three rails; the paykit worker and both fiat verification legs
+    // confirm against this hold).
+    let order = match crate::handlers::holds::acquire_payment_hold(
+        &mut tx,
+        order,
+        state.config.fiat_payment_window_seconds,
+        now,
+    )
+    .await
+    {
+        Ok(Ok(order)) => order,
+        Ok(Err(failure)) => {
+            let reason = if failure.code == ErrorCode::InsufficientInventory {
+                "sold_out"
+            } else {
+                "hold_unavailable"
+            };
+            return method_error(failure.code, reason, &failure.message);
+        }
+        Err(error) => return internal("payment hold", &error),
+    };
+
     let (fiat_checkout_url, paykit_reference, adapter): (Option<String>, Option<String>, &str) =
         match method {
             "bitcoin" => {
@@ -735,6 +759,42 @@ async fn apply_fiat_paid(
                 "The order was not found.",
             )
         })?;
+    if payment.state == "expired" {
+        // The money is real but the payment window already elapsed: the
+        // sweep released the hold and cancelled the order, so the fact is
+        // retained under manual review — never silently dropped, never a
+        // confirmation of inventory the order no longer holds (exactly like
+        // a late Locks completion).
+        let updated: Option<(i64,)> = sqlx::query_as(
+            "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+             updated_at = $2 WHERE id = $1 AND state = 'expired' RETURNING revision",
+        )
+        .bind(payment.id)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| internal("manual review update", &error))?;
+        if let Some((revision,)) = updated {
+            insert_event(
+                &mut tx,
+                Uuid::new_v4(),
+                &ids::payment_aggregate_id(payment.id),
+                revision,
+                actor,
+                "payment.manual_review",
+                now,
+            )
+            .await
+            .map_err(|error| internal("manual review event", &error))?;
+        }
+        let response = order_response(&mut tx, &order, json!({ "verified": true }))
+            .await
+            .map_err(|error| internal("order projection", &error))?;
+        tx.commit()
+            .await
+            .map_err(|error| internal("manual review commit", &error))?;
+        return Ok(response);
+    }
     if payment.state != "awaiting_entitlement" {
         // Already confirmed (or under review): a duplicate verification has
         // no further effect.

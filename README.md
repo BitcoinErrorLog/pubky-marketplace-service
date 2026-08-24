@@ -61,7 +61,10 @@ Migrations in `crates/service/migrations/` are applied automatically at boot
 | `LOCKS_SERVER_URL` | unset | Lock Server base URL; setting it enables Locks verification |
 | `LOCKS_BUNDLE_ENCRYPTION_KEY` | unset | 32-byte hex key encrypting bundle ids at rest (XChaCha20-Poly1305) |
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
-| `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | marketplace payment window for Locks-correlated payments (≥ 60) |
+| `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the `payment.register_locks` lock point (≥ 60); the correlation window IS the hold window |
+| `FIAT_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the payment-method bind lock point (`POST /v0/orders/{id}/payment-method`, all three rails) (≥ 60) |
+| `SANDBOX_PAYMENT_WINDOW_SECONDS` | `900` | hold window armed by the sandbox lock point (`payment.sandbox_advance`'s first transition out of `awaiting_entitlement`) (≥ 60) |
+| `DROP_CLAIM_WINDOW_SECONDS` | `600` | hold window armed at checkout for drop-bound orders (lock-at-claim) (≥ 60) |
 | `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation |
 | `ATTESTOR_SECRET_KEY` | unset | 32-byte hex Ed25519 secret of the attestor identity (ADR 0024); its z-base-32 public key is the attestor pubky |
 | `ATTESTOR_ORDER_SALT` | unset | 32-byte hex salt for `order_ref` hashing; must stay stable for the attestor identity's lifetime |
@@ -241,6 +244,89 @@ on server time, outbox delivery) run in the background worker runtime, not
 as client commands. All other command kinds are rejected by the envelope
 contract until they are ported with their tests.
 
+## Inventory semantics: only a payment locks an item
+
+Checkout does not hold stock. `checkout.create` validates the cart against
+the pinned listing snapshot and **refuses when the requested quantity is
+not available at that instant** (`INSUFFICIENT_INVENTORY`, the pinned copy
+`Checkout quantity is unavailable.`) — but that check is advisory: the
+command creates the immutable order snapshot and its sandbox-adapter
+payment and moves **no inventory**. The order starts with `stock_held =
+false` and no hold window; the listing's `server_revision` does not bump.
+Abandoned carts therefore block nobody, and racing checkouts never contend:
+any number of buyers can hold orders against the same stock — only payments
+compete for it.
+
+**Payment lock points.** The inventory hold is acquired at the moment a
+payment starts. Each lock point atomically moves `available → reserved` for
+the order's quantities under the listing row lock — failing with
+`INSUFFICIENT_INVENTORY` and the pinned copy
+`The listing sold out before this payment started.` when the stock is gone —
+and arms a bounded server-time hold window on the order
+(`orders.hold_expires_at`):
+
+| Lock point | Window |
+| --- | --- |
+| `payment.register_locks` | `LOCKS_PAYMENT_WINDOW_SECONDS` (default 3600) — the existing correlation window IS the hold window; one window concept, not two |
+| `POST /v0/orders/{id}/payment-method` (bind, all three rails) | `FIAT_PAYMENT_WINDOW_SECONDS` (default 3600, min 60) |
+| `payment.sandbox_advance` transitioning OUT of `awaiting_entitlement` (the first transition; gated by `SANDBOX_PAYMENTS_ENABLED` as always) | `SANDBOX_PAYMENT_WINDOW_SECONDS` (default 900, min 60) |
+
+A lock point on an order that ALREADY holds stock never double-decrements
+(idempotent by order): a drop-bound order re-arms its window to the lock
+point's own span (see Drops), an ordinary order re-arms nothing. A lock
+point on an order that is no longer `pending_payment` is refused — a
+cancelled order can never grab stock. Auction orders are outside this
+mechanism entirely: the winner's hold is the winning `reservations` row,
+taken at close and swept by reservation expiry exactly as before.
+
+**Confirmation.** `confirm_order` (sandbox command, Locks worker, paykit
+worker, and both fiat verification legs all converge there) requires the
+order to hold stock — every confirming path passes a lock point first by
+construction, so a missing hold is an `INVARIANT_VIOLATION` — and converts
+`reserved → sold` exactly as before, clearing the hold flags in the same
+update.
+
+**Window expiry.** The worker's `payment_window` task sweeps pending,
+unconfirmed orders whose hold window elapsed on server time: the hold
+releases (`reserved → available`, crediting a stamped drop first under the
+shared lock order), the payment moves to `expired`
+(`awaiting_entitlement → expired`, the machine's `payment_window` edge),
+and the ORDER is cancelled (`pending_payment → cancelled`, the contract's
+`server`-triggered `payment_window` variant) with the stored
+`cancellation_reason` `payment window elapsed`. Post-expiry the buyer
+simply checks out again. Payments under `manual_review` are deliberately
+not swept (a human decides those — their money may be real); a sandbox
+payment the buyer drove to `detected` has no `detected → expired` edge, so
+its lapsed order cancels and restocks with the payment record left
+untouched, exactly as buyer cancellation leaves it. Confirmed orders are
+`paid` and are never touched by the sweep. Money observed AFTER expiry is
+never dropped: a late Locks completion, a late paykit settlement (when the
+payment was already detected on-chain), and a late fiat verification all
+route the expired payment to `manual_review`.
+
+**Cancellation.** Buyer/seller cancellation of a pending order releases the
+hold ONLY when one exists — an unheld pending order releases nothing, and
+the quantity-balance `CHECK` constraints prove no negative movement can
+happen.
+
+**Drops keep lock-at-claim.** See Drops below: the FCFS race is the
+product, so drop gating still debits the drop AND moves the listing unit at
+checkout — but the claim is bounded by `DROP_CLAIM_WINDOW_SECONDS` (default
+600) from checkout, and a payment lock point re-arms the window to its own
+(longer) span. A claimed-but-never-paid drop order expires through the same
+sweep, restocking the drop, freeing the buyer's per-drop cap, and releasing
+the listing unit.
+
+**Migration 0012 backfill.** Under the old semantics every
+`pending_payment` checkout order had decremented its listings at checkout,
+so migration 0012 marks them all `stock_held = true` (auction orders
+excluded — their hold is the reservation row): orders with a Locks
+correlation keep the correlation's window as their hold window; orders with
+a bound payment method get `now() + interval '1 hour'` (the fiat window
+default); every other pending order — legacy abandoned carts included —
+gets `now() + interval '1 hour'`, so listings bricked by abandoned carts
+self-clean through the new worker within the hour.
+
 ## Post-purchase lifecycle
 
 The post-purchase commands drive the canonical order machine
@@ -249,7 +335,10 @@ and refund branches) exactly as the prototype engine did:
 
 - **Payments and receipts.** `payment.sandbox_advance` (buyer only) drives
   the sandbox payment adapter; the service records these transitions and
-  **never observes, holds, or moves funds**. Confirmation is the transition
+  **never observes, holds, or moves funds**. Its first transition out of
+  `awaiting_entitlement` is a payment lock point (see Inventory semantics
+  above): it acquires the order's inventory hold and arms the sandbox hold
+  window. Confirmation is the transition
   that issues the durable receipt (`receipts` table, one per order/payment,
   append-only) and moves the order to `paid`. The receipt `content_hash` is
   the BLAKE3 hex digest of the canonical snake_case receipt payload
@@ -267,7 +356,9 @@ and refund branches) exactly as the prototype engine did:
   inventory conversion, notification) is shared by both paths.
 - **Cancellation.** `order.cancel_request` (buyer only, from
   `pending_payment`/`paid`/`processing`): an unpaid order cancels
-  immediately and its held stock returns to the listing; a paid order moves
+  immediately, and its held stock — ONLY when a payment lock point (or a
+  drop claim) actually acquired one; an unheld pending order releases
+  nothing — returns to the listing; a paid order moves
   to `cancel_requested` awaiting the seller. `order.cancel_approve` (seller
   only, from `cancel_requested`) moves the order to `cancelled` and returns
   the sold quantities to available under the same quantity-balance
@@ -337,6 +428,17 @@ the per-buyer cap, all inside the hold's transaction), and always derives
 its state from server time plus the paid count: `announced` → `live` →
 `ended_closed` / `ended_sold_out` / `ended_cancelled` (all ends terminal).
 
+**Lock-at-claim, bounded.** Unlike ordinary listings ("only a payment locks
+an item" — see Inventory semantics above), drop-bound checkout still holds
+stock AND debits the drop's remaining/per-buyer counters AT CHECKOUT: the
+FCFS race is the product. The claim is no longer forever, though — the
+order's hold window arms immediately with `DROP_CLAIM_WINDOW_SECONDS`
+(default 600), and a payment lock point re-arms it to its own (longer)
+span. A claimed-but-never-paid order expires through the payment-window
+sweep, which credits the drop (restocking a live drop and freeing the
+buyer's per-drop cap), releases the listing unit, and cancels the order.
+Editions and the sell-out transition on confirmation are unchanged.
+
 **Single-line drop checkout.** Editions map one order to one unit, so a
 checkout containing a drop-bound line must contain EXACTLY that one line
 with quantity 1. Anything else is refused with 422 `INVALID_COMMAND` and
@@ -401,11 +503,14 @@ advance a payment (ADR-0019 §7).
   payment/order and the Locks lifecycle identity `{creator, bundle_id}`.
   The bundle id is the buyer's cryptographically random lifecycle handle —
   a bearer secret — and the lock resource's creator must equal the order's
-  seller. The correlation binds order id, buyer, creator, BLAKE3 lock
+  seller.   The correlation binds order id, buyer, creator, BLAKE3 lock
   resource hash, amount, asset, and guarantee policy version
   (upstream-integration "Transaction-service correlation"). Registration
-  flips the payment to the `locks` adapter, which permanently refuses
-  `payment.sandbox_advance`, and does **not** advance the payment state.
+  is a payment lock point (see Inventory semantics above): it acquires the
+  order's inventory hold and arms the payment window — the correlation
+  window IS the hold window. It flips the payment to the `locks` adapter,
+  which permanently refuses `payment.sandbox_advance`, and does **not**
+  advance the payment state.
 - **Correlation secrecy.** The bundle id is stored only as
   XChaCha20-Poly1305 ciphertext (random 24-byte nonce, payment id as
   associated data, so ciphertexts cannot be transplanted between rows);
@@ -436,16 +541,19 @@ advance a payment (ADR-0019 §7).
     payment failure to the viewer).
   - `failed` / `expired` (the Locks task aged out) → recorded as an
     upstream fact and polling stops; the payment is **not** expired by it.
-- **Expiry vs late completion.** The `payment_window` task moves a payment
-  still `awaiting_entitlement` to `expired` once the marketplace window
-  (`LOCKS_PAYMENT_WINDOW_SECONDS`, stamped at registration) elapses on
-  server time — deliberately separate from upstream failure. The
-  correlation keeps polling after the window (bounded by the Lock Server's
-  own task ageing), so a completion verified **after** marketplace expiry
-  moves the payment `expired → manual_review` and is retained — never a
-  confirmation of a dead order, never silently discarded. A verified
-  completion whose order can no longer be confirmed (e.g. cancelled while
-  pending, or a lapsed auction hold) also goes to `manual_review`.
+- **Expiry vs late completion.** The `payment_window` task sweeps the
+  ORDER's hold window (`LOCKS_PAYMENT_WINDOW_SECONDS`, armed at
+  registration — the correlation window IS the hold window): once it
+  elapses on server time with the payment still `awaiting_entitlement`,
+  the hold restocks, the payment moves to `expired`, and the order is
+  cancelled with the stored reason `payment window elapsed` — deliberately
+  separate from upstream failure. The correlation keeps polling after the
+  window (bounded by the Lock Server's own task ageing), so a completion
+  verified **after** marketplace expiry moves the payment
+  `expired → manual_review` and is retained — never a confirmation of a
+  dead order, never silently discarded. A verified completion whose order
+  can no longer be confirmed (e.g. cancelled while pending, or a lapsed
+  auction hold) also goes to `manual_review`.
 - **History.** Every observed upstream status change and every marketplace
   action on it is appended to `payment_locks_observations` (append-only by
   trigger, statuses only — no bearer material), so late-completion and
@@ -628,12 +736,15 @@ lifecycle verification, and the marketplace payment window.
   `auction.close` command; the `active` status guard plus the partial unique
   index `orders_one_winner_per_auction` make the close exactly-once even
   when the command and the worker race.
-- **Locks verification and payment window.** See "Locks verification"
-  above: the verification task runs only when the deployment has Locks
-  configured; the window sweep always runs, so correlations registered
-  before a configuration change still expire on schedule. Both hold the
-  same leases and carry the same crash-safety and at-most-once effect
-  properties as the other tasks (payment CAS + unique event index).
+- **Locks verification and the payment window.** The verification task
+  (see "Locks verification" above) runs only when the deployment has Locks
+  configured. The `payment_window` sweep always runs and covers EVERY armed
+  hold window (Locks, fiat/bitcoin bind, sandbox, drop claims — see
+  Inventory semantics above): a lapsed hold restocks, the payment expires,
+  and the order cancels with the stored reason `payment window elapsed`.
+  Both hold the same leases and carry the same crash-safety and
+  at-most-once effect properties as the other tasks (payment CAS + unique
+  event index).
 
 ## Moderation (task 3.5)
 

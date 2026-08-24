@@ -32,6 +32,7 @@ pub async fn advance(
     actor: &str,
     command: &Command,
     payload: &AdvanceSandboxPaymentPayload,
+    sandbox_payment_window_seconds: i64,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let payment: Option<PaymentRow> = sqlx::query_as(&format!(
@@ -100,6 +101,25 @@ pub async fn advance(
             ErrorCode::InvariantViolation,
             "Payment order is missing.",
         )));
+    };
+    // The sandbox lock point: the first transition out of
+    // awaiting_entitlement is the payment start, so it acquires the order's
+    // inventory hold (or re-arms a drop claim's window) before anything
+    // else moves.
+    let order = if payment.state == "awaiting_entitlement" {
+        match crate::handlers::holds::acquire_payment_hold(
+            tx,
+            order,
+            sandbox_payment_window_seconds,
+            now,
+        )
+        .await?
+        {
+            Ok(order) => order,
+            Err(failure) => return Ok(Err(failure)),
+        }
+    } else {
+        order
     };
 
     let updated_payment: PaymentRow = sqlx::query_as(&format!(
@@ -179,6 +199,18 @@ pub(crate) async fn confirm_order(
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The order can no longer be paid.",
+        )));
+    }
+
+    // Every confirming path passes a payment lock point first by
+    // construction ("only a payment locks an item"), so a non-auction order
+    // that does not hold stock here is an invariant violation, never a race
+    // to tolerate. Auction orders hold through their winning reservation,
+    // checked below.
+    if order.auction_aggregate_id.is_none() && !order.stock_held {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvariantViolation,
+            "The reserved inventory for this order is no longer held.",
         )));
     }
 
@@ -309,9 +341,12 @@ pub(crate) async fn confirm_order(
     .fetch_one(&mut **tx)
     .await?;
 
+    // The hold clears with the conversion: the stock is sold now, so no
+    // window can release it and no cancellation path treats it as reserved.
     let updated_order: OrderRow = sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, state = 'paid', receipt_id = $2, \
-         edition = $3, updated_at = $4 WHERE id = $1 RETURNING {ORDER_COLUMNS}"
+         edition = $3, stock_held = false, hold_expires_at = NULL, updated_at = $4 \
+         WHERE id = $1 RETURNING {ORDER_COLUMNS}"
     ))
     .bind(order.id)
     .bind(receipt_id)
