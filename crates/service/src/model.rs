@@ -341,6 +341,10 @@ pub struct OrderRow {
     /// Optional processor/transaction reference: the buyer-supplied PayPal
     /// transaction id, or the matched Stripe Checkout Session id.
     pub fiat_transaction_ref: Option<String>,
+    /// Who verified the fiat payment that paid the order: `processor`
+    /// (Stripe key lookup), `gateway` (verified PayPal IPN), or `seller`
+    /// (manual confirm-received). NULL until verified.
+    pub fiat_verified_by: Option<String>,
     /// Paykit payment-request reference for physical bitcoin orders
     /// (Crockford base32 of the order UUID; the status-lookup bundle id).
     pub paykit_request_reference: Option<String>,
@@ -365,12 +369,17 @@ impl OrderRow {
     }
 
     /// How the bound fiat method is verified: `processor` (Stripe, via the
-    /// seller's restricted key against the Stripe API) or `seller-attested`
-    /// (PayPal, buyer reports + seller confirms). This asymmetry is
-    /// deliberate and must stay visible to both parties.
+    /// seller's restricted key against the Stripe API), `gateway-notified`
+    /// (PayPal, a postback-verified IPN from PayPal's servers paid the
+    /// order), or `seller-attested` (PayPal fallback: buyer reports + seller
+    /// confirms). The provenance asymmetry is deliberate and must stay
+    /// visible to both parties.
     pub fn fiat_verification(&self) -> Value {
         match self.payment_method.as_deref() {
             Some("stripe") => json!("processor"),
+            Some("paypal") if self.fiat_verified_by.as_deref() == Some("gateway") => {
+                json!("gateway-notified")
+            }
             Some("paypal") => json!("seller-attested"),
             _ => Value::Null,
         }

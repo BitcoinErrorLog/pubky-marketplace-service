@@ -31,8 +31,8 @@ use marketplace_service::locks::{
     LocksKeys, LocksLifecycleClient, LocksLookupOutcome, LocksRuntime,
 };
 use marketplace_service::payments::{
-    PaykitClient, PaykitStatusOutcome, PaykitStatusSource, PaymentsRuntime, StripeClient,
-    StripeKeyCipher,
+    PaykitClient, PaykitStatusOutcome, PaykitStatusSource, PaymentsRuntime, PaypalIpnVerifier,
+    StripeClient, StripeKeyCipher,
 };
 use marketplace_service::AppState;
 
@@ -1255,8 +1255,18 @@ impl PaykitStatusSource for FakePaykitStatus {
 /// A test app with the payment-methods runtime enabled, wired to fresh
 /// Stripe and paykit-server doubles through the real HTTP clients.
 pub async fn test_app_with_payments(pool: PgPool) -> (TestApp, FakeStripe, FakePaykit) {
+    let (app, stripe, paykit, _ipn) = test_app_with_payments_and_ipn(pool).await;
+    (app, stripe, paykit)
+}
+
+/// [`test_app_with_payments`] plus the handle to the PayPal IPN validation
+/// double, for tests posting IPN messages.
+pub async fn test_app_with_payments_and_ipn(
+    pool: PgPool,
+) -> (TestApp, FakeStripe, FakePaykit, FakePaypalIpn) {
     let stripe = spawn_fake_stripe().await;
     let paykit = spawn_fake_paykit().await;
+    let ipn = spawn_fake_paypal_ipn().await;
     let runtime = Arc::new(PaymentsRuntime {
         stripe_key_cipher: StripeKeyCipher::from_hex(TEST_STRIPE_ENCRYPTION_KEY)
             .expect("test stripe key parses"),
@@ -1265,6 +1275,7 @@ pub async fn test_app_with_payments(pool: PgPool) -> (TestApp, FakeStripe, FakeP
             PaykitClient::new(&paykit.base_url, TEST_PAYKIT_SIGNING_SEED)
                 .expect("fake paykit client builds"),
         ),
+        paypal_ipn: PaypalIpnVerifier::new(&ipn.base_url).expect("fake ipn verifier builds"),
     });
     let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
@@ -1279,7 +1290,65 @@ pub async fn test_app_with_payments(pool: PgPool) -> (TestApp, FakeStripe, FakeP
         },
         stripe,
         paykit,
+        ipn,
     )
+}
+
+#[derive(Default)]
+struct FakePaypalIpnState {
+    /// Answer `INVALID` instead of `VERIFIED`.
+    reject: bool,
+    /// Raw postback bodies received (each must carry `cmd=_notify-validate`).
+    postbacks: Vec<String>,
+}
+
+/// A local double of PayPal's IPN validation endpoint, reached through the
+/// REAL [`PaypalIpnVerifier`], so the postback body shape and verdict
+/// mapping are exercised end to end.
+pub struct FakePaypalIpn {
+    state: Arc<Mutex<FakePaypalIpnState>>,
+    pub base_url: String,
+}
+
+impl FakePaypalIpn {
+    pub fn reject(&self) {
+        self.state.lock().expect("fake ipn lock").reject = true;
+    }
+
+    pub fn postbacks(&self) -> Vec<String> {
+        self.state.lock().expect("fake ipn lock").postbacks.clone()
+    }
+}
+
+async fn serve_paypal_ipn_validation(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaypalIpnState>>>,
+    body: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut guard = state.lock().expect("fake ipn lock");
+    guard.postbacks.push(body);
+    let answer = if guard.reject { "INVALID" } else { "VERIFIED" };
+    (StatusCode::OK, answer.to_string()).into_response()
+}
+
+pub async fn spawn_fake_paypal_ipn() -> FakePaypalIpn {
+    let state: Arc<Mutex<FakePaypalIpnState>> = Arc::default();
+    let router = Router::new()
+        .route("/", axum::routing::post(serve_paypal_ipn_validation))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake paypal ipn binds");
+    let addr = listener.local_addr().expect("fake paypal ipn address");
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("fake paypal ipn serves");
+    });
+    FakePaypalIpn {
+        state,
+        base_url: format!("http://{addr}"),
+    }
 }
 
 /// A SAT-denominated register command so bitcoin binding has a

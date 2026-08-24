@@ -446,6 +446,12 @@ async fn paypal_binding_builds_the_seller_direct_checkout_url(pool: PgPool) {
     );
     assert!(url.contains("no_shipping=1"), "{url}");
     assert!(url.contains("no_note=1"), "{url}");
+    // PayPal notifies the service directly when the payment completes, so
+    // the order advances without either participant clicking anything.
+    assert!(
+        url.contains("notify_url=https%3A%2F%2Fsvc.test%2Fv0%2Fpaypal%2Fipn"),
+        "{url}"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -771,6 +777,153 @@ async fn paypal_attestation_applies_only_to_paypal_orders(pool: PgPool) {
     let (status, body) = confirm_received(&app, &seller.token, &order.order_id).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["reason"], json!("method_mismatch"));
+}
+
+// ---------------------------------------------------------------------------
+// PayPal IPN (gateway-notified confirmation)
+// ---------------------------------------------------------------------------
+
+/// A completed-payment IPN body for the fixture order (147.96 USD to the
+/// configured merchant email), with per-field overrides applied last.
+fn ipn_body(order_id: &str, overrides: &[(&str, &str)]) -> String {
+    let mut fields = vec![
+        ("payment_status", "Completed"),
+        ("receiver_email", "merchant@example.com"),
+        ("business", "merchant@example.com"),
+        ("mc_gross", "147.96"),
+        ("mc_currency", "USD"),
+        ("custom", order_id),
+        ("txn_id", "7XP31449AB123456C"),
+    ];
+    for (name, value) in overrides {
+        if let Some(field) = fields.iter_mut().find(|(key, _)| key == name) {
+            field.1 = value;
+        }
+    }
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in fields {
+        serializer.append_pair(name, value);
+    }
+    serializer.finish()
+}
+
+async fn post_ipn(app: &TestApp, body: String) -> StatusCode {
+    let (status, _) = send_bytes(
+        app.router.clone(),
+        "POST",
+        "/v0/paypal/ipn",
+        body.into_bytes(),
+    )
+    .await;
+    status
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_verified_completed_ipn_pays_the_order_without_any_participant(pool: PgPool) {
+    let (app, _stripe, _paykit, ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    put_config(&app, &seller.token, &full_config_body()).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
+
+    let status = post_ipn(&app, ipn_body(&order.order_id, &[])).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The postback echoed the exact body under cmd=_notify-validate.
+    let postbacks = ipn.postbacks();
+    assert_eq!(postbacks.len(), 1);
+    assert!(postbacks[0].starts_with("cmd=_notify-validate&"));
+    assert!(postbacks[0].contains("payment_status=Completed"));
+
+    let order_view = read_order(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(order_view["state"], json!("paid"), "{order_view}");
+    assert_eq!(order_view["fiat_verification"], json!("gateway-notified"));
+    assert_eq!(
+        order_view["fiat_transaction_ref"],
+        json!("7XP31449AB123456C")
+    );
+    assert!(order_view["receipt_id"].is_string());
+    assert_eq!(order_view["payment"]["state"], json!("confirmed"));
+
+    // The gateway actor notifies BOTH participants.
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.payment_confirmed'"
+        )
+        .await,
+        2
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_ipn_that_fails_postback_validation_is_dropped(pool: PgPool) {
+    let (app, _stripe, _paykit, ipn) = test_app_with_payments_and_ipn(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    put_config(&app, &seller.token, &full_config_body()).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
+
+    ipn.reject();
+    let status = post_ipn(&app, ipn_body(&order.order_id, &[])).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let order_view = read_order(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(order_view["state"], json!("pending_payment"));
+    assert_eq!(order_view["fiat_verification"], json!("seller-attested"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_ipn_that_does_not_match_server_held_facts_is_dropped(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    put_config(&app, &seller.token, &full_config_body()).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
+
+    // Underpayment, wrong currency, wrong receiver, and a non-completed
+    // status must all be dropped without advancing anything.
+    for overrides in [
+        [("mc_gross", "1.00")].as_slice(),
+        [("mc_currency", "EUR")].as_slice(),
+        [
+            ("receiver_email", "attacker@example.com"),
+            ("business", "attacker@example.com"),
+        ]
+        .as_slice(),
+        [("payment_status", "Pending")].as_slice(),
+    ] {
+        let status = post_ipn(&app, ipn_body(&order.order_id, overrides)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let order_view = read_order(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(order_view["state"], json!("pending_payment"));
+    assert_eq!(
+        order_view["payment"]["state"],
+        json!("awaiting_entitlement")
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn duplicate_ipns_confirm_exactly_once(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    put_config(&app, &seller.token, &full_config_body()).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
+
+    for _ in 0..3 {
+        let status = post_ipn(&app, ipn_body(&order.order_id, &[])).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 1);
+    let order_view = read_order(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(order_view["state"], json!("paid"));
 }
 
 // ---------------------------------------------------------------------------

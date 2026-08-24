@@ -39,6 +39,11 @@ pub const ENV_PAYKIT_SERVER_URL: &str = "PAYKIT_SERVER_URL";
 /// Environment variable holding the 32-byte hex ed25519 seed whose public
 /// key paykit-server trusts as `marketplace.trusted_public_key`.
 pub const ENV_PAYKIT_REQUEST_SIGNING_KEY: &str = "PAYKIT_REQUEST_SIGNING_KEY";
+/// Environment variable overriding PayPal's IPN validation endpoint.
+/// Production leaves it unset (`https://ipnpb.paypal.com/cgi-bin/webscr`);
+/// tests point it at a local double so the real postback client is
+/// exercised end to end.
+pub const ENV_PAYPAL_IPN_VERIFY_URL: &str = "PAYPAL_IPN_VERIFY_URL";
 
 const XNONCE_LEN: usize = 24;
 const KEY_LEN: usize = 32;
@@ -235,6 +240,83 @@ impl StripeClient {
             }
         }
         Ok(None)
+    }
+}
+
+/// The outcome of echoing an IPN message back to PayPal for validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpnVerdict {
+    /// PayPal answered `VERIFIED`: the message is authentic.
+    Verified,
+    /// PayPal answered `INVALID` (or anything else): the message is not
+    /// PayPal's and must be dropped.
+    Invalid,
+    /// PayPal could not be reached; the caller answers non-2xx so PayPal
+    /// retries the notification later.
+    Unavailable,
+}
+
+/// The PayPal IPN postback client: authenticity of an inbound notification
+/// is established the only way the protocol offers — echoing the exact
+/// received body back to PayPal prefixed with `cmd=_notify-validate` and
+/// trusting only a literal `VERIFIED` answer. No seller credentials are
+/// involved.
+pub struct PaypalIpnVerifier {
+    verify_url: String,
+    http: reqwest::Client,
+}
+
+impl std::fmt::Debug for PaypalIpnVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaypalIpnVerifier")
+            .field("verify_url", &self.verify_url)
+            .finish()
+    }
+}
+
+impl PaypalIpnVerifier {
+    pub fn new(verify_url: &str) -> anyhow::Result<Self> {
+        let verify_url = verify_url.trim_end_matches('/').to_string();
+        if !verify_url.starts_with("http://") && !verify_url.starts_with("https://") {
+            anyhow::bail!("{ENV_PAYPAL_IPN_VERIFY_URL} must be an http(s) URL");
+        }
+        Ok(Self {
+            verify_url,
+            http: reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?,
+        })
+    }
+
+    pub async fn verify(&self, raw_body: &str) -> IpnVerdict {
+        let postback = format!("cmd=_notify-validate&{raw_body}");
+        let response = self
+            .http
+            .post(&self.verify_url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(postback)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                tracing::warn!(status = %response.status(), "paypal ipn postback rejected");
+                return IpnVerdict::Unavailable;
+            }
+            Err(_) => {
+                tracing::warn!("paypal ipn postback transport failure");
+                return IpnVerdict::Unavailable;
+            }
+        };
+        match response.text().await {
+            Ok(text) if text.trim() == "VERIFIED" => IpnVerdict::Verified,
+            Ok(_) => IpnVerdict::Invalid,
+            Err(_) => {
+                tracing::warn!("paypal ipn postback returned an unreadable body");
+                IpnVerdict::Unavailable
+            }
+        }
     }
 }
 
@@ -462,6 +544,7 @@ pub struct PaymentsRuntime {
     pub stripe_key_cipher: StripeKeyCipher,
     pub stripe: StripeClient,
     pub paykit: Option<PaykitClient>,
+    pub paypal_ipn: PaypalIpnVerifier,
 }
 
 impl std::fmt::Debug for PaymentsRuntime {
@@ -500,10 +583,14 @@ pub fn payments_runtime_from_env() -> anyhow::Result<Option<Arc<PaymentsRuntime>
              {ENV_PAYKIT_REQUEST_SIGNING_KEY}, or neither"
         ),
     };
+    let ipn_verify_url = std::env::var(ENV_PAYPAL_IPN_VERIFY_URL)
+        .unwrap_or_else(|_| "https://ipnpb.paypal.com/cgi-bin/webscr".to_string());
+    let paypal_ipn = PaypalIpnVerifier::new(&ipn_verify_url)?;
     Ok(Some(Arc::new(PaymentsRuntime {
         stripe_key_cipher,
         stripe,
         paykit,
+        paypal_ipn,
     })))
 }
 

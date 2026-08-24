@@ -10,9 +10,12 @@
 //! - The Stripe leg is processor-verified: the service lists the seller's
 //!   recent Checkout Sessions with their stored restricted key and matches
 //!   `client_reference_id == order id` plus exact amount and currency.
-//! - The PayPal leg is seller-attested: the buyer reports payment, the
-//!   seller confirms receipt. The projection exposes the difference as
-//!   `fiat_verification: 'processor' | 'seller-attested'`.
+//! - The PayPal leg is gateway-notified when it can be: PayPal's IPN
+//!   callback (postback-verified, matched against the seller's configured
+//!   email and the exact order total) pays the order automatically. The
+//!   buyer-reports/seller-confirms pair remains as the fallback when no IPN
+//!   arrives. The projection exposes the provenance as `fiat_verification:
+//!   'processor' | 'gateway-notified' | 'seller-attested'`.
 //! - Payment confirmation reuses the sandbox/Locks confirmation path
 //!   (`confirm_order`): receipt exactly once, inventory reserved → sold,
 //!   payment CAS `awaiting_entitlement → confirmed`. A confirmation the
@@ -382,6 +385,7 @@ fn paypal_checkout_url(
     merchant_email: &str,
     order: &OrderRow,
     return_origin: Option<&str>,
+    notify_origin: Option<&str>,
 ) -> Result<String, &'static str> {
     if order.exponent < 0 || order.exponent > 4 {
         return Err("the order currency exponent is outside PayPal's supported range");
@@ -409,6 +413,13 @@ fn paypal_checkout_url(
         url.query_pairs_mut()
             .append_pair("return", &orders_url)
             .append_pair("cancel_return", &orders_url);
+    }
+    // The IPN callback: PayPal's servers notify this service directly when
+    // the payment completes, so the order advances without either
+    // participant clicking anything (authenticity established by postback).
+    if let Some(origin) = notify_origin {
+        let ipn_url = format!("{}/v0/paypal/ipn", origin.trim_end_matches('/'));
+        url.query_pairs_mut().append_pair("notify_url", &ipn_url);
     }
     Ok(url.to_string())
 }
@@ -624,8 +635,12 @@ pub async fn bind_payment_method(
                         "PayPal payment requires a fiat-denominated order.",
                     );
                 }
-                match paypal_checkout_url(&email, &order, state.config.public_app_origin.as_deref())
-                {
+                match paypal_checkout_url(
+                    &email,
+                    &order,
+                    state.config.public_app_origin.as_deref(),
+                    state.config.public_service_origin.as_deref(),
+                ) {
                     Ok(url) => (Some(url), None, "paypal"),
                     Err(message) => {
                         return method_error(
@@ -753,6 +768,7 @@ async fn apply_fiat_paid(
     actor: &str,
     order_id: Uuid,
     transaction_ref: Option<&str>,
+    verified_by: &str,
     now: DateTime<Utc>,
 ) -> Result<Response, Response> {
     let mut tx = state
@@ -835,6 +851,12 @@ async fn apply_fiat_paid(
             .await
             .map_err(|error| internal("transaction reference update", &error))?;
     }
+    sqlx::query("UPDATE orders SET fiat_verified_by = $2 WHERE id = $1")
+        .bind(order.id)
+        .bind(verified_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| internal("verification provenance update", &error))?;
     let command_id = Uuid::new_v4();
     match crate::handlers::payment::confirm_order(&mut tx, actor, command_id, &payment, order, now)
         .await
@@ -861,23 +883,30 @@ async fn apply_fiat_paid(
             )
             .await
             .map_err(|error| internal("payment confirmation event", &error))?;
-            let counterparty = if actor == confirmed_order.buyer_pubky {
-                confirmed_order.seller_pubky.clone()
+            // A participant actor notifies the counterparty; a non-participant
+            // actor (the PayPal gateway) notifies both sides, since neither
+            // of them drove the confirmation.
+            let recipients: Vec<&str> = if actor == confirmed_order.buyer_pubky {
+                vec![&confirmed_order.seller_pubky]
+            } else if actor == confirmed_order.seller_pubky {
+                vec![&confirmed_order.buyer_pubky]
             } else {
-                confirmed_order.buyer_pubky.clone()
+                vec![&confirmed_order.buyer_pubky, &confirmed_order.seller_pubky]
             };
-            insert_notification_intent(
-                &mut tx,
-                event_id,
-                "payment_confirmed",
-                &counterparty,
-                actor,
-                &ids::order_aggregate_id(confirmed_order.id),
-                None,
-                now,
-            )
-            .await
-            .map_err(|error| internal("payment confirmation notification", &error))?;
+            for recipient in recipients {
+                insert_notification_intent(
+                    &mut tx,
+                    event_id,
+                    "payment_confirmed",
+                    recipient,
+                    actor,
+                    &ids::order_aggregate_id(confirmed_order.id),
+                    None,
+                    now,
+                )
+                .await
+                .map_err(|error| internal("payment confirmation notification", &error))?;
+            }
             let response = order_response(&mut tx, &confirmed_order, json!({ "verified": true }))
                 .await
                 .map_err(|error| internal("order projection", &error))?;
@@ -1011,7 +1040,16 @@ pub async fn verify_fiat_payment(
     }
     if payment.state != "awaiting_entitlement" {
         // Already advanced: idempotent success.
-        return match apply_fiat_paid(&state, &actor.0, order_id, None, state.clock.now()).await {
+        return match apply_fiat_paid(
+            &state,
+            &actor.0,
+            order_id,
+            None,
+            "processor",
+            state.clock.now(),
+        )
+        .await
+        {
             Ok(response) | Err(response) => response,
         };
     }
@@ -1049,6 +1087,7 @@ pub async fn verify_fiat_payment(
                 &actor.0,
                 order_id,
                 Some(&matched.session_id),
+                "processor",
                 state.clock.now(),
             )
             .await
@@ -1241,7 +1280,147 @@ pub async fn confirm_fiat_received(
             "Receipt confirmation applies only to PayPal-bound orders.",
         );
     }
-    match apply_fiat_paid(&state, &actor.0, order_id, None, state.clock.now()).await {
+    match apply_fiat_paid(
+        &state,
+        &actor.0,
+        order_id,
+        None,
+        "seller",
+        state.clock.now(),
+    )
+    .await
+    {
         Ok(response) | Err(response) => response,
+    }
+}
+
+/// The actor recorded on events driven by a verified PayPal IPN: not a
+/// participant pubky, so confirmation notifications fan out to both sides.
+const PAYPAL_GATEWAY_ACTOR: &str = "paypal-ipn";
+
+/// Parses a decimal money string (`"147.96"`) into minor units under the
+/// order's exponent, strictly: the fraction must carry exactly the
+/// exponent's digits (PayPal always sends the currency's full precision).
+fn parse_gateway_amount_minor(value: &str, exponent: i32) -> Option<i64> {
+    let exponent = usize::try_from(exponent).ok()?;
+    let (whole, fraction) = match value.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (value, ""),
+    };
+    if whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if fraction.len() != exponent || !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let scale = 10_i64.checked_pow(exponent as u32)?;
+    let whole: i64 = whole.parse().ok()?;
+    let fraction: i64 = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse().ok()?
+    };
+    whole.checked_mul(scale)?.checked_add(fraction)
+}
+
+/// `POST /v0/paypal/ipn` (public, unauthenticated): PayPal's Instant
+/// Payment Notification callback for seller-direct `_xclick` payments.
+///
+/// Authenticity is established by the postback (the exact body is echoed to
+/// PayPal and only `VERIFIED` proceeds); authorization is established by
+/// matching the notification against server-held facts — the receiver must
+/// be the seller's configured PayPal email and the amount and currency must
+/// equal the order total exactly. Anything that doesn't match is dropped
+/// with a 200 (PayPal retries non-2xx; a mismatch will never become valid).
+/// Transient failures answer 5xx so PayPal retries.
+pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response {
+    let Ok(payments) = payments_runtime(&state) else {
+        tracing::warn!("paypal ipn received while payment methods are disabled");
+        return StatusCode::OK.into_response();
+    };
+    match payments.paypal_ipn.verify(&body).await {
+        crate::payments::IpnVerdict::Verified => {}
+        crate::payments::IpnVerdict::Invalid => {
+            tracing::warn!("paypal ipn failed postback validation; dropped");
+            return StatusCode::OK.into_response();
+        }
+        crate::payments::IpnVerdict::Unavailable => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    let fields: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(body.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+    let field = |name: &str| fields.get(name).map(String::as_str).unwrap_or_default();
+
+    let payment_status = field("payment_status");
+    if payment_status != "Completed" {
+        // Pending/Refunded/Reversed etc.: retained in the logs, never a
+        // confirmation. Refund flows stay on the existing dispute surface.
+        tracing::info!(
+            payment_status,
+            "paypal ipn ignored: not a completed payment"
+        );
+        return StatusCode::OK.into_response();
+    }
+    let Ok(order_id) = field("custom").parse::<Uuid>() else {
+        tracing::warn!("paypal ipn dropped: custom field is not an order id");
+        return StatusCode::OK.into_response();
+    };
+    let Some((order, _payment)) = (match read_order_and_payment(&state, order_id).await {
+        Ok(pair) => pair,
+        Err(error) => return internal("ipn order lookup", &error),
+    }) else {
+        tracing::warn!(%order_id, "paypal ipn dropped: order not found");
+        return StatusCode::OK.into_response();
+    };
+    if order.payment_method.as_deref() != Some("paypal") {
+        tracing::warn!(%order_id, "paypal ipn dropped: order is not paypal-bound");
+        return StatusCode::OK.into_response();
+    }
+    let config = match load_config(&state.pool, &order.seller_pubky).await {
+        Ok(config) => config,
+        Err(error) => return internal("ipn payment config read", &error),
+    };
+    let Some(merchant_email) = config.and_then(|config| config.paypal_merchant_email) else {
+        tracing::warn!(%order_id, "paypal ipn dropped: seller has no paypal email configured");
+        return StatusCode::OK.into_response();
+    };
+    let receiver = field("receiver_email");
+    let business = field("business");
+    let merchant = merchant_email.to_ascii_lowercase();
+    if receiver.to_ascii_lowercase() != merchant && business.to_ascii_lowercase() != merchant {
+        tracing::warn!(%order_id, "paypal ipn dropped: receiver is not the configured seller");
+        return StatusCode::OK.into_response();
+    }
+    if field("mc_currency") != order.currency {
+        tracing::warn!(%order_id, "paypal ipn dropped: currency mismatch");
+        return StatusCode::OK.into_response();
+    }
+    if parse_gateway_amount_minor(field("mc_gross"), order.exponent) != Some(order.total_minor) {
+        tracing::warn!(%order_id, "paypal ipn dropped: amount mismatch");
+        return StatusCode::OK.into_response();
+    }
+    let txn_id = field("txn_id");
+    let transaction_ref = (!txn_id.is_empty() && txn_id.len() <= 64).then_some(txn_id);
+    match apply_fiat_paid(
+        &state,
+        PAYPAL_GATEWAY_ACTOR,
+        order_id,
+        transaction_ref,
+        "gateway",
+        state.clock.now(),
+    )
+    .await
+    {
+        Ok(response) | Err(response) => {
+            // PayPal only needs the status: 2xx acknowledges, 5xx retries.
+            if response.status().is_server_error() {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            } else {
+                StatusCode::OK.into_response()
+            }
+        }
     }
 }

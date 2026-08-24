@@ -91,6 +91,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v0/drops/{seller_pubky}/{drop_id}",
             get(queries::get_public_drop),
         )
+        // Public: PayPal's IPN callback. Unauthenticated by nature;
+        // authenticity is the postback, authorization is the match against
+        // the seller's configured email and the exact order total.
+        .route("/v0/paypal/ipn", post(crate::payment_methods::paypal_ipn))
         .merge(protected)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

@@ -57,6 +57,12 @@ pub struct Config {
     /// hosted checkouts that support one (PayPal `_xclick` `return`/
     /// `cancel_return`). Optional: unset omits the return parameters.
     pub public_app_origin: Option<String>,
+    /// This service's own public origin (`PUBLIC_SERVICE_ORIGIN`, e.g.
+    /// `https://marketplace-service-production.up.railway.app`), used to
+    /// build gateway callback URLs (PayPal `notify_url` → `/v0/paypal/ipn`).
+    /// Optional: unset omits the callback and PayPal payments stay
+    /// participant-attested.
+    pub public_service_origin: Option<String>,
     /// Whether `payment.sandbox_advance` is accepted at all
     /// (`SANDBOX_PAYMENTS_ENABLED`, default false). The sandbox adapter lets
     /// the buyer drive payment transitions by explicit command; on a
@@ -115,18 +121,8 @@ impl Config {
         let moderator_pubkys =
             parse_moderator_pubkys(&std::env::var("MODERATOR_PUBKYS").unwrap_or_default())?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
-        let public_app_origin = match std::env::var("PUBLIC_APP_ORIGIN") {
-            Ok(raw) => {
-                let trimmed = raw.trim().trim_end_matches('/').to_string();
-                let parsed = url::Url::parse(&trimmed)
-                    .map_err(|_| anyhow::anyhow!("PUBLIC_APP_ORIGIN must be a valid URL"))?;
-                if parsed.scheme() != "https" && parsed.scheme() != "http" {
-                    anyhow::bail!("PUBLIC_APP_ORIGIN must be an http(s) origin");
-                }
-                Some(trimmed)
-            }
-            Err(_) => None,
-        };
+        let public_app_origin = env_origin("PUBLIC_APP_ORIGIN")?;
+        let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
         Ok(Self {
             bind_addr,
             database_url,
@@ -143,6 +139,7 @@ impl Config {
             paykit_poll_seconds,
             moderator_pubkys,
             public_app_origin,
+            public_service_origin,
             sandbox_payments_enabled,
         })
     }
@@ -169,6 +166,7 @@ impl Config {
             paykit_poll_seconds: 15,
             moderator_pubkys: Vec::new(),
             public_app_origin: Some("https://app.test".to_string()),
+            public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
         }
     }
@@ -198,6 +196,23 @@ fn env_i64(name: &str, default: i64) -> anyhow::Result<i64> {
             .parse()
             .map_err(|_| anyhow::anyhow!("{name} must be an integer")),
         Err(_) => Ok(default),
+    }
+}
+
+/// An optional http(s) origin from the environment, normalized without a
+/// trailing slash.
+fn env_origin(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let trimmed = raw.trim().trim_end_matches('/').to_string();
+            let parsed = url::Url::parse(&trimmed)
+                .map_err(|_| anyhow::anyhow!("{name} must be a valid URL"))?;
+            if parsed.scheme() != "https" && parsed.scheme() != "http" {
+                anyhow::bail!("{name} must be an http(s) origin");
+            }
+            Ok(Some(trimmed))
+        }
+        Err(_) => Ok(None),
     }
 }
 
