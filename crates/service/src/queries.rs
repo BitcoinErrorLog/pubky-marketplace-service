@@ -215,6 +215,68 @@ pub async fn get_listing(
     }
 }
 
+/// `GET /v1/listings/{aggregate_id}/bids`: the auction's bid history as the
+/// visible price progression — sequence, bidder, the visible price right
+/// after each bid, and when. Any authenticated user may read it (the same
+/// audience that can bid), which is what makes the one-winner algorithm
+/// auditable from outside. Deliberately ABSENT: every bidder's proxy
+/// maximum, which stays secret forever; bids recorded before the visible
+/// price existed show `visible_amount: null` rather than an invented figure.
+pub async fn list_listing_bids(
+    State(state): State<AppState>,
+    Path(aggregate_id): Path<String>,
+) -> Response {
+    let listing: Result<Option<ListingRow>, sqlx::Error> = sqlx::query_as(&format!(
+        "SELECT {LISTING_COLUMNS} FROM listings WHERE aggregate_id = $1"
+    ))
+    .bind(&aggregate_id)
+    .fetch_optional(&state.pool)
+    .await;
+    let listing = match listing {
+        Ok(Some(listing)) => listing,
+        Ok(None) => return query_error(ErrorCode::NotFound, "The listing was not found."),
+        Err(error) => return internal_error("listing", &error),
+    };
+    type BidHistoryRow = (i64, String, Option<i64>, String, i32, DateTime<Utc>);
+    let rows: Result<Vec<BidHistoryRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT sequence, bidder_pubky, visible_amount_minor, currency, exponent, created_at \
+         FROM bids WHERE listing_aggregate_id = $1 ORDER BY sequence",
+    )
+    .bind(&aggregate_id)
+    .fetch_all(&state.pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let bids: Vec<Value> = rows
+                .into_iter()
+                .map(
+                    |(sequence, bidder_pubky, visible_amount_minor, currency, exponent, at)| {
+                        json!({
+                            "sequence": sequence,
+                            "bidder_pubky": bidder_pubky,
+                            "visible_amount": visible_amount_minor
+                                .map(|amount| crate::model::money_json(amount, &currency, exponent)),
+                            "created_at": crate::clock::format_timestamp(at),
+                        })
+                    },
+                )
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "bids": bids,
+                    "auction": listing.auction.clone().unwrap_or(Value::Null),
+                    // Clients correct their countdown against the service
+                    // clock — the only clock auctions run on.
+                    "server_time": crate::clock::format_timestamp(state.clock.now()),
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => internal_error("bid history", &error),
+    }
+}
+
 /// `GET /v1/offers`: offers where the caller is buyer or seller, never
 /// another user's.
 pub async fn list_offers(

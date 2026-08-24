@@ -141,6 +141,14 @@ pub async fn place_bid(
             .min(runner_up.maximum_amount_minor + auction.minimum_increment.amount_minor),
         None => listing.unit_price_amount_minor,
     };
+    // The post-bid visible price is recorded on the bid row itself so bid
+    // history can show the price progression without ever exposing any
+    // bidder's secret proxy maximum.
+    sqlx::query("UPDATE bids SET visible_amount_minor = $2 WHERE id = $1")
+        .bind(bid.id)
+        .bind(visible_amount)
+        .execute(&mut **tx)
+        .await?;
     let should_extend = auction.anti_sniping_window_seconds > 0
         && (auction.ends_at - now)
             <= chrono::Duration::seconds(auction.anti_sniping_window_seconds);

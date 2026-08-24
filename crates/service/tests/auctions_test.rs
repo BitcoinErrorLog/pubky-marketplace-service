@@ -12,7 +12,7 @@ use sqlx::PgPool;
 
 use common::{
     close_auction_command, count, execute, listing_aggregate, new_actor, place_bid_command,
-    register_auction_command, register_command, test_app, TestApp,
+    register_auction_command, register_command, send, test_app, TestApp,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::workers::drain_outbox;
@@ -76,6 +76,77 @@ async fn applies_deterministic_proxy_bidding_and_reserve_status(pool: PgPool) {
     assert_eq!(auction["reserve_met"], json!(true));
     assert_eq!(auction["bid_count"], json!(2));
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM bids").await, 2);
+}
+
+#[sqlx::test]
+async fn bid_history_shows_the_visible_price_progression_and_never_the_maximums(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let other_buyer = new_actor(&app).await;
+    let observer = new_actor(&app).await;
+    execute(
+        &app,
+        &seller.token,
+        &register_auction_command(&seller.pubky),
+    )
+    .await;
+    execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 1, 10_000, 1),
+    )
+    .await;
+    execute(
+        &app,
+        &other_buyer.token,
+        &place_bid_command(&seller.pubky, 2, 8_000, 2),
+    )
+    .await;
+
+    // Any authenticated user — not only participants — audits the history.
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/listings/{}/bids", listing_aggregate(&seller.pubky)),
+        Some(&observer.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let bids = body["bids"].as_array().expect("bids array");
+    assert_eq!(bids.len(), 2);
+    // The visible price progression: the first bid opens at the start price,
+    // the second (a losing 8k proxy against a 10k proxy) pushes the visible
+    // price to runner-up + increment.
+    assert_eq!(bids[0]["sequence"], json!(1));
+    assert_eq!(bids[0]["bidder_pubky"], json!(buyer.pubky));
+    assert_eq!(bids[0]["visible_amount"]["amount_minor"], json!(4_500));
+    assert_eq!(bids[1]["sequence"], json!(2));
+    assert_eq!(bids[1]["bidder_pubky"], json!(other_buyer.pubky));
+    assert_eq!(bids[1]["visible_amount"]["amount_minor"], json!(8_500));
+    assert!(bids[0]["created_at"].is_string());
+    // The secret proxy maximums (10_000 / 8_000) must never appear anywhere
+    // in the response.
+    let serialized = body.to_string();
+    assert!(!serialized.contains("maximum"), "{serialized}");
+    assert!(!serialized.contains("10000"), "{serialized}");
+    assert!(!serialized.contains("8000"), "{serialized}");
+    // The countdown correction and the live auction terms ride along.
+    assert!(body["server_time"].is_string());
+    assert_eq!(body["auction"]["bid_count"], json!(2));
+
+    // Unauthenticated reads are refused: the audit audience is the same
+    // audience that can bid.
+    let (status, _) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/listings/{}/bids", listing_aggregate(&seller.pubky)),
+        None,
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 // TS case: "uses first accepted sequence as the proxy-bid tie breaker"

@@ -21,6 +21,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/commands", post(execute_command))
         .route("/v1/reports", get(list_reports))
         .route("/v1/listings/{aggregate_id}", get(queries::get_listing))
+        .route(
+            "/v1/listings/{aggregate_id}/bids",
+            get(queries::list_listing_bids),
+        )
         .route("/v1/drops/{aggregate_id}", get(queries::get_drop))
         .route(
             "/v1/drops/{aggregate_id}/me",
