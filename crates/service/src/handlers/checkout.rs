@@ -45,7 +45,28 @@ pub async fn handle(
                 "A buyer cannot purchase their own listing.",
             )));
         }
-        if listing.sale_format != "fixed_price" || listing.state != "available" {
+        if listing.sale_format != "fixed_price" {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidState,
+                "Only fixed-price listings can enter checkout.",
+            )));
+        }
+        // State-specific refusals: a `reserved` listing is held by another
+        // buyer's in-flight payment and may restock when its window lapses —
+        // the buyer deserves that truth, not a generic unavailability.
+        if listing.state == "reserved" {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidState,
+                "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.",
+            )));
+        }
+        if listing.state == "sold" {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidState,
+                "This listing has sold out.",
+            )));
+        }
+        if listing.state != "available" {
             return Ok(Err(CommandFailure::new(
                 ErrorCode::InvalidState,
                 "Only available fixed-price listings can enter checkout.",

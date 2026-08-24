@@ -374,7 +374,7 @@ async fn rejects_duplicate_lines_self_purchase_stale_stock_and_oversell(pool: Pg
 }
 
 // TS case: checkout of a fully reserved listing is rejected as INVALID_STATE
-// ("Only available fixed-price listings can enter checkout.").
+// with the state-specific truth — another buyer's hold may lapse and restock.
 #[sqlx::test]
 async fn rejects_checkout_of_a_reserved_listing(pool: PgPool) {
     let app = test_app(pool).await;
@@ -398,7 +398,7 @@ async fn rejects_checkout_of_a_reserved_listing(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
     assert_eq!(
         body["error"]["message"],
-        json!("Only available fixed-price listings can enter checkout.")
+        json!("Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.")
     );
 }
 
