@@ -285,8 +285,7 @@ pub async fn put_shipping_config(
         Ok(row) => (
             StatusCode::OK,
             Json(json!({
-                "ok": true,
-                "config": config_view(
+                "shipping_config": config_view(
                     &row.ship_from,
                     row.shippo_api_key_ciphertext.is_some(),
                     row.updated_at,
@@ -314,8 +313,7 @@ pub async fn get_shipping_config(
         Ok(Some(row)) => (
             StatusCode::OK,
             Json(json!({
-                "ok": true,
-                "config": config_view(
+                "shipping_config": config_view(
                     &row.ship_from,
                     row.shippo_api_key_ciphertext.is_some(),
                     row.updated_at,
@@ -325,7 +323,7 @@ pub async fn get_shipping_config(
             .into_response(),
         Ok(None) => (
             StatusCode::OK,
-            Json(json!({ "ok": true, "config": Value::Null })),
+            Json(json!({ "shipping_config": Value::Null })),
         )
             .into_response(),
         Err(error) => internal("shipping config read", &error),

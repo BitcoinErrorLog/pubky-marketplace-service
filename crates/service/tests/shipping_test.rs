@@ -96,8 +96,8 @@ async fn shipping_config_upserts_and_never_returns_the_token(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["config"]["shippo_api_key_set"], json!(true));
-    assert_eq!(body["config"]["ship_from"]["city"], json!("Split"));
+    assert_eq!(body["shipping_config"]["shippo_api_key_set"], json!(true));
+    assert_eq!(body["shipping_config"]["ship_from"]["city"], json!("Split"));
     assert!(
         !body.to_string().contains(SHIPPO_KEY),
         "the token must never be echoed"
@@ -109,8 +109,11 @@ async fn shipping_config_upserts_and_never_returns_the_token(pool: PgPool) {
     let (status, body) =
         put_shipping_config(&app, &seller.token, &json!({ "ship_from": moved })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["config"]["shippo_api_key_set"], json!(true));
-    assert_eq!(body["config"]["ship_from"]["city"], json!("Zagreb"));
+    assert_eq!(body["shipping_config"]["shippo_api_key_set"], json!(true));
+    assert_eq!(
+        body["shipping_config"]["ship_from"]["city"],
+        json!("Zagreb")
+    );
 
     // An empty string clears the key.
     let (status, body) = put_shipping_config(
@@ -120,7 +123,7 @@ async fn shipping_config_upserts_and_never_returns_the_token(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["config"]["shippo_api_key_set"], json!(false));
+    assert_eq!(body["shipping_config"]["shippo_api_key_set"], json!(false));
 
     // Malformed inputs are refused.
     let (status, body) = put_shipping_config(
