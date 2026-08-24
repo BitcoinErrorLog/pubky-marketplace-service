@@ -74,6 +74,9 @@ pub struct ListingRow {
     pub unit_price_amount_minor: i64,
     pub unit_price_currency: String,
     pub unit_price_exponent: i32,
+    /// Flat seller-signed shipping per order line, in the listing currency's
+    /// minor units (0 = free / not configured).
+    pub shipping_minor: i64,
     pub sale_format: String,
     pub auction: Option<Value>,
     pub updated_at: DateTime<Utc>,
@@ -103,6 +106,11 @@ impl ListingRow {
             "reserved_quantity": self.reserved_quantity,
             "sold_quantity": self.sold_quantity,
             "unit_price": self.unit_price_json(),
+            "shipping": money_json(
+                self.shipping_minor,
+                &self.unit_price_currency,
+                self.unit_price_exponent,
+            ),
             "sale_format": self.sale_format,
             "auction": self.auction.clone().unwrap_or(Value::Null),
             "updated_at": format_timestamp(self.updated_at),

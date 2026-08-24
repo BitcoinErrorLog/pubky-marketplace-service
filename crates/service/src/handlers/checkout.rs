@@ -7,7 +7,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::executor::insert_event;
-use crate::handlers::{current_listing_revision, fetch_listing, sandbox_tax_minor, SHIPPING_MINOR};
+use crate::handlers::{current_listing_revision, fetch_listing};
 use crate::model::{money_json, ListingRow, OrderRow, PaymentRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -192,8 +192,16 @@ pub async fn handle(
                 listing.unit_price_amount_minor * line.quantity
             })
             .sum();
-        let tax_minor = sandbox_tax_minor(subtotal_minor, SHIPPING_MINOR);
-        let total_minor = subtotal_minor + SHIPPING_MINOR + tax_minor;
+        // Shipping is the seller-signed flat rate, charged once per order
+        // line (quantity-independent). Tax is NOT computed: this service
+        // has no basis to determine anyone's tax, so it never invents one —
+        // sellers price tax into their listings if they need to.
+        let shipping_minor: i64 = indices
+            .iter()
+            .map(|&index| resolved[index].1.shipping_minor)
+            .sum();
+        let tax_minor = 0;
+        let total_minor = subtotal_minor + shipping_minor + tax_minor;
         let order_id = Uuid::new_v4();
         let payment_id = Uuid::new_v4();
 
@@ -216,7 +224,7 @@ pub async fn handle(
             lines: Value::Array(lines),
             delivery_address: Some(delivery_address.clone()),
             subtotal_minor,
-            shipping_minor: SHIPPING_MINOR,
+            shipping_minor,
             tax_minor,
             total_minor,
             currency: currency.clone(),
@@ -397,20 +405,4 @@ pub async fn handle(
             "payments": payments,
         }),
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sandbox_tax_minor;
-
-    #[test]
-    fn sandbox_tax_matches_the_prototype_rounding() {
-        // Prototype fixture: subtotal 12_500 + shipping 1_200 => tax 1_096.
-        assert_eq!(sandbox_tax_minor(12_500, 1_200), 1_096);
-        assert_eq!(sandbox_tax_minor(0, 1_200), 96);
-        // 8% of 13_707 = 1_096.56 rounds to 1_097.
-        assert_eq!(sandbox_tax_minor(12_507, 1_200), 1_097);
-        // 8% of 13_705 = 1_096.4 rounds to 1_096.
-        assert_eq!(sandbox_tax_minor(12_505, 1_200), 1_096);
-    }
 }

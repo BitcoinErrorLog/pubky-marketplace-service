@@ -568,7 +568,7 @@ async fn dispute_and_refund_outcomes_annotate_the_order_ref(pool: PgPool) {
             "refund.record_external",
             &order_id,
             6,
-            json!({ "amount_minor": 14_796, "transaction_id": "tx-refund-1" }),
+            json!({ "amount_minor": 13_700, "transaction_id": "tx-refund-1" }),
             2_242,
         ),
     )

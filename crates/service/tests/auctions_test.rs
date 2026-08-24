@@ -314,14 +314,15 @@ async fn closes_reserve_met_auction_with_one_winner_and_reservation(pool: PgPool
     );
     assert_eq!(body["result"]["reservation"]["quantity"], json!(1));
     // The winning order snapshots the final visible price (8_500) with the
-    // sandbox shipping and tax policy.
+    // seller-signed shipping and no invented tax.
     let order = &body["result"]["order"];
     assert_eq!(order["buyer_pubky"], json!(buyer.pubky));
     assert_eq!(order["seller_pubky"], json!(seller.pubky));
     assert_eq!(order["state"], json!("pending_payment"));
     assert_eq!(order["subtotal"]["amount_minor"], json!(8_500));
     assert_eq!(order["shipping"]["amount_minor"], json!(1_200));
-    assert_eq!(order["total"]["amount_minor"], json!(8_500 + 1_200 + 776));
+    assert_eq!(order["tax"]["amount_minor"], json!(0));
+    assert_eq!(order["total"]["amount_minor"], json!(8_500 + 1_200));
     assert_eq!(
         body["result"]["payment"]["state"],
         json!("awaiting_entitlement")

@@ -663,6 +663,7 @@ pub fn register_command(seller_pubky: &str, quantity: i64) -> Value {
             "content_hash": "a".repeat(64),
             "quantity": quantity,
             "unit_price": { "amount_minor": 12_500, "currency": "USD", "exponent": 2 },
+            "shipping_minor": 1_200,
         },
     })
 }

@@ -223,6 +223,12 @@ pub struct RegisterListingPayload {
     pub content_hash: String,
     pub quantity: i64,
     pub unit_price: Money,
+    /// Flat shipping charged once per order line for this listing, in the
+    /// listing currency's minor units (0 = free shipping). Derived from the
+    /// cheapest priceable option in the seller-signed record's
+    /// `shippingOptions`; defaults to 0 for records/clients that predate it.
+    #[serde(default)]
+    pub shipping_minor: i64,
     #[serde(default)]
     pub sale_format: SaleFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -970,6 +976,12 @@ pub fn validate_register_listing_payload(
         ));
     }
     validate_positive_money("payload.unit_price", &payload.unit_price, &mut issues);
+    if !(0..=MAX_SAFE_INTEGER).contains(&payload.shipping_minor) {
+        issues.push(issue(
+            "payload.shipping_minor",
+            "Expected a non-negative shipping amount",
+        ));
+    }
 
     let is_auction = payload.sale_format == SaleFormat::Auction;
     if is_auction != payload.auction_terms.is_some() {

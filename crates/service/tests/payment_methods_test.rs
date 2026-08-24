@@ -430,8 +430,9 @@ async fn paypal_binding_builds_the_seller_direct_checkout_url(pool: PgPool) {
     let url = bound["fiat_checkout_url"].as_str().expect("checkout url");
     assert!(url.starts_with("https://www.paypal.com/cgi-bin/webscr?cmd=_xclick"));
     assert!(url.contains("business=merchant%40example.com"), "{url}");
-    // The 12_500 + 1_200 shipping + 1_096 tax fixture totals 147.96 USD.
-    assert!(url.contains("amount=147.96"), "{url}");
+    // The 12_500 + 1_200 seller-signed shipping fixture totals 137.00 USD
+    // (no invented tax).
+    assert!(url.contains("amount=137.00"), "{url}");
     assert!(url.contains("currency_code=USD"), "{url}");
     assert!(url.contains(&format!("custom={}", order.order_id)), "{url}");
     // The buyer must be sent back to their orders page after commit —
@@ -783,14 +784,14 @@ async fn paypal_attestation_applies_only_to_paypal_orders(pool: PgPool) {
 // PayPal IPN (gateway-notified confirmation)
 // ---------------------------------------------------------------------------
 
-/// A completed-payment IPN body for the fixture order (147.96 USD to the
+/// A completed-payment IPN body for the fixture order (137.00 USD to the
 /// configured merchant email), with per-field overrides applied last.
 fn ipn_body(order_id: &str, overrides: &[(&str, &str)]) -> String {
     let mut fields = vec![
         ("payment_status", "Completed"),
         ("receiver_email", "merchant@example.com"),
         ("business", "merchant@example.com"),
-        ("mc_gross", "147.96"),
+        ("mc_gross", "137.00"),
         ("mc_currency", "USD"),
         ("custom", order_id),
         ("txn_id", "7XP31449AB123456C"),

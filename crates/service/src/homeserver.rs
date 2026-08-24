@@ -203,6 +203,14 @@ struct RecordSale {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RecordShippingOption {
+    pricing: String,
+    #[serde(default)]
+    price: Option<RecordMoney>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListingRecord {
     #[serde(default)]
     title: Option<String>,
@@ -211,7 +219,31 @@ struct ListingRecord {
     media: Vec<RecordMedia>,
     #[serde(default)]
     variants: Vec<RecordVariant>,
+    #[serde(default)]
+    shipping_options: Vec<RecordShippingOption>,
     sale: RecordSale,
+}
+
+/// The flat shipping the service will charge per order line: the cheapest
+/// PRICEABLE option the seller signed — `free` is 0, `flat` is its price
+/// when it is denominated in the listing currency. `calculated` options
+/// (and flat options in another currency) cannot be priced here and are
+/// skipped. No options, or none priceable, means no shipping charge —
+/// the service never invents a price the seller did not sign.
+fn shipping_minor_from_options(options: &[RecordShippingOption], listing_currency: &str) -> i64 {
+    options
+        .iter()
+        .filter_map(|option| match option.pricing.as_str() {
+            "free" => Some(0),
+            "flat" => option
+                .price
+                .as_ref()
+                .filter(|price| price.currency == listing_currency && price.amount_minor >= 0)
+                .map(|price| price.amount_minor),
+            _ => None,
+        })
+        .min()
+        .unwrap_or(0)
 }
 
 /// Derives the registration payload from a fetched record, mirroring the
@@ -253,6 +285,8 @@ pub fn registration_payload_from_record(
     } else {
         None
     };
+    let shipping_minor =
+        shipping_minor_from_options(&record.shipping_options, &unit_price.currency);
     Some(RegisterListingPayload {
         seller_pubky: seller_pubky.to_string(),
         listing_id: listing_id.to_string(),
@@ -268,6 +302,7 @@ pub fn registration_payload_from_record(
             .unwrap_or_default(),
         quantity: record.variants.iter().map(|variant| variant.quantity).sum(),
         unit_price,
+        shipping_minor,
         sale_format,
         auction_terms,
     })

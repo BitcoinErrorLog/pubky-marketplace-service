@@ -49,6 +49,25 @@ fn homeserver_record(revision: i64, quantities: &[i64]) -> Value {
             "sku": null,
             "priceOverride": null,
         })).collect::<Vec<_>>(),
+        "shippingOptions": [
+            {
+                "id": "ship_flat",
+                "pricing": "flat",
+                "label": "Seller shipping",
+                "price": { "amountMinor": 500, "currency": "USD", "exponent": 2 },
+                "estimatedMinDays": 2,
+                "estimatedMaxDays": 7,
+            },
+            {
+                "id": "ship_calc",
+                "pricing": "calculated",
+                "label": "Carrier calculated",
+                "provider": "ups",
+                "serviceCode": "ground",
+                "estimatedMinDays": 2,
+                "estimatedMaxDays": 7,
+            },
+        ],
         "sale": {
             "acceptsOffers": true,
             "format": "fixed_price",
@@ -102,6 +121,9 @@ async fn a_buyer_sync_registers_an_unregistered_listing(pool: PgPool) {
     assert_eq!(listing["available_quantity"], json!(5));
     assert_eq!(listing["state"], json!("available"));
     assert_eq!(listing["unit_price"]["amount_minor"], json!(12_500));
+    // The cheapest PRICEABLE seller-signed option: the $5 flat rate (the
+    // calculated option cannot be priced here and is skipped).
+    assert_eq!(listing["shipping"]["amount_minor"], json!(500));
     assert_eq!(listing["sale_format"], json!("fixed_price"));
 
     let (status, body) = read_listing(&app, &buyer.token, &aggregate_id).await;

@@ -18,10 +18,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::executor::insert_event;
-use crate::handlers::{
-    fetch_listing_for_update, insert_notification_intent, sandbox_tax_minor, LISTING_COLUMNS,
-    SHIPPING_MINOR,
-};
+use crate::handlers::{fetch_listing_for_update, insert_notification_intent, LISTING_COLUMNS};
 use crate::model::{
     money_json, AuctionState, BidRow, ListingRow, OrderRow, PaymentRow, ReservationRow,
 };
@@ -378,13 +375,14 @@ pub async fn close_locked_auction(
             created_at: now,
         };
 
-        // The winning order snapshots the final auction price and applies the
-        // same sandbox shipping/tax policy as checkout, so payment and
-        // fulfillment behave uniformly downstream.
+        // The winning order snapshots the final auction price and applies
+        // the same pricing policy as checkout: the seller-signed flat
+        // shipping and no invented tax.
         let final_price = closed_auction.current_price.clone();
         let subtotal_minor = final_price.amount_minor;
-        let tax_minor = sandbox_tax_minor(subtotal_minor, SHIPPING_MINOR);
-        let total_minor = subtotal_minor + SHIPPING_MINOR + tax_minor;
+        let shipping_minor = listing.shipping_minor;
+        let tax_minor = 0;
+        let total_minor = subtotal_minor + shipping_minor + tax_minor;
         let order_id = Uuid::new_v4();
         let payment_id = Uuid::new_v4();
         let lines = json!([{
@@ -415,7 +413,7 @@ pub async fn close_locked_auction(
             lines,
             delivery_address: None,
             subtotal_minor,
-            shipping_minor: SHIPPING_MINOR,
+            shipping_minor,
             tax_minor,
             total_minor,
             currency: final_price.currency.clone(),

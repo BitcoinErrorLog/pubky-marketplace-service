@@ -30,16 +30,7 @@ use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 pub const LISTING_COLUMNS: &str = "aggregate_id, seller_pubky, listing_id, title, \
      listing_revision, content_hash, server_revision, state, total_quantity, \
      available_quantity, reserved_quantity, sold_quantity, unit_price_amount_minor, \
-     unit_price_currency, unit_price_exponent, sale_format, auction, updated_at";
-
-/// Flat sandbox shipping per seller order, identical to the prototype engine.
-pub const SHIPPING_MINOR: i64 = 1_200;
-
-/// Sandbox tax: 8% of subtotal + shipping, rounded half up in integer math
-/// (`Math.round((subtotal + shipping) * 0.08)` in the prototype engine).
-pub fn sandbox_tax_minor(subtotal_minor: i64, shipping_minor: i64) -> i64 {
-    (8 * (subtotal_minor + shipping_minor) + 50) / 100
-}
+     unit_price_currency, unit_price_exponent, shipping_minor, sale_format, auction, updated_at";
 
 pub async fn fetch_listing(
     tx: &mut Transaction<'_, Postgres>,

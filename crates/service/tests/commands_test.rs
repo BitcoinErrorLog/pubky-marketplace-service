@@ -278,8 +278,10 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
     assert_eq!(order["state"], json!("pending_payment"));
     assert_eq!(order["subtotal"]["amount_minor"], json!(12_500));
     assert_eq!(order["shipping"]["amount_minor"], json!(1_200));
-    assert_eq!(order["tax"]["amount_minor"], json!(1_096));
-    assert_eq!(order["total"]["amount_minor"], json!(14_796));
+    // Tax is never invented by the service; shipping is the seller-signed
+    // flat rate from the registration payload.
+    assert_eq!(order["tax"]["amount_minor"], json!(0));
+    assert_eq!(order["total"]["amount_minor"], json!(13_700));
     assert_eq!(order["guarantee_policy_version"], json!(1));
     let line = &order["lines"][0];
     assert_eq!(line["listing_revision"], json!(1));
@@ -288,7 +290,7 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
     let payment = &body["result"]["payments"][0];
     assert_eq!(payment["state"], json!("awaiting_entitlement"));
     assert_eq!(payment["adapter"], json!("sandbox"));
-    assert_eq!(payment["amount"]["amount_minor"], json!(14_796));
+    assert_eq!(payment["amount"]["amount_minor"], json!(13_700));
     // The order starts with NO hold and no armed window.
     assert_eq!(order["stock_held"], json!(false));
     assert_eq!(order["hold_expires_at"], json!(null));

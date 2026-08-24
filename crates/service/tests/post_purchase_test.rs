@@ -71,7 +71,7 @@ async fn advances_sandbox_payment_through_detection_to_confirmation_and_issues_r
     let receipt = &confirmed["result"]["receipt"];
     let receipt_id = receipt["id"].as_str().expect("receipt id present");
     assert_eq!(confirmed["result"]["order"]["receipt_id"], receipt["id"]);
-    assert_eq!(receipt["total"]["amount_minor"], json!(14_796));
+    assert_eq!(receipt["total"]["amount_minor"], json!(13_700));
     assert_eq!(receipt["issuer_pubky"], json!(seller.pubky));
     assert_eq!(receipt["recipient_pubky"], json!(buyer.pubky));
     let content_hash = receipt["content_hash"].as_str().expect("hash present");
