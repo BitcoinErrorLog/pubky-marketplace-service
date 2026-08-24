@@ -101,9 +101,43 @@ pub async fn handle(
     let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
     if let Some(current) = &current {
         // Convergent no-op: the aggregate already reflects this record
-        // revision (or a newer one). Nothing changes, no event is emitted,
-        // and the caller learns the current server revision.
+        // revision (or a newer one) — with ONE narrow healing exception.
+        // When the service's own derivation evolves (shipping was added
+        // after listings were first registered), the record hasn't changed
+        // but what the service reads out of it has. An equal-revision sync
+        // heals exactly that derived field: shipping is inventory-neutral,
+        // so nothing else (quantity, price, state) is touched.
         if registration.listing_revision <= current.listing_revision {
+            if registration.listing_revision == current.listing_revision
+                && registration.shipping_minor != current.shipping_minor
+            {
+                let healed: crate::model::ListingRow = sqlx::query_as(&format!(
+                    "UPDATE listings SET server_revision = server_revision + 1, \
+                     shipping_minor = $2, updated_at = $3 WHERE aggregate_id = $1 \
+                     RETURNING {}",
+                    crate::handlers::LISTING_COLUMNS
+                ))
+                .bind(&command.aggregate_id)
+                .bind(registration.shipping_minor)
+                .bind(now)
+                .fetch_one(&mut **tx)
+                .await?;
+                let event_id = crate::executor::insert_event(
+                    tx,
+                    command.command_id,
+                    &command.aggregate_id,
+                    healed.server_revision,
+                    actor,
+                    "listing.synced",
+                    now,
+                )
+                .await?;
+                return Ok(Ok(HandlerSuccess {
+                    revision: healed.server_revision,
+                    event_ids: vec![event_id],
+                    result: json!({ "kind": "listing", "listing": healed.view() }),
+                }));
+            }
             return Ok(Ok(HandlerSuccess {
                 revision: current.server_revision,
                 event_ids: vec![],

@@ -198,13 +198,31 @@ async fn a_stale_record_never_regresses_a_newer_aggregate(pool: PgPool) {
     assert_eq!(
         status,
         StatusCode::OK,
-        "stale-record sync must no-op: {body}"
+        "stale-record sync must not regress: {body}"
     );
     assert_eq!(body["ok"], json!(true));
-    assert_eq!(body["revision"], json!(1));
-    assert_eq!(body["event_ids"], json!([]));
-    // The aggregate keeps the registered quantity, not the record's 7.
+    // The aggregate keeps the registered quantity, not the record's 7 —
+    // inventory never moves on an equal-revision sync.
     assert_eq!(body["result"]["listing"]["total_quantity"], json!(1));
+    // But the seller-signed record's shipping ($5 flat) HEALS the
+    // registration-supplied $12: shipping is a derived, inventory-neutral
+    // term and the record is the canonical source for it.
+    assert_eq!(
+        body["result"]["listing"]["shipping"]["amount_minor"],
+        json!(500)
+    );
+    assert_eq!(body["revision"], json!(2));
+
+    // A second sync of the same record converges: nothing left to heal.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "re-sync failed: {body}");
+    assert_eq!(body["revision"], json!(2));
+    assert_eq!(body["event_ids"], json!([]));
 }
 
 #[sqlx::test(migrations = "./migrations")]
