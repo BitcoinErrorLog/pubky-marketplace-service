@@ -60,7 +60,7 @@ pub const ORDER_COLUMNS: &str =
      currency, exponent, guarantee_policy_version, payment_id, receipt_id, edition, \
      cancellation_reason, stock_held, hold_expires_at, \
      shipment, return_request, dispute, external_refund, payment_method, fiat_checkout_url, \
-     payment_reported_at, fiat_transaction_ref, fiat_verified_by, paykit_request_reference, paykit_request_state, \
+     payment_reported_at, fiat_transaction_ref, fiat_verified_by, shipping_label, paykit_request_reference, paykit_request_state, \
      paykit_last_checked_at, created_at, updated_at";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \

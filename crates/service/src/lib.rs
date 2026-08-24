@@ -19,6 +19,7 @@ pub mod payment_methods;
 pub mod payments;
 pub mod queries;
 pub mod result;
+pub mod shipping;
 pub mod workers;
 
 use std::sync::Arc;

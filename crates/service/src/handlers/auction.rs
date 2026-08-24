@@ -436,6 +436,7 @@ pub async fn close_locked_auction(
             payment_reported_at: None,
             fiat_transaction_ref: None,
             fiat_verified_by: None,
+            shipping_label: None,
             paykit_request_reference: None,
             paykit_request_state: None,
             paykit_last_checked_at: None,

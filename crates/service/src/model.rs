@@ -353,6 +353,10 @@ pub struct OrderRow {
     /// (Stripe key lookup), `gateway` (verified PayPal IPN), or `seller`
     /// (manual confirm-received). NULL until verified.
     pub fiat_verified_by: Option<String>,
+    /// A purchased Shippo label: SELLER-ONLY (the PDF embeds the buyer's
+    /// address), deliberately absent from [`Self::view`] and served
+    /// exclusively through the seller-scoped label endpoints.
+    pub shipping_label: Option<Value>,
     /// Paykit payment-request reference for physical bitcoin orders
     /// (Crockford base32 of the order UUID; the status-lookup bundle id).
     pub paykit_request_reference: Option<String>,

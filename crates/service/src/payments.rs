@@ -24,7 +24,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Environment variable holding the 32-byte hex key sealing Stripe
 /// restricted keys at rest. Setting it enables the payment-methods surface.
@@ -39,6 +39,10 @@ pub const ENV_PAYKIT_SERVER_URL: &str = "PAYKIT_SERVER_URL";
 /// Environment variable holding the 32-byte hex ed25519 seed whose public
 /// key paykit-server trusts as `marketplace.trusted_public_key`.
 pub const ENV_PAYKIT_REQUEST_SIGNING_KEY: &str = "PAYKIT_REQUEST_SIGNING_KEY";
+/// Environment variable overriding the Shippo API base URL. Production
+/// leaves it unset (`https://api.goshippo.com`); tests point it at a local
+/// double so the real HTTP client is exercised end to end.
+pub const ENV_SHIPPO_API_BASE: &str = "SHIPPO_API_BASE";
 /// Environment variable overriding PayPal's IPN validation endpoint.
 /// Production leaves it unset (`https://ipnpb.paypal.com/cgi-bin/webscr`);
 /// tests point it at a local double so the real postback client is
@@ -240,6 +244,287 @@ impl StripeClient {
             }
         }
         Ok(None)
+    }
+}
+
+/// How a Shippo API call failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShippoError {
+    /// Shippo rejected the seller's API token (401/403).
+    KeyInvalid,
+    /// Shippo refused the request with actionable messages (bad address,
+    /// unpurchasable rate, ...). The joined messages are seller-facing.
+    Rejected(String),
+    /// Shippo is unreachable or answered malformed; retryable.
+    Unavailable,
+}
+
+/// One purchasable rate from a Shippo shipment quote.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShippoRate {
+    pub rate_id: String,
+    pub provider: String,
+    pub servicelevel: String,
+    /// Decimal amount string exactly as Shippo quotes it (e.g. `"7.85"`).
+    pub amount: String,
+    pub currency: String,
+    pub estimated_days: Option<i64>,
+    pub duration_terms: Option<String>,
+}
+
+/// A purchased Shippo label.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShippoLabel {
+    pub transaction_id: String,
+    pub carrier: String,
+    pub servicelevel: String,
+    pub amount: String,
+    pub currency: String,
+    pub tracking_number: String,
+    pub tracking_url: Option<String>,
+    pub label_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShippoRateWire {
+    object_id: String,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    servicelevel: Option<ShippoServiceLevelWire>,
+    #[serde(default)]
+    amount: Option<String>,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    estimated_days: Option<i64>,
+    #[serde(default)]
+    duration_terms: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShippoServiceLevelWire {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShippoMessageWire {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShippoShipmentWire {
+    #[serde(default)]
+    rates: Vec<ShippoRateWire>,
+    #[serde(default)]
+    messages: Vec<ShippoMessageWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShippoTransactionWire {
+    object_id: String,
+    status: String,
+    #[serde(default)]
+    tracking_number: Option<String>,
+    #[serde(default)]
+    tracking_url_provider: Option<String>,
+    #[serde(default)]
+    label_url: Option<String>,
+    #[serde(default)]
+    messages: Vec<ShippoMessageWire>,
+}
+
+impl ShippoRateWire {
+    fn into_rate(self) -> ShippoRate {
+        ShippoRate {
+            rate_id: self.object_id,
+            provider: self.provider.unwrap_or_default(),
+            servicelevel: self
+                .servicelevel
+                .and_then(|level| level.name)
+                .unwrap_or_default(),
+            amount: self.amount.unwrap_or_default(),
+            currency: self.currency.unwrap_or_default(),
+            estimated_days: self.estimated_days,
+            duration_terms: self.duration_terms,
+        }
+    }
+}
+
+fn joined_messages(messages: &[ShippoMessageWire]) -> String {
+    let joined: Vec<&str> = messages
+        .iter()
+        .filter_map(|message| message.text.as_deref())
+        .collect();
+    if joined.is_empty() {
+        "Shippo refused the request.".to_string()
+    } else {
+        joined.join(" ")
+    }
+}
+
+/// The real Shippo API client, reached with each SELLER's own API token —
+/// the service holds no platform shipping credentials (same trust shape as
+/// the Stripe restricted key). Tests exercise this exact client against a
+/// local double (`SHIPPO_API_BASE`).
+pub struct ShippoClient {
+    base_url: String,
+    http: reqwest::Client,
+}
+
+impl std::fmt::Debug for ShippoClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShippoClient")
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
+impl ShippoClient {
+    pub fn new(base_url: &str) -> anyhow::Result<Self> {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+            anyhow::bail!("{ENV_SHIPPO_API_BASE} must be an http(s) URL");
+        }
+        Ok(Self {
+            base_url,
+            http: reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?,
+        })
+    }
+
+    async fn post(
+        &self,
+        api_key: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, ShippoError> {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("ShippoToken {api_key}"),
+            )
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| {
+                tracing::warn!("shippo transport failure");
+                ShippoError::Unavailable
+            })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(ShippoError::KeyInvalid);
+        }
+        Ok(response)
+    }
+
+    /// Quotes a synchronous shipment and returns its purchasable rates.
+    pub async fn shipment_rates(
+        &self,
+        api_key: &str,
+        address_from: &serde_json::Value,
+        address_to: &serde_json::Value,
+        parcel: &serde_json::Value,
+    ) -> Result<Vec<ShippoRate>, ShippoError> {
+        let body = serde_json::json!({
+            "address_from": address_from,
+            "address_to": address_to,
+            "parcels": [parcel],
+            "async": false,
+        });
+        let response = self.post(api_key, "/shipments/", &body).await?;
+        let status = response.status();
+        let shipment: ShippoShipmentWire = response.json().await.map_err(|_| {
+            tracing::warn!("shippo shipment response was malformed");
+            ShippoError::Unavailable
+        })?;
+        if !status.is_success() {
+            return Err(ShippoError::Rejected(joined_messages(&shipment.messages)));
+        }
+        let rates: Vec<ShippoRate> = shipment
+            .rates
+            .into_iter()
+            .map(ShippoRateWire::into_rate)
+            .collect();
+        if rates.is_empty() {
+            return Err(ShippoError::Rejected(joined_messages(&shipment.messages)));
+        }
+        Ok(rates)
+    }
+
+    /// Purchases a label for a previously quoted rate. The rate is re-read
+    /// first so the stored label carries the carrier and price the seller
+    /// actually bought.
+    pub async fn purchase_label(
+        &self,
+        api_key: &str,
+        rate_id: &str,
+    ) -> Result<ShippoLabel, ShippoError> {
+        let rate_response = self
+            .http
+            .get(format!("{}/rates/{rate_id}", self.base_url))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("ShippoToken {api_key}"),
+            )
+            .send()
+            .await
+            .map_err(|_| ShippoError::Unavailable)?;
+        let rate_status = rate_response.status();
+        if rate_status == reqwest::StatusCode::UNAUTHORIZED
+            || rate_status == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(ShippoError::KeyInvalid);
+        }
+        if rate_status == reqwest::StatusCode::NOT_FOUND {
+            return Err(ShippoError::Rejected(
+                "The selected rate no longer exists; quote rates again.".to_string(),
+            ));
+        }
+        if !rate_status.is_success() {
+            return Err(ShippoError::Unavailable);
+        }
+        let rate: ShippoRateWire = rate_response
+            .json()
+            .await
+            .map_err(|_| ShippoError::Unavailable)?;
+        let rate = rate.into_rate();
+
+        let body = serde_json::json!({
+            "rate": rate_id,
+            "label_file_type": "PDF",
+            "async": false,
+        });
+        let response = self.post(api_key, "/transactions/", &body).await?;
+        let status = response.status();
+        let transaction: ShippoTransactionWire = response.json().await.map_err(|_| {
+            tracing::warn!("shippo transaction response was malformed");
+            ShippoError::Unavailable
+        })?;
+        if !status.is_success() || transaction.status != "SUCCESS" {
+            return Err(ShippoError::Rejected(joined_messages(
+                &transaction.messages,
+            )));
+        }
+        let (Some(tracking_number), Some(label_url)) =
+            (transaction.tracking_number, transaction.label_url)
+        else {
+            tracing::warn!("shippo SUCCESS transaction lacked tracking or label url");
+            return Err(ShippoError::Unavailable);
+        };
+        Ok(ShippoLabel {
+            transaction_id: transaction.object_id,
+            carrier: rate.provider,
+            servicelevel: rate.servicelevel,
+            amount: rate.amount,
+            currency: rate.currency,
+            tracking_number,
+            tracking_url: transaction.tracking_url_provider,
+            label_url,
+        })
     }
 }
 
@@ -545,6 +830,7 @@ pub struct PaymentsRuntime {
     pub stripe: StripeClient,
     pub paykit: Option<PaykitClient>,
     pub paypal_ipn: PaypalIpnVerifier,
+    pub shippo: ShippoClient,
 }
 
 impl std::fmt::Debug for PaymentsRuntime {
@@ -586,11 +872,15 @@ pub fn payments_runtime_from_env() -> anyhow::Result<Option<Arc<PaymentsRuntime>
     let ipn_verify_url = std::env::var(ENV_PAYPAL_IPN_VERIFY_URL)
         .unwrap_or_else(|_| "https://ipnpb.paypal.com/cgi-bin/webscr".to_string());
     let paypal_ipn = PaypalIpnVerifier::new(&ipn_verify_url)?;
+    let shippo_base = std::env::var(ENV_SHIPPO_API_BASE)
+        .unwrap_or_else(|_| "https://api.goshippo.com".to_string());
+    let shippo = ShippoClient::new(&shippo_base)?;
     Ok(Some(Arc::new(PaymentsRuntime {
         stripe_key_cipher,
         stripe,
         paykit,
         paypal_ipn,
+        shippo,
     })))
 }
 

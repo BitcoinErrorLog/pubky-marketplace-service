@@ -76,6 +76,7 @@ Migrations in `crates/service/migrations/` are applied automatically at boot
 | `PUBLIC_APP_ORIGIN` | unset | the web app's public origin (e.g. `https://shop.pubky.app`); when set, hosted checkouts that support a return destination (PayPal `_xclick`) send the buyer back to `{origin}/marketplace/orders` after commit/cancel |
 | `PUBLIC_SERVICE_ORIGIN` | unset | this service's own public origin; when set, PayPal checkout links carry `notify_url={origin}/v0/paypal/ipn` so PayPal's IPN pays the order automatically (postback-verified, matched against seller email + exact order total). Unset, PayPal stays participant-attested |
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |
+| `SHIPPO_API_BASE` | `https://api.goshippo.com` | Shippo API base for the seller-token label integration (`/v0/sellers/me/shipping-config`, `/v0/orders/{id}/shipping/*`); tests point it at a local double |
 | `SANDBOX_PAYMENTS_ENABLED` | `false` | accept `payment.sandbox_advance` at all; must stay `false` on any deployment handling real orders |
 
 The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
