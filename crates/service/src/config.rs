@@ -52,6 +52,11 @@ pub struct Config {
     /// disputes: the dispute queue, disputed-order projections, and audited
     /// evidence reads) — it grants no other authority.
     pub moderator_pubkys: Vec<String>,
+    /// The deployment's public web-app origin (`PUBLIC_APP_ORIGIN`, e.g.
+    /// `https://shop.pubky.app`), used as the buyer return destination on
+    /// hosted checkouts that support one (PayPal `_xclick` `return`/
+    /// `cancel_return`). Optional: unset omits the return parameters.
+    pub public_app_origin: Option<String>,
     /// Whether `payment.sandbox_advance` is accepted at all
     /// (`SANDBOX_PAYMENTS_ENABLED`, default false). The sandbox adapter lets
     /// the buyer drive payment transitions by explicit command; on a
@@ -110,6 +115,18 @@ impl Config {
         let moderator_pubkys =
             parse_moderator_pubkys(&std::env::var("MODERATOR_PUBKYS").unwrap_or_default())?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
+        let public_app_origin = match std::env::var("PUBLIC_APP_ORIGIN") {
+            Ok(raw) => {
+                let trimmed = raw.trim().trim_end_matches('/').to_string();
+                let parsed = url::Url::parse(&trimmed)
+                    .map_err(|_| anyhow::anyhow!("PUBLIC_APP_ORIGIN must be a valid URL"))?;
+                if parsed.scheme() != "https" && parsed.scheme() != "http" {
+                    anyhow::bail!("PUBLIC_APP_ORIGIN must be an http(s) origin");
+                }
+                Some(trimmed)
+            }
+            Err(_) => None,
+        };
         Ok(Self {
             bind_addr,
             database_url,
@@ -125,6 +142,7 @@ impl Config {
             locks_poll_seconds,
             paykit_poll_seconds,
             moderator_pubkys,
+            public_app_origin,
             sandbox_payments_enabled,
         })
     }
@@ -150,6 +168,7 @@ impl Config {
             locks_poll_seconds: 30,
             paykit_poll_seconds: 15,
             moderator_pubkys: Vec::new(),
+            public_app_origin: Some("https://app.test".to_string()),
             sandbox_payments_enabled: true,
         }
     }

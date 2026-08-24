@@ -434,6 +434,18 @@ async fn paypal_binding_builds_the_seller_direct_checkout_url(pool: PgPool) {
     assert!(url.contains("amount=147.96"), "{url}");
     assert!(url.contains("currency_code=USD"), "{url}");
     assert!(url.contains(&format!("custom={}", order.order_id)), "{url}");
+    // The buyer must be sent back to their orders page after commit —
+    // without a `return` URL PayPal's legacy WPS flow dead-ends post-payment.
+    assert!(
+        url.contains("return=https%3A%2F%2Fapp.test%2Fmarketplace%2Forders"),
+        "{url}"
+    );
+    assert!(
+        url.contains("cancel_return=https%3A%2F%2Fapp.test%2Fmarketplace%2Forders"),
+        "{url}"
+    );
+    assert!(url.contains("no_shipping=1"), "{url}");
+    assert!(url.contains("no_note=1"), "{url}");
 }
 
 #[sqlx::test(migrations = "./migrations")]

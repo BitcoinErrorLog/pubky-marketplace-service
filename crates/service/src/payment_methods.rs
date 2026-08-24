@@ -370,7 +370,19 @@ pub struct BindPaymentMethodBody {
 /// Builds the PayPal "Buy Now" (`_xclick`) checkout URL: seller-direct,
 /// no platform credentials, with the order id in `custom` for the buyer's
 /// later report.
-fn paypal_checkout_url(merchant_email: &str, order: &OrderRow) -> Result<String, &'static str> {
+///
+/// `return_origin` (the deployment's public app origin, when configured)
+/// gives PayPal somewhere to send the buyer after commit. Without a
+/// `return` URL PayPal's legacy WPS flow has no receipt destination and its
+/// post-payment page can dead-end ("Things don't appear to be working") —
+/// the payment itself completes, but the buyer is stranded on paypal.com
+/// instead of back on their order. `no_shipping`/`no_note` are set because
+/// the marketplace collects its own delivery address and messages.
+fn paypal_checkout_url(
+    merchant_email: &str,
+    order: &OrderRow,
+    return_origin: Option<&str>,
+) -> Result<String, &'static str> {
     if order.exponent < 0 || order.exponent > 4 {
         return Err("the order currency exponent is outside PayPal's supported range");
     }
@@ -389,7 +401,15 @@ fn paypal_checkout_url(merchant_email: &str, order: &OrderRow) -> Result<String,
         .append_pair("item_name", &format!("Order {}", order.id))
         .append_pair("amount", &amount)
         .append_pair("currency_code", &order.currency)
-        .append_pair("custom", &order.id.to_string());
+        .append_pair("custom", &order.id.to_string())
+        .append_pair("no_shipping", "1")
+        .append_pair("no_note", "1");
+    if let Some(origin) = return_origin {
+        let orders_url = format!("{}/marketplace/orders", origin.trim_end_matches('/'));
+        url.query_pairs_mut()
+            .append_pair("return", &orders_url)
+            .append_pair("cancel_return", &orders_url);
+    }
     Ok(url.to_string())
 }
 
@@ -604,7 +624,8 @@ pub async fn bind_payment_method(
                         "PayPal payment requires a fiat-denominated order.",
                     );
                 }
-                match paypal_checkout_url(&email, &order) {
+                match paypal_checkout_url(&email, &order, state.config.public_app_origin.as_deref())
+                {
                     Ok(url) => (Some(url), None, "paypal"),
                     Err(message) => {
                         return method_error(
