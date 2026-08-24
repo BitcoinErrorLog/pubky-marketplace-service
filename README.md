@@ -73,6 +73,7 @@ Migrations in `crates/service/migrations/` are applied automatically at boot
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests; its pubky-formatted public key is paykit-server's `marketplace.trusted_public_key` |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
+| `PUBLIC_APP_ORIGIN` | unset | the web app's public origin (e.g. `https://shop.pubky.app`); when set, hosted checkouts that support a return destination (PayPal `_xclick`) send the buyer back to `{origin}/marketplace/orders` after commit/cancel |
 | `SANDBOX_PAYMENTS_ENABLED` | `false` | accept `payment.sandbox_advance` at all; must stay `false` on any deployment handling real orders |
 
 The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
