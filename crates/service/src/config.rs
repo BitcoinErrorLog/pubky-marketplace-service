@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 use axum::http::HeaderValue;
-use marketplace_domain::pubky::is_valid_pubky;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -46,12 +45,6 @@ pub struct Config {
     /// Minimum seconds between paykit-server status polls for one pending
     /// bitcoin order.
     pub paykit_poll_seconds: i64,
-    /// Pubkys holding the moderator role (`MODERATOR_PUBKYS`, comma
-    /// separated). Validated as z-base-32 at startup. The role is scoped to
-    /// moderation (reading all reports, deciding reports, and adjudicating
-    /// disputes: the dispute queue, disputed-order projections, and audited
-    /// evidence reads) — it grants no other authority.
-    pub moderator_pubkys: Vec<String>,
     /// The deployment's public web-app origin (`PUBLIC_APP_ORIGIN`, e.g.
     /// `https://shop.pubky.app`), used as the buyer return destination on
     /// hosted checkouts that support one (PayPal `_xclick` `return`/
@@ -118,8 +111,6 @@ impl Config {
         if paykit_poll_seconds < 1 {
             anyhow::bail!("PAYKIT_POLL_SECONDS must be at least 1");
         }
-        let moderator_pubkys =
-            parse_moderator_pubkys(&std::env::var("MODERATOR_PUBKYS").unwrap_or_default())?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         let public_app_origin = env_origin("PUBLIC_APP_ORIGIN")?;
         let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
@@ -137,15 +128,10 @@ impl Config {
             drop_claim_window_seconds,
             locks_poll_seconds,
             paykit_poll_seconds,
-            moderator_pubkys,
             public_app_origin,
             public_service_origin,
             sandbox_payments_enabled,
         })
-    }
-
-    pub fn is_moderator(&self, pubky: &str) -> bool {
-        self.moderator_pubkys.iter().any(|entry| entry == pubky)
     }
 
     /// Configuration used by the integration test harness.
@@ -164,30 +150,11 @@ impl Config {
             drop_claim_window_seconds: 600,
             locks_poll_seconds: 30,
             paykit_poll_seconds: 15,
-            moderator_pubkys: Vec::new(),
             public_app_origin: Some("https://app.test".to_string()),
             public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
         }
     }
-}
-
-/// Parses the comma-separated moderator list, rejecting anything that is not
-/// a 52-character z-base-32 Pubky so a misconfigured role fails at startup.
-pub fn parse_moderator_pubkys(raw: &str) -> anyhow::Result<Vec<String>> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| {
-            if is_valid_pubky(entry) {
-                Ok(entry.to_string())
-            } else {
-                Err(anyhow::anyhow!(
-                    "MODERATOR_PUBKYS contains an invalid pubky (expected 52 z-base-32 characters)"
-                ))
-            }
-        })
-        .collect()
 }
 
 fn env_i64(name: &str, default: i64) -> anyhow::Result<i64> {
@@ -227,26 +194,3 @@ fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_moderator_pubkys;
-
-    #[test]
-    fn parses_a_valid_moderator_list() {
-        let raw = format!(" {} , {} ", "y".repeat(52), "o".repeat(52));
-        let parsed = parse_moderator_pubkys(&raw).expect("valid list parses");
-        assert_eq!(parsed, vec!["y".repeat(52), "o".repeat(52)]);
-        assert_eq!(
-            parse_moderator_pubkys("").expect("empty list parses"),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_moderator_pubkys_at_startup() {
-        parse_moderator_pubkys("not-a-pubky").expect_err("invalid pubky rejected");
-        parse_moderator_pubkys(&"y".repeat(51)).expect_err("wrong length rejected");
-        let mixed = format!("{},{}", "y".repeat(52), "L".repeat(52));
-        parse_moderator_pubkys(&mixed).expect_err("mixed list rejected");
-    }
-}

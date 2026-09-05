@@ -80,7 +80,6 @@ pub enum CommandPayload {
     CreateReview(ReviewTermsPayload),
     UpdateReview(ReviewTermsPayload),
     SetBandConsent(SetBandConsentPayload),
-    DisavowAttestation(DisavowAttestationPayload),
 }
 
 impl Command {
@@ -113,7 +112,6 @@ impl Command {
             CommandPayload::CreateReview(_) => "review.create",
             CommandPayload::UpdateReview(_) => "review.update",
             CommandPayload::SetBandConsent(_) => "attestation.set_band_consent",
-            CommandPayload::DisavowAttestation(_) => "attestation.disavow",
         }
     }
 
@@ -150,7 +148,6 @@ impl Command {
                 serde_json::to_value(p)
             }
             CommandPayload::SetBandConsent(p) => serde_json::to_value(p),
-            CommandPayload::DisavowAttestation(p) => serde_json::to_value(p),
         }
         .expect("command payloads serialize infallibly");
         json!({
@@ -522,16 +519,6 @@ pub struct SetBandConsentPayload {
     pub allows_amount_band: bool,
 }
 
-/// Moderator-only disavowal of an order's purchase attestation (fraud or
-/// collusion detected after the fact). The reason stays internal; only the
-/// outcome is ever published as an attestor annotation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DisavowAttestationPayload {
-    pub order_id: Uuid,
-    pub reason: String,
-}
-
 fn aggregate_id_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -669,9 +656,6 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
             .and_then(|payload| validate_review_terms(payload, CommandPayload::UpdateReview))?,
         "attestation.set_band_consent" => {
             parse_payload(&envelope.payload).map(CommandPayload::SetBandConsent)?
-        }
-        "attestation.disavow" => {
-            parse_payload(&envelope.payload).and_then(validate_disavow_attestation)?
         }
         _ => return Err(vec![issue("kind", "Unsupported command kind")]),
     };
@@ -1117,18 +1101,6 @@ fn validate_record_external_refund(
     );
     if issues.is_empty() {
         Ok(CommandPayload::RecordExternalRefund(payload))
-    } else {
-        Err(issues)
-    }
-}
-
-fn validate_disavow_attestation(
-    mut payload: DisavowAttestationPayload,
-) -> Result<CommandPayload, Vec<ValidationIssue>> {
-    let mut issues = Vec::new();
-    validate_trimmed("payload.reason", &mut payload.reason, 1, 2_000, &mut issues);
-    if issues.is_empty() {
-        Ok(CommandPayload::DisavowAttestation(payload))
     } else {
         Err(issues)
     }
