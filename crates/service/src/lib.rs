@@ -44,8 +44,8 @@ pub struct AppState {
     pub locks: Option<Arc<LocksRuntime>>,
     /// The attestor signing identity (ADR 0024). `None` when the deployment
     /// carries no attestor key: reviews still work but no purchase
-    /// attestations are issued, no annotations are recorded, the weekly stat
-    /// job does not run, and `attestation.disavow` is refused (fail closed;
+    /// attestations are issued, no annotations are recorded, and the weekly
+    /// stat job does not run (fail closed;
     /// see [`attestor::Attestor::from_env`]).
     pub attestor: Option<Arc<Attestor>>,
     /// The homeserver listing-record fetch backing `listing.sync`. Required
