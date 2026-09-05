@@ -796,23 +796,6 @@ pub fn close_auction_command(
     })
 }
 
-pub fn report_command(command_id: &str, target_id: &str) -> Value {
-    json!({
-        "version": 1,
-        "command_id": command_id,
-        "aggregate_id": format!("report:{command_id}"),
-        "expected_revision": 0,
-        "issued_at": "2026-08-19T22:00:00.000Z",
-        "kind": "trust.report",
-        "payload": {
-            "target_type": "listing",
-            "target_id": target_id,
-            "reason": "counterfeit",
-            "details": "Brand markings appear inconsistent.",
-        },
-    })
-}
-
 pub fn checkout_command_with_id(seller_pubky: &str, command_id: &str) -> Value {
     json!({
         "version": 1,

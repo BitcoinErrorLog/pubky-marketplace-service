@@ -79,8 +79,6 @@ pub enum CommandPayload {
     RecordExternalRefund(RecordExternalRefundPayload),
     CreateReview(ReviewTermsPayload),
     UpdateReview(ReviewTermsPayload),
-    CreateReport(CreateReportPayload),
-    DecideReport(DecideReportPayload),
     SetBandConsent(SetBandConsentPayload),
     DisavowAttestation(DisavowAttestationPayload),
 }
@@ -114,8 +112,6 @@ impl Command {
             CommandPayload::RecordExternalRefund(_) => "refund.record_external",
             CommandPayload::CreateReview(_) => "review.create",
             CommandPayload::UpdateReview(_) => "review.update",
-            CommandPayload::CreateReport(_) => "trust.report",
-            CommandPayload::DecideReport(_) => "trust.decide",
             CommandPayload::SetBandConsent(_) => "attestation.set_band_consent",
             CommandPayload::DisavowAttestation(_) => "attestation.disavow",
         }
@@ -153,8 +149,6 @@ impl Command {
             CommandPayload::CreateReview(p) | CommandPayload::UpdateReview(p) => {
                 serde_json::to_value(p)
             }
-            CommandPayload::CreateReport(p) => serde_json::to_value(p),
-            CommandPayload::DecideReport(p) => serde_json::to_value(p),
             CommandPayload::SetBandConsent(p) => serde_json::to_value(p),
             CommandPayload::DisavowAttestation(p) => serde_json::to_value(p),
         }
@@ -538,61 +532,6 @@ pub struct DisavowAttestationPayload {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReportTargetType {
-    Listing,
-    User,
-    Message,
-    Review,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReportReason {
-    ProhibitedItem,
-    Counterfeit,
-    Scam,
-    Harassment,
-    Unsafe,
-    Other,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateReportPayload {
-    pub target_type: ReportTargetType,
-    pub target_id: String,
-    pub reason: ReportReason,
-    pub details: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReportDecision {
-    Dismissed,
-    Actioned,
-}
-
-impl ReportDecision {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ReportDecision::Dismissed => "dismissed",
-            ReportDecision::Actioned => "actioned",
-        }
-    }
-}
-
-/// Moderator decision on a report (`trust.decide`, this service only; the
-/// prototype engine has no report decisions).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DecideReportPayload {
-    pub report_id: Uuid,
-    pub decision: ReportDecision,
-    pub rationale: String,
-}
-
 fn aggregate_id_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -728,8 +667,6 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
             .and_then(|payload| validate_review_terms(payload, CommandPayload::CreateReview))?,
         "review.update" => parse_payload(&envelope.payload)
             .and_then(|payload| validate_review_terms(payload, CommandPayload::UpdateReview))?,
-        "trust.report" => parse_payload(&envelope.payload).and_then(validate_create_report)?,
-        "trust.decide" => parse_payload(&envelope.payload).and_then(validate_decide_report)?,
         "attestation.set_band_consent" => {
             parse_payload(&envelope.payload).map(CommandPayload::SetBandConsent)?
         }
@@ -1213,48 +1150,6 @@ fn validate_review_terms(
     }
 }
 
-fn validate_create_report(
-    mut payload: CreateReportPayload,
-) -> Result<CommandPayload, Vec<ValidationIssue>> {
-    let mut issues = Vec::new();
-    if payload.target_id.is_empty() || payload.target_id.chars().count() > 300 {
-        issues.push(issue(
-            "payload.target_id",
-            "Expected between 1 and 300 characters",
-        ));
-    }
-    validate_trimmed(
-        "payload.details",
-        &mut payload.details,
-        1,
-        2_000,
-        &mut issues,
-    );
-    if issues.is_empty() {
-        Ok(CommandPayload::CreateReport(payload))
-    } else {
-        Err(issues)
-    }
-}
-
-fn validate_decide_report(
-    mut payload: DecideReportPayload,
-) -> Result<CommandPayload, Vec<ValidationIssue>> {
-    let mut issues = Vec::new();
-    validate_trimmed(
-        "payload.rationale",
-        &mut payload.rationale,
-        1,
-        2_000,
-        &mut issues,
-    );
-    if issues.is_empty() {
-        Ok(CommandPayload::DecideReport(payload))
-    } else {
-        Err(issues)
-    }
-}
-
 fn validate_create_checkout(
     mut payload: CreateCheckoutPayload,
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
@@ -1633,41 +1528,6 @@ mod tests {
         let issues = parse_command(&close_extra).expect_err("close payload must be empty");
         let serialized = serde_json::to_string(&issues).expect("issues serialize");
         assert!(!serialized.contains("secret-address"));
-    }
-
-    #[test]
-    fn parses_trust_report_and_decide_commands() {
-        let mut report = offer_command_json();
-        report["kind"] = json!("trust.report");
-        report["aggregate_id"] = json!("report:00000000-0000-4000-8000-000000000500");
-        report["expected_revision"] = json!(0);
-        report["payload"] = json!({
-            "target_type": "listing",
-            "target_id": format!("listing:{}_boots_01", "y".repeat(52)),
-            "reason": "counterfeit",
-            "details": "Brand markings appear inconsistent.",
-        });
-        assert_eq!(
-            parse_command(&report).expect("valid report").kind(),
-            "trust.report"
-        );
-
-        let mut bad_reason = report.clone();
-        bad_reason["payload"]["reason"] = json!("not-a-reason");
-        parse_command(&bad_reason).expect_err("unknown reason invalid");
-
-        let mut decide = offer_command_json();
-        decide["kind"] = json!("trust.decide");
-        decide["aggregate_id"] = json!("report:00000000-0000-4000-8000-000000000500");
-        decide["payload"] = json!({
-            "report_id": "00000000-0000-4000-8000-000000000500",
-            "decision": "actioned",
-            "rationale": "Listing removed after review.",
-        });
-        assert_eq!(
-            parse_command(&decide).expect("valid decide").kind(),
-            "trust.decide"
-        );
     }
 
     fn order_command_json(kind: &str, payload: Value) -> Value {

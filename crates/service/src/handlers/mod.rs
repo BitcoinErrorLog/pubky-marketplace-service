@@ -9,7 +9,6 @@ pub mod locks;
 pub mod offers;
 pub mod payment;
 pub mod register_listing;
-pub mod report;
 pub mod reserve_inventory;
 pub mod returns;
 pub mod reviews;

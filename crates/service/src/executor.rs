@@ -273,20 +273,6 @@ async fn dispatch(
         CommandPayload::UpdateReview(payload) => {
             crate::handlers::reviews::update(tx, actor, command, payload, now).await
         }
-        CommandPayload::CreateReport(payload) => {
-            crate::handlers::report::create(tx, actor, command, payload, now).await
-        }
-        CommandPayload::DecideReport(payload) => {
-            crate::handlers::report::decide(
-                tx,
-                actor,
-                command,
-                payload,
-                &state.config.moderator_pubkys,
-                now,
-            )
-            .await
-        }
         CommandPayload::SetBandConsent(payload) => {
             crate::handlers::attestation::set_band_consent(tx, actor, command, payload, now).await
         }

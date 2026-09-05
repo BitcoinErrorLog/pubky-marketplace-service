@@ -1,11 +1,11 @@
 //! Role-scoped read projections.
 //!
 //! Every endpoint requires the same Bearer session as `/v1/commands` and
-//! enforces object-level participation in the SQL `WHERE` clause, exactly
-//! like the existing `GET /v1/reports` scope: the authenticated actor is
-//! bound as a query parameter, so a non-participant's query can never match
-//! another user's rows. Single-object endpoints return 404 for absent *and*
-//! non-participant rows, so they do not reveal whether an aggregate exists.
+//! enforces object-level participation in the SQL `WHERE` clause: the
+//! authenticated actor is bound as a query parameter, so a non-participant's
+//! query can never match another user's rows. Single-object endpoints return
+//! 404 for absent *and* non-participant rows, so they do not reveal whether
+//! an aggregate exists.
 //!
 //! Redaction (ADR-0019 §8): projections never carry private delivery
 //! details (`orders.delivery_address`) or the Locks bundle correlation,
