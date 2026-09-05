@@ -57,7 +57,13 @@ deletes the operator annotation outcomes
 (`dispute_resolved_for_buyer`/`dispute_resolved_for_seller`/
 `attestation_disavowed`, artefacts with no meaning in a peer-to-peer
 marketplace), briefly lifting and re-creating the annotations append-only
-trigger to do so. There is **no DOWN migration** — dropped tables and
+trigger to do so. It also re-adds `orders_total_balance` as **NOT VALID**
+(never validated): staging's historical paid orders were charged a real
+tax, so their stored `total_minor` includes the removed `tax_minor` — those
+totals are what buyers actually paid and the receipts attest them, so they
+are kept as-is, while the constraint still enforces
+`total = subtotal + shipping` for every new insert/update. There is
+**no DOWN migration** — dropped tables and
 columns cannot be restored — so production must be empty or backed up
 before applying (it is empty as of 2026-09-05). Configuration is
 environment-based:

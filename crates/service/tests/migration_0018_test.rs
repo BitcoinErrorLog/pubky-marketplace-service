@@ -2,9 +2,13 @@
 //! applies every migration to a fresh database, so it cannot express
 //! "seed rows on the pre-0018 schema". This test drives the migration files
 //! directly against the throwaway Postgres from `DATABASE_URL`:
-//! apply 0001..=0017, seed a `disputed` order plus one annotation of each
-//! outcome, apply 0018, and assert the remediation and the narrowed
-//! constraints. The scratch database is dropped at the end.
+//! apply 0001..=0017, seed a `disputed` order, a paid order whose
+//! historical `tax_minor` is included in `total_minor` (the staging deploy
+//! failure class), plus one annotation of each outcome, apply 0018 twice,
+//! and assert the remediation and the narrowed constraints — including
+//! `orders_total_balance` re-added NOT VALID so legacy paid totals survive
+//! while new inserts stay balanced. The scratch database is dropped at the
+//! end.
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
@@ -80,10 +84,13 @@ async fn migration_0018_remediates_disputed_orders_and_operator_annotations() {
         apply(&pool, number).await;
     }
 
-    // Seed on the pre-0018 schema: one disputed order, plus one annotation
+    // Seed on the pre-0018 schema: one disputed order, one PAID order whose
+    // historical tax_minor = 150 is included in total_minor (the staging
+    // failure class: total = subtotal + shipping + tax), plus one annotation
     // per outcome (three operator outcomes that must go, one refund that
     // must stay).
     let order_id = Uuid::new_v4();
+    let taxed_order_id = Uuid::new_v4();
     let seeded_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
         .expect("seed timestamp")
         .to_utc();
@@ -100,6 +107,20 @@ async fn migration_0018_remediates_disputed_orders_and_operator_annotations() {
     .execute(&pool)
     .await
     .expect("seed disputed order");
+
+    sqlx::query(
+        "INSERT INTO orders (id, buyer_pubky, seller_pubky, revision, state, lines, \
+         delivery_address, subtotal_minor, shipping_minor, tax_minor, total_minor, currency, \
+         exponent, guarantee_policy_version, payment_id, created_at, updated_at) \
+         VALUES ($1, 'buyer', 'seller', 1, 'paid', '[]', '{}', 100, 10, 150, 260, 'EUR', 2, \
+         1, $2, $3, $3)",
+    )
+    .bind(taxed_order_id)
+    .bind(Uuid::new_v4())
+    .bind(seeded_at)
+    .execute(&pool)
+    .await
+    .expect("seed paid order with historical tax");
 
     for outcome in [
         "refunded",
@@ -119,7 +140,10 @@ async fn migration_0018_remediates_disputed_orders_and_operator_annotations() {
         .expect("seed annotation");
     }
 
-    // The migration under test.
+    // The migration under test, applied twice to prove idempotency (the
+    // second application is how the revised file re-runs on production
+    // after its `_sqlx_migrations` row is removed).
+    apply(&pool, 18).await;
     apply(&pool, 18).await;
 
     let order = sqlx::query("SELECT state, revision, updated_at FROM orders WHERE id = $1")
@@ -141,20 +165,70 @@ async fn migration_0018_remediates_disputed_orders_and_operator_annotations() {
         .expect("fetch remaining annotations");
     assert_eq!(remaining, ["refunded"]);
 
-    let constraints: Vec<String> = sqlx::query_scalar(
-        "SELECT conname FROM pg_constraint WHERE conname IN \
-         ('orders_state_check', 'attestation_annotations_outcome_check') ORDER BY conname",
+    // The taxed legacy row keeps the total that was actually paid: the
+    // re-added balance check is NOT VALID, so historical rows are exempt.
+    let taxed_total: i64 = sqlx::query_scalar("SELECT total_minor FROM orders WHERE id = $1")
+        .bind(taxed_order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch taxed order after migration");
+    assert_eq!(taxed_total, 260);
+
+    let constraints: Vec<(String, bool)> = sqlx::query(
+        "SELECT conname, convalidated FROM pg_constraint WHERE conname IN \
+         ('orders_state_check', 'attestation_annotations_outcome_check', \
+         'orders_total_balance') ORDER BY conname",
     )
     .fetch_all(&pool)
     .await
-    .expect("fetch check constraints");
+    .expect("fetch check constraints")
+    .into_iter()
+    .map(|row| {
+        (
+            row.get::<String, _>("conname"),
+            row.get::<bool, _>("convalidated"),
+        )
+    })
+    .collect();
     assert_eq!(
         constraints,
         [
-            "attestation_annotations_outcome_check".to_string(),
-            "orders_state_check".to_string()
+            ("attestation_annotations_outcome_check".to_string(), true),
+            ("orders_state_check".to_string(), true),
+            ("orders_total_balance".to_string(), false)
         ]
     );
+
+    // NOT VALID still bites new rows: a violating insert is rejected, a
+    // conforming one succeeds.
+    let violating = sqlx::query(
+        "INSERT INTO orders (id, buyer_pubky, seller_pubky, revision, state, lines, \
+         delivery_address, subtotal_minor, shipping_minor, total_minor, currency, \
+         exponent, guarantee_policy_version, payment_id, created_at, updated_at) \
+         VALUES ($1, 'buyer', 'seller', 1, 'paid', '[]', '{}', 100, 10, 999, 'EUR', 2, \
+         1, $2, now(), now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(
+        violating.is_err(),
+        "total != subtotal + shipping must violate orders_total_balance"
+    );
+
+    sqlx::query(
+        "INSERT INTO orders (id, buyer_pubky, seller_pubky, revision, state, lines, \
+         delivery_address, subtotal_minor, shipping_minor, total_minor, currency, \
+         exponent, guarantee_policy_version, payment_id, created_at, updated_at) \
+         VALUES ($1, 'buyer', 'seller', 1, 'paid', '[]', '{}', 100, 10, 110, 'EUR', 2, \
+         1, $2, now(), now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("conforming insert must succeed");
 
     // The narrowed constraints actually reject the removed vocabulary.
     let rejected = sqlx::query("UPDATE orders SET state = 'disputed' WHERE id = $1")
@@ -175,8 +249,7 @@ async fn migration_0018_remediates_disputed_orders_and_operator_annotations() {
         "annotations must be append-only again"
     );
 
-    // Idempotent: a second application is a no-op.
-    apply(&pool, 18).await;
+    // Both applications were idempotent: the remediated state is unchanged.
     let state: String = sqlx::query_scalar("SELECT state FROM orders WHERE id = $1")
         .bind(order_id)
         .fetch_one(&pool)

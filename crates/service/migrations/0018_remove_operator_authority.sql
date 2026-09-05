@@ -16,6 +16,15 @@
 -- re-added check constraint is dropped first, and the remediation UPDATE /
 -- DELETE are no-ops once applied.
 --
+-- This file is edited in place (no 0019): the first staging deploy rolled
+-- back inside its transaction (`orders_total_balance` was violated by
+-- historical paid test orders whose totals include the removed tax), so
+-- staging never recorded version 18, and production applied 0018 while
+-- still empty — the operator deletes production's `_sqlx_migrations` row
+-- for version 18 so this revised, idempotent file simply re-runs there. No
+-- environment retains the old text of 0018, so a follow-up migration would
+-- have nothing to fix.
+--
 -- There is NO DOWN migration: dropped tables/columns cannot be restored.
 -- Production must be empty or backed up before applying (it is empty as of
 -- 2026-09-05).
@@ -39,9 +48,16 @@ DROP TABLE IF EXISTS reports;
 ALTER TABLE orders DROP COLUMN IF EXISTS tax_minor;
 
 ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_total_balance;
+-- NOT VALID, and deliberately never VALIDATEd: staging's historical paid
+-- orders were charged a real tax on checkout, so their stored total_minor
+-- includes the now-dropped tax_minor and would violate the narrowed check.
+-- Those totals are the amounts buyers actually paid and the receipts
+-- attest them, so rewriting them would falsify history. NOT VALID enforces
+-- the balance for every NEW insert/update (all Rust insert paths compute
+-- total = subtotal + shipping) while leaving existing rows untouched.
 ALTER TABLE orders
     ADD CONSTRAINT orders_total_balance
-    CHECK (total_minor = subtotal_minor + shipping_minor);
+    CHECK (total_minor = subtotal_minor + shipping_minor) NOT VALID;
 
 -- === State vocabularies ======================================================
 -- `disputed` leaves the order state enum; refund annotations are the only
