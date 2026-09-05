@@ -46,7 +46,21 @@ cargo run -p marketplace-service
 
 Migrations in `crates/service/migrations/` are applied automatically at boot
 (they can also be applied manually with `sqlx migrate run` from
-`crates/service/`). Configuration is environment-based:
+`crates/service/`).
+
+**Migration 0018 (remove operator authority) remediates rows.** Before it
+narrows the order-state and annotation-outcome check constraints, it
+completes any `disputed` order (no arbiter exists any more, so an order
+awaiting adjudication completes as if undisputed — a seller-favour default,
+owner-approved for the staging test data; production has no rows) and
+deletes the operator annotation outcomes
+(`dispute_resolved_for_buyer`/`dispute_resolved_for_seller`/
+`attestation_disavowed`, artefacts with no meaning in a peer-to-peer
+marketplace), briefly lifting and re-creating the annotations append-only
+trigger to do so. There is **no DOWN migration** — dropped tables and
+columns cannot be restored — so production must be empty or backed up
+before applying (it is empty as of 2026-09-05). Configuration is
+environment-based:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
