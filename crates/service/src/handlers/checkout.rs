@@ -193,15 +193,14 @@ pub async fn handle(
             })
             .sum();
         // Shipping is the seller-signed flat rate, charged once per order
-        // line (quantity-independent). Tax is NOT computed: this service
-        // has no basis to determine anyone's tax, so it never invents one —
-        // sellers price tax into their listings if they need to.
+        // line (quantity-independent). The price the buyer pays is exactly
+        // the seller's listed price plus that shipping — nothing else is
+        // added.
         let shipping_minor: i64 = indices
             .iter()
             .map(|&index| resolved[index].1.shipping_minor)
             .sum();
-        let tax_minor = 0;
-        let total_minor = subtotal_minor + shipping_minor + tax_minor;
+        let total_minor = subtotal_minor + shipping_minor;
         let order_id = Uuid::new_v4();
         let payment_id = Uuid::new_v4();
 
@@ -225,7 +224,6 @@ pub async fn handle(
             delivery_address: Some(delivery_address.clone()),
             subtotal_minor,
             shipping_minor,
-            tax_minor,
             total_minor,
             currency: currency.clone(),
             exponent,
@@ -254,11 +252,11 @@ pub async fn handle(
         sqlx::query(
             "INSERT INTO orders (id, checkout_command_id, drop_aggregate_id, buyer_pubky, \
              seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
-             shipping_minor, tax_minor, total_minor, currency, exponent, \
+             shipping_minor, total_minor, currency, exponent, \
              guarantee_policy_version, payment_id, stock_held, hold_expires_at, created_at, \
              updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-             $18, $19, $20, $20)",
+             $18, $19, $19)",
         )
         .bind(order.id)
         .bind(command.command_id)
@@ -271,7 +269,6 @@ pub async fn handle(
         .bind(&order.delivery_address)
         .bind(order.subtotal_minor)
         .bind(order.shipping_minor)
-        .bind(order.tax_minor)
         .bind(order.total_minor)
         .bind(&order.currency)
         .bind(order.exponent)

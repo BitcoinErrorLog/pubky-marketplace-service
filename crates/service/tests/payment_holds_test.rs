@@ -502,10 +502,10 @@ async fn the_backfill_marks_exactly_the_legacy_pending_checkout_orders(pool: PgP
             async move {
                 sqlx::query(
                     "INSERT INTO orders (id, auction_aggregate_id, buyer_pubky, seller_pubky, \
-                 revision, state, lines, subtotal_minor, shipping_minor, tax_minor, \
+                 revision, state, lines, subtotal_minor, shipping_minor, \
                  total_minor, currency, exponent, guarantee_policy_version, payment_id, \
                  payment_method, created_at, updated_at) \
-                 VALUES ($1, $2, 'buyer', 'seller', 1, $3, '[]'::jsonb, 0, 0, 0, 0, 'USD', 2, \
+                 VALUES ($1, $2, 'buyer', 'seller', 1, $3, '[]'::jsonb, 0, 0, 0, 'USD', 2, \
                  1, $4, $5, $6, $6)",
                 )
                 .bind(id)

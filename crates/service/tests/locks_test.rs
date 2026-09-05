@@ -107,7 +107,7 @@ async fn registration_stores_an_encrypted_bound_correlation(pool: PgPool) {
     assert_eq!(payment_id.to_string(), order.payment_id);
     assert_eq!(buyer_pubky, buyer.pubky);
     assert_eq!(creator_pubky, seller.pubky);
-    assert_eq!(amount, 13_700); // 12_500 + 1_200 seller-signed shipping, no invented tax
+    assert_eq!(amount, 13_700); // 12_500 + 1_200 seller-signed shipping
     assert_eq!(asset, "USD");
     assert_eq!(policy, 1);
     assert!(

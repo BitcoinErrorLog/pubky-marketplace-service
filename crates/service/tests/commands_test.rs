@@ -278,9 +278,8 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
     assert_eq!(order["state"], json!("pending_payment"));
     assert_eq!(order["subtotal"]["amount_minor"], json!(12_500));
     assert_eq!(order["shipping"]["amount_minor"], json!(1_200));
-    // Tax is never invented by the service; shipping is the seller-signed
-    // flat rate from the registration payload.
-    assert_eq!(order["tax"]["amount_minor"], json!(0));
+    // The total is exactly the listed price plus the seller-signed flat
+    // shipping from the registration payload — nothing else is added.
     assert_eq!(order["total"]["amount_minor"], json!(13_700));
     assert_eq!(order["guarantee_policy_version"], json!(1));
     let line = &order["lines"][0];
