@@ -56,8 +56,9 @@ ALTER TABLE orders
 -- row is inserted: handlers record the *causing* action (review.created,
 -- order.cancelled, ...) and there is no order.completed event kind;
 -- projections read orders.state directly, and the seller-stats worker keys
--- off fulfillment.delivered events, which a disputed order already has
--- (disputes open post-delivery). The one-row gap in per-aggregate event
+-- off fulfillment.delivered events: a disputed order that had reached
+-- delivered already has one, and a pre-delivery disputed order correctly
+-- records no delivery stat. The one-row gap in per-aggregate event
 -- revisions is harmless — events_one_per_aggregate_revision only enforces
 -- uniqueness, and the next event claims revision + 1.
 UPDATE orders
