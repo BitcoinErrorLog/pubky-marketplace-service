@@ -385,12 +385,11 @@ pub async fn close_locked_auction(
 
         // The winning order snapshots the final auction price and applies
         // the same pricing policy as checkout: the seller-signed flat
-        // shipping and no invented tax.
+        // shipping, nothing else added.
         let final_price = closed_auction.current_price.clone();
         let subtotal_minor = final_price.amount_minor;
         let shipping_minor = listing.shipping_minor;
-        let tax_minor = 0;
-        let total_minor = subtotal_minor + shipping_minor + tax_minor;
+        let total_minor = subtotal_minor + shipping_minor;
         let order_id = Uuid::new_v4();
         let payment_id = Uuid::new_v4();
         let lines = json!([{
@@ -422,7 +421,6 @@ pub async fn close_locked_auction(
             delivery_address: None,
             subtotal_minor,
             shipping_minor,
-            tax_minor,
             total_minor,
             currency: final_price.currency.clone(),
             exponent: final_price.exponent,
@@ -452,10 +450,10 @@ pub async fn close_locked_auction(
         };
         sqlx::query(
             "INSERT INTO orders (id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
-             state, lines, delivery_address, subtotal_minor, shipping_minor, tax_minor, \
+             state, lines, delivery_address, subtotal_minor, shipping_minor, \
              total_minor, currency, exponent, guarantee_policy_version, payment_id, \
              created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $12, $13, $14, $15, $15)",
         )
         .bind(order.id)
         .bind(&listing.aggregate_id)
@@ -466,7 +464,6 @@ pub async fn close_locked_auction(
         .bind(&order.lines)
         .bind(order.subtotal_minor)
         .bind(order.shipping_minor)
-        .bind(order.tax_minor)
         .bind(order.total_minor)
         .bind(&order.currency)
         .bind(order.exponent)

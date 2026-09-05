@@ -46,7 +46,7 @@ pub const MAX_LIMIT: i64 = 200;
 
 pub const ORDER_COLUMNS: &str =
     "id, auction_aggregate_id, drop_aggregate_id, buyer_pubky, seller_pubky, revision, \
-     state, lines, delivery_address, subtotal_minor, shipping_minor, tax_minor, total_minor, \
+     state, lines, delivery_address, subtotal_minor, shipping_minor, total_minor, \
      currency, exponent, guarantee_policy_version, payment_id, receipt_id, edition, \
      cancellation_reason, stock_held, hold_expires_at, \
      shipment, return_request, external_refund, payment_method, fiat_checkout_url, \

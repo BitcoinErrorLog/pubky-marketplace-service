@@ -431,7 +431,7 @@ async fn paypal_binding_builds_the_seller_direct_checkout_url(pool: PgPool) {
     assert!(url.starts_with("https://www.paypal.com/cgi-bin/webscr?cmd=_xclick"));
     assert!(url.contains("business=merchant%40example.com"), "{url}");
     // The 12_500 + 1_200 seller-signed shipping fixture totals 137.00 USD
-    // (no invented tax).
+    // exactly.
     assert!(url.contains("amount=137.00"), "{url}");
     assert!(url.contains("currency_code=USD"), "{url}");
     assert!(url.contains(&format!("custom={}", order.order_id)), "{url}");
