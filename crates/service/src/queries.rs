@@ -772,5 +772,3 @@ pub async fn list_notifications(
         Err(error) => internal_error("notifications", &error),
     }
 }
-
-

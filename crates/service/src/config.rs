@@ -193,4 +193,3 @@ fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
         Err(_) => Ok(default),
     }
 }
-
