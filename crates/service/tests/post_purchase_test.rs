@@ -1,8 +1,8 @@
 //! Post-purchase lifecycle tests: sandbox payment advancement with receipt
-//! issue, fulfillment, returns, disputes, externally evidenced refunds, and
-//! reviews — ported from the TypeScript prototype suite by case name, plus
-//! the durable-service proofs (participant refusals, idempotent replays,
-//! constraint-enforced review uniqueness, evidence redaction).
+//! issue, fulfillment, returns, externally evidenced refunds, and reviews —
+//! ported from the TypeScript prototype suite by case name, plus the
+//! durable-service proofs (participant refusals, idempotent replays,
+//! constraint-enforced review uniqueness).
 
 mod common;
 
@@ -11,9 +11,9 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use common::{
-    checkout_command, count, create_paid_order, execute, indexed_command_id, listing_aggregate,
-    new_actor, order_command, payment_command, place_bid_command, register_auction_command,
-    register_command, send, test_app, test_app_with_moderators, TestApp,
+    checkout_command, count, create_paid_order, execute, listing_aggregate, new_actor,
+    order_command, payment_command, place_bid_command, register_auction_command,
+    register_command, send, test_app, TestApp,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::expiry::expire_due_reservations;
@@ -521,8 +521,8 @@ async fn refuses_external_refunds_without_independent_evidence(pool: PgPool) {
         .iter()
         .any(|issue| issue["path"] == json!("payload.transaction_id")));
 
-    // A paid order that has not gone through return receipt, dispute, or
-    // cancellation cannot be marked refunded, evidence or not.
+    // A paid order that has not gone through return receipt or cancellation
+    // cannot be marked refunded, evidence or not.
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -547,547 +547,6 @@ async fn refuses_external_refunds_without_independent_evidence(pool: PgPool) {
         )
         .await,
         0
-    );
-}
-
-// TS case: "opens participant disputes and restricts resolution to the
-// sandbox moderator" — moderator identity adapted to the configured
-// MODERATOR_PUBKYS role.
-#[sqlx::test]
-async fn opens_participant_disputes_and_restricts_resolution_to_configured_moderators(
-    pool: PgPool,
-) {
-    let (moderator_keypair, moderator_pubky) = common::random_keypair();
-    let app = test_app_with_moderators(pool, vec![moderator_pubky.clone()]).await;
-    let moderator_token = common::authenticate(&app, &moderator_keypair).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let order = create_paid_order(&app, &seller, &buyer).await;
-    let order_id = order.order_id.as_str();
-
-    let (status, opened) = execute(
-        &app,
-        &buyer.token,
-        &order_command(
-            "dispute.open",
-            order_id,
-            2,
-            json!({ "reason": "Seller stopped responding", "requested_remedy": "refund" }),
-            1_230,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "dispute open failed: {opened}");
-    assert_eq!(opened["result"]["order"]["state"], json!("disputed"));
-    assert_eq!(opened["result"]["order"]["dispute"]["state"], json!("open"));
-    assert_eq!(
-        opened["result"]["order"]["dispute"]["opened_by"],
-        json!(buyer.pubky)
-    );
-
-    // Participants are not moderators: self-resolution is refused for the
-    // seller and the buyer alike.
-    for ordinary in [&seller, &buyer] {
-        let (status, body) = execute(
-            &app,
-            &ordinary.token,
-            &order_command(
-                "dispute.resolve",
-                order_id,
-                3,
-                json!({ "resolution": "seller_favor", "rationale": "Self-resolution attempt" }),
-                1_231,
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "unexpected: {body}");
-        assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
-    }
-
-    let (status, resolved) = execute(
-        &app,
-        &moderator_token,
-        &order_command(
-            "dispute.resolve",
-            order_id,
-            3,
-            json!({ "resolution": "buyer_refund", "rationale": "Evidence supports the buyer." }),
-            1_232,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "resolution failed: {resolved}");
-    // A buyer remedy leaves the order disputed, awaiting the externally
-    // evidenced refund.
-    assert_eq!(resolved["result"]["order"]["state"], json!("disputed"));
-    assert_eq!(
-        resolved["result"]["order"]["dispute"]["state"],
-        json!("resolved")
-    );
-    assert_eq!(
-        resolved["result"]["order"]["dispute"]["resolution"],
-        json!("buyer_refund")
-    );
-
-    // The refund evidence record completes the buyer-remedy path.
-    let (status, refunded) = execute(
-        &app,
-        &seller.token,
-        &order_command(
-            "refund.record_external",
-            order_id,
-            4,
-            json!({
-                "amount_minor": order.total_minor,
-                "transaction_id": "bitcoin-tx-evidence-456",
-            }),
-            1_233,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "refund failed: {refunded}");
-    assert_eq!(
-        refunded["result"]["order"]["state"],
-        json!("refunded_external")
-    );
-
-    // Both participants were notified of the resolution through the outbox.
-    drain_outbox(&app.pool, app.clock.now(), 30)
-        .await
-        .expect("outbox drains");
-    for participant in [&buyer, &seller] {
-        let (status, body) = get(&app, "/v1/notifications", &participant.token).await;
-        assert_eq!(status, StatusCode::OK);
-        let types: Vec<&str> = body["notifications"]
-            .as_array()
-            .expect("notifications array")
-            .iter()
-            .filter_map(|n| n["type"].as_str())
-            .collect();
-        assert!(types.contains(&"dispute_updated"), "got: {types:?}");
-    }
-}
-
-// New in the Rust service: a non-buyer remedy completes the order.
-#[sqlx::test]
-async fn a_seller_favor_resolution_completes_the_disputed_order(pool: PgPool) {
-    let (moderator_keypair, moderator_pubky) = common::random_keypair();
-    let app = test_app_with_moderators(pool, vec![moderator_pubky]).await;
-    let moderator_token = common::authenticate(&app, &moderator_keypair).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let order = create_paid_order(&app, &seller, &buyer).await;
-
-    execute(
-        &app,
-        &seller.token,
-        &order_command(
-            "dispute.open",
-            &order.order_id,
-            2,
-            json!({ "reason": "Buyer refuses contact", "requested_remedy": "other" }),
-            1_234,
-        ),
-    )
-    .await;
-    let (status, resolved) = execute(
-        &app,
-        &moderator_token,
-        &order_command(
-            "dispute.resolve",
-            &order.order_id,
-            3,
-            json!({ "resolution": "seller_favor", "rationale": "The order was fulfilled as described." }),
-            1_235,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "resolution failed: {resolved}");
-    assert_eq!(resolved["result"]["order"]["state"], json!("completed"));
-    assert_eq!(
-        resolved["result"]["order"]["dispute"]["state"],
-        json!("resolved")
-    );
-}
-
-// New in the Rust service (dispute.evidence has no prototype counterpart):
-// evidence is recorded append-only and its body never appears in ordinary
-// projections or command results (ADR-0019 §8) — it is served only by the
-// scoped case-file read, covered separately below.
-#[sqlx::test]
-async fn dispute_evidence_is_recorded_append_only_and_never_exposed(pool: PgPool) {
-    let app = test_app(pool).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let order = create_paid_order(&app, &seller, &buyer).await;
-    let order_id = order.order_id.as_str();
-
-    // Evidence requires an open dispute.
-    let evidence_body = "Carrier photo reference SECRET-EVIDENCE-42";
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &order_command(
-            "dispute.evidence",
-            order_id,
-            2,
-            json!({ "body": evidence_body }),
-            1_240,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "unexpected: {body}");
-    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
-
-    execute(
-        &app,
-        &buyer.token,
-        &order_command(
-            "dispute.open",
-            order_id,
-            2,
-            json!({ "reason": "Item arrived damaged", "requested_remedy": "refund" }),
-            1_241,
-        ),
-    )
-    .await;
-    let (status, added) = execute(
-        &app,
-        &buyer.token,
-        &order_command(
-            "dispute.evidence",
-            order_id,
-            3,
-            json!({ "body": evidence_body }),
-            1_242,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "evidence failed: {added}");
-    assert_eq!(added["result"]["order"]["revision"], json!(4));
-    assert_eq!(
-        added["result"]["order"]["dispute"]["evidence_count"],
-        json!(1)
-    );
-    // The body is withheld from the command result the submitter authored,
-    // exactly as from every read projection.
-    assert!(!added.to_string().contains("SECRET-EVIDENCE-42"));
-
-    let (status, projected) = get(&app, &format!("/v1/orders/{order_id}"), &buyer.token).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(projected["dispute"]["evidence_count"], json!(1));
-    assert!(!projected.to_string().contains("SECRET-EVIDENCE-42"));
-
-    // Nor from the order list projection.
-    let (status, listed) = get(&app, "/v1/orders", &buyer.token).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(!listed.to_string().contains("SECRET-EVIDENCE-42"));
-
-    // The row itself is durable and append-only.
-    assert_eq!(
-        count(&app.pool, "SELECT COUNT(*) FROM dispute_evidence").await,
-        1
-    );
-    let tampered = sqlx::query("UPDATE dispute_evidence SET body = 'rewritten'")
-        .execute(&app.pool)
-        .await;
-    assert!(tampered.is_err(), "evidence must reject UPDATE");
-    let deleted = sqlx::query("DELETE FROM dispute_evidence")
-        .execute(&app.pool)
-        .await;
-    assert!(deleted.is_err(), "evidence must reject DELETE");
-}
-
-// New in the Rust service: the dispute case file (ADR-0019 §5, §8 —
-// "Operator queries return role-scoped, deliberately redacted views"). The
-// two dispute participants and the configured moderator role read the
-// evidence itself; each side sees what the other alleged; anyone else is
-// refused with the existence-hiding 404. Moderator reads are privileged
-// cross-user access and leave an append-only audit row; participant reads
-// are ordinary object participation and leave none.
-#[sqlx::test]
-async fn dispute_evidence_is_readable_by_participants_and_moderators_only(pool: PgPool) {
-    let (moderator_keypair, moderator_pubky) = common::random_keypair();
-    let app = test_app_with_moderators(pool, vec![moderator_pubky.clone()]).await;
-    let moderator_token = common::authenticate(&app, &moderator_keypair).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let stranger = new_actor(&app).await;
-    let order = create_paid_order(&app, &seller, &buyer).await;
-    let order_id = order.order_id.as_str();
-    let evidence_uri = format!("/v1/orders/{order_id}/evidence");
-
-    // Before any dispute: a participant reads their (empty) case file, but
-    // the moderator role does not reach an undisputed order at all.
-    let (status, body) = get(&app, &evidence_uri, &buyer.token).await;
-    assert_eq!(status, StatusCode::OK, "unexpected: {body}");
-    assert_eq!(body["evidence"], json!([]));
-    let (status, body) = get(&app, &evidence_uri, &moderator_token).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {body}");
-
-    execute(
-        &app,
-        &buyer.token,
-        &order_command(
-            "dispute.open",
-            order_id,
-            2,
-            json!({ "reason": "Item arrived damaged", "requested_remedy": "refund" }),
-            1_260,
-        ),
-    )
-    .await;
-    let buyer_evidence = "Unboxing photo BUYER-EVIDENCE-77";
-    let seller_evidence = "Carrier handover scan SELLER-EVIDENCE-88";
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &order_command(
-            "dispute.evidence",
-            order_id,
-            3,
-            json!({ "body": buyer_evidence }),
-            1_261,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "buyer evidence failed: {body}");
-    // Distinct timestamps make the newest-first ordering observable.
-    app.clock.advance_seconds(60);
-    let (status, body) = execute(
-        &app,
-        &seller.token,
-        &order_command(
-            "dispute.evidence",
-            order_id,
-            4,
-            json!({ "body": seller_evidence }),
-            1_262,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "seller evidence failed: {body}");
-
-    // The moderator reads the full case file, newest first: submitter,
-    // body, byte size, and timestamp per item.
-    let (status, body) = get(&app, &evidence_uri, &moderator_token).await;
-    assert_eq!(status, StatusCode::OK, "moderator read failed: {body}");
-    assert_eq!(body["order_id"], json!(order_id));
-    let items = body["evidence"].as_array().expect("evidence array");
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0]["submitter_pubky"], json!(seller.pubky));
-    assert_eq!(items[0]["body"], json!(seller_evidence));
-    assert_eq!(items[0]["body_bytes"], json!(seller_evidence.len()));
-    assert_eq!(items[1]["submitter_pubky"], json!(buyer.pubky));
-    assert_eq!(items[1]["body"], json!(buyer_evidence));
-
-    // Each participant sees the whole file, including the counterparty's
-    // submission: a party who cannot see the allegation cannot answer it.
-    for participant in [&buyer, &seller] {
-        let (status, body) = get(&app, &evidence_uri, &participant.token).await;
-        assert_eq!(status, StatusCode::OK, "participant read failed: {body}");
-        let rendered = body.to_string();
-        assert!(rendered.contains("BUYER-EVIDENCE-77"), "got: {rendered}");
-        assert!(rendered.contains("SELLER-EVIDENCE-88"), "got: {rendered}");
-    }
-
-    // A non-participant non-moderator is refused with the same 404 an
-    // absent order returns — never an empty list.
-    let (status, body) = get(&app, &evidence_uri, &stranger.token).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {body}");
-    assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
-
-    // Exactly the one moderator read was audited (the pre-dispute refusal
-    // and the participant reads leave no rows), and the audit trail is
-    // append-only like report_decisions.
-    assert_eq!(
-        count(&app.pool, "SELECT COUNT(*) FROM dispute_evidence_reads").await,
-        1
-    );
-    let (reader, items_served): (String, i64) =
-        sqlx::query_as("SELECT reader_pubky, evidence_items FROM dispute_evidence_reads")
-            .fetch_one(&app.pool)
-            .await
-            .expect("audit row present");
-    assert_eq!(reader, moderator_pubky);
-    assert_eq!(items_served, 2);
-    let tampered = sqlx::query("UPDATE dispute_evidence_reads SET reader_pubky = 'rewritten'")
-        .execute(&app.pool)
-        .await;
-    assert!(tampered.is_err(), "audit rows must reject UPDATE");
-    let deleted = sqlx::query("DELETE FROM dispute_evidence_reads")
-        .execute(&app.pool)
-        .await;
-    assert!(deleted.is_err(), "audit rows must reject DELETE");
-}
-
-// New in the Rust service: the moderator adjudication surface. The dispute
-// queue and the disputed-order projection give a configured moderator the
-// dispute reason and the order revision that dispute.resolve requires;
-// non-moderators are refused the queue outright; page sizes follow the
-// bounded-limit convention; resolved cases stay readable for review.
-#[sqlx::test]
-async fn the_dispute_queue_is_moderator_only_and_bounded(pool: PgPool) {
-    let (moderator_keypair, moderator_pubky) = common::random_keypair();
-    let app = test_app_with_moderators(pool, vec![moderator_pubky]).await;
-    let moderator_token = common::authenticate(&app, &moderator_keypair).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let order = create_paid_order(&app, &seller, &buyer).await;
-    let order_id = order.order_id.as_str();
-    // A second, undisputed order stays outside the moderator's reach.
-    let bystander_seller = new_actor(&app).await;
-    let bystander_buyer = new_actor(&app).await;
-    let undisputed = create_paid_order(&app, &bystander_seller, &bystander_buyer).await;
-
-    execute(
-        &app,
-        &buyer.token,
-        &order_command(
-            "dispute.open",
-            order_id,
-            2,
-            json!({ "reason": "Wrong item shipped", "requested_remedy": "refund" }),
-            1_270,
-        ),
-    )
-    .await;
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &order_command(
-            "dispute.evidence",
-            order_id,
-            3,
-            json!({ "body": "Label photo QUEUE-EVIDENCE-13" }),
-            1_271,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "evidence failed: {body}");
-
-    // The queue serves moderators the disputed order's projection: dispute
-    // reason, state, and the revision dispute.resolve needs — but never the
-    // delivery address or any evidence content.
-    let (status, body) = get(&app, "/v1/disputes", &moderator_token).await;
-    assert_eq!(status, StatusCode::OK, "queue read failed: {body}");
-    let disputes = body["disputes"].as_array().expect("disputes array");
-    assert_eq!(disputes.len(), 1);
-    assert_eq!(disputes[0]["id"], json!(order_id));
-    assert_eq!(disputes[0]["revision"], json!(4));
-    assert_eq!(
-        disputes[0]["dispute"]["reason"],
-        json!("Wrong item shipped")
-    );
-    assert_eq!(disputes[0]["dispute"]["evidence_count"], json!(1));
-    assert!(disputes[0].get("delivery_address").is_none());
-    assert!(!body.to_string().contains("QUEUE-EVIDENCE-13"));
-
-    // The single-order projection opens to the moderator for the disputed
-    // order only; an undisputed order stays 404 like any foreign order.
-    let (status, body) = get(&app, &format!("/v1/orders/{order_id}"), &moderator_token).await;
-    assert_eq!(status, StatusCode::OK, "unexpected: {body}");
-    assert!(body.get("delivery_address").is_none());
-    let (status, body) = get(
-        &app,
-        &format!("/v1/orders/{}", undisputed.order_id),
-        &moderator_token,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {body}");
-
-    // Non-moderators are refused the queue — participants included.
-    for ordinary in [&buyer, &seller, &bystander_buyer] {
-        let (status, body) = get(&app, "/v1/disputes", &ordinary.token).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "unexpected: {body}");
-        assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
-    }
-
-    // Bounded pagination, per the projection convention.
-    let (status, body) = get(&app, "/v1/disputes?limit=0", &moderator_token).await;
-    assert_eq!(
-        status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "unexpected: {body}"
-    );
-    assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"));
-    let (status, body) = get(
-        &app,
-        &format!("/v1/orders/{order_id}/evidence?limit=201"),
-        &moderator_token,
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "unexpected: {body}"
-    );
-    assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"));
-    app.clock.advance_seconds(60);
-    let (status, body) = execute(
-        &app,
-        &seller.token,
-        &order_command(
-            "dispute.evidence",
-            order_id,
-            4,
-            json!({ "body": "Second item" }),
-            1_272,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "second evidence failed: {body}");
-    let (status, body) = get(
-        &app,
-        &format!("/v1/orders/{order_id}/evidence?limit=1"),
-        &moderator_token,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "unexpected: {body}");
-    let items = body["evidence"].as_array().expect("evidence array");
-    assert_eq!(items.len(), 1, "the page is capped at the requested limit");
-    assert_eq!(items[0]["body"], json!("Second item"));
-
-    // Resolution does not close the case file: the moderator can still
-    // review the queue and the evidence afterwards, and post-resolution
-    // reads are audited exactly like pre-resolution ones.
-    let (status, body) = execute(
-        &app,
-        &moderator_token,
-        &order_command(
-            "dispute.resolve",
-            order_id,
-            5,
-            json!({
-                "resolution": "seller_favor",
-                "rationale": "The evidence supports the seller.",
-            }),
-            1_273,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "resolution failed: {body}");
-    let (status, body) = get(&app, "/v1/disputes", &moderator_token).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["disputes"][0]["dispute"]["state"], json!("resolved"));
-    let (status, body) = get(
-        &app,
-        &format!("/v1/orders/{order_id}/evidence"),
-        &moderator_token,
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "post-resolution read failed: {body}"
-    );
-    assert_eq!(
-        body["evidence"].as_array().expect("evidence array").len(),
-        2
-    );
-    assert_eq!(
-        count(&app.pool, "SELECT COUNT(*) FROM dispute_evidence_reads").await,
-        2
     );
 }
 
@@ -1118,18 +577,6 @@ async fn refuses_non_participants_on_every_post_purchase_command(pool: PgPool) {
         (
             "refund.record_external",
             json!({ "amount_minor": 100, "transaction_id": "bitcoin-tx-evidence-789" }),
-        ),
-        (
-            "dispute.open",
-            json!({ "reason": "Unrelated party filing", "requested_remedy": "refund" }),
-        ),
-        (
-            "dispute.evidence",
-            json!({ "body": "Unrelated party evidence" }),
-        ),
-        (
-            "dispute.resolve",
-            json!({ "resolution": "seller_favor", "rationale": "Unrelated party ruling" }),
         ),
         (
             "review.create",
@@ -1178,14 +625,10 @@ async fn refuses_non_participants_on_every_post_purchase_command(pool: PgPool) {
 }
 
 // New in the Rust service: exact replays of every post-purchase command
-// return the stored result without re-executing (ADR-0019 §3). Two orders
-// are needed because the dispute path and the completed return path exclude
-// each other on one order (a received return can no longer enter dispute).
+// return the stored result without re-executing (ADR-0019 §3).
 #[sqlx::test]
 async fn replays_each_post_purchase_command_idempotently(pool: PgPool) {
-    let (moderator_keypair, moderator_pubky) = common::random_keypair();
-    let app = test_app_with_moderators(pool, vec![moderator_pubky]).await;
-    let moderator_token = common::authenticate(&app, &moderator_keypair).await;
+    let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     execute(&app, &seller.token, &register_command(&seller.pubky, 2)).await;
@@ -1195,20 +638,6 @@ async fn replays_each_post_purchase_command_idempotently(pool: PgPool) {
         .expect("order id present")
         .to_string();
     let payment_id = body["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("payment id present")
-        .to_string();
-    // Checkout moves no inventory, so the second checkout still sees the
-    // listing at revision 1.
-    let second_checkout =
-        common::checkout_command_with_id(&seller.pubky, &indexed_command_id(0x8000, 1_279));
-    let (status, body) = execute(&app, &buyer.token, &second_checkout).await;
-    assert_eq!(status, StatusCode::OK, "second checkout failed: {body}");
-    let dispute_order_id = body["result"]["orders"][0]["id"]
-        .as_str()
-        .expect("order id present")
-        .to_string();
-    let dispute_payment_id = body["result"]["payments"][0]["id"]
         .as_str()
         .expect("payment id present")
         .to_string();
@@ -1288,46 +717,11 @@ async fn replays_each_post_purchase_command_idempotently(pool: PgPool) {
                 1_288,
             ),
         ),
-        (
-            "buyer",
-            payment_command(&dispute_payment_id, 1, "confirmed", 1, 1_289),
-        ),
-        (
-            "buyer",
-            order_command(
-                "dispute.open",
-                &dispute_order_id,
-                2,
-                json!({ "reason": "Seller went unresponsive", "requested_remedy": "refund" }),
-                1_290,
-            ),
-        ),
-        (
-            "buyer",
-            order_command(
-                "dispute.evidence",
-                &dispute_order_id,
-                3,
-                json!({ "body": "Message log reference 77." }),
-                1_291,
-            ),
-        ),
-        (
-            "moderator",
-            order_command(
-                "dispute.resolve",
-                &dispute_order_id,
-                4,
-                json!({ "resolution": "buyer_refund", "rationale": "The seller never responded." }),
-                1_292,
-            ),
-        ),
     ];
     for (role, command) in steps {
         let token = match role {
             "buyer" => &buyer.token,
-            "seller" => &seller.token,
-            _ => &moderator_token,
+            _ => &seller.token,
         };
         let (status, first) = execute(&app, token, &command).await;
         assert_eq!(
@@ -1739,7 +1133,6 @@ async fn order_projections_carry_post_purchase_sub_objects_for_participants(pool
         );
         assert_eq!(projected["shipment"]["state"], json!("delivered"));
         assert_eq!(projected["return_request"], Value::Null);
-        assert_eq!(projected["dispute"], Value::Null);
         assert_eq!(projected["external_refund"], Value::Null);
         assert_eq!(projected["reviews"][0]["rating"], json!(5));
         assert_eq!(

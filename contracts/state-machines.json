@@ -335,7 +335,6 @@
         "return_requested",
         "return_approved",
         "return_received",
-        "disputed",
         "refunded_external",
         "closed"
       ],
@@ -390,16 +389,6 @@
           ]
         },
         {
-          "from": "paid",
-          "to": "disputed",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "dispute.open"
-            }
-          ]
-        },
-        {
           "from": "processing",
           "to": "shipped",
           "via": [
@@ -416,16 +405,6 @@
             {
               "trigger": "command",
               "name": "order.cancel_request"
-            }
-          ]
-        },
-        {
-          "from": "processing",
-          "to": "disputed",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "dispute.open"
             }
           ]
         },
@@ -450,16 +429,6 @@
           ]
         },
         {
-          "from": "shipped",
-          "to": "disputed",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "dispute.open"
-            }
-          ]
-        },
-        {
           "from": "delivered",
           "to": "return_requested",
           "via": [
@@ -480,32 +449,12 @@
           ]
         },
         {
-          "from": "delivered",
-          "to": "disputed",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "dispute.open"
-            }
-          ]
-        },
-        {
           "from": "completed",
           "to": "return_requested",
           "via": [
             {
               "trigger": "command",
               "name": "return.request"
-            }
-          ]
-        },
-        {
-          "from": "completed",
-          "to": "disputed",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "dispute.open"
             }
           ]
         },
@@ -520,16 +469,6 @@
           ]
         },
         {
-          "from": "return_requested",
-          "to": "disputed",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "dispute.open"
-            }
-          ]
-        },
-        {
           "from": "return_approved",
           "to": "return_received",
           "via": [
@@ -540,37 +479,7 @@
           ]
         },
         {
-          "from": "return_approved",
-          "to": "disputed",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "dispute.open"
-            }
-          ]
-        },
-        {
           "from": "return_received",
-          "to": "refunded_external",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "refund.record_external"
-            }
-          ]
-        },
-        {
-          "from": "disputed",
-          "to": "completed",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "dispute.resolve"
-            }
-          ]
-        },
-        {
-          "from": "disputed",
           "to": "refunded_external",
           "via": [
             {
@@ -601,9 +510,6 @@
         "return.approve",
         "return.receive",
         "refund.record_external",
-        "dispute.open",
-        "dispute.evidence",
-        "dispute.resolve",
         "review.create",
         "review.update"
       ],
@@ -758,32 +664,6 @@
         "return.approve",
         "return.receive",
         "refund.record_external"
-      ],
-      "unreachable_states": []
-    },
-    {
-      "aggregate": "dispute",
-      "states": [
-        "open",
-        "resolved"
-      ],
-      "initial": "open",
-      "transitions": [
-        {
-          "from": "open",
-          "to": "resolved",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "dispute.resolve"
-            }
-          ]
-        }
-      ],
-      "commands": [
-        "dispute.open",
-        "dispute.evidence",
-        "dispute.resolve"
       ],
       "unreachable_states": []
     },

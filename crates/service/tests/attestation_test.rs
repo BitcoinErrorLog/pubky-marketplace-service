@@ -1,7 +1,7 @@
 //! Purchase attestation tests (ADR 0024, trust & reputation Phase 1):
 //! issuance inside `review.create`, D2 both-sides amount-band consent,
 //! claim shape, offline signature verifiability against the attestor pubky,
-//! the idempotent participant-scoped re-fetch, dispute/refund annotations,
+//! the idempotent participant-scoped re-fetch, refund annotations,
 //! the moderator disavowal escape hatch, the weekly stat-attestation job,
 //! and the deterministic receipt and drop-edition attestation endpoints.
 
@@ -513,63 +513,53 @@ async fn reviews_still_work_without_an_attestor_and_return_no_attestation(pool: 
 }
 
 #[sqlx::test]
-async fn dispute_and_refund_outcomes_annotate_the_order_ref(pool: PgPool) {
-    let (moderator_keypair, moderator_pubky) = common::random_keypair();
-    let app = test_app_with_attestor_and_moderators(pool, vec![moderator_pubky]).await;
-    let moderator_token = common::authenticate(&app, &moderator_keypair).await;
+async fn refund_outcomes_annotate_the_order_ref(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
     let attestor = test_attestor();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let order_id = delivered_order(&app, &seller, &buyer).await;
     let order_ref = attestor.order_ref(order_id.parse().expect("uuid"));
 
-    // Open a dispute and resolve it for the buyer: the resolution annotates
-    // the order_ref (never revokes anything).
+    // The peer-to-peer return flow: the buyer requests, the seller approves
+    // and receives, then records the externally evidenced refund — the
+    // refund annotates the order_ref (never revokes anything).
     let (status, body) = execute(
         &app,
         &buyer.token,
         &order_command(
-            "dispute.open",
+            "return.request",
             &order_id,
             4,
-            json!({ "reason": "Item not as described", "requested_remedy": "refund" }),
+            json!({ "reason": "Item not as described", "requested_amount_minor": 13_700 }),
             2_240,
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "dispute open failed: {body}");
+    assert_eq!(status, StatusCode::OK, "return request failed: {body}");
     let (status, body) = execute(
         &app,
-        &moderator_token,
-        &order_command(
-            "dispute.resolve",
-            &order_id,
-            5,
-            json!({ "resolution": "buyer_refund", "rationale": "Evidence supports the buyer." }),
-            2_241,
-        ),
+        &seller.token,
+        &order_command("return.approve", &order_id, 5, json!({}), 2_241),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "dispute resolve failed: {body}");
-    let outcomes: Vec<(String,)> = sqlx::query_as(
-        "SELECT outcome FROM attestation_annotations WHERE order_ref = $1 ORDER BY annotated_at, outcome",
+    assert_eq!(status, StatusCode::OK, "return approve failed: {body}");
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &order_command("return.receive", &order_id, 6, json!({}), 2_242),
     )
-    .bind(&order_ref)
-    .fetch_all(&app.pool)
-    .await
-    .expect("annotations readable");
-    assert_eq!(outcomes, vec![("dispute_resolved_for_buyer".to_string(),)]);
-
-    // The externally evidenced refund annotates too.
+    .await;
+    assert_eq!(status, StatusCode::OK, "return receive failed: {body}");
     let (status, body) = execute(
         &app,
         &seller.token,
         &order_command(
             "refund.record_external",
             &order_id,
-            6,
+            7,
             json!({ "amount_minor": 13_700, "transaction_id": "tx-refund-1" }),
-            2_242,
+            2_243,
         ),
     )
     .await;
@@ -581,13 +571,7 @@ async fn dispute_and_refund_outcomes_annotate_the_order_ref(pool: PgPool) {
     .fetch_all(&app.pool)
     .await
     .expect("annotations readable");
-    assert_eq!(
-        outcomes,
-        vec![
-            ("dispute_resolved_for_buyer".to_string(),),
-            ("refunded".to_string(),),
-        ]
-    );
+    assert_eq!(outcomes, vec![("refunded".to_string(),)]);
 }
 
 #[sqlx::test]
@@ -1081,7 +1065,6 @@ async fn stat_attestation_job_signs_weekly_seller_stats(pool: PgPool) {
     assert_eq!(body["seller"], json!(seller.pubky));
     assert_eq!(body["ordersCompletedBand"], json!("0"));
     assert_eq!(body["medianTimeToShipHours"], json!(0));
-    assert_eq!(body["disputeRatePermille"], json!(0));
     assert_eq!(body["completionRatePermille"], json!(1000));
     assert_eq!(body["period"]["to"], json!("2026-08-19"));
 

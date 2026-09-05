@@ -9,7 +9,7 @@
 //!   `eligibilityAttestation` field. Durable, no expiry; verifiable offline
 //!   by decoding `iss` from z-base-32 (the pubky *is* the verification key).
 //! - **Seller stat attestations** computed weekly from the private order
-//!   book (D3: median time-to-ship, dispute rate, completion rate) and
+//!   book (D3: median time-to-ship, completion rate) and
 //!   signed for later publication on the attestor's own homeserver
 //!   (publication is Phase 3 of the trust & reputation plan; this service
 //!   currently signs and stores them).

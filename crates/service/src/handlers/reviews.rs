@@ -196,8 +196,7 @@ async fn issue_attestation(
     let listing_uri = listing_uri_from_order(order);
 
     // Day-granularity completion date: the delivery confirmation when the
-    // order was delivered, otherwise the issuance day (orders completed via
-    // dispute resolution never carry a delivery event).
+    // order was delivered, otherwise the issuance day.
     let delivered: Option<(DateTime<Utc>,)> = sqlx::query_as(
         "SELECT occurred_at FROM events WHERE aggregate_id = $1 AND kind = 'fulfillment.delivered' \
          ORDER BY occurred_at DESC LIMIT 1",

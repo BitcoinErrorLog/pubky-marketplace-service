@@ -259,24 +259,6 @@ async fn dispatch(
             )
             .await
         }
-        CommandPayload::OpenDispute(payload) => {
-            crate::handlers::disputes::open(tx, actor, command, payload, now).await
-        }
-        CommandPayload::AddDisputeEvidence(payload) => {
-            crate::handlers::disputes::add_evidence(tx, actor, command, payload, now).await
-        }
-        CommandPayload::ResolveDispute(payload) => {
-            crate::handlers::disputes::resolve(
-                tx,
-                actor,
-                command,
-                payload,
-                &state.config.moderator_pubkys,
-                state.attestor.as_deref(),
-                now,
-            )
-            .await
-        }
         CommandPayload::CreateReview(payload) => {
             crate::handlers::reviews::create(
                 tx,

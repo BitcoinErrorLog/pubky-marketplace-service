@@ -206,7 +206,6 @@ pub fn order_machine() -> AggregateMachine {
             "return_requested",
             "return_approved",
             "return_received",
-            "disputed",
             "refunded_external",
             "closed",
         ],
@@ -234,14 +233,12 @@ pub fn order_machine() -> AggregateMachine {
                 "cancel_requested",
                 vec![Command("order.cancel_request")],
             ),
-            t("paid", "disputed", vec![Command("dispute.open")]),
             t("processing", "shipped", vec![Command("fulfillment.ship")]),
             t(
                 "processing",
                 "cancel_requested",
                 vec![Command("order.cancel_request")],
             ),
-            t("processing", "disputed", vec![Command("dispute.open")]),
             t(
                 "cancel_requested",
                 "cancelled",
@@ -252,44 +249,29 @@ pub fn order_machine() -> AggregateMachine {
                 "delivered",
                 vec![Command("fulfillment.confirm_delivery")],
             ),
-            t("shipped", "disputed", vec![Command("dispute.open")]),
             t(
                 "delivered",
                 "return_requested",
                 vec![Command("return.request")],
             ),
             t("delivered", "completed", vec![Command("review.create")]),
-            t("delivered", "disputed", vec![Command("dispute.open")]),
             t(
                 "completed",
                 "return_requested",
                 vec![Command("return.request")],
             ),
-            t("completed", "disputed", vec![Command("dispute.open")]),
             t(
                 "return_requested",
                 "return_approved",
                 vec![Command("return.approve")],
             ),
             t(
-                "return_requested",
-                "disputed",
-                vec![Command("dispute.open")],
-            ),
-            t(
                 "return_approved",
                 "return_received",
                 vec![Command("return.receive")],
             ),
-            t("return_approved", "disputed", vec![Command("dispute.open")]),
             t(
                 "return_received",
-                "refunded_external",
-                vec![Command("refund.record_external")],
-            ),
-            t("disputed", "completed", vec![Command("dispute.resolve")]),
-            t(
-                "disputed",
                 "refunded_external",
                 vec![Command("refund.record_external")],
             ),
@@ -310,9 +292,6 @@ pub fn order_machine() -> AggregateMachine {
             "return.approve",
             "return.receive",
             "refund.record_external",
-            "dispute.open",
-            "dispute.evidence",
-            "dispute.resolve",
             "review.create",
             "review.update",
         ],
@@ -344,22 +323,6 @@ pub fn return_machine() -> AggregateMachine {
             "return.receive",
             "refund.record_external",
         ],
-        unreachable_states: vec![],
-    }
-}
-
-/// The dispute sub-state carried on an order (the client's
-/// `orderSchema.dispute.state` enum). The moderator decision
-/// (`dispute.resolve`) is the close transition; evidence
-/// (`dispute.evidence`, this service only) appends to the record without a
-/// state change.
-pub fn dispute_machine() -> AggregateMachine {
-    AggregateMachine {
-        aggregate: "dispute",
-        states: vec!["open", "resolved"],
-        initial: "open",
-        transitions: vec![t("open", "resolved", vec![Command("dispute.resolve")])],
-        commands: vec!["dispute.open", "dispute.evidence", "dispute.resolve"],
         unreachable_states: vec![],
     }
 }
@@ -514,7 +477,6 @@ pub fn all_machines() -> Vec<AggregateMachine> {
         order_machine(),
         payment_machine(),
         return_machine(),
-        dispute_machine(),
         report_machine(),
         drop_machine(),
     ]
@@ -625,7 +587,7 @@ mod tests {
                 .as_array()
                 .expect("aggregates array")
                 .len(),
-            10
+            9
         );
     }
 
