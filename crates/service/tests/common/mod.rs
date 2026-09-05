@@ -51,12 +51,6 @@ pub async fn test_app(pool: PgPool) -> TestApp {
     test_app_with_config(pool, Config::for_tests()).await
 }
 
-pub async fn test_app_with_moderators(pool: PgPool, moderator_pubkys: Vec<String>) -> TestApp {
-    let mut config = Config::for_tests();
-    config.moderator_pubkys = moderator_pubkys;
-    test_app_with_config(pool, config).await
-}
-
 pub async fn test_app_with_config(pool: PgPool, config: Config) -> TestApp {
     test_app_full(pool, config, None).await
 }
@@ -74,15 +68,6 @@ pub fn test_attestor() -> Arc<Attestor> {
 
 pub async fn test_app_with_attestor(pool: PgPool) -> TestApp {
     test_app_full(pool, Config::for_tests(), Some(test_attestor())).await
-}
-
-pub async fn test_app_with_attestor_and_moderators(
-    pool: PgPool,
-    moderator_pubkys: Vec<String>,
-) -> TestApp {
-    let mut config = Config::for_tests();
-    config.moderator_pubkys = moderator_pubkys;
-    test_app_full(pool, config, Some(test_attestor())).await
 }
 
 pub async fn test_app_full(

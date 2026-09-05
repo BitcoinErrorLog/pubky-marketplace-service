@@ -2,7 +2,7 @@
 //! issuance inside `review.create`, D2 both-sides amount-band consent,
 //! claim shape, offline signature verifiability against the attestor pubky,
 //! the idempotent participant-scoped re-fetch, refund annotations,
-//! the moderator disavowal escape hatch, the weekly stat-attestation job,
+//! the weekly stat-attestation job,
 //! and the deterministic receipt and drop-edition attestation endpoints.
 
 mod common;
@@ -17,9 +17,8 @@ use sqlx::PgPool;
 use common::{
     checkout_command, count, create_paid_order, drop_record_json, execute, indexed_command_id,
     new_actor, order_command, payment_command, register_command, send, sync_drop_command, test_app,
-    test_app_with_attestor, test_app_with_attestor_and_moderators, test_app_with_homeserver,
-    test_app_with_homeserver_and_attestor, test_attestor, ts_after, FakeHomeserver, PaidOrder,
-    TestActor, TestApp,
+    test_app_with_attestor, test_app_with_homeserver, test_app_with_homeserver_and_attestor,
+    test_attestor, ts_after, FakeHomeserver, PaidOrder, TestActor, TestApp,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::workers::generate_due_stat_attestations;
@@ -572,63 +571,6 @@ async fn refund_outcomes_annotate_the_order_ref(pool: PgPool) {
     .await
     .expect("annotations readable");
     assert_eq!(outcomes, vec![("refunded".to_string(),)]);
-}
-
-#[sqlx::test]
-async fn attestation_disavowal_is_moderator_only_and_annotates(pool: PgPool) {
-    let (moderator_keypair, moderator_pubky) = common::random_keypair();
-    let app = test_app_with_attestor_and_moderators(pool, vec![moderator_pubky]).await;
-    let moderator_token = common::authenticate(&app, &moderator_keypair).await;
-    let attestor = test_attestor();
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let order_id = delivered_order(&app, &seller, &buyer).await;
-
-    // A participant may not disavow — this is the moderator escape hatch.
-    let (status, body) = execute(
-        &app,
-        &seller.token,
-        &order_command(
-            "attestation.disavow",
-            &order_id,
-            4,
-            json!({ "reason": "trying to scrub my own record" }),
-            2_250,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "unexpected: {body}");
-    assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
-
-    let (status, body) = execute(
-        &app,
-        &moderator_token,
-        &order_command(
-            "attestation.disavow",
-            &order_id,
-            4,
-            json!({ "reason": "wash-trading ring detected" }),
-            2_251,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "disavow failed: {body}");
-    let (outcome, reason): (String, Option<String>) =
-        sqlx::query_as("SELECT outcome, reason FROM attestation_annotations WHERE order_ref = $1")
-            .bind(attestor.order_ref(order_id.parse().expect("uuid")))
-            .fetch_one(&app.pool)
-            .await
-            .expect("annotation exists");
-    assert_eq!(outcome, "attestation_disavowed");
-    assert_eq!(reason.as_deref(), Some("wash-trading ring detected"));
-    assert_eq!(
-        count(
-            &app.pool,
-            "SELECT COUNT(*) FROM events WHERE kind = 'attestation.disavowed'"
-        )
-        .await,
-        1
-    );
 }
 
 #[sqlx::test]

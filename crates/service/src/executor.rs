@@ -276,18 +276,6 @@ async fn dispatch(
         CommandPayload::SetBandConsent(payload) => {
             crate::handlers::attestation::set_band_consent(tx, actor, command, payload, now).await
         }
-        CommandPayload::DisavowAttestation(payload) => {
-            crate::handlers::attestation::disavow(
-                tx,
-                actor,
-                command,
-                payload,
-                state.attestor.as_deref(),
-                &state.config.moderator_pubkys,
-                now,
-            )
-            .await
-        }
     }
 }
 

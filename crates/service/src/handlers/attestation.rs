@@ -1,7 +1,6 @@
 //! Attestation-adjacent commands (ADR 0024): the seller's standing
-//! amount-band consent (ratified D2) and the moderator-only disavowal
-//! escape hatch, plus the shared annotation writer the dispute/refund
-//! handlers use.
+//! amount-band consent (ratified D2), plus the shared annotation writer
+//! the refund handler uses.
 //!
 //! Annotations are stored append-only keyed by the salted `order_ref`; the
 //! attestor-homeserver publisher that makes them public is Phase 3 of the
@@ -9,7 +8,7 @@
 //! the ground truth that publisher will read.
 
 use chrono::{DateTime, Utc};
-use marketplace_domain::commands::{DisavowAttestationPayload, SetBandConsentPayload};
+use marketplace_domain::commands::SetBandConsentPayload;
 use marketplace_domain::{ids, Command, ErrorCode};
 use serde_json::json;
 use sqlx::{Postgres, Transaction};
@@ -18,9 +17,6 @@ use uuid::Uuid;
 use crate::attestor::Attestor;
 use crate::clock::format_timestamp;
 use crate::executor::insert_event;
-use crate::handlers::{fetch_order_for_update, fetch_order_reviews, order_json_with_reviews};
-use crate::model::OrderRow;
-use crate::queries::ORDER_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 /// `attestation.set_band_consent`: upserts the actor's own standing
@@ -91,87 +87,6 @@ pub async fn set_band_consent(
                 "revision": new_revision,
                 "updated_at": format_timestamp(now),
             },
-        }),
-    }))
-}
-
-/// `attestation.disavow`: the moderator-only fraud/collusion escape hatch
-/// (design §5.6). Records an `attestation_disavowed` annotation keyed by
-/// the order's salted `order_ref`; the reason stays internal. Refused when
-/// the deployment carries no attestor (no salt means no `order_ref`).
-pub async fn disavow(
-    tx: &mut Transaction<'_, Postgres>,
-    actor: &str,
-    command: &Command,
-    payload: &DisavowAttestationPayload,
-    attestor: Option<&Attestor>,
-    moderator_pubkys: &[String],
-    now: DateTime<Utc>,
-) -> Result<HandlerResult, sqlx::Error> {
-    let Some(attestor) = attestor else {
-        return Ok(Err(CommandFailure::new(
-            ErrorCode::InvalidState,
-            "Attestation support is not configured on this deployment.",
-        )));
-    };
-    if !moderator_pubkys.iter().any(|entry| entry == actor) {
-        return Ok(Err(CommandFailure::new(
-            ErrorCode::Unauthorized,
-            "Only a configured moderator may disavow attestations.",
-        )));
-    }
-    let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
-            ErrorCode::NotFound,
-            "The order was not found.",
-        )));
-    };
-    if command.aggregate_id != ids::order_aggregate_id(order.id)
-        || command.expected_revision != order.revision
-    {
-        return Ok(Err(CommandFailure::with_revision(
-            ErrorCode::RevisionConflict,
-            "The order revision is stale.",
-            order.revision,
-        )));
-    }
-
-    let updated: OrderRow = sqlx::query_as(&format!(
-        "UPDATE orders SET revision = revision + 1, updated_at = $3 \
-         WHERE id = $1 AND revision = $2 RETURNING {ORDER_COLUMNS}"
-    ))
-    .bind(order.id)
-    .bind(order.revision)
-    .bind(now)
-    .fetch_one(&mut **tx)
-    .await?;
-
-    insert_annotation(
-        tx,
-        attestor,
-        order.id,
-        "attestation_disavowed",
-        Some(&payload.reason),
-        now,
-    )
-    .await?;
-    let event_id = insert_event(
-        tx,
-        command.command_id,
-        &ids::order_aggregate_id(updated.id),
-        updated.revision,
-        actor,
-        "attestation.disavowed",
-        now,
-    )
-    .await?;
-    let reviews = fetch_order_reviews(tx, updated.id).await?;
-    Ok(Ok(HandlerSuccess {
-        revision: updated.revision,
-        event_ids: vec![event_id],
-        result: json!({
-            "kind": "order",
-            "order": order_json_with_reviews(&updated, &reviews),
         }),
     }))
 }
