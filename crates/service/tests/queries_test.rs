@@ -1,7 +1,7 @@
 //! Role-scoped read projection tests: every projection carries the
 //! aggregate revision the client needs for `expected_revision`, every
-//! endpoint refuses non-participants (object fetches 404, lists scope in
-//! the WHERE clause like `GET /v1/reports`), and no projection exposes
+//! endpoint refuses non-participants (object fetches 404, lists scope the
+//! actor in the WHERE clause), and no projection exposes
 //! delivery details or Locks bundle ids (ADR-0019 §8).
 
 mod common;

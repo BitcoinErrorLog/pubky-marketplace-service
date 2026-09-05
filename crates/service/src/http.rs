@@ -19,7 +19,6 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/v1/commands", post(execute_command))
-        .route("/v1/reports", get(list_reports))
         .route("/v1/listings/{aggregate_id}", get(queries::get_listing))
         .route(
             "/v1/listings/{aggregate_id}/bids",
@@ -127,47 +126,6 @@ async fn ready(State(state): State<AppState>) -> Response {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "status": "unavailable" })),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// Role-scoped report queries (task 3.5): a configured moderator reads every
-/// report; any other authenticated user reads only the reports they
-/// submitted, never another user's.
-async fn list_reports(
-    State(state): State<AppState>,
-    Extension(actor): Extension<Actor>,
-) -> Response {
-    let columns = crate::handlers::report::REPORT_COLUMNS;
-    let result = if state.config.is_moderator(&actor.0) {
-        let sql = format!("SELECT {columns} FROM reports ORDER BY created_at DESC");
-        sqlx::query_as::<_, crate::model::ReportRow>(&sql)
-            .fetch_all(&state.pool)
-            .await
-    } else {
-        let sql = format!(
-            "SELECT {columns} FROM reports WHERE reporter_pubky = $1 ORDER BY created_at DESC"
-        );
-        sqlx::query_as::<_, crate::model::ReportRow>(&sql)
-            .bind(&actor.0)
-            .fetch_all(&state.pool)
-            .await
-    };
-    match result {
-        Ok(reports) => {
-            let views: Vec<Value> = reports.iter().map(crate::model::ReportRow::view).collect();
-            (StatusCode::OK, Json(json!({ "reports": views }))).into_response()
-        }
-        Err(error) => {
-            tracing::error!(error = %error, "report query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "ok": false,
-                    "error": { "code": "INTERNAL", "message": "Reports could not be listed." },
-                })),
             )
                 .into_response()
         }

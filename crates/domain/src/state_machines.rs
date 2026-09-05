@@ -450,24 +450,6 @@ pub fn drop_machine() -> AggregateMachine {
     }
 }
 
-/// Trust reports (task 3.5). Reports are created by any authenticated user;
-/// decisions are moderator-only and recorded append-only. The prototype
-/// engine stored reports with a single `open` state and no decisions; the
-/// decision flow is canonical to this service.
-pub fn report_machine() -> AggregateMachine {
-    AggregateMachine {
-        aggregate: "report",
-        states: vec!["open", "dismissed", "actioned"],
-        initial: "open",
-        transitions: vec![
-            t("open", "dismissed", vec![Command("trust.decide")]),
-            t("open", "actioned", vec![Command("trust.decide")]),
-        ],
-        commands: vec!["trust.report", "trust.decide"],
-        unreachable_states: vec![],
-    }
-}
-
 pub fn all_machines() -> Vec<AggregateMachine> {
     vec![
         listing_machine(),
@@ -477,7 +459,6 @@ pub fn all_machines() -> Vec<AggregateMachine> {
         order_machine(),
         payment_machine(),
         return_machine(),
-        report_machine(),
         drop_machine(),
     ]
 }
@@ -587,7 +568,7 @@ mod tests {
                 .as_array()
                 .expect("aggregates array")
                 .len(),
-            9
+            8
         );
     }
 

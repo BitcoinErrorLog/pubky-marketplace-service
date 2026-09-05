@@ -668,42 +668,6 @@
       "unreachable_states": []
     },
     {
-      "aggregate": "report",
-      "states": [
-        "open",
-        "dismissed",
-        "actioned"
-      ],
-      "initial": "open",
-      "transitions": [
-        {
-          "from": "open",
-          "to": "dismissed",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "trust.decide"
-            }
-          ]
-        },
-        {
-          "from": "open",
-          "to": "actioned",
-          "via": [
-            {
-              "trigger": "command",
-              "name": "trust.decide"
-            }
-          ]
-        }
-      ],
-      "commands": [
-        "trust.report",
-        "trust.decide"
-      ],
-      "unreachable_states": []
-    },
-    {
       "aggregate": "drop",
       "states": [
         "announced",

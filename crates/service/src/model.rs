@@ -264,37 +264,6 @@ impl BidRow {
 }
 
 #[derive(Debug, Clone, FromRow)]
-pub struct ReportRow {
-    pub id: Uuid,
-    pub reporter_pubky: String,
-    pub target_type: String,
-    pub target_id: String,
-    pub reason: String,
-    pub details: String,
-    pub state: String,
-    pub revision: i64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl ReportRow {
-    pub fn view(&self) -> Value {
-        json!({
-            "id": self.id,
-            "reporter_pubky": self.reporter_pubky,
-            "target_type": self.target_type,
-            "target_id": self.target_id,
-            "reason": self.reason,
-            "details": self.details,
-            "state": self.state,
-            "revision": self.revision,
-            "created_at": format_timestamp(self.created_at),
-            "updated_at": format_timestamp(self.updated_at),
-        })
-    }
-}
-
-#[derive(Debug, Clone, FromRow)]
 pub struct OrderRow {
     pub id: Uuid,
     /// Internal correlation to the winning auction, never serialized.
