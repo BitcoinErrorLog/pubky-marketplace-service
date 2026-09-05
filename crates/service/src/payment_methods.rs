@@ -1357,7 +1357,8 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
     let payment_status = field("payment_status");
     if payment_status != "Completed" {
         // Pending/Refunded/Reversed etc.: retained in the logs, never a
-        // confirmation. Refund flows stay on the existing dispute surface.
+        // confirmation. Refunds stay on the peer-to-peer return/refund
+        // surface (`refund.record_external`).
         tracing::info!(
             payment_status,
             "paypal ipn ignored: not a completed payment"

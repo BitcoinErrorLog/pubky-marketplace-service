@@ -238,7 +238,6 @@ pub async fn handle(
             hold_expires_at,
             shipment: None,
             return_request: None,
-            dispute: None,
             external_refund: None,
             payment_method: None,
             fiat_checkout_url: None,

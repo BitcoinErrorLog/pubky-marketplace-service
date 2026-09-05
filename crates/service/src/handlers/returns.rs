@@ -250,10 +250,8 @@ pub async fn record_external_refund(
             "Only the seller may record a refund.",
         )));
     }
-    if !matches!(
-        order.state.as_str(),
-        "return_received" | "disputed" | "cancelled"
-    ) || payload.amount_minor > order.total_minor
+    if !matches!(order.state.as_str(), "return_received" | "cancelled")
+        || payload.amount_minor > order.total_minor
         || order.external_refund.is_some()
     {
         return Ok(Err(CommandFailure::new(

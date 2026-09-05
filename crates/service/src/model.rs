@@ -337,7 +337,6 @@ pub struct OrderRow {
     pub hold_expires_at: Option<DateTime<Utc>>,
     pub shipment: Option<Value>,
     pub return_request: Option<Value>,
-    pub dispute: Option<Value>,
     pub external_refund: Option<Value>,
     /// The buyer-bound payment method (`bitcoin` | `stripe` | `paypal`),
     /// NULL until bound.
@@ -420,7 +419,6 @@ impl OrderRow {
             "hold_expires_at": self.hold_expires_at.map(format_timestamp),
             "shipment": self.shipment.clone().unwrap_or(Value::Null),
             "return_request": self.return_request.clone().unwrap_or(Value::Null),
-            "dispute": self.dispute.clone().unwrap_or(Value::Null),
             "external_refund": self.external_refund.clone().unwrap_or(Value::Null),
             "payment_method": self.payment_method,
             "fiat_checkout_url": self.fiat_checkout_url,
@@ -488,34 +486,6 @@ impl ReviewRow {
             "text": self.text,
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
-        })
-    }
-}
-
-/// An append-only dispute evidence row. The body is private order evidence
-/// (ADR-0019 §8): it is served only through the scoped case-file read
-/// (`GET /v1/orders/{id}/evidence`, dispute participants and configured
-/// moderators), never through general projections or command results.
-#[derive(Debug, Clone, FromRow)]
-pub struct DisputeEvidenceRow {
-    pub id: Uuid,
-    pub order_id: Uuid,
-    pub submitter_pubky: String,
-    pub body: String,
-    /// Byte size of the body (`octet_length`), so metadata-level views can
-    /// describe the item without repeating it.
-    pub body_bytes: i32,
-    pub created_at: DateTime<Utc>,
-}
-
-impl DisputeEvidenceRow {
-    pub fn view(&self) -> Value {
-        json!({
-            "id": self.id,
-            "submitter_pubky": self.submitter_pubky,
-            "body": self.body,
-            "body_bytes": self.body_bytes,
-            "created_at": format_timestamp(self.created_at),
         })
     }
 }

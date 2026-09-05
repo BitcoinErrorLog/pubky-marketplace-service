@@ -77,9 +77,6 @@ pub enum CommandPayload {
     ApproveReturn(OrderActionPayload),
     ReceiveReturn(OrderActionPayload),
     RecordExternalRefund(RecordExternalRefundPayload),
-    OpenDispute(OpenDisputePayload),
-    AddDisputeEvidence(DisputeEvidencePayload),
-    ResolveDispute(ResolveDisputePayload),
     CreateReview(ReviewTermsPayload),
     UpdateReview(ReviewTermsPayload),
     CreateReport(CreateReportPayload),
@@ -115,9 +112,6 @@ impl Command {
             CommandPayload::ApproveReturn(_) => "return.approve",
             CommandPayload::ReceiveReturn(_) => "return.receive",
             CommandPayload::RecordExternalRefund(_) => "refund.record_external",
-            CommandPayload::OpenDispute(_) => "dispute.open",
-            CommandPayload::AddDisputeEvidence(_) => "dispute.evidence",
-            CommandPayload::ResolveDispute(_) => "dispute.resolve",
             CommandPayload::CreateReview(_) => "review.create",
             CommandPayload::UpdateReview(_) => "review.update",
             CommandPayload::CreateReport(_) => "trust.report",
@@ -156,9 +150,6 @@ impl Command {
             | CommandPayload::ReceiveReturn(p) => serde_json::to_value(p),
             CommandPayload::RequestReturn(p) => serde_json::to_value(p),
             CommandPayload::RecordExternalRefund(p) => serde_json::to_value(p),
-            CommandPayload::OpenDispute(p) => serde_json::to_value(p),
-            CommandPayload::AddDisputeEvidence(p) => serde_json::to_value(p),
-            CommandPayload::ResolveDispute(p) => serde_json::to_value(p),
             CommandPayload::CreateReview(p) | CommandPayload::UpdateReview(p) => {
                 serde_json::to_value(p)
             }
@@ -513,70 +504,6 @@ pub struct RecordExternalRefundPayload {
     pub transaction_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DisputeRemedy {
-    Refund,
-    PartialRefund,
-    Replacement,
-    Other,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OpenDisputePayload {
-    pub order_id: Uuid,
-    pub reason: String,
-    pub requested_remedy: DisputeRemedy,
-}
-
-/// Evidence attached to an open dispute (`dispute.evidence`, this service
-/// only). The body is stored append-only and is never echoed back in any
-/// response (ADR-0019 §8: order evidence stays private).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DisputeEvidencePayload {
-    pub order_id: Uuid,
-    pub body: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DisputeResolution {
-    BuyerRefund,
-    PartialRefund,
-    SellerFavor,
-    Replacement,
-}
-
-impl DisputeResolution {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DisputeResolution::BuyerRefund => "buyer_refund",
-            DisputeResolution::PartialRefund => "partial_refund",
-            DisputeResolution::SellerFavor => "seller_favor",
-            DisputeResolution::Replacement => "replacement",
-        }
-    }
-
-    /// Buyer remedies leave the order disputed awaiting the external refund;
-    /// the others complete the order (prototype engine semantics).
-    pub fn favors_buyer(self) -> bool {
-        matches!(
-            self,
-            DisputeResolution::BuyerRefund | DisputeResolution::PartialRefund
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResolveDisputePayload {
-    pub order_id: Uuid,
-    pub resolution: DisputeResolution,
-    pub rationale: String,
-}
-
 /// Review terms shared by `review.create` and `review.update` (the update
 /// command is this service only; the prototype had no review editing).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -797,11 +724,6 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         "refund.record_external" => {
             parse_payload(&envelope.payload).and_then(validate_record_external_refund)?
         }
-        "dispute.open" => parse_payload(&envelope.payload).and_then(validate_open_dispute)?,
-        "dispute.evidence" => {
-            parse_payload(&envelope.payload).and_then(validate_dispute_evidence)?
-        }
-        "dispute.resolve" => parse_payload(&envelope.payload).and_then(validate_resolve_dispute)?,
         "review.create" => parse_payload(&envelope.payload)
             .and_then(|payload| validate_review_terms(payload, CommandPayload::CreateReview))?,
         "review.update" => parse_payload(&envelope.payload)
@@ -1258,48 +1180,6 @@ fn validate_record_external_refund(
     );
     if issues.is_empty() {
         Ok(CommandPayload::RecordExternalRefund(payload))
-    } else {
-        Err(issues)
-    }
-}
-
-fn validate_open_dispute(
-    mut payload: OpenDisputePayload,
-) -> Result<CommandPayload, Vec<ValidationIssue>> {
-    let mut issues = Vec::new();
-    validate_trimmed("payload.reason", &mut payload.reason, 1, 2_000, &mut issues);
-    if issues.is_empty() {
-        Ok(CommandPayload::OpenDispute(payload))
-    } else {
-        Err(issues)
-    }
-}
-
-fn validate_dispute_evidence(
-    mut payload: DisputeEvidencePayload,
-) -> Result<CommandPayload, Vec<ValidationIssue>> {
-    let mut issues = Vec::new();
-    validate_trimmed("payload.body", &mut payload.body, 1, 2_000, &mut issues);
-    if issues.is_empty() {
-        Ok(CommandPayload::AddDisputeEvidence(payload))
-    } else {
-        Err(issues)
-    }
-}
-
-fn validate_resolve_dispute(
-    mut payload: ResolveDisputePayload,
-) -> Result<CommandPayload, Vec<ValidationIssue>> {
-    let mut issues = Vec::new();
-    validate_trimmed(
-        "payload.rationale",
-        &mut payload.rationale,
-        1,
-        2_000,
-        &mut issues,
-    );
-    if issues.is_empty() {
-        Ok(CommandPayload::ResolveDispute(payload))
     } else {
         Err(issues)
     }
@@ -1847,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_cancellation_return_refund_dispute_and_review_commands() {
+    fn parses_cancellation_return_refund_and_review_commands() {
         let order_id = "00000000-0000-4000-8000-00000000aaaa";
         for (kind, payload) in [
             (
@@ -1864,18 +1744,6 @@ mod tests {
             (
                 "refund.record_external",
                 json!({ "order_id": order_id, "amount_minor": 14_796, "transaction_id": "bitcoin-tx-evidence-123" }),
-            ),
-            (
-                "dispute.open",
-                json!({ "order_id": order_id, "reason": "No response", "requested_remedy": "refund" }),
-            ),
-            (
-                "dispute.evidence",
-                json!({ "order_id": order_id, "body": "Carrier photo reference 42." }),
-            ),
-            (
-                "dispute.resolve",
-                json!({ "order_id": order_id, "resolution": "buyer_refund", "rationale": "Evidence supports the buyer." }),
             ),
             (
                 "review.create",
@@ -1907,12 +1775,6 @@ mod tests {
         );
         let issues = parse_command(&zero_rating).expect_err("rating 0 invalid");
         assert!(issues.iter().any(|i| i.path == "payload.rating"));
-
-        let bad_remedy = order_command_json(
-            "dispute.open",
-            json!({ "order_id": order_id, "reason": "r", "requested_remedy": "escrow" }),
-        );
-        parse_command(&bad_remedy).expect_err("unknown remedy invalid");
     }
 
     const TEST_BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";

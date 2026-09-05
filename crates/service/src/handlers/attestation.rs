@@ -176,10 +176,9 @@ pub async fn disavow(
     }))
 }
 
-/// Appends one attestor outcome annotation for an order. Dispute outcomes
-/// are stored with the winning side (`dispute_resolved_for_buyer` /
-/// `dispute_resolved_for_seller`); the Phase 3 publisher maps them to the
-/// reviewer-relative record vocabulary per review role.
+/// Appends one attestor outcome annotation for an order. The Phase 3
+/// publisher maps outcomes to the reviewer-relative record vocabulary per
+/// review role.
 pub async fn insert_annotation(
     tx: &mut Transaction<'_, Postgres>,
     attestor: &Attestor,

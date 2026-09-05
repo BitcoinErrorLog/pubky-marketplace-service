@@ -1215,13 +1215,12 @@ struct SellerOrderStats {
     paid_at: Option<DateTime<Utc>>,
     shipped_at: Option<DateTime<Utc>>,
     delivered_at: Option<DateTime<Utc>>,
-    disputed: Option<bool>,
     cancelled: Option<bool>,
     refunded: Option<bool>,
 }
 
 /// Computes and signs the weekly per-seller stat attestations (ratified D3:
-/// median time-to-ship, dispute rate, completion rate — banded and
+/// median time-to-ship, completion rate — banded and
 /// per-mille, never raw amounts). A seller is due when they have at least
 /// one delivered order in the trailing window and no attestation newer than
 /// the weekly cadence. Rows are stored for the Phase 3 attestor-homeserver
@@ -1259,7 +1258,6 @@ pub async fn generate_due_stat_attestations(
                MIN(CASE WHEN e.kind = 'receipt.issued' THEN e.occurred_at END) AS paid_at, \
                MIN(CASE WHEN e.kind = 'fulfillment.shipped' THEN e.occurred_at END) AS shipped_at, \
                MIN(CASE WHEN e.kind = 'fulfillment.delivered' THEN e.occurred_at END) AS delivered_at, \
-               BOOL_OR(e.kind = 'dispute.opened') AS disputed, \
                BOOL_OR(e.kind = 'order.cancelled') AS cancelled, \
                BOOL_OR(e.kind = 'refund.recorded_external') AS refunded \
              FROM orders o JOIN events e ON e.aggregate_id = 'order:' || o.id::text \
@@ -1279,10 +1277,6 @@ pub async fn generate_due_stat_attestations(
         if completed < 1 {
             continue;
         }
-        let disputed = per_order
-            .iter()
-            .filter(|order| order.disputed.unwrap_or(false))
-            .count() as i64;
         let terminated_badly = per_order
             .iter()
             .filter(|order| order.cancelled.unwrap_or(false) || order.refunded.unwrap_or(false))
@@ -1299,7 +1293,6 @@ pub async fn generate_due_stat_attestations(
         ship_hours.sort_unstable();
         let median_ship_hours = median(&ship_hours);
 
-        let dispute_rate_permille = disputed * 1_000 / completed;
         let completion_rate_permille = completed * 1_000 / (completed + terminated_badly);
         let period_from = window_start.format("%Y-%m-%d").to_string();
         let period_to = now.format("%Y-%m-%d").to_string();
@@ -1314,7 +1307,6 @@ pub async fn generate_due_stat_attestations(
             "period": { "from": period_from, "to": period_to },
             "ordersCompletedBand": completed.ilog10().to_string(),
             "medianTimeToShipHours": median_ship_hours,
-            "disputeRatePermille": dispute_rate_permille,
             "completionRatePermille": completion_rate_permille,
         });
         let jws = attestor.sign_seller_stats(&body);

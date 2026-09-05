@@ -437,7 +437,6 @@ pub async fn close_locked_auction(
             hold_expires_at: None,
             shipment: None,
             return_request: None,
-            dispute: None,
             external_refund: None,
             payment_method: None,
             fiat_checkout_url: None,
