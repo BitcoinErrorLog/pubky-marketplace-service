@@ -12,8 +12,8 @@ use sqlx::PgPool;
 
 use common::{
     checkout_command, count, create_paid_order, execute, listing_aggregate, new_actor,
-    order_command, payment_command, place_bid_command, register_auction_command,
-    register_command, send, test_app, TestApp,
+    order_command, payment_command, place_bid_command, register_auction_command, register_command,
+    send, test_app, TestApp,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::expiry::expire_due_reservations;
