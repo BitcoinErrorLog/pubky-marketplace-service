@@ -244,17 +244,34 @@ pub fn order_machine() -> AggregateMachine {
                 "cancelled",
                 vec![Command("order.cancel_approve")],
             ),
+            // `delivery_assume` is the server-time delivery assumption
+            // (there is no carrier tracking feed): DELIVERY_ASSUME_DAYS
+            // after shipment the worker marks the order delivered with
+            // `delivery_assumed = true` on the projection. Same edge as the
+            // buyer's confirmation, one extra trigger.
             t(
                 "shipped",
                 "delivered",
-                vec![Command("fulfillment.confirm_delivery")],
+                vec![
+                    Command("fulfillment.confirm_delivery"),
+                    Server("delivery_assume"),
+                ],
             ),
             t(
                 "delivered",
                 "return_requested",
                 vec![Command("return.request")],
             ),
-            t("delivered", "completed", vec![Command("review.create")]),
+            // `order_auto_complete` is the server-time completion:
+            // AUTO_COMPLETE_DAYS after delivery the worker completes the
+            // order. An open return/cancel request is its own order state,
+            // so it blocks the sweep by construction. Same edge as the
+            // buyer's review, one extra trigger.
+            t(
+                "delivered",
+                "completed",
+                vec![Command("review.create"), Server("order_auto_complete")],
+            ),
             t(
                 "completed",
                 "return_requested",

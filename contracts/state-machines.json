@@ -425,6 +425,10 @@
             {
               "trigger": "command",
               "name": "fulfillment.confirm_delivery"
+            },
+            {
+              "trigger": "server",
+              "name": "delivery_assume"
             }
           ]
         },
@@ -445,6 +449,10 @@
             {
               "trigger": "command",
               "name": "review.create"
+            },
+            {
+              "trigger": "server",
+              "name": "order_auto_complete"
             }
           ]
         },
