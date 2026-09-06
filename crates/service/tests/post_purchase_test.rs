@@ -1153,3 +1153,197 @@ async fn order_projections_carry_post_purchase_sub_objects_for_participants(pool
     );
     assert_eq!(listed_order["reviews"].as_array().map(Vec::len), Some(1));
 }
+
+// The return/refund loop is strictly two-party (ADR-0019: no arbiter, no
+// custody): each step accepts exactly one role, and the projection always
+// names who acts next.
+#[sqlx::test]
+async fn return_flow_rejects_wrong_roles_and_shows_who_acts_next(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_paid_order(&app, &seller, &buyer).await;
+    let order_id = order.order_id.as_str();
+
+    // Only the seller ships; only the buyer confirms delivery.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &order_command(
+            "fulfillment.ship",
+            order_id,
+            2,
+            json!({ "carrier": "Sandbox Post", "tracking_number": "TRACK-ROLE" }),
+            1_500,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unexpected: {body}");
+    assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
+
+    execute(
+        &app,
+        &seller.token,
+        &order_command(
+            "fulfillment.ship",
+            order_id,
+            2,
+            json!({ "carrier": "Sandbox Post", "tracking_number": "TRACK-ROLE" }),
+            1_501,
+        ),
+    )
+    .await;
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &order_command(
+            "fulfillment.confirm_delivery",
+            order_id,
+            3,
+            json!({}),
+            1_502,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unexpected: {body}");
+    assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
+    execute(
+        &app,
+        &buyer.token,
+        &order_command(
+            "fulfillment.confirm_delivery",
+            order_id,
+            3,
+            json!({}),
+            1_503,
+        ),
+    )
+    .await;
+
+    // Delivered: the buyer acts next (review or return request).
+    let (_, projected) = get(&app, &format!("/v1/orders/{order_id}"), &buyer.token).await;
+    assert_eq!(projected["state"], json!("delivered"));
+    assert_eq!(projected["next_actor"], json!("buyer"));
+
+    // Only the buyer may open the return.
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &order_command(
+            "return.request",
+            order_id,
+            4,
+            json!({ "reason": "Seller cannot open a return", "requested_amount_minor": 100 }),
+            1_504,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unexpected: {body}");
+    assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
+    let (status, requested) = execute(
+        &app,
+        &buyer.token,
+        &order_command(
+            "return.request",
+            order_id,
+            4,
+            json!({ "reason": "Not as described", "requested_amount_minor": 100 }),
+            1_505,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "return request failed: {requested}");
+
+    // return_requested: the seller approves — the buyer cannot.
+    let (_, projected) = get(&app, &format!("/v1/orders/{order_id}"), &seller.token).await;
+    assert_eq!(projected["return_request"]["state"], json!("requested"));
+    assert_eq!(projected["next_actor"], json!("seller"));
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &order_command("return.approve", order_id, 5, json!({}), 1_506),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unexpected: {body}");
+    assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
+    execute(
+        &app,
+        &seller.token,
+        &order_command("return.approve", order_id, 5, json!({}), 1_507),
+    )
+    .await;
+
+    // return_approved: the seller receives — the buyer cannot.
+    let (_, projected) = get(&app, &format!("/v1/orders/{order_id}"), &buyer.token).await;
+    assert_eq!(projected["return_request"]["state"], json!("approved"));
+    assert_eq!(projected["next_actor"], json!("seller"));
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &order_command("return.receive", order_id, 6, json!({}), 1_508),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unexpected: {body}");
+    assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
+    execute(
+        &app,
+        &seller.token,
+        &order_command("return.receive", order_id, 6, json!({}), 1_509),
+    )
+    .await;
+
+    // return_received: the seller records the external refund evidence —
+    // the buyer cannot, and the service never moves funds itself.
+    let (_, projected) = get(&app, &format!("/v1/orders/{order_id}"), &buyer.token).await;
+    assert_eq!(projected["return_request"]["state"], json!("received"));
+    assert_eq!(projected["next_actor"], json!("seller"));
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &order_command(
+            "refund.record_external",
+            order_id,
+            7,
+            json!({ "amount_minor": 100, "transaction_id": "bitcoin-tx-evidence-role" }),
+            1_510,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unexpected: {body}");
+    assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
+    let (status, refunded) = execute(
+        &app,
+        &seller.token,
+        &order_command(
+            "refund.record_external",
+            order_id,
+            7,
+            json!({ "amount_minor": 100, "transaction_id": "bitcoin-tx-evidence-role" }),
+            1_511,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "refund record failed: {refunded}");
+
+    // Terminal: no participant acts next, and every transition notified the
+    // other party.
+    let (_, projected) = get(&app, &format!("/v1/orders/{order_id}"), &buyer.token).await;
+    assert_eq!(projected["state"], json!("refunded_external"));
+    assert_eq!(projected["next_actor"], Value::Null);
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.return_updated'"
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.refund_recorded'"
+        )
+        .await,
+        1
+    );
+}

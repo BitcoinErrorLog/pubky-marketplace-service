@@ -235,6 +235,7 @@ pub async fn handle(
             stock_held,
             hold_expires_at,
             shipment: None,
+            delivery_assumed: false,
             return_request: None,
             external_refund: None,
             payment_method: None,

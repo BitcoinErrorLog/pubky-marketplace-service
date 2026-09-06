@@ -304,6 +304,12 @@ pub struct OrderRow {
     /// pending cancels the order, expires the payment, and restocks.
     pub hold_expires_at: Option<DateTime<Utc>>,
     pub shipment: Option<Value>,
+    /// TRUE only when the server-time `delivery_assume` transition marked
+    /// the order delivered (DELIVERY_ASSUME_DAYS after shipment; there is
+    /// no carrier tracking feed). A buyer-confirmed delivery stays FALSE,
+    /// so the UI can tell an assumed delivery apart and ask the buyer to
+    /// report a non-arrival.
+    pub delivery_assumed: bool,
     pub return_request: Option<Value>,
     pub external_refund: Option<Value>,
     /// The buyer-bound payment method (`bitcoin` | `stripe` | `paypal`),
@@ -364,6 +370,22 @@ impl OrderRow {
         }
     }
 
+    /// Which participant drives the next recorded transition, derived from
+    /// the order state so a projection always shows who acts next (the
+    /// current return step itself is `return_request.state`). Server-time
+    /// transitions (delivery assumption, auto-completion, hold expiry) fire
+    /// without either participant; `"delivered"` still reads `"buyer"`
+    /// because only the buyer's review or return request beats the
+    /// auto-complete clock. Terminal states have no next actor.
+    pub fn next_actor(&self) -> Option<&'static str> {
+        match self.state.as_str() {
+            "pending_payment" | "shipped" | "delivered" => Some("buyer"),
+            "paid" | "processing" | "cancel_requested" | "return_requested" | "return_approved"
+            | "return_received" => Some("seller"),
+            _ => None,
+        }
+    }
+
     pub fn view(&self) -> Value {
         json!({
             "id": self.id,
@@ -385,6 +407,8 @@ impl OrderRow {
             "stock_held": self.stock_held,
             "hold_expires_at": self.hold_expires_at.map(format_timestamp),
             "shipment": self.shipment.clone().unwrap_or(Value::Null),
+            "delivery_assumed": self.delivery_assumed,
+            "next_actor": self.next_actor(),
             "return_request": self.return_request.clone().unwrap_or(Value::Null),
             "external_refund": self.external_refund.clone().unwrap_or(Value::Null),
             "payment_method": self.payment_method,

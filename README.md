@@ -92,6 +92,8 @@ environment-based:
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests; its pubky-formatted public key is paykit-server's `marketplace.trusted_public_key` |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
+| `DELIVERY_ASSUME_DAYS` | `14` | days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1) |
+| `AUTO_COMPLETE_DAYS` | `14` | days after delivery when the worker completes a `delivered` order on server time, unless a return/cancel request is open (≥ 1) |
 | `PUBLIC_APP_ORIGIN` | unset | the web app's public origin (e.g. `https://shop.pubky.app`); when set, hosted checkouts that support a return destination (PayPal `_xclick`) send the buyer back to `{origin}/marketplace/orders` after commit/cancel |
 | `PUBLIC_SERVICE_ORIGIN` | unset | this service's own public origin; when set, PayPal checkout links carry `notify_url={origin}/v0/paypal/ipn` so PayPal's IPN pays the order automatically (postback-verified, matched against seller email + exact order total). Unset, PayPal stays participant-attested |
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |

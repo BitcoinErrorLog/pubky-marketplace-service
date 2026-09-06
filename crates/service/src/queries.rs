@@ -49,7 +49,7 @@ pub const ORDER_COLUMNS: &str =
      state, lines, delivery_address, subtotal_minor, shipping_minor, total_minor, \
      currency, exponent, guarantee_policy_version, payment_id, receipt_id, edition, \
      cancellation_reason, stock_held, hold_expires_at, \
-     shipment, return_request, external_refund, payment_method, fiat_checkout_url, \
+     shipment, delivery_assumed, return_request, external_refund, payment_method, fiat_checkout_url, \
      payment_reported_at, fiat_transaction_ref, fiat_verified_by, shipping_label, paykit_request_reference, paykit_request_state, \
      paykit_last_checked_at, created_at, updated_at";
 

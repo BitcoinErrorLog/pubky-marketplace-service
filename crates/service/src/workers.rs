@@ -31,6 +31,18 @@
 //! Locks v1 leaves transport/status failures pending, so upstream trouble
 //! never expires a payment by itself — and a completion verified after the
 //! window goes to `manual_review`, never silently discarded.
+//!
+//! Delivery autocomplete semantics (ADR-0019): there is NO carrier
+//! tracking feed, so post-purchase liveness is server time. A `shipped`
+//! order is marked `delivered` once `DELIVERY_ASSUME_DAYS` has elapsed
+//! since the ship timestamp, flagged `delivery_assumed = true` so the UI
+//! can say "marked delivered automatically after N days; tell us if it
+//! hasn't arrived" (the `delivery_assume` trigger on the machine's
+//! shipped → delivered edge). A `delivered` order completes once
+//! `AUTO_COMPLETE_DAYS` has elapsed (`order_auto_complete` on the
+//! delivered → completed edge); an open return or cancel request is its
+//! own order state, so it blocks the sweep by construction. Both events
+//! are attributed to the system actor, never to a peer.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::ids;
@@ -56,6 +68,11 @@ pub const TASK_LOCKS_VERIFICATION: &str = "locks_verification";
 pub const TASK_PAYKIT_VERIFICATION: &str = "paykit_verification";
 pub const TASK_PAYMENT_WINDOW: &str = "payment_window";
 pub const TASK_STAT_ATTESTATIONS: &str = "stat_attestations";
+pub const TASK_DELIVERY_AUTOCOMPLETE: &str = "delivery_autocomplete";
+
+/// The actor stamped on server-time post-purchase events and their
+/// notifications: the system, never a peer (ADR-0019).
+pub const SYSTEM_ACTOR: &str = "system";
 
 const OUTBOX_BATCH_SIZE: i64 = 100;
 const LOCKS_VERIFY_BATCH_SIZE: i64 = 25;
@@ -1087,6 +1104,168 @@ pub async fn expire_due_payment_windows(pool: &PgPool, now: DateTime<Utc>) -> an
     Ok(expired)
 }
 
+/// Marks `shipped` orders `delivered` once `assume_days` have elapsed since
+/// the ship timestamp — the `delivery_assume` server trigger on the
+/// machine's shipped → delivered edge, standing in for the carrier
+/// tracking feed this service deliberately does not have. The update is a
+/// compare-and-swap on `state = 'shipped'`, so a double-claim (lease
+/// violation or a racing pass) transitions the order exactly once; the
+/// `delivery_assumed` flag tells the projection — and the buyer — the
+/// delivery was assumed, not confirmed. Both participants are notified;
+/// the event is attributed to the system actor, never a peer.
+pub async fn assume_due_deliveries(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    assume_days: i64,
+) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let due: Vec<(Uuid, Value, String, String)> = sqlx::query_as(
+        "SELECT id, shipment, buyer_pubky, seller_pubky FROM orders \
+         WHERE state = 'shipped' AND (shipment->>'shipped_at')::timestamptz <= $1 \
+         ORDER BY (shipment->>'shipped_at')::timestamptz FOR UPDATE SKIP LOCKED",
+    )
+    .bind(now - chrono::Duration::days(assume_days))
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut assumed = 0u64;
+    for (order_id, shipment, buyer_pubky, seller_pubky) in due {
+        let mut delivered = shipment;
+        delivered["state"] = serde_json::json!("delivered");
+        delivered["delivered_at"] = serde_json::json!(crate::clock::format_timestamp(now));
+        debug_assert!(marketplace_domain::state_machines::can_transition(
+            &marketplace_domain::state_machines::order_machine(),
+            "shipped",
+            "delivered"
+        ));
+        let updated: Option<(i64,)> = sqlx::query_as(
+            "UPDATE orders SET revision = revision + 1, state = 'delivered', shipment = $2, \
+             delivery_assumed = TRUE, updated_at = $3 \
+             WHERE id = $1 AND state = 'shipped' RETURNING revision",
+        )
+        .bind(order_id)
+        .bind(&delivered)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((revision,)) = updated else {
+            continue;
+        };
+        let aggregate_id = ids::order_aggregate_id(order_id);
+        let event_id = crate::executor::insert_event(
+            &mut tx,
+            Uuid::new_v4(),
+            &aggregate_id,
+            revision,
+            SYSTEM_ACTOR,
+            "fulfillment.delivered",
+            now,
+        )
+        .await?;
+        // The buyer gets the assumption prompt ("tell us if it hasn't
+        // arrived"); the seller hears the delivery exactly as they would
+        // for a buyer confirmation.
+        insert_notification_intent(
+            &mut tx,
+            event_id,
+            "order_delivery_assumed",
+            &buyer_pubky,
+            SYSTEM_ACTOR,
+            &aggregate_id,
+            None,
+            now,
+        )
+        .await?;
+        insert_notification_intent(
+            &mut tx,
+            event_id,
+            "order_delivered",
+            &seller_pubky,
+            SYSTEM_ACTOR,
+            &aggregate_id,
+            None,
+            now,
+        )
+        .await?;
+        tracing::info!(order_id = %order_id, "assumed delivery on server time");
+        assumed += 1;
+    }
+    tx.commit().await?;
+    Ok(assumed)
+}
+
+/// Completes `delivered` orders once `auto_complete_days` have elapsed
+/// since the delivery timestamp — the `order_auto_complete` server trigger
+/// on the machine's delivered → completed edge. An open return or cancel
+/// request blocks completion by construction: `return_requested`,
+/// `return_approved`, `return_received`, and `cancel_requested` are their
+/// own order states, so such an order never matches the `state =
+/// 'delivered'` claim or the compare-and-swap. The event is attributed to
+/// the system actor, never a peer.
+pub async fn complete_due_delivered_orders(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    auto_complete_days: i64,
+) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let due: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT id, buyer_pubky, seller_pubky FROM orders \
+         WHERE state = 'delivered' AND (shipment->>'delivered_at')::timestamptz <= $1 \
+         ORDER BY (shipment->>'delivered_at')::timestamptz FOR UPDATE SKIP LOCKED",
+    )
+    .bind(now - chrono::Duration::days(auto_complete_days))
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut completed = 0u64;
+    for (order_id, buyer_pubky, seller_pubky) in due {
+        debug_assert!(marketplace_domain::state_machines::can_transition(
+            &marketplace_domain::state_machines::order_machine(),
+            "delivered",
+            "completed"
+        ));
+        let updated: Option<(i64,)> = sqlx::query_as(
+            "UPDATE orders SET revision = revision + 1, state = 'completed', updated_at = $2 \
+             WHERE id = $1 AND state = 'delivered' RETURNING revision",
+        )
+        .bind(order_id)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((revision,)) = updated else {
+            continue;
+        };
+        let aggregate_id = ids::order_aggregate_id(order_id);
+        let event_id = crate::executor::insert_event(
+            &mut tx,
+            Uuid::new_v4(),
+            &aggregate_id,
+            revision,
+            SYSTEM_ACTOR,
+            "order.completed",
+            now,
+        )
+        .await?;
+        for recipient in [&buyer_pubky, &seller_pubky] {
+            insert_notification_intent(
+                &mut tx,
+                event_id,
+                "order_completed",
+                recipient,
+                SYSTEM_ACTOR,
+                &aggregate_id,
+                None,
+                now,
+            )
+            .await?;
+        }
+        tracing::info!(order_id = %order_id, "auto-completed order on server time");
+        completed += 1;
+    }
+    tx.commit().await?;
+    Ok(completed)
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct WorkerSummary {
     pub reservations_expired: u64,
@@ -1098,6 +1277,8 @@ pub struct WorkerSummary {
     pub paykit_payments_applied: u64,
     pub payment_windows_expired: u64,
     pub stat_attestations_signed: u64,
+    pub deliveries_assumed: u64,
+    pub orders_auto_completed: u64,
 }
 
 /// One worker pass: for each task, take the lease, drain, release. Tasks
@@ -1188,6 +1369,25 @@ pub async fn run_once(
     if try_acquire_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now, lease_seconds).await? {
         summary.payment_windows_expired = expire_due_payment_windows(&state.pool, now).await?;
         release_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now).await?;
+    }
+    // Post-purchase liveness is server time (no carrier tracking feed):
+    // assume delivery after DELIVERY_ASSUME_DAYS, then auto-complete after
+    // AUTO_COMPLETE_DAYS unless a return/cancel request is open.
+    if try_acquire_lease(
+        &state.pool,
+        TASK_DELIVERY_AUTOCOMPLETE,
+        holder,
+        now,
+        lease_seconds,
+    )
+    .await?
+    {
+        summary.deliveries_assumed =
+            assume_due_deliveries(&state.pool, now, state.config.delivery_assume_days).await?;
+        summary.orders_auto_completed =
+            complete_due_delivered_orders(&state.pool, now, state.config.auto_complete_days)
+                .await?;
+        release_lease(&state.pool, TASK_DELIVERY_AUTOCOMPLETE, holder, now).await?;
     }
     // Weekly seller stat attestations (ratified D3) run only when the
     // deployment holds the attestor key: unsigned stats would be worthless.
@@ -1367,6 +1567,8 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             paykit_payments_applied = summary.paykit_payments_applied,
                             payment_windows_expired = summary.payment_windows_expired,
                             stat_attestations_signed = summary.stat_attestations_signed,
+                            deliveries_assumed = summary.deliveries_assumed,
+                            orders_auto_completed = summary.orders_auto_completed,
                             "worker pass completed"
                         );
                     }

@@ -45,6 +45,18 @@ pub struct Config {
     /// Minimum seconds between paykit-server status polls for one pending
     /// bitcoin order.
     pub paykit_poll_seconds: i64,
+    /// Days after shipment when a `shipped` order is marked `delivered` on
+    /// server time (`DELIVERY_ASSUME_DAYS`, default 14, minimum 1). There is
+    /// no carrier tracking feed (ADR-0019); the assumption flags
+    /// `delivery_assumed = true` on the order projection so the UI can say
+    /// "marked delivered automatically after N days; tell us if it hasn't
+    /// arrived".
+    pub delivery_assume_days: i64,
+    /// Days after delivery when a `delivered` order completes on server time
+    /// (`AUTO_COMPLETE_DAYS`, default 14, minimum 1), unless a return or
+    /// cancel request is open (those are their own order states, so an open
+    /// request takes the order out of the sweep by construction).
+    pub auto_complete_days: i64,
     /// The deployment's public web-app origin (`PUBLIC_APP_ORIGIN`, e.g.
     /// `https://shop.pubky.app`), used as the buyer return destination on
     /// hosted checkouts that support one (PayPal `_xclick` `return`/
@@ -111,6 +123,8 @@ impl Config {
         if paykit_poll_seconds < 1 {
             anyhow::bail!("PAYKIT_POLL_SECONDS must be at least 1");
         }
+        let delivery_assume_days = env_days("DELIVERY_ASSUME_DAYS", 14)?;
+        let auto_complete_days = env_days("AUTO_COMPLETE_DAYS", 14)?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         let public_app_origin = env_origin("PUBLIC_APP_ORIGIN")?;
         let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
@@ -128,6 +142,8 @@ impl Config {
             drop_claim_window_seconds,
             locks_poll_seconds,
             paykit_poll_seconds,
+            delivery_assume_days,
+            auto_complete_days,
             public_app_origin,
             public_service_origin,
             sandbox_payments_enabled,
@@ -150,6 +166,8 @@ impl Config {
             drop_claim_window_seconds: 600,
             locks_poll_seconds: 30,
             paykit_poll_seconds: 15,
+            delivery_assume_days: 14,
+            auto_complete_days: 14,
             public_app_origin: Some("https://app.test".to_string()),
             public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
@@ -163,6 +181,28 @@ fn env_i64(name: &str, default: i64) -> anyhow::Result<i64> {
             .parse()
             .map_err(|_| anyhow::anyhow!("{name} must be an integer")),
         Err(_) => Ok(default),
+    }
+}
+
+/// A positive whole-day count from the environment (minimum 1, so a
+/// deployment cannot disable or zero out a server-time post-purchase
+/// transition).
+fn env_days(name: &str, default: i64) -> anyhow::Result<i64> {
+    parse_days(name, std::env::var(name).ok().as_deref(), default)
+}
+
+fn parse_days(name: &str, raw: Option<&str>, default: i64) -> anyhow::Result<i64> {
+    match raw {
+        None => Ok(default),
+        Some(value) => {
+            let days: i64 = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{name} must be an integer"))?;
+            if days < 1 {
+                anyhow::bail!("{name} must be at least 1");
+            }
+            Ok(days)
+        }
     }
 }
 
@@ -191,5 +231,37 @@ fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
             _ => Err(anyhow::anyhow!("{name} must be true, false, 1, or 0")),
         },
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_days;
+
+    #[test]
+    fn delivery_day_counts_parse_with_defaults_and_bounds() {
+        // Unset falls back to the default; a positive integer parses.
+        assert_eq!(parse_days("DELIVERY_ASSUME_DAYS", None, 14).unwrap(), 14);
+        assert_eq!(
+            parse_days("AUTO_COMPLETE_DAYS", Some("30"), 14).unwrap(),
+            30
+        );
+
+        // Non-integer input is rejected.
+        let error = parse_days("DELIVERY_ASSUME_DAYS", Some("two"), 14).unwrap_err();
+        assert!(
+            error.to_string().contains("must be an integer"),
+            "unexpected: {error}"
+        );
+
+        // Zero and negative counts are rejected: a deployment cannot
+        // disable the server-time transitions by configuration.
+        for value in ["0", "-3"] {
+            let error = parse_days("AUTO_COMPLETE_DAYS", Some(value), 14).unwrap_err();
+            assert!(
+                error.to_string().contains("must be at least 1"),
+                "unexpected: {error}"
+            );
+        }
     }
 }

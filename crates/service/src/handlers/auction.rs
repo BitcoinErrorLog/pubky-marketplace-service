@@ -434,6 +434,7 @@ pub async fn close_locked_auction(
             stock_held: false,
             hold_expires_at: None,
             shipment: None,
+            delivery_assumed: false,
             return_request: None,
             external_refund: None,
             payment_method: None,
