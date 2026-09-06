@@ -74,6 +74,10 @@ pub const TASK_DELIVERY_AUTOCOMPLETE: &str = "delivery_autocomplete";
 /// notifications: the system, never a peer (ADR-0019).
 pub const SYSTEM_ACTOR: &str = "system";
 
+/// Max inner claim loops per lease so a huge backlog cannot hold
+/// `TASK_DELIVERY_AUTOCOMPLETE` indefinitely (next interval resumes).
+pub const DELIVERY_SWEEP_MAX_BATCHES: u32 = 10;
+
 const OUTBOX_BATCH_SIZE: i64 = 100;
 const LOCKS_VERIFY_BATCH_SIZE: i64 = 25;
 const PAYKIT_VERIFY_BATCH_SIZE: i64 = 25;
@@ -1104,6 +1108,22 @@ pub async fn expire_due_payment_windows(pool: &PgPool, now: DateTime<Utc>) -> an
     Ok(expired)
 }
 
+/// RFC3339-shaped prefix (`YYYY-MM-DDTHH:MM:SS`). Used only to over-include
+/// candidates in SQL; due-ness and validity are decided in Rust so a
+/// malformed `shipment` timestamp cannot `::timestamptz`-abort the batch.
+const SHIPMENT_INSTANT_PREFIX: &str = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}";
+
+fn parse_shipment_instant(raw: Option<&str>) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw?)
+        .ok()
+        .map(|ts| ts.with_timezone(&Utc))
+}
+
+struct DeliverySweepClaim {
+    claimed: u64,
+    processed: u64,
+}
+
 /// Marks `shipped` orders `delivered` once `assume_days` have elapsed since
 /// the ship timestamp — the `delivery_assume` server trigger on the
 /// machine's shipped → delivered edge, standing in for the carrier
@@ -1113,25 +1133,74 @@ pub async fn expire_due_payment_windows(pool: &PgPool, now: DateTime<Utc>) -> an
 /// `delivery_assumed` flag tells the projection — and the buyer — the
 /// delivery was assumed, not confirmed. Both participants are notified;
 /// the event is attributed to the system actor, never a peer.
+///
+/// Claims are bounded (`batch_size` per inner transaction, up to
+/// `max_batches` per call) so a backlog cannot hold row locks on every due
+/// order at once. Malformed `shipped_at` values are skipped and logged by
+/// order id (no payload/PII) so they cannot abort the rest of the batch.
 pub async fn assume_due_deliveries(
     pool: &PgPool,
     now: DateTime<Utc>,
     assume_days: i64,
+    batch_size: i64,
+    max_batches: u32,
 ) -> anyhow::Result<u64> {
+    let cutoff = now - chrono::Duration::days(assume_days);
+    let cutoff_text = crate::clock::format_timestamp(cutoff);
+    let mut assumed = 0u64;
+    for _ in 0..max_batches {
+        let pass = assume_due_deliveries_batch(pool, now, cutoff, &cutoff_text, batch_size).await?;
+        assumed += pass.processed;
+        if pass.claimed < batch_size as u64 {
+            break;
+        }
+    }
+    Ok(assumed)
+}
+
+async fn assume_due_deliveries_batch(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    cutoff: DateTime<Utc>,
+    cutoff_text: &str,
+    batch_size: i64,
+) -> anyhow::Result<DeliverySweepClaim> {
     let mut tx = pool.begin().await?;
-    let due: Vec<(Uuid, Value, String, String)> = sqlx::query_as(
-        "SELECT id, shipment, buyer_pubky, seller_pubky FROM orders \
-         WHERE state = 'shipped' AND (shipment->>'shipped_at')::timestamptz <= $1 \
-         ORDER BY (shipment->>'shipped_at')::timestamptz FOR UPDATE SKIP LOCKED",
+    let due: Vec<(Uuid, Value, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, shipment, buyer_pubky, seller_pubky, shipment->>'shipped_at' \
+         FROM orders \
+         WHERE state = 'shipped' \
+         AND (shipment->>'shipped_at' IS NULL \
+              OR shipment->>'shipped_at' !~ $2 \
+              OR left(shipment->>'shipped_at', 19) <= left($1, 19)) \
+         ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED",
     )
-    .bind(now - chrono::Duration::days(assume_days))
+    .bind(cutoff_text)
+    .bind(SHIPMENT_INSTANT_PREFIX)
+    .bind(batch_size)
     .fetch_all(&mut *tx)
     .await?;
 
-    let mut assumed = 0u64;
-    for (order_id, shipment, buyer_pubky, seller_pubky) in due {
+    let claimed = due.len() as u64;
+    let mut processed = 0u64;
+    for (order_id, shipment, buyer_pubky, seller_pubky, shipped_at) in due {
+        let Some(shipped_at) = parse_shipment_instant(shipped_at.as_deref()) else {
+            tracing::warn!(
+                order_id = %order_id,
+                "skipping shipped order with malformed shipment timestamp"
+            );
+            continue;
+        };
+        if shipped_at > cutoff {
+            continue;
+        }
         let mut delivered = shipment;
         delivered["state"] = serde_json::json!("delivered");
+        // `delivered_at` is the server instant of the assumption, not
+        // `shipped_at + assume_days`. This is a system event (no carrier
+        // tracking feed, not peer-attested): the auto-complete clock must
+        // start when the service marked delivery, not when the parcel
+        // hypothetically arrived.
         delivered["delivered_at"] = serde_json::json!(crate::clock::format_timestamp(now));
         debug_assert!(marketplace_domain::state_machines::can_transition(
             &marketplace_domain::state_machines::order_machine(),
@@ -1162,9 +1231,6 @@ pub async fn assume_due_deliveries(
             now,
         )
         .await?;
-        // The buyer gets the assumption prompt ("tell us if it hasn't
-        // arrived"); the seller hears the delivery exactly as they would
-        // for a buyer confirmation.
         insert_notification_intent(
             &mut tx,
             event_id,
@@ -1188,10 +1254,10 @@ pub async fn assume_due_deliveries(
         )
         .await?;
         tracing::info!(order_id = %order_id, "assumed delivery on server time");
-        assumed += 1;
+        processed += 1;
     }
     tx.commit().await?;
-    Ok(assumed)
+    Ok(DeliverySweepClaim { claimed, processed })
 }
 
 /// Completes `delivered` orders once `auto_complete_days` have elapsed
@@ -1206,19 +1272,59 @@ pub async fn complete_due_delivered_orders(
     pool: &PgPool,
     now: DateTime<Utc>,
     auto_complete_days: i64,
+    batch_size: i64,
+    max_batches: u32,
 ) -> anyhow::Result<u64> {
+    let cutoff = now - chrono::Duration::days(auto_complete_days);
+    let cutoff_text = crate::clock::format_timestamp(cutoff);
+    let mut completed = 0u64;
+    for _ in 0..max_batches {
+        let pass = complete_due_delivered_orders_batch(pool, now, cutoff, &cutoff_text, batch_size)
+            .await?;
+        completed += pass.processed;
+        if pass.claimed < batch_size as u64 {
+            break;
+        }
+    }
+    Ok(completed)
+}
+
+async fn complete_due_delivered_orders_batch(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    cutoff: DateTime<Utc>,
+    cutoff_text: &str,
+    batch_size: i64,
+) -> anyhow::Result<DeliverySweepClaim> {
     let mut tx = pool.begin().await?;
-    let due: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, buyer_pubky, seller_pubky FROM orders \
-         WHERE state = 'delivered' AND (shipment->>'delivered_at')::timestamptz <= $1 \
-         ORDER BY (shipment->>'delivered_at')::timestamptz FOR UPDATE SKIP LOCKED",
+    let due: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, buyer_pubky, seller_pubky, shipment->>'delivered_at' \
+         FROM orders \
+         WHERE state = 'delivered' \
+         AND (shipment->>'delivered_at' IS NULL \
+              OR shipment->>'delivered_at' !~ $2 \
+              OR left(shipment->>'delivered_at', 19) <= left($1, 19)) \
+         ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED",
     )
-    .bind(now - chrono::Duration::days(auto_complete_days))
+    .bind(cutoff_text)
+    .bind(SHIPMENT_INSTANT_PREFIX)
+    .bind(batch_size)
     .fetch_all(&mut *tx)
     .await?;
 
-    let mut completed = 0u64;
-    for (order_id, buyer_pubky, seller_pubky) in due {
+    let claimed = due.len() as u64;
+    let mut processed = 0u64;
+    for (order_id, buyer_pubky, seller_pubky, delivered_at) in due {
+        let Some(delivered_at) = parse_shipment_instant(delivered_at.as_deref()) else {
+            tracing::warn!(
+                order_id = %order_id,
+                "skipping delivered order with malformed shipment timestamp"
+            );
+            continue;
+        };
+        if delivered_at > cutoff {
+            continue;
+        }
         debug_assert!(marketplace_domain::state_machines::can_transition(
             &marketplace_domain::state_machines::order_machine(),
             "delivered",
@@ -1260,10 +1366,10 @@ pub async fn complete_due_delivered_orders(
             .await?;
         }
         tracing::info!(order_id = %order_id, "auto-completed order on server time");
-        completed += 1;
+        processed += 1;
     }
     tx.commit().await?;
-    Ok(completed)
+    Ok(DeliverySweepClaim { claimed, processed })
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1382,11 +1488,22 @@ pub async fn run_once(
     )
     .await?
     {
-        summary.deliveries_assumed =
-            assume_due_deliveries(&state.pool, now, state.config.delivery_assume_days).await?;
-        summary.orders_auto_completed =
-            complete_due_delivered_orders(&state.pool, now, state.config.auto_complete_days)
-                .await?;
+        summary.deliveries_assumed = assume_due_deliveries(
+            &state.pool,
+            now,
+            state.config.delivery_assume_days,
+            state.config.delivery_sweep_batch_size,
+            DELIVERY_SWEEP_MAX_BATCHES,
+        )
+        .await?;
+        summary.orders_auto_completed = complete_due_delivered_orders(
+            &state.pool,
+            now,
+            state.config.auto_complete_days,
+            state.config.delivery_sweep_batch_size,
+            DELIVERY_SWEEP_MAX_BATCHES,
+        )
+        .await?;
         release_lease(&state.pool, TASK_DELIVERY_AUTOCOMPLETE, holder, now).await?;
     }
     // Weekly seller stat attestations (ratified D3) run only when the

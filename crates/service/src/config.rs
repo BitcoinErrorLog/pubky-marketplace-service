@@ -2,6 +2,14 @@ use std::net::SocketAddr;
 
 use axum::http::HeaderValue;
 
+/// Default `DELIVERY_ASSUME_DAYS` when the env var is unset.
+pub const DEFAULT_DELIVERY_ASSUME_DAYS: i64 = 14;
+/// Default `AUTO_COMPLETE_DAYS` when the env var is unset.
+pub const DEFAULT_AUTO_COMPLETE_DAYS: i64 = 14;
+/// Default `DELIVERY_SWEEP_BATCH_SIZE`: rows claimed per inner pass
+/// (same shape as the paykit/outbox worker batches).
+pub const DEFAULT_DELIVERY_SWEEP_BATCH_SIZE: i64 = 100;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -57,6 +65,11 @@ pub struct Config {
     /// cancel request is open (those are their own order states, so an open
     /// request takes the order out of the sweep by construction).
     pub auto_complete_days: i64,
+    /// Rows claimed per inner delivery/auto-complete sweep pass
+    /// (`DELIVERY_SWEEP_BATCH_SIZE`, default 100, minimum 1). The worker
+    /// iterates until a pass claims fewer than this many rows or the
+    /// per-lease batch cap is hit.
+    pub delivery_sweep_batch_size: i64,
     /// The deployment's public web-app origin (`PUBLIC_APP_ORIGIN`, e.g.
     /// `https://shop.pubky.app`), used as the buyer return destination on
     /// hosted checkouts that support one (PayPal `_xclick` `return`/
@@ -123,8 +136,12 @@ impl Config {
         if paykit_poll_seconds < 1 {
             anyhow::bail!("PAYKIT_POLL_SECONDS must be at least 1");
         }
-        let delivery_assume_days = env_days("DELIVERY_ASSUME_DAYS", 14)?;
-        let auto_complete_days = env_days("AUTO_COMPLETE_DAYS", 14)?;
+        let delivery_assume_days = env_days("DELIVERY_ASSUME_DAYS", DEFAULT_DELIVERY_ASSUME_DAYS)?;
+        let auto_complete_days = env_days("AUTO_COMPLETE_DAYS", DEFAULT_AUTO_COMPLETE_DAYS)?;
+        let delivery_sweep_batch_size = env_days(
+            "DELIVERY_SWEEP_BATCH_SIZE",
+            DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+        )?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         let public_app_origin = env_origin("PUBLIC_APP_ORIGIN")?;
         let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
@@ -144,6 +161,7 @@ impl Config {
             paykit_poll_seconds,
             delivery_assume_days,
             auto_complete_days,
+            delivery_sweep_batch_size,
             public_app_origin,
             public_service_origin,
             sandbox_payments_enabled,
@@ -166,8 +184,9 @@ impl Config {
             drop_claim_window_seconds: 600,
             locks_poll_seconds: 30,
             paykit_poll_seconds: 15,
-            delivery_assume_days: 14,
-            auto_complete_days: 14,
+            delivery_assume_days: DEFAULT_DELIVERY_ASSUME_DAYS,
+            auto_complete_days: DEFAULT_AUTO_COMPLETE_DAYS,
+            delivery_sweep_batch_size: DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
             public_app_origin: Some("https://app.test".to_string()),
             public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
@@ -236,19 +255,27 @@ fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_days;
+    use super::{parse_days, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS};
 
     #[test]
     fn delivery_day_counts_parse_with_defaults_and_bounds() {
         // Unset falls back to the default; a positive integer parses.
-        assert_eq!(parse_days("DELIVERY_ASSUME_DAYS", None, 14).unwrap(), 14);
         assert_eq!(
-            parse_days("AUTO_COMPLETE_DAYS", Some("30"), 14).unwrap(),
+            parse_days("DELIVERY_ASSUME_DAYS", None, DEFAULT_DELIVERY_ASSUME_DAYS).unwrap(),
+            DEFAULT_DELIVERY_ASSUME_DAYS
+        );
+        assert_eq!(
+            parse_days("AUTO_COMPLETE_DAYS", Some("30"), DEFAULT_AUTO_COMPLETE_DAYS).unwrap(),
             30
         );
 
         // Non-integer input is rejected.
-        let error = parse_days("DELIVERY_ASSUME_DAYS", Some("two"), 14).unwrap_err();
+        let error = parse_days(
+            "DELIVERY_ASSUME_DAYS",
+            Some("two"),
+            DEFAULT_DELIVERY_ASSUME_DAYS,
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("must be an integer"),
             "unexpected: {error}"
@@ -257,7 +284,12 @@ mod tests {
         // Zero and negative counts are rejected: a deployment cannot
         // disable the server-time transitions by configuration.
         for value in ["0", "-3"] {
-            let error = parse_days("AUTO_COMPLETE_DAYS", Some(value), 14).unwrap_err();
+            let error = parse_days(
+                "AUTO_COMPLETE_DAYS",
+                Some(value),
+                DEFAULT_AUTO_COMPLETE_DAYS,
+            )
+            .unwrap_err();
             assert!(
                 error.to_string().contains("must be at least 1"),
                 "unexpected: {error}"

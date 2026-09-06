@@ -18,11 +18,38 @@ use common::{
     count, create_paid_order, execute, new_actor, order_command, send, test_app, TestApp,
 };
 use marketplace_service::clock::Clock;
+use marketplace_service::config::{
+    DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS, DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+};
 use marketplace_service::workers::{
-    assume_due_deliveries, complete_due_delivered_orders, run_once,
+    assume_due_deliveries, complete_due_delivered_orders, run_once, DELIVERY_SWEEP_MAX_BATCHES,
 };
 
 const DAY_SECONDS: i64 = 24 * 60 * 60;
+
+async fn assume_due(pool: &PgPool, now: chrono::DateTime<chrono::Utc>) -> u64 {
+    assume_due_deliveries(
+        pool,
+        now,
+        DEFAULT_DELIVERY_ASSUME_DAYS,
+        DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+        DELIVERY_SWEEP_MAX_BATCHES,
+    )
+    .await
+    .expect("assume sweep runs")
+}
+
+async fn complete_due(pool: &PgPool, now: chrono::DateTime<chrono::Utc>) -> u64 {
+    complete_due_delivered_orders(
+        pool,
+        now,
+        DEFAULT_AUTO_COMPLETE_DAYS,
+        DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+        DELIVERY_SWEEP_MAX_BATCHES,
+    )
+    .await
+    .expect("complete sweep runs")
+}
 
 async fn get(app: &TestApp, uri: &str, token: &str) -> (StatusCode, Value) {
     send(app.router.clone(), "GET", uri, Some(token), &json!(null)).await
@@ -87,9 +114,9 @@ async fn assumes_delivery_after_the_configured_window_and_flags_the_projection(p
         .expect("worker pass runs");
     assert_eq!(summary.deliveries_assumed, 0);
 
-    // 14 days (the test-config DELIVERY_ASSUME_DAYS) after shipment the
-    // order is due.
-    app.clock.advance_seconds(14 * DAY_SECONDS);
+    // Config-default DELIVERY_ASSUME_DAYS after shipment the order is due.
+    app.clock
+        .advance_seconds(DEFAULT_DELIVERY_ASSUME_DAYS * DAY_SECONDS);
     let summary = run_once(&app.state, holder, app.clock.now())
         .await
         .expect("worker pass runs");
@@ -156,15 +183,12 @@ async fn auto_completes_delivered_orders_after_the_configured_window(pool: PgPoo
     confirm_delivery(&app, &buyer.token, order_id, 1_411).await;
 
     // Inside the window nothing completes.
-    let completed = complete_due_delivered_orders(&app.pool, app.clock.now(), 14)
-        .await
-        .expect("sweep runs");
+    let completed = complete_due(&app.pool, app.clock.now()).await;
     assert_eq!(completed, 0);
 
-    app.clock.advance_seconds(14 * DAY_SECONDS);
-    let completed = complete_due_delivered_orders(&app.pool, app.clock.now(), 14)
-        .await
-        .expect("sweep runs");
+    app.clock
+        .advance_seconds(DEFAULT_AUTO_COMPLETE_DAYS * DAY_SECONDS);
+    let completed = complete_due(&app.pool, app.clock.now()).await;
     assert_eq!(completed, 1);
 
     let (state, _, revision) = order_state(&app.pool, order_id).await;
@@ -244,12 +268,8 @@ async fn open_return_or_cancel_requests_block_auto_complete(pool: PgPool) {
 
     // Well past both windows: neither order moves.
     app.clock.advance_seconds(30 * DAY_SECONDS);
-    let assumed = assume_due_deliveries(&app.pool, app.clock.now(), 14)
-        .await
-        .expect("sweep runs");
-    let completed = complete_due_delivered_orders(&app.pool, app.clock.now(), 14)
-        .await
-        .expect("sweep runs");
+    let assumed = assume_due(&app.pool, app.clock.now()).await;
+    let completed = complete_due(&app.pool, app.clock.now()).await;
     assert_eq!((assumed, completed), (0, 0));
 
     let (state, _, _) = order_state(&app.pool, &returned.order_id).await;
@@ -277,14 +297,27 @@ async fn worker_transitions_are_idempotent_under_double_claim(pool: PgPool) {
     let order = create_paid_order(&app, &seller, &buyer).await;
     let order_id = order.order_id.as_str();
     ship(&app, &seller.token, order_id, 1_430).await;
-    app.clock.advance_seconds(14 * DAY_SECONDS);
+    app.clock
+        .advance_seconds(DEFAULT_DELIVERY_ASSUME_DAYS * DAY_SECONDS);
 
     // Two racing passes claim the same due order: SKIP LOCKED plus the
     // state compare-and-swap let exactly one apply the effect.
     let now = app.clock.now();
     let (first, second) = tokio::join!(
-        assume_due_deliveries(&app.pool, now, 14),
-        assume_due_deliveries(&app.pool, now, 14)
+        assume_due_deliveries(
+            &app.pool,
+            now,
+            DEFAULT_DELIVERY_ASSUME_DAYS,
+            DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+            DELIVERY_SWEEP_MAX_BATCHES
+        ),
+        assume_due_deliveries(
+            &app.pool,
+            now,
+            DEFAULT_DELIVERY_ASSUME_DAYS,
+            DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+            DELIVERY_SWEEP_MAX_BATCHES
+        )
     );
     assert_eq!(
         first.expect("first pass") + second.expect("second pass"),
@@ -294,9 +327,7 @@ async fn worker_transitions_are_idempotent_under_double_claim(pool: PgPool) {
 
     // A sequential re-run is a no-op: no extra event, no extra revision.
     let events_before = count(&app.pool, "SELECT COUNT(*) FROM events").await;
-    let repeated = assume_due_deliveries(&app.pool, app.clock.now(), 14)
-        .await
-        .expect("re-run");
+    let repeated = assume_due(&app.pool, app.clock.now()).await;
     assert_eq!(repeated, 0);
     assert_eq!(
         count(&app.pool, "SELECT COUNT(*) FROM events").await,
@@ -309,16 +340,27 @@ async fn worker_transitions_are_idempotent_under_double_claim(pool: PgPool) {
     );
 
     // Same guarantee for the auto-completion edge.
-    app.clock.advance_seconds(14 * DAY_SECONDS);
+    app.clock
+        .advance_seconds(DEFAULT_AUTO_COMPLETE_DAYS * DAY_SECONDS);
     let now = app.clock.now();
     let (first, second) = tokio::join!(
-        complete_due_delivered_orders(&app.pool, now, 14),
-        complete_due_delivered_orders(&app.pool, now, 14)
+        complete_due_delivered_orders(
+            &app.pool,
+            now,
+            DEFAULT_AUTO_COMPLETE_DAYS,
+            DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+            DELIVERY_SWEEP_MAX_BATCHES
+        ),
+        complete_due_delivered_orders(
+            &app.pool,
+            now,
+            DEFAULT_AUTO_COMPLETE_DAYS,
+            DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+            DELIVERY_SWEEP_MAX_BATCHES
+        )
     );
     assert_eq!(first.expect("first pass") + second.expect("second pass"), 1);
-    let repeated = complete_due_delivered_orders(&app.pool, app.clock.now(), 14)
-        .await
-        .expect("re-run");
+    let repeated = complete_due(&app.pool, app.clock.now()).await;
     assert_eq!(repeated, 0);
     let (state, _, revision) = order_state(&app.pool, order_id).await;
     assert_eq!((state.as_str(), revision), ("completed", 5));
@@ -329,5 +371,88 @@ async fn worker_transitions_are_idempotent_under_double_claim(pool: PgPool) {
         )
         .await,
         1
+    );
+}
+
+// N+1 due orders with batch_size N are drained across successive passes
+// (max_batches = 1 so each call is one inner claim).
+#[sqlx::test]
+async fn delivery_sweep_processes_a_batch_plus_one_across_passes(pool: PgPool) {
+    let app = test_app(pool).await;
+    for i in 0..3 {
+        let seller = new_actor(&app).await;
+        let buyer = new_actor(&app).await;
+        let order = create_paid_order(&app, &seller, &buyer).await;
+        ship(&app, &seller.token, &order.order_id, 1_600 + i).await;
+    }
+    app.clock
+        .advance_seconds(DEFAULT_DELIVERY_ASSUME_DAYS * DAY_SECONDS);
+    let now = app.clock.now();
+    let batch_size = 2i64;
+    let first = assume_due_deliveries(&app.pool, now, DEFAULT_DELIVERY_ASSUME_DAYS, batch_size, 1)
+        .await
+        .expect("first pass");
+    assert_eq!(first, 2, "first pass claims one batch");
+    let remaining_shipped = count(
+        &app.pool,
+        "SELECT COUNT(*) FROM orders WHERE state = 'shipped'",
+    )
+    .await;
+    assert_eq!(remaining_shipped, 1);
+    let second = assume_due_deliveries(&app.pool, now, DEFAULT_DELIVERY_ASSUME_DAYS, batch_size, 1)
+        .await
+        .expect("second pass");
+    assert_eq!(second, 1, "remainder processed on the next pass");
+    let delivered = count(
+        &app.pool,
+        "SELECT COUNT(*) FROM orders WHERE state = 'delivered'",
+    )
+    .await;
+    assert_eq!(delivered, 3);
+}
+
+// A malformed shipment timestamp is skipped (logged by order id) and does
+// not abort valid due rows in the same claim.
+#[sqlx::test]
+async fn malformed_shipment_timestamp_is_skipped_and_valid_rows_still_transition(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller_ok = new_actor(&app).await;
+    let buyer_ok = new_actor(&app).await;
+    let ok = create_paid_order(&app, &seller_ok, &buyer_ok).await;
+    ship(&app, &seller_ok.token, &ok.order_id, 1_610).await;
+
+    let seller_poison = new_actor(&app).await;
+    let buyer_poison = new_actor(&app).await;
+    let poison = create_paid_order(&app, &seller_poison, &buyer_poison).await;
+    ship(&app, &seller_poison.token, &poison.order_id, 1_611).await;
+
+    let seller_ok2 = new_actor(&app).await;
+    let buyer_ok2 = new_actor(&app).await;
+    let ok2 = create_paid_order(&app, &seller_ok2, &buyer_ok2).await;
+    ship(&app, &seller_ok2.token, &ok2.order_id, 1_612).await;
+
+    sqlx::query(
+        "UPDATE orders SET shipment = jsonb_set(shipment, '{shipped_at}', \
+         to_jsonb('not-a-timestamp'::text)) WHERE id = $1::uuid",
+    )
+    .bind(&poison.order_id)
+    .execute(&app.pool)
+    .await
+    .expect("poison shipment");
+
+    app.clock
+        .advance_seconds(DEFAULT_DELIVERY_ASSUME_DAYS * DAY_SECONDS);
+    let assumed = assume_due(&app.pool, app.clock.now()).await;
+    assert_eq!(assumed, 2, "valid rows still assume delivery");
+
+    let (ok_state, ok_flag, _) = order_state(&app.pool, &ok.order_id).await;
+    let (ok2_state, ok2_flag, _) = order_state(&app.pool, &ok2.order_id).await;
+    let (poison_state, poison_flag, _) = order_state(&app.pool, &poison.order_id).await;
+    assert_eq!((ok_state.as_str(), ok_flag), ("delivered", true));
+    assert_eq!((ok2_state.as_str(), ok2_flag), ("delivered", true));
+    assert_eq!(
+        (poison_state.as_str(), poison_flag),
+        ("shipped", false),
+        "poison row stays shipped"
     );
 }
