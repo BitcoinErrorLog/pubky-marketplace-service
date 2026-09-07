@@ -446,6 +446,10 @@ pub async fn close_locked_auction(
             paykit_request_reference: None,
             paykit_request_state: None,
             paykit_last_checked_at: None,
+            // Auction listings are shipping-only (§A2 v1 scope, enforced at
+            // registration): an auction order is always a shipped order.
+            fulfillment: "shipping".to_string(),
+            first_revealed_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -453,8 +457,9 @@ pub async fn close_locked_auction(
             "INSERT INTO orders (id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
              state, lines, delivery_address, subtotal_minor, shipping_minor, \
              total_minor, currency, exponent, guarantee_policy_version, payment_id, \
-             created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $12, $13, $14, $15, $15)",
+             fulfillment, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $12, $13, $14, 'shipping', \
+             $15, $15)",
         )
         .bind(order.id)
         .bind(&listing.aggregate_id)

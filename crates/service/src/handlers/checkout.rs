@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
-use marketplace_domain::commands::{CheckoutLine, Command, CreateCheckoutPayload};
+use marketplace_domain::commands::{
+    CheckoutLine, Command, CreateCheckoutPayload, FulfillmentMethod,
+};
 use marketplace_domain::state_machines::{can_transition, listing_machine};
 use marketplace_domain::{ids, ErrorCode};
 use serde_json::{json, Value};
@@ -135,24 +137,66 @@ pub async fn handle(
         }
     }
 
-    // Group checkout lines by seller, preserving line order.
-    let mut seller_groups: Vec<(String, Vec<usize>)> = Vec::new();
-    for (index, (_, listing)) in resolved.iter().enumerate() {
-        match seller_groups
+    // Group checkout lines by (seller, fulfillment), preserving line order
+    // (§A2: one order per seller group per fulfillment choice; several
+    // pickup lines from one seller share one pickup order in Wave 7, and
+    // the reveal is per order line). The buyer's choice is validated against
+    // the methods each listing publishes and is NEVER rewritten — a
+    // disallowed choice is a typed refusal, not a silent fall back to
+    // shipping.
+    let mut groups: Vec<(String, FulfillmentMethod, Vec<usize>)> = Vec::new();
+    for (index, (line, listing)) in resolved.iter().enumerate() {
+        let method = line.fulfillment.unwrap_or(FulfillmentMethod::Shipping);
+        let published = listing
+            .fulfillment_methods
+            .iter()
+            .any(|published| published == method.as_str());
+        if !published {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidState,
+                "A checkout line's listing does not publish the chosen fulfillment method.",
+            )));
+        }
+        match groups
             .iter_mut()
-            .find(|(seller, _)| *seller == listing.seller_pubky)
-        {
-            Some((_, indices)) => indices.push(index),
-            None => seller_groups.push((listing.seller_pubky.clone(), vec![index])),
+            .find(|(seller, group_method, _)| {
+                *seller == listing.seller_pubky && *group_method == method
+            }) {
+            Some((_, _, indices)) => indices.push(index),
+            None => groups.push((listing.seller_pubky.clone(), method, vec![index])),
         }
     }
+    // The address rule, re-checked handler-side (parse validation already
+    // enforces it): a checkout with any shipped group REQUIRES an address,
+    // and a pickup-only checkout presenting one is rejected — never stored.
+    let any_shipped = groups
+        .iter()
+        .any(|(_, method, _)| *method == FulfillmentMethod::Shipping);
+    match (&payload.delivery_address, any_shipped) {
+        (Some(_), false) => {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidCommand,
+                "A pickup-only checkout must not carry a delivery address.",
+            )));
+        }
+        (None, true) => {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidCommand,
+                "A delivery address is required when any checkout group ships.",
+            )));
+        }
+        _ => {}
+    }
 
-    let delivery_address = serde_json::to_value(&payload.delivery_address)
-        .expect("delivery address serializes infallibly");
-    let mut orders: Vec<Value> = Vec::with_capacity(seller_groups.len());
-    let mut payments: Vec<Value> = Vec::with_capacity(seller_groups.len());
-    let mut event_ids: Vec<Uuid> = Vec::with_capacity(seller_groups.len());
-    for (seller_pubky, indices) in &seller_groups {
+    let delivery_address = payload
+        .delivery_address
+        .as_ref()
+        .map(|address| serde_json::to_value(address).expect("delivery address serializes"));
+    let mut orders: Vec<Value> = Vec::with_capacity(groups.len());
+    let mut payments: Vec<Value> = Vec::with_capacity(groups.len());
+    let mut event_ids: Vec<Uuid> = Vec::with_capacity(groups.len());
+    for (seller_pubky, group_method, indices) in &groups {
+        let pickup = *group_method == FulfillmentMethod::Pickup;
         let lines: Vec<Value> = indices
             .iter()
             .map(|&index| {
@@ -169,6 +213,7 @@ pub async fn handle(
                         &listing.unit_price_currency,
                         listing.unit_price_exponent,
                     ),
+                    "fulfillment": group_method.as_str(),
                 });
                 // The buyer's variant snapshot rides the order line so
                 // packing slips and order rows can show which variant was
@@ -193,13 +238,18 @@ pub async fn handle(
             })
             .sum();
         // Shipping is the seller-signed flat rate, charged once per order
-        // line (quantity-independent). The price the buyer pays is exactly
-        // the seller's listed price plus that shipping — nothing else is
-        // added.
-        let shipping_minor: i64 = indices
-            .iter()
-            .map(|&index| resolved[index].1.shipping_minor)
-            .sum();
+        // line (quantity-independent) — and ONLY on shipped orders: a
+        // pickup order's shipping is zero, never charged and refunded later
+        // (§A2). The price the buyer pays is exactly the seller's listed
+        // price plus that shipping — nothing else is added.
+        let shipping_minor: i64 = if pickup {
+            0
+        } else {
+            indices
+                .iter()
+                .map(|&index| resolved[index].1.shipping_minor)
+                .sum()
+        };
         let total_minor = subtotal_minor + shipping_minor;
         let order_id = Uuid::new_v4();
         let payment_id = Uuid::new_v4();
@@ -221,7 +271,13 @@ pub async fn handle(
             revision: 1,
             state: "pending_payment".to_string(),
             lines: Value::Array(lines),
-            delivery_address: Some(delivery_address.clone()),
+            // The address is stored only on shipped orders; a pickup order
+            // never had one (§A2, the strictest reading of the policy).
+            delivery_address: if pickup {
+                None
+            } else {
+                delivery_address.clone()
+            },
             subtotal_minor,
             shipping_minor,
             total_minor,
@@ -247,6 +303,8 @@ pub async fn handle(
             paykit_request_reference: None,
             paykit_request_state: None,
             paykit_last_checked_at: None,
+            fulfillment: group_method.as_str().to_string(),
+            first_revealed_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -254,10 +312,10 @@ pub async fn handle(
             "INSERT INTO orders (id, checkout_command_id, drop_aggregate_id, buyer_pubky, \
              seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
              shipping_minor, total_minor, currency, exponent, \
-             guarantee_policy_version, payment_id, stock_held, hold_expires_at, created_at, \
-             updated_at) \
+             guarantee_policy_version, payment_id, stock_held, hold_expires_at, fulfillment, \
+             created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-             $18, $19, $19)",
+             $18, $19, $20, $20)",
         )
         .bind(order.id)
         .bind(command.command_id)
@@ -277,6 +335,7 @@ pub async fn handle(
         .bind(order.payment_id)
         .bind(order.stock_held)
         .bind(order.hold_expires_at)
+        .bind(&order.fulfillment)
         .bind(now)
         .execute(&mut **tx)
         .await?;

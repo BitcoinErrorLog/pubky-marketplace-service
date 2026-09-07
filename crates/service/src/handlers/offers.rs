@@ -86,6 +86,15 @@ pub async fn create(
             "Offer amount must use the listing asset and exponent.",
         )));
     }
+    // Offers settle through the shipping flow only (§A2 v1 scope): an offer
+    // on a listing that does not publish `shipping` is refused with a typed
+    // error, never silently converted to shipping.
+    if !listing.fulfillment_methods.iter().any(|m| m == "shipping") {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "Offers are available only on listings that ship.",
+        )));
+    }
 
     let aggregate_id = ids::offer_aggregate_id(command.command_id);
     let expires_at = now + chrono::Duration::seconds(payload.expires_in_seconds);

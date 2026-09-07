@@ -858,9 +858,17 @@ async fn apply_fiat_paid(
         .await
         .map_err(|error| internal("verification provenance update", &error))?;
     let command_id = Uuid::new_v4();
-    match crate::handlers::payment::confirm_order(&mut tx, actor, command_id, &payment, order, now)
-        .await
-        .map_err(|error| internal("order confirmation", &error))?
+    match crate::handlers::payment::confirm_order(
+        &mut tx,
+        actor,
+        command_id,
+        &payment,
+        order,
+        state.pickup.as_deref(),
+        now,
+    )
+    .await
+    .map_err(|error| internal("order confirmation", &error))?
     {
         Ok((confirmed_order, _receipt, _receipt_event_id)) => {
             let (revision,): (i64,) = sqlx::query_as(

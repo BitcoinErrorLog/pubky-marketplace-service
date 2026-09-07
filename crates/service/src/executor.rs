@@ -211,6 +211,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.config.sandbox_payment_window_seconds,
+                state.pickup.as_deref(),
                 now,
             )
             .await
@@ -238,6 +239,36 @@ async fn dispatch(
         }
         CommandPayload::ConfirmDelivery(payload) => {
             crate::handlers::fulfillment::confirm_delivery(tx, actor, command, payload, now).await
+        }
+        CommandPayload::SetPickupDetails(payload) => {
+            crate::handlers::pickup::set(
+                tx,
+                actor,
+                command,
+                payload,
+                state.pickup.as_deref(),
+                state.config.sandbox_payments_enabled,
+                now,
+            )
+            .await
+        }
+        CommandPayload::ClearPickupDetails(payload) => {
+            crate::handlers::pickup::clear(
+                tx,
+                actor,
+                command,
+                payload,
+                state.pickup.as_deref(),
+                state.config.sandbox_payments_enabled,
+                now,
+            )
+            .await
+        }
+        CommandPayload::MarkReadyForPickup(payload) => {
+            crate::handlers::fulfillment::mark_ready(tx, actor, command, payload, now).await
+        }
+        CommandPayload::ConfirmPickup(payload) => {
+            crate::handlers::fulfillment::confirm_pickup(tx, actor, command, payload, now).await
         }
         CommandPayload::RequestReturn(payload) => {
             crate::handlers::returns::request(tx, actor, command, payload, now).await

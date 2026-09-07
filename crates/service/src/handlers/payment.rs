@@ -33,6 +33,7 @@ pub async fn advance(
     command: &Command,
     payload: &AdvanceSandboxPaymentPayload,
     sandbox_payment_window_seconds: i64,
+    pickup: Option<&crate::pickup::PickupKeys>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let payment: Option<PaymentRow> = sqlx::query_as(&format!(
@@ -146,7 +147,9 @@ pub async fn advance(
 
     let (updated_order, receipt) = if payload.target == SandboxPaymentTarget::Confirmed {
         let (order, receipt, receipt_event_id) =
-            match confirm_order(tx, actor, command.command_id, &payment, order, now).await? {
+            match confirm_order(tx, actor, command.command_id, &payment, order, pickup, now)
+                .await?
+            {
                 Ok(confirmed) => confirmed,
                 Err(failure) => return Ok(Err(failure)),
             };
@@ -187,12 +190,21 @@ pub async fn advance(
 /// row lock (ADR-0026 layer 2). Shared by the sandbox command and the
 /// worker's Locks/paykit verification (`command_id` is the sandbox command
 /// id or the correlation id, for event traceability).
+///
+/// Pickup orders additionally pin their terms IN THIS RECEIPT TRANSACTION
+/// (§A3): per pickup line, the details version shown at payment and a
+/// sealed snapshot of it (AAD = order id ‖ line index ‖ version), plus the
+/// adapter confirming the payment (`payment.adapter` — `"sandbox"` for
+/// `payment.sandbox_advance`, the worker's rail otherwise). Because every
+/// confirmation path calls this one function, sandbox confirmations pin
+/// exactly like worker-confirmed payments.
 pub(crate) async fn confirm_order(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command_id: Uuid,
     payment: &PaymentRow,
     order: OrderRow,
+    pickup: Option<&crate::pickup::PickupKeys>,
     now: DateTime<Utc>,
 ) -> Result<Result<(OrderRow, ReceiptRow, Uuid), CommandFailure>, sqlx::Error> {
     if !can_transition(&order_machine(), &order.state, "paid") {
@@ -341,17 +353,35 @@ pub(crate) async fn confirm_order(
     .fetch_one(&mut **tx)
     .await?;
 
+    // The pickup pin rides the receipt transaction: the immutable per-line
+    // terms snapshot is written (or not, when the listing had no details)
+    // exactly once, in the same transaction as the receipt insert.
+    let pinned_lines = if order.fulfillment == "pickup" {
+        crate::handlers::pickup::pin_pickup_lines(
+            tx,
+            order.id,
+            &order.lines,
+            &payment.adapter,
+            pickup,
+            now,
+        )
+        .await?
+    } else {
+        order.lines.clone()
+    };
+
     // The hold clears with the conversion: the stock is sold now, so no
     // window can release it and no cancellation path treats it as reserved.
     let updated_order: OrderRow = sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, state = 'paid', receipt_id = $2, \
-         edition = $3, stock_held = false, hold_expires_at = NULL, updated_at = $4 \
+         edition = $3, stock_held = false, hold_expires_at = NULL, lines = $5, updated_at = $4 \
          WHERE id = $1 RETURNING {ORDER_COLUMNS}"
     ))
     .bind(order.id)
     .bind(receipt_id)
     .bind(edition)
     .bind(now)
+    .bind(&pinned_lines)
     .fetch_one(&mut **tx)
     .await?;
     let receipt_event_id = insert_event(

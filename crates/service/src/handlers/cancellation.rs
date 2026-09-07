@@ -58,7 +58,7 @@ pub async fn request(
     }
     if !matches!(
         order.state.as_str(),
-        "pending_payment" | "paid" | "processing"
+        "pending_payment" | "paid" | "processing" | "ready_for_pickup"
     ) {
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
@@ -66,14 +66,43 @@ pub async fn request(
         )));
     }
 
+    // The unilateral buyer exits of the pickup design (§A3/§A6). From
+    // `paid` or `ready_for_pickup` on a PICKUP order, the request moves the
+    // order straight to `cancelled` — no seller approval — while either:
+    //   * a post-payment terms change exists (any line's current details
+    //     version > `version_at_payment`, or the details were cleared); or
+    //   * the bounded withdrawal window is open (`first_revealed_at`
+    //     stamped, no handover confirm yet — `fulfillment.mark_ready` does
+    //     NOT close it, and a handover confirm has already moved the order
+    //     out of these states, closing the window by construction).
+    // Outside those conditions — including a request that races
+    // `mark_ready` before any first reveal — the same command yields the
+    // ordinary `cancel_requested` awaiting the seller, as today.
+    let unilateral = if order.fulfillment == "pickup"
+        && matches!(order.state.as_str(), "paid" | "ready_for_pickup")
+    {
+        let terms_changed =
+            crate::handlers::pickup::order_has_unresolved_terms_change(tx, &order).await?;
+        let withdrawal_open = order.first_revealed_at.is_some();
+        terms_changed || withdrawal_open
+    } else {
+        false
+    };
+
     // An unpaid order cancels immediately and releases its hold — when one
     // exists; a paid order awaits the seller's approval (prototype engine
-    // semantics). Under "only a payment locks an item" an ordinary pending
-    // order holds nothing until a payment lock point runs, so cancelling it
-    // releases nothing.
+    // semantics), unless a unilateral pickup exit applies. Under "only a
+    // payment locks an item" an ordinary pending order holds nothing until
+    // a payment lock point runs, so cancelling it releases nothing.
     let immediate = order.state == "pending_payment";
     let (to_state, event_kind) = if immediate {
         ("cancelled", "order.cancelled")
+    } else if unilateral {
+        // The distinct event kind (§A3): the reputation worker's
+        // `terminated_badly` aggregation excludes the WHOLE order when its
+        // terminal cancel is `order.cancelled_terms_change`, including any
+        // `refund.recorded_external` leg on it.
+        ("cancelled", "order.cancelled_terms_change")
     } else {
         ("cancel_requested", "order.cancel_requested")
     };
@@ -92,6 +121,21 @@ pub async fn request(
             if let Err(failure) = release_lines(tx, &order, HeldQuantity::Reserved, now).await? {
                 return Ok(Err(failure));
             }
+        }
+    } else if unilateral {
+        // The unilateral exit reuses `approve`'s release path VERBATIM
+        // (§A8): the payment confirmation moved the quantities
+        // reserved -> sold, so the reversal credits a stamped drop first
+        // and then returns them sold -> available — the listing machine
+        // declares this edge for `order.cancel_request` exactly as for
+        // `order.cancel_approve`. The payment and receipt stay untouched:
+        // the refund remains seller-recorded external evidence
+        // (`refund.record_external`, ADR-0019); cancelling moves no money.
+        if let Err(failure) = credit_order_drop(tx, &order, now).await? {
+            return Ok(Err(failure));
+        }
+        if let Err(failure) = release_lines(tx, &order, HeldQuantity::Sold, now).await? {
+            return Ok(Err(failure));
         }
     }
 
