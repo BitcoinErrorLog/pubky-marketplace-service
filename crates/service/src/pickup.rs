@@ -199,11 +199,16 @@ const PROBE_BATCH_SIZE: i64 = 100;
 const PROBE_MAX_BATCHES: u32 = 3;
 
 /// The outcome of probing one sealed family: one row per key class found
-/// within the bound, plus the number of rows scanned (the observability
-/// counter proving the probe stays bounded).
+/// within the bound, the number of rows the ascending scan paged (the
+/// observability counter proving the probe stays bounded), the number of
+/// DISTINCT rows opened across both sampled ends, and — when the family
+/// holds more rows than the probe opened — the family's row count, proving
+/// the probe was partial.
 struct ProbeScan {
     rows: Vec<ProbeRow>,
     scanned: u64,
+    probed: u64,
+    family_total: Option<u64>,
 }
 
 /// Whether the probe may stop paging: both key classes were found, or no
@@ -222,13 +227,18 @@ fn probe_scan_complete(probes: &[Option<ProbeRow>; 2], keys: &PickupKeys, batche
 /// under the previous key). Probing only the first row of the family could
 /// miss a half-rotated table whose previous key was dropped — the straggler
 /// class must be probed too, or it would fail the first buyer's reveal
-/// instead of the boot (§A8). Bounded to [`PROBE_MAX_BATCHES`] batches.
+/// instead of the boot (§A8). Bounded to [`PROBE_MAX_BATCHES`] ascending
+/// batches, PLUS the family's LAST batch: the ascending scan can stop at
+/// the first all-current batch, so both ends of the family are always
+/// sampled and a straggler hiding past the bound at the far end still
+/// fails the boot.
 async fn details_probe_rows(pool: &PgPool, keys: &PickupKeys) -> Result<ProbeScan, sqlx::Error> {
     // [opens under the current key, does not] — one probe row each.
     let mut probes: [Option<ProbeRow>; 2] = [None, None];
     let mut scanned = 0u64;
     let mut batches = 0u32;
     let mut cursor: Option<(String, i64)> = None;
+    let mut stopped_early = false;
     loop {
         let rows: Vec<(String, i64, Vec<u8>)> =
             match &cursor {
@@ -266,22 +276,81 @@ async fn details_probe_rows(pool: &PgPool, keys: &PickupKeys) -> Result<ProbeSca
             }
         }
         if probe_scan_complete(&probes, keys, batches) {
+            stopped_early = true;
             break;
         }
     }
+    let tail = details_tail_rows(pool).await?;
+    let probed = scanned + classify_tail_rows(&tail, &cursor, keys, &mut probes);
+    // The probe was partial when the family holds rows NEITHER sampled end
+    // opened; the count runs only then, never on the common small-table
+    // boot (it is one aggregate query, and only at startup).
+    let family_total = if stopped_early {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM listing_pickup_details")
+            .fetch_one(pool)
+            .await?;
+        (count as u64 > probed).then_some(count as u64)
+    } else {
+        None
+    };
     Ok(ProbeScan {
         rows: probes.into_iter().flatten().collect(),
         scanned,
+        probed,
+        family_total,
     })
 }
 
+/// The LAST batch of the details family (the tail end the bounded
+/// ascending scan may never reach).
+async fn details_tail_rows(pool: &PgPool) -> Result<Vec<(String, i64, Vec<u8>)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT aggregate_id, version, details_ciphertext FROM listing_pickup_details \
+         ORDER BY aggregate_id DESC, version DESC LIMIT $1",
+    )
+    .bind(PROBE_BATCH_SIZE)
+    .fetch_all(pool)
+    .await
+}
+
+/// Classifies one probe row per key class from the details family's tail
+/// batch, returning how many rows were NEW (rows at or below the ascending
+/// cursor were already opened by the scan and are skipped, not re-opened).
+fn classify_tail_rows(
+    tail: &[(String, i64, Vec<u8>)],
+    cursor: &Option<(String, i64)>,
+    keys: &PickupKeys,
+    probes: &mut [Option<ProbeRow>; 2],
+) -> u64 {
+    let mut probed = 0u64;
+    for (aggregate_id, version, ciphertext) in tail {
+        if cursor.as_ref().is_some_and(|(after_id, after_version)| {
+            (aggregate_id.as_str(), *version) <= (after_id.as_str(), *after_version)
+        }) {
+            continue;
+        }
+        probed += 1;
+        let aad = details_aad(aggregate_id, *version);
+        let class = usize::from(!keys.opens_under_current(&aad, ciphertext));
+        if probes[class].is_none() {
+            probes[class] = Some(ProbeRow {
+                aad,
+                ciphertext: ciphertext.clone(),
+            });
+        }
+    }
+    probed
+}
+
 /// The snapshot family's [`details_probe_rows`]: one probe row per key
-/// class, paged on (order_id, line_index), under the same batch bound.
+/// class, paged on (order_id, line_index), under the same batch bound and
+/// the same two-ended sampling (the family's LAST batch is probed too).
 async fn snapshot_probe_rows(pool: &PgPool, keys: &PickupKeys) -> Result<ProbeScan, sqlx::Error> {
     let mut probes: [Option<ProbeRow>; 2] = [None, None];
     let mut scanned = 0u64;
     let mut batches = 0u32;
     let mut cursor: Option<(Uuid, i32)> = None;
+    let mut stopped_early = false;
     loop {
         let rows: Vec<(Uuid, i32, i64, Vec<u8>)> = match &cursor {
             None => {
@@ -323,12 +392,46 @@ async fn snapshot_probe_rows(pool: &PgPool, keys: &PickupKeys) -> Result<ProbeSc
             }
         }
         if probe_scan_complete(&probes, keys, batches) {
+            stopped_early = true;
             break;
         }
     }
+    // The tail end of the family (see the details probe): rows at or below
+    // the ascending cursor were already opened and are skipped.
+    let tail: Vec<(Uuid, i32, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT order_id, line_index, version, snapshot_ciphertext \
+         FROM pickup_line_snapshots ORDER BY order_id DESC, line_index DESC LIMIT $1",
+    )
+    .bind(PROBE_BATCH_SIZE)
+    .fetch_all(pool)
+    .await?;
+    let mut probed = scanned;
+    for (order_id, line_index, version, ciphertext) in tail {
+        if cursor.is_some_and(|(after_order, after_line)| {
+            (order_id, line_index) <= (after_order, after_line)
+        }) {
+            continue;
+        }
+        probed += 1;
+        let aad = snapshot_aad(order_id, line_index, version);
+        let class = usize::from(!keys.opens_under_current(&aad, &ciphertext));
+        if probes[class].is_none() {
+            probes[class] = Some(ProbeRow { aad, ciphertext });
+        }
+    }
+    let family_total = if stopped_early {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pickup_line_snapshots")
+            .fetch_one(pool)
+            .await?;
+        (count as u64 > probed).then_some(count as u64)
+    } else {
+        None
+    };
     Ok(ProbeScan {
         rows: probes.into_iter().flatten().collect(),
         scanned,
+        probed,
+        family_total,
     })
 }
 
@@ -337,9 +440,14 @@ async fn snapshot_probe_rows(pool: &PgPool, keys: &PickupKeys) -> Result<ProbeSc
 /// without `PICKUP_DETAILS_ENCRYPTION_KEY` configured, and attempts real
 /// opens — current key, then previous — across BOTH sealed families and
 /// BOTH key classes of each (a row already under the current key AND a row
-/// still under the previous one, when such rows exist), so a wrong key or a
-/// half-rotated table whose previous key was dropped fails the boot rather
-/// than the first buyer's reveal (§A8).
+/// still under the previous one, when such rows exist). The probe is
+/// bounded: at most [`PROBE_MAX_BATCHES`] ascending batches per family,
+/// PLUS the family's LAST batch — both ends are always sampled, so a wrong
+/// key or a straggler at either end of a half-rotated table fails the
+/// boot. Rows BETWEEN the sampled ends are not probed (a family larger
+/// than the probe coverage is logged once as a partial probe); with a
+/// previous key configured those stragglers are the re-seal job's
+/// responsibility (§A8).
 pub async fn assert_pickup_sealing_coherent(
     pool: &PgPool,
     keys: Option<&PickupKeys>,
@@ -361,6 +469,16 @@ pub async fn assert_pickup_sealing_coherent(
             scanned = scan.scanned,
             "pickup boot probe scanned the sealed family (bounded)"
         );
+        if let Some(total) = scan.family_total {
+            tracing::warn!(
+                family,
+                total,
+                probed = scan.probed,
+                "pickup boot probe was partial: the family holds more rows than the bounded \
+                 probe opened (only the two ends were sampled); rows in between are the \
+                 re-seal job's responsibility"
+            );
+        }
         for row in scan.rows {
             keys.open(&row.aad, &row.ciphertext).map_err(|_| {
                 anyhow::anyhow!(
@@ -400,12 +518,12 @@ const RESEAL_BATCH_SIZE: i64 = 100;
 /// unopenable — a wrong key must never be silently skipped, but one
 /// corrupt row must not stall the rotation of every row after it.
 ///
-/// The completion criterion is folded into the same streamed pass rather
-/// than a second fetch-all sweep: the pass already classifies every row of
-/// both families exactly once, so `remaining_under_previous` is the rows
-/// that failed the current-key open minus the rows this pass re-sealed —
-/// unopenable rows are NOT counted as "under previous" (they open under
-/// neither key). Rotation is complete only when it reaches zero (§A1).
+/// The completion criterion is MEASURED, not derived from the pass's own
+/// counters: on the unopenable-free path one independent sweep counts the
+/// rows of both families that still open under the previous key (one AEAD
+/// open per row — acceptable here because it runs once per pass, at
+/// completion). Rotation is complete only when that measured count reaches
+/// zero (§A1).
 pub async fn reseal_previous_key_batch(
     pool: &PgPool,
     keys: &PickupKeys,
@@ -415,9 +533,8 @@ pub async fn reseal_previous_key_batch(
         return Ok(ResealProgress::default());
     }
     let mut progress = ResealProgress::default();
-    // Rows that failed the current-key open, per family, so the completion
-    // count can be derived without re-opening a single ciphertext.
-    let mut failed_current = 0u64;
+    // Rows that opened under NEITHER key — a single counter across BOTH
+    // families (not per family): one corrupt row anywhere fails the pass.
     let mut unopenable = 0u64;
 
     // Family 1: details versions, paged on (aggregate_id, version).
@@ -454,7 +571,6 @@ pub async fn reseal_previous_key_batch(
             if keys.opens_under_current(&aad, ciphertext) {
                 continue;
             }
-            failed_current += 1;
             let plaintext = match keys.open_under_previous(&aad, ciphertext) {
                 Ok(plaintext) => plaintext,
                 Err(_) => {
@@ -523,7 +639,6 @@ pub async fn reseal_previous_key_batch(
             if keys.opens_under_current(&aad, ciphertext) {
                 continue;
             }
-            failed_current += 1;
             let plaintext = match keys.open_under_previous(&aad, ciphertext) {
                 Ok(plaintext) => plaintext,
                 Err(_) => {
@@ -555,20 +670,56 @@ pub async fn reseal_previous_key_batch(
 
     // The completion criterion spans BOTH families: rotation is complete
     // only when zero rows in either family remain sealed under the
-    // previous key. Every row that failed the current-key open was either
-    // re-sealed above (no longer under previous) or recorded unopenable
-    // (under NEITHER key — not counted here); seals only ever write the
-    // current key, so nothing new enters the previous class mid-pass.
-    progress.remaining_under_previous = failed_current
-        .saturating_sub(progress.details_resealed + progress.snapshots_resealed)
-        .saturating_sub(unopenable);
+    // previous key. Seals only ever write the current key, so nothing new
+    // enters the previous class mid-pass.
     if unopenable > 0 {
         anyhow::bail!(
             "{unopenable} sealed pickup row(s) open under neither the current nor the previous \
              pickup key (their identities were logged); the rest of the pass completed"
         );
     }
+    // Completion is reported only from a MEASURED count, never inferred
+    // from this pass's counters: one independent sweep over both families
+    // counting the rows that still open under the previous key.
+    progress.remaining_under_previous = count_rows_under_previous(pool, keys).await?;
     Ok(progress)
+}
+
+/// The measured completion signal: one sweep over BOTH sealed families
+/// counting the rows that still open under the PREVIOUS key (one AEAD open
+/// per row — it runs once per pass, at completion, so the unbounded read
+/// is acceptable). A row opens under the previous key iff it is still
+/// sealed under it: current-key seals never authenticate under the
+/// distinct previous key.
+async fn count_rows_under_previous(pool: &PgPool, keys: &PickupKeys) -> anyhow::Result<u64> {
+    let mut remaining = 0u64;
+    let details: Vec<(String, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT aggregate_id, version, details_ciphertext FROM listing_pickup_details",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (aggregate_id, version, ciphertext) in details {
+        if keys
+            .open_under_previous(&details_aad(&aggregate_id, version), &ciphertext)
+            .is_ok()
+        {
+            remaining += 1;
+        }
+    }
+    let snapshots: Vec<(Uuid, i32, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT order_id, line_index, version, snapshot_ciphertext FROM pickup_line_snapshots",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (order_id, line_index, version, ciphertext) in snapshots {
+        if keys
+            .open_under_previous(&snapshot_aad(order_id, line_index, version), &ciphertext)
+            .is_ok()
+        {
+            remaining += 1;
+        }
+    }
+    Ok(remaining)
 }
 
 /// The retention purge (§A3): hard-deletes pinned snapshots whose
@@ -756,6 +907,55 @@ mod tests {
         assert_pickup_sealing_coherent(&pool, Some(&rotated))
             .await
             .expect("all-current table with a previous key boots");
+    }
+
+    // Two-ended sampling: with no previous key configured the ascending
+    // scan stops at the first all-current batch, so an unopenable row
+    // hiding at the END of the family would boot green and fail the first
+    // buyer's reveal — the probe also samples the family's LAST batch, so
+    // the straggler fails the boot instead.
+    #[sqlx::test]
+    async fn boot_probe_catches_an_unopenable_row_at_the_end_of_the_family(pool: PgPool) {
+        let keys = keys();
+        let unknown = PickupKeys::from_hex(OTHER_KEY, None).expect("other key parses");
+        let aggregate = "listing:probe_tail";
+        let now = Utc::now();
+        let row_count = PROBE_BATCH_SIZE * 2 + 1;
+        for version in 1..=row_count {
+            // Only the LAST row is unopenable under the configured key.
+            let sealing = if version == row_count {
+                &unknown
+            } else {
+                &keys
+            };
+            let ciphertext = sealing.seal(&details_aad(aggregate, version), b"spot");
+            sqlx::query(
+                "INSERT INTO listing_pickup_details (aggregate_id, seller_pubky, version, \
+                 details_ciphertext, created_at, updated_at) VALUES ($1, 's', $2, $3, $4, $4)",
+            )
+            .bind(aggregate)
+            .bind(version)
+            .bind(&ciphertext)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("seed details");
+        }
+
+        // The ascending scan still stops at the first all-current batch...
+        let scan = details_probe_rows(&pool, &keys).await.expect("probe runs");
+        assert_eq!(scan.scanned, PROBE_BATCH_SIZE as u64);
+        // ...but the tail batch was sampled too: both key classes were
+        // found, and the family is reported larger than the probe coverage.
+        assert_eq!(scan.rows.len(), 2, "the tail row adds the straggler class");
+        assert_eq!(
+            scan.family_total,
+            Some(row_count as u64),
+            "the probe was partial: rows sit between the sampled ends"
+        );
+        assert_pickup_sealing_coherent(&pool, Some(&keys))
+            .await
+            .expect_err("the unopenable last row must fail the boot, not the first reveal");
     }
 
     struct NoLocksClient;

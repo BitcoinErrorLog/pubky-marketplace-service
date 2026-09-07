@@ -3715,6 +3715,88 @@ async fn a_failed_claimed_item_does_not_stall_the_rest_of_the_batch(pool: PgPool
     );
 }
 
+// A permanently unopenable row fails the re-seal TASK, not the tick: the
+// pass error is logged per-task (its unopenable count rides the message),
+// the remaining worker tasks still run, and run_once returns Ok with the
+// tick summary.
+#[sqlx::test]
+async fn a_failing_reseal_task_does_not_fail_the_tick(pool: PgPool) {
+    let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let state = AppState::new(pool.clone(), clock.clone(), common::config_durable())
+        .with_pickup(Some(common::test_pickup_keys_with_previous()))
+        .with_attestor(Some(test_attestor()));
+    let app = TestApp {
+        router: build_router(state.clone()),
+        pool: pool.clone(),
+        clock,
+        state,
+    };
+
+    // One details row sealed under an UNKNOWN key: the re-seal pass fails
+    // on it every tick (the operator-mishap fixture).
+    let unknown = PickupKeys::from_hex(
+        "9999999999999999999999999999999999999999999999999999999999999999",
+        None,
+    )
+    .expect("unknown key parses");
+    let seller = "s".repeat(52);
+    let aggregate = listing_agg(&seller, "boots_01");
+    let ciphertext = unknown.seal(&pickup::details_aad(&aggregate, 1), SPOT.as_bytes());
+    sqlx::query(
+        "INSERT INTO listing_pickup_details (aggregate_id, seller_pubky, version, \
+         details_ciphertext, created_at, updated_at) VALUES ($1, $2, 1, $3, $4, $4)",
+    )
+    .bind(&aggregate)
+    .bind(&seller)
+    .bind(&ciphertext)
+    .bind(now)
+    .execute(&app.pool)
+    .await
+    .expect("details row");
+
+    // One seller due for a weekly attestation: a delivered SHIPPING order
+    // whose delivered event sits inside the stat window.
+    let order_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO orders (id, buyer_pubky, seller_pubky, revision, state, lines, \
+         subtotal_minor, shipping_minor, total_minor, currency, exponent, \
+         guarantee_policy_version, payment_id, fulfillment, created_at, updated_at) \
+         VALUES ($1, 'b', $2, 1, 'delivered', '[]', 100, 0, 100, 'USD', 2, 1, $3, \
+         'shipping', $4, $4)",
+    )
+    .bind(order_id)
+    .bind(&seller)
+    .bind(Uuid::new_v4())
+    .bind(now)
+    .execute(&app.pool)
+    .await
+    .expect("seed order");
+    sqlx::query(
+        "INSERT INTO events (id, command_id, aggregate_id, revision, actor_pubky, kind, \
+         occurred_at) VALUES ($1, $2, $3, 1, $4, 'fulfillment.delivered', $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(format!("order:{order_id}"))
+    .bind(&seller)
+    .bind(now)
+    .execute(&app.pool)
+    .await
+    .expect("seed delivered event");
+
+    // The re-seal pass fails on the unopenable row, yet the tick returns Ok
+    // and the tasks after the re-seal still ran.
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("a failing re-seal task must not fail the tick");
+    assert_eq!(summary.pickup_rows_resealed, 0, "nothing rotated");
+    assert_eq!(
+        summary.stat_attestations_signed, 1,
+        "the attestation task after the re-seal task still ran"
+    );
+}
+
 // One buyer with TWO paid orders on the same listing gets one notification
 // per order on a details update — the notifications dedup on (event id,
 // recipient) must never collapse them.

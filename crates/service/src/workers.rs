@@ -1520,9 +1520,11 @@ pub struct WorkerSummary {
 }
 
 /// One worker pass: for each task, take the lease, drain, release. Tasks
-/// whose lease is held by another live instance are skipped. The lease is
-/// released on EVERY exit path — a drain error propagates only after the
-/// release, so a failing task never squats on its lease until expiry.
+/// whose lease is held by another live instance are skipped. A drain error
+/// propagates only after the release, so a failing task never squats on
+/// its lease until expiry. Panics are NOT caught (there is no
+/// catch_unwind): a panicking task takes the pass down and leaves its
+/// lease to expire on its own.
 pub async fn run_once(
     state: &AppState,
     holder: Uuid,
@@ -1682,14 +1684,29 @@ pub async fn run_once(
         {
             let result = crate::pickup::reseal_previous_key_batch(&state.pool, pickup, now).await;
             release_lease(&state.pool, TASK_PICKUP_RESEAL, holder, now).await?;
-            let progress = result?;
-            summary.pickup_rows_resealed = progress.details_resealed + progress.snapshots_resealed;
-            if progress.remaining_under_previous == 0 && summary.pickup_rows_resealed > 0 {
-                tracing::info!(
-                    resealed = summary.pickup_rows_resealed,
-                    "pickup key rotation complete: zero rows remain under the previous key \
-                     across both sealed families"
-                );
+            // A failed re-seal pass (a permanently unopenable row) is a
+            // PER-TASK failure: it is logged with its unopenable count and
+            // the tick continues — it must not skip the remaining tasks or
+            // discard the tick summary on every pass. The pass retries on
+            // the next tick; only the OTHER tasks' failures fail run_once.
+            match result {
+                Ok(progress) => {
+                    summary.pickup_rows_resealed =
+                        progress.details_resealed + progress.snapshots_resealed;
+                    if progress.remaining_under_previous == 0 && summary.pickup_rows_resealed > 0 {
+                        tracing::info!(
+                            resealed = summary.pickup_rows_resealed,
+                            "pickup key rotation complete: zero rows remain under the previous \
+                             key across both sealed families"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "pickup re-seal pass failed; continuing with the remaining worker tasks"
+                    );
+                }
             }
         }
     }

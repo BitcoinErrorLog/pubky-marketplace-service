@@ -161,8 +161,9 @@ async fn current_details(
     .await
 }
 
-/// The fan-out runs in chunks so a listing with very many paid orders
-/// bounds the per-iteration work of one command transaction; per-order
+/// The fan-out iterates in chunks purely as iteration structure inside the
+/// ONE command transaction — chunking neither bounds nor splits the
+/// transaction (every chunk commits or rolls back together); per-order
 /// semantics (one event + one intent per order) are unchanged.
 const NOTIFY_FANOUT_CHUNK: usize = 100;
 
