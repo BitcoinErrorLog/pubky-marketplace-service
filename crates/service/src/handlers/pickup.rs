@@ -161,6 +161,11 @@ async fn current_details(
     .await
 }
 
+/// The fan-out runs in chunks so a listing with very many paid orders
+/// bounds the per-iteration work of one command transaction; per-order
+/// semantics (one event + one intent per order) are unchanged.
+const NOTIFY_FANOUT_CHUNK: usize = 100;
+
 /// Notifies the buyers of every PAID, non-terminal pickup order touching
 /// this listing (§A3: an edit or a clear is never silent). One fan-out
 /// event per ORDER on the details aggregate: the notifications table
@@ -192,29 +197,31 @@ async fn notify_paid_buyers(
     }
     let details_aggregate = details_aggregate_id(&listing.aggregate_id);
     let mut revision = next_details_event_revision(tx, &details_aggregate).await?;
-    for (buyer, order_id) in buyers {
-        let event_id = insert_event(
-            tx,
-            command.command_id,
-            &details_aggregate,
-            revision,
-            actor,
-            "pickup_details.buyer_notified",
-            now,
-        )
-        .await?;
-        revision += 1;
-        insert_notification_intent(
-            tx,
-            event_id,
-            notification_type,
-            &buyer,
-            actor,
-            &marketplace_domain::ids::order_aggregate_id(order_id),
-            None,
-            now,
-        )
-        .await?;
+    for chunk in buyers.chunks(NOTIFY_FANOUT_CHUNK) {
+        for (buyer, order_id) in chunk {
+            let event_id = insert_event(
+                tx,
+                command.command_id,
+                &details_aggregate,
+                revision,
+                actor,
+                "pickup_details.buyer_notified",
+                now,
+            )
+            .await?;
+            revision += 1;
+            insert_notification_intent(
+                tx,
+                event_id,
+                notification_type,
+                buyer,
+                actor,
+                &marketplace_domain::ids::order_aggregate_id(*order_id),
+                None,
+                now,
+            )
+            .await?;
+        }
     }
     Ok(())
 }

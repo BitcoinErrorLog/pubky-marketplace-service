@@ -3241,6 +3241,144 @@ async fn reveal_refuses_an_order_that_pinned_nothing(pool: PgPool) {
     assert_eq!(body["result"]["order"]["state"], json!("delivered"));
 }
 
+// Partial pin: one seller, TWO pickup listings in one order — one with
+// details, one without. Only the detailed line pins a snapshot, and the
+// reveal serves that pinned subset instead of refusing the order. The
+// orders-list projection's `pickup_terms_changed` flag reads false before
+// an edit and true after one.
+#[sqlx::test]
+async fn reveal_serves_the_pinned_subset_of_a_partially_detailed_order(pool: PgPool) {
+    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &register_pickup_listing(&seller.pubky, "boots_01", 5, 0xc51),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &register_pickup_listing(&seller.pubky, "boots_02", 5, 0xc52),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Details on boots_01 only; boots_02 never gains any.
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &set_details(&seller.pubky, "boots_01", 0, SPOT, 0xc53),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // One checkout, two pickup lines, one (seller, fulfillment) group.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_lines(
+            vec![
+                line(&seller.pubky, "boots_01", 1, "pickup"),
+                line(&seller.pubky, "boots_02", 1, "pickup"),
+            ],
+            false,
+            "00000000-0000-4000-9000-000000000c54",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
+    assert_eq!(
+        body["result"]["orders"].as_array().expect("orders").len(),
+        1,
+        "same seller and fulfillment split into one order"
+    );
+    let order = PickupOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    };
+    confirm_via_locks(&app, &fake, &buyer, &order, &seller, TEST_BUNDLE_ID, 0xc55).await;
+
+    // Exactly one snapshot pinned — for the boots_01 line only; the
+    // boots_02 line carries no version_at_payment.
+    let snapshots: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT line_index, listing_aggregate_id FROM pickup_line_snapshots \
+         WHERE order_id = $1::uuid",
+    )
+    .bind(&order.order_id)
+    .fetch_all(&app.pool)
+    .await
+    .expect("snapshots");
+    assert_eq!(
+        snapshots,
+        vec![(0, listing_agg(&seller.pubky, "boots_01"))],
+        "only the detailed line pins"
+    );
+    let (lines,): (Value,) = sqlx::query_as("SELECT lines FROM orders WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("order row");
+    assert_eq!(lines[0]["version_at_payment"], json!(1));
+    assert!(
+        lines[1].get("version_at_payment").is_none(),
+        "the detail-less line pins nothing"
+    );
+
+    // The reveal serves the pinned subset rather than refusing.
+    let (status, body) = reveal(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lines"].as_array().expect("lines").len(), 1);
+    assert_eq!(body["lines"][0]["line_index"], json!(0));
+    assert_eq!(body["lines"][0]["details"]["spot"], json!(SPOT));
+    assert_eq!(body["lines"][0]["withdrawn_by_seller"], json!(false));
+
+    // The orders-list projection flags no terms change before an edit…
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/orders",
+        Some(&buyer.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = &body["orders"][0];
+    assert_eq!(listed["id"], json!(order.order_id));
+    assert_eq!(listed["pickup_terms_changed"], json!(false));
+
+    // …and true after the detailed listing's terms move past the pin.
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &set_details(&seller.pubky, "boots_01", 1, SPOT_EDITED, 0xc56),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/orders",
+        Some(&buyer.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["orders"][0]["pickup_terms_changed"],
+        json!(true),
+        "an edit past version_at_payment flags the order in the list"
+    );
+}
+
 // A details row that fails to open (sealed under an unknown key) must FAIL
 // the confirmation cleanly — receipt transaction rolled back, no panic.
 #[sqlx::test]
