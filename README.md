@@ -460,6 +460,10 @@ splits one order per (seller, fulfillment) — several pickup lines from one
 seller share one pickup order; pickup orders charge no shipping and store no
 buyer address (a pickup-only checkout presenting one is rejected
 `INVALID_COMMAND`). Every order carries a required `fulfillment` column.
+Digital lines are N/A (§A8 7.1): the service has no digital item concept —
+every registered order is a shipped or pickup physical order, so there are
+no digital lines to keep outside the (seller, fulfillment) split key or the
+`fulfillment = 'shipping'` backfill.
 
 The seller's pickup details (spot or address, instructions, availability
 windows with their IANA zone) live ONLY in the service, sealed

@@ -12,7 +12,10 @@
 -- can simply re-run. Pre-existing orders backfill to `fulfillment =
 -- 'shipping'` — every order the service has ever created is a shipped
 -- physical order (digital listings carry no fulfillment choice and are not
--- registered with this service; §A2). The `version_at_payment` pin lives as
+-- registered with this service; §A2). §A8 7.1 (digital lines outside the
+-- split key and the backfill) is therefore N/A: this service has no
+-- digital item concept, so there are no digital lines to exclude. The
+-- `version_at_payment` pin lives as
 -- a JSON key on the order line: pre-migration rows simply have no such key,
 -- which reads as "no terms version pinned" (§A3). Sealed pickup rows are
 -- XChaCha20-Poly1305 ciphertext with a fresh nonce per seal; the plaintext
@@ -51,7 +54,8 @@ UPDATE orders SET fulfillment = 'shipping' WHERE fulfillment IS DISTINCT FROM 's
 ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_fulfillment_check;
 ALTER TABLE orders
     ADD CONSTRAINT orders_fulfillment_check
-    CHECK (fulfillment IN ('shipping', 'pickup'));
+    CHECK (fulfillment IN ('shipping', 'pickup')) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_fulfillment_check;
 
 -- The first successful buyer reveal stamps the bounded withdrawal window
 -- (§A3); NULL until the first reveal.
@@ -80,7 +84,8 @@ ALTER TABLE orders
             'return_requested', 'return_approved', 'return_received',
             'refunded_external', 'closed'
         )
-    );
+    ) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_state_check;
 
 -- === Sealed pickup details (family 1) =====================================
 -- Append-only per-listing versions of the seller's pickup details, sealed
