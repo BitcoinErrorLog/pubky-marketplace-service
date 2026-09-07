@@ -100,6 +100,9 @@ environment-based:
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |
 | `SHIPPO_API_BASE` | `https://api.goshippo.com` | Shippo API base for the seller-token label integration (`/v0/sellers/me/shipping-config`, `/v0/orders/{id}/shipping/*`); tests point it at a local double |
 | `SANDBOX_PAYMENTS_ENABLED` | `false` | accept `payment.sandbox_advance` at all; must stay `false` on any deployment handling real orders |
+| `PICKUP_DETAILS_ENCRYPTION_KEY` | unset | 32-byte hex key sealing local-pickup details and pinned payment snapshots at rest (XChaCha20-Poly1305); must differ from the Locks key material; pickup is OFF without it |
+| `PICKUP_DETAILS_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous pickup key for the dual-key read window during rotation; the re-seal worker migrates both sealed families to the current key |
+| `PICKUP_DISPUTE_RETENTION_DAYS` | `30` | days a cancelled-after-payment order's pinned pickup snapshot is retained as the dispute exhibit when no refund evidence ever lands, before the ordinary terminal-order purge takes it (≥ 1) |
 
 The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
 closed at startup** on a partial configuration (a URL without keys, or keys
@@ -107,6 +110,18 @@ without a URL), rather than running with verification silently disabled or
 bearer material unprotected. With none of them set the deployment is
 sandbox-only: `payment.register_locks` is refused and the lifecycle poller
 is not scheduled.
+
+`PICKUP_DETAILS_ENCRYPTION_KEY` is all-or-none: when it is set the boot
+probe (`assert_pickup_sealing_coherent`, run after migrations) attempts one
+real open — current key, then previous — across BOTH sealed pickup families
+(details versions and pinned snapshots) and refuses to start when sealed
+rows exist that no configured key opens. When it is unset, pickup is OFF:
+`pickup_details.set` is refused and no details are ever stored. Independently,
+when `SANDBOX_PAYMENTS_ENABLED` is on, `pickup_details.set` and the buyer
+pickup reveal are refused outright, and `/health` reports
+`pickup_available: false`. Key rotation: deploy with both keys, run the
+re-seal worker to completion (zero rows in either family remain under the
+previous key), then remove the previous key.
 
 `SANDBOX_PAYMENTS_ENABLED` is the server-side boundary for the sandbox
 payment adapter. Every checkout starts on the `sandbox` adapter until a real
@@ -259,7 +274,10 @@ Commands implemented: `listing.register`, `drop.sync`, `drop.cancel`,
 `payment.sandbox_advance`, `payment.register_locks`,
 `order.cancel_request`, `order.cancel_approve`,
 `fulfillment.ship`,
-`fulfillment.confirm_delivery`, `return.request`, `return.approve`,
+`fulfillment.confirm_delivery`, `pickup_details.set`,
+`pickup_details.clear`, `fulfillment.mark_ready`,
+`fulfillment.confirm_pickup` (see Local pickup),
+`return.request`, `return.approve`,
 `return.receive`, `refund.record_external`,
 `review.create`, `review.update` (this service only), and
 `attestation.set_band_consent`.
@@ -433,6 +451,51 @@ request, to the buyer on approval — `order_shipped`, `order_delivered`,
 `refund_recorded`,
 `review_received`). `review.update` emits none — the
 prototype had no counterpart to copy.
+
+## Local pickup (Wave 7 safe subset)
+
+Listings publish `fulfillmentMethods` (`shipping` | `pickup` | both) on the
+owner-signed record, echoed at `listing.register`/`listing.sync`. Checkout
+splits one order per (seller, fulfillment) — several pickup lines from one
+seller share one pickup order; pickup orders charge no shipping and store no
+buyer address (a pickup-only checkout presenting one is rejected
+`INVALID_COMMAND`). Every order carries a required `fulfillment` column.
+
+The seller's pickup details (spot or address, instructions, availability
+windows with their IANA zone) live ONLY in the service, sealed
+(XChaCha20-Poly1305, AAD-bound, fresh nonce per seal) under
+`PICKUP_DETAILS_ENCRYPTION_KEY`, written exclusively by
+`pickup_details.set` (whole-payload upsert, monotonic per-listing version
+through the surviving `listing_pickup_version_counters` row, CAS on
+`expected_version`) and `pickup_details.clear` (retains only versions pinned
+by paid, non-terminal orders; the counter survives so versions never
+restart). No sync path can null them. Payment confirmation pins, per pickup
+line and inside the receipt transaction, `version_at_payment` plus a sealed
+snapshot (AAD = order id ‖ line index ‖ version) and the confirming adapter;
+the buyer-only reveal (`GET /v1/orders/{id}/pickup-details`,
+`Cache-Control: no-store`) serves that pinned snapshot — never current
+details — gated on the durable payment fact (`receipt_id IS NOT NULL`),
+refused on terminal orders, on sandbox deployments, and whenever the pinned
+adapter was `payment.sandbox_advance` regardless of the current flag. The
+seller's owner read is `GET /v1/listings/{aggregate_id}/pickup-details`.
+The first successful reveal stamps `first_revealed_at`.
+
+The order machine gains `ready_for_pickup`: `fulfillment.mark_ready`
+(seller) arms it; `fulfillment.confirm_pickup` (buyer OR seller, from
+`paid` or `ready_for_pickup`) writes the one-row `pickup_handovers` record
+(server instant, confirming role) and emits `fulfillment.delivered` like a
+shipped delivery; a seller-actor confirm is refused while a post-payment
+terms change is unresolved. The buyer holds two unilateral exits via
+`order.cancel_request` — a post-payment terms change (version bump or
+clear) and the bounded withdrawal window (first reveal until handover
+confirm; `mark_ready` does not close it) — which cancel immediately with
+the distinct `order.cancelled_terms_change` event, release inventory
+through approve's path, and are excluded whole (including any
+`refund.recorded_external` leg) from the reputation worker's
+`terminated_badly`. Pickup completions count toward reputation only on a
+buyer-confirmed handover or a dispute-free auto-complete; the auto-complete
+sweep coalesces the handover instant for pickup orders, locking
+`FOR UPDATE OF orders`.
 
 ## Drops (ADR-0026)
 

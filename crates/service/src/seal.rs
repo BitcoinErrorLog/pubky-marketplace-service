@@ -21,7 +21,13 @@ pub fn seal(key: &[u8; KEY_LEN], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .expect("XChaCha20-Poly1305 encryption is infallible for in-memory buffers");
     let mut sealed = Vec::with_capacity(XNONCE_LEN + ciphertext.len());
     sealed.extend_from_slice(&nonce_bytes);

@@ -30,9 +30,9 @@ use serde::Deserialize;
 use sha2::Sha256;
 use uuid::Uuid;
 
-use crate::seal::{self, KEY_LEN};
 #[cfg(test)]
 use crate::seal::XNONCE_LEN;
+use crate::seal::{self, KEY_LEN};
 
 /// Environment variable naming the Lock Server base URL. Setting it enables
 /// Locks verification and makes both keys mandatory (fail closed).
@@ -89,14 +89,18 @@ impl LocksKeys {
     /// XChaCha20-Poly1305 ciphertext, with the owning payment id as
     /// associated data so ciphertexts cannot be transplanted between rows.
     pub fn encrypt_bundle_id(&self, payment_id: Uuid, bundle_id: &str) -> Vec<u8> {
-        seal::seal(&self.encryption, payment_id.as_bytes(), bundle_id.as_bytes())
+        seal::seal(
+            &self.encryption,
+            payment_id.as_bytes(),
+            bundle_id.as_bytes(),
+        )
     }
 
     /// Opens a sealed bundle id. Fails when the ciphertext was not produced
     /// under this key for this payment (wrong key configured, or tampering).
     pub fn decrypt_bundle_id(&self, payment_id: Uuid, sealed: &[u8]) -> anyhow::Result<String> {
-        let plaintext = seal::open(&self.encryption, payment_id.as_bytes(), sealed)
-            .map_err(|_| {
+        let plaintext =
+            seal::open(&self.encryption, payment_id.as_bytes(), sealed).map_err(|_| {
                 anyhow::anyhow!(
                     "bundle id ciphertext did not authenticate under the configured key"
                 )

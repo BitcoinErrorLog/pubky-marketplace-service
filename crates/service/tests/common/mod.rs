@@ -34,6 +34,7 @@ use marketplace_service::payments::{
     PaykitClient, PaykitStatusOutcome, PaykitStatusSource, PaymentsRuntime, PaypalIpnVerifier,
     ShippoClient, StripeClient, StripeKeyCipher,
 };
+use marketplace_service::pickup::PickupKeys;
 use marketplace_service::AppState;
 
 /// The fixed test instant used by the TypeScript prototype suite.
@@ -101,6 +102,79 @@ pub const TEST_LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X
 pub fn test_locks_keys() -> LocksKeys {
     LocksKeys::from_hex(TEST_LOCKS_ENCRYPTION_KEY, TEST_LOCKS_HMAC_KEY)
         .expect("test locks keys parse")
+}
+
+/// Deterministic test keys for the pickup-details seal (distinct from the
+/// Locks key material, as production requires).
+pub const TEST_PICKUP_ENCRYPTION_KEY: &str =
+    "3333333333333333333333333333333333333333333333333333333333333333";
+/// The previous key for dual-key rotation tests.
+pub const TEST_PICKUP_PREVIOUS_ENCRYPTION_KEY: &str =
+    "4444444444444444444444444444444444444444444444444444444444444444";
+
+pub fn test_pickup_keys() -> Arc<PickupKeys> {
+    Arc::new(PickupKeys::from_hex(TEST_PICKUP_ENCRYPTION_KEY, None).expect("test pickup keys"))
+}
+
+pub fn test_pickup_keys_with_previous() -> Arc<PickupKeys> {
+    Arc::new(
+        PickupKeys::from_hex(
+            TEST_PICKUP_ENCRYPTION_KEY,
+            Some(TEST_PICKUP_PREVIOUS_ENCRYPTION_KEY),
+        )
+        .expect("test pickup keys with previous"),
+    )
+}
+
+/// A `Config::for_tests` variant with the sandbox deployment boundary off,
+/// so pickup commands and the buyer reveal are permitted.
+pub fn config_durable() -> Config {
+    let mut config = Config::for_tests();
+    config.sandbox_payments_enabled = false;
+    config
+}
+
+/// A test app with the pickup seal configured. `sandbox` steers the
+/// deployment boundary: pickup writes and reveals are refused while it is
+/// on (the flag-toggle window tests rebuild the app on the same pool).
+pub async fn test_app_with_pickup(pool: PgPool, sandbox: bool) -> TestApp {
+    let mut config = config_durable();
+    config.sandbox_payments_enabled = sandbox;
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let state =
+        AppState::new(pool.clone(), clock.clone(), config).with_pickup(Some(test_pickup_keys()));
+    TestApp {
+        router: build_router(state.clone()),
+        pool,
+        clock,
+        state,
+    }
+}
+
+/// A test app with pickup sealing AND Locks verification (sandbox off):
+/// orders confirm through the real verification-worker seam, so their
+/// pinned adapter is the worker's rail and the buyer reveal is permitted.
+pub async fn test_app_with_pickup_and_locks(pool: PgPool) -> (TestApp, Arc<FakeLocksClient>) {
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let fake = Arc::new(FakeLocksClient::default());
+    let locks = Arc::new(LocksRuntime {
+        keys: test_locks_keys(),
+        client: fake.clone(),
+    });
+    let state = AppState::new(pool.clone(), clock.clone(), config_durable())
+        .with_locks(Some(locks))
+        .with_pickup(Some(test_pickup_keys()));
+    (
+        TestApp {
+            router: build_router(state.clone()),
+            pool,
+            clock,
+            state,
+        },
+        fake,
+    )
 }
 
 /// Programmable Lock Server lifecycle double for tests. Outcomes are keyed

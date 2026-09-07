@@ -147,8 +147,7 @@ pub async fn advance(
 
     let (updated_order, receipt) = if payload.target == SandboxPaymentTarget::Confirmed {
         let (order, receipt, receipt_event_id) =
-            match confirm_order(tx, actor, command.command_id, &payment, order, pickup, now)
-                .await?
+            match confirm_order(tx, actor, command.command_id, &payment, order, pickup, now).await?
             {
                 Ok(confirmed) => confirmed,
                 Err(failure) => return Ok(Err(failure)),

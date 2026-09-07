@@ -157,11 +157,9 @@ pub async fn handle(
                 "A checkout line's listing does not publish the chosen fulfillment method.",
             )));
         }
-        match groups
-            .iter_mut()
-            .find(|(seller, group_method, _)| {
-                *seller == listing.seller_pubky && *group_method == method
-            }) {
+        match groups.iter_mut().find(|(seller, group_method, _)| {
+            *seller == listing.seller_pubky && *group_method == method
+        }) {
             Some((_, _, indices)) => indices.push(index),
             None => groups.push((listing.seller_pubky.clone(), method, vec![index])),
         }

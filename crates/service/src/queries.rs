@@ -419,9 +419,7 @@ pub async fn get_order(
             let mut view = order_with_payment(&order, payment.as_ref(), &order_reviews);
             let orders = [order];
             let mut views = [view];
-            if let Err(error) =
-                attach_pickup_terms_flags(&state.pool, &orders, &mut views).await
-            {
+            if let Err(error) = attach_pickup_terms_flags(&state.pool, &orders, &mut views).await {
                 return internal_error("pickup terms flags", &error);
             }
             view = views.into_iter().next().expect("one view");

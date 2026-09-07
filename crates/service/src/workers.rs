@@ -555,8 +555,16 @@ async fn apply_completed_lifecycle(
             let Some(order) = fetch_order_for_update(&mut tx, payment.order_id).await? else {
                 anyhow::bail!("correlation {} references a missing order", row.id);
             };
-            match confirm_order(&mut tx, &payment.buyer_pubky, row.id, &payment, order, pickup, now)
-                .await?
+            match confirm_order(
+                &mut tx,
+                &payment.buyer_pubky,
+                row.id,
+                &payment,
+                order,
+                pickup,
+                now,
+            )
+            .await?
             {
                 Ok((order, _receipt, _receipt_event_id)) => {
                     let (revision,): (i64,) = sqlx::query_as(
@@ -652,8 +660,7 @@ pub async fn verify_due_locks_lifecycles(
         let outcome = locks.client.lookup(&row.creator_pubky, &bundle_id).await;
         match outcome {
             LocksLookupOutcome::Status(LocksTaskStatus::Completed) => {
-                if apply_completed_lifecycle(&state.pool, row, state.pickup.as_deref(), now)
-                    .await?
+                if apply_completed_lifecycle(&state.pool, row, state.pickup.as_deref(), now).await?
                 {
                     applied += 1;
                 }
@@ -828,7 +835,17 @@ async fn apply_confirmed_paykit_payment(
     let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
         anyhow::bail!("paykit order {} is missing", row.id);
     };
-    match confirm_order(&mut tx, &row.buyer_pubky, row.id, &payment, order, pickup, now).await? {
+    match confirm_order(
+        &mut tx,
+        &row.buyer_pubky,
+        row.id,
+        &payment,
+        order,
+        pickup,
+        now,
+    )
+    .await?
+    {
         Ok((order, _receipt, _receipt_event_id)) => {
             let (revision,): (i64,) = sqlx::query_as(
                 "UPDATE payments SET state = 'confirmed', revision = revision + 1, \
@@ -1331,7 +1348,7 @@ async fn complete_due_delivered_orders_batch(
     // (orders only — never the handover row), so the coalescing read cannot
     // deadlock against concurrent order writers.
     let due: Vec<DeliveredOrderClaim> = sqlx::query_as(
-            "SELECT o.id, o.buyer_pubky, o.seller_pubky, o.fulfillment, \
+        "SELECT o.id, o.buyer_pubky, o.seller_pubky, o.fulfillment, \
                     o.shipment->>'delivered_at' AS delivered_at, \
                     h.confirmed_at AS handover_at \
              FROM orders o LEFT JOIN pickup_handovers h ON h.order_id = o.id \
@@ -1344,13 +1361,13 @@ async fn complete_due_delivered_orders_batch(
                     OR left(o.shipment->>'delivered_at', 19) <= left($2, 19))) \
              ) \
              ORDER BY o.id LIMIT $4 FOR UPDATE OF o SKIP LOCKED",
-        )
-        .bind(cutoff)
-        .bind(cutoff_text)
-        .bind(SHIPMENT_INSTANT_PREFIX)
-        .bind(batch_size)
-        .fetch_all(&mut *tx)
-        .await?;
+    )
+    .bind(cutoff)
+    .bind(cutoff_text)
+    .bind(SHIPMENT_INSTANT_PREFIX)
+    .bind(batch_size)
+    .fetch_all(&mut *tx)
+    .await?;
 
     let claimed = due.len() as u64;
     let mut processed = 0u64;
@@ -1576,8 +1593,14 @@ pub async fn run_once(
     // orders went terminal, and — while a previous key is configured — the
     // dual-key re-seal job across BOTH sealed families (§A1/§A3).
     if let Some(pickup) = &state.pickup {
-        if try_acquire_lease(&state.pool, TASK_PICKUP_RETENTION, holder, now, lease_seconds)
-            .await?
+        if try_acquire_lease(
+            &state.pool,
+            TASK_PICKUP_RETENTION,
+            holder,
+            now,
+            lease_seconds,
+        )
+        .await?
         {
             let (snapshots_purged, versions_purged) =
                 crate::pickup::purge_terminal_pickup_retention(
@@ -1597,9 +1620,7 @@ pub async fn run_once(
             let progress =
                 crate::pickup::reseal_previous_key_batch(&state.pool, pickup, now).await?;
             summary.pickup_rows_resealed = progress.details_resealed + progress.snapshots_resealed;
-            if progress.remaining_under_previous == 0
-                && summary.pickup_rows_resealed > 0
-            {
+            if progress.remaining_under_previous == 0 && summary.pickup_rows_resealed > 0 {
                 tracing::info!(
                     resealed = summary.pickup_rows_resealed,
                     "pickup key rotation complete: zero rows remain under the previous key \
