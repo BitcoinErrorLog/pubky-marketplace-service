@@ -8,6 +8,7 @@ pub mod holds;
 pub mod locks;
 pub mod offers;
 pub mod payment;
+pub mod pickup;
 pub mod register_listing;
 pub mod reserve_inventory;
 pub mod returns;
@@ -28,7 +29,8 @@ use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 pub const LISTING_COLUMNS: &str = "aggregate_id, seller_pubky, listing_id, title, \
      listing_revision, content_hash, server_revision, state, total_quantity, \
      available_quantity, reserved_quantity, sold_quantity, unit_price_amount_minor, \
-     unit_price_currency, unit_price_exponent, shipping_minor, sale_format, auction, updated_at";
+     unit_price_currency, unit_price_exponent, shipping_minor, sale_format, auction, \
+     fulfillment_methods, updated_at";
 
 pub async fn fetch_listing(
     tx: &mut Transaction<'_, Postgres>,

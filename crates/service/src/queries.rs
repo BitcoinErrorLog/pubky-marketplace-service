@@ -51,7 +51,7 @@ pub const ORDER_COLUMNS: &str =
      cancellation_reason, stock_held, hold_expires_at, \
      shipment, delivery_assumed, return_request, external_refund, payment_method, fiat_checkout_url, \
      payment_reported_at, fiat_transaction_ref, fiat_verified_by, shipping_label, paykit_request_reference, paykit_request_state, \
-     paykit_last_checked_at, created_at, updated_at";
+     paykit_last_checked_at, fulfillment, first_revealed_at, created_at, updated_at";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
      state, confirmations, amount_minor, currency, exponent, created_at, updated_at";
@@ -338,7 +338,7 @@ pub async fn list_orders(
         Ok(reviews) => reviews,
         Err(error) => return internal_error("reviews", &error),
     };
-    let views: Vec<Value> = orders
+    let mut views: Vec<Value> = orders
         .iter()
         .map(|order| {
             let payment = payments.iter().find(|payment| payment.order_id == order.id);
@@ -349,7 +349,32 @@ pub async fn list_orders(
             order_with_payment(order, payment, &order_reviews)
         })
         .collect();
+    if let Err(error) = attach_pickup_terms_flags(&state.pool, &orders, &mut views).await {
+        return internal_error("pickup terms flags", &error);
+    }
     (StatusCode::OK, Json(json!({ "orders": views }))).into_response()
+}
+
+/// Stamps the "meeting point updated since you ordered" flag (§A3) onto
+/// order views: true when the current details version exceeds a line's
+/// `version_at_payment` or the details were cleared. The reveal itself
+/// keeps serving the pinned snapshot. Shipped orders and unpaid orders
+/// always read false.
+async fn attach_pickup_terms_flags(
+    pool: &sqlx::PgPool,
+    orders: &[OrderRow],
+    views: &mut [Value],
+) -> Result<(), sqlx::Error> {
+    let flags = crate::handlers::pickup::pickup_terms_changed_flags(pool, orders).await?;
+    for view in views {
+        let changed = view["id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .and_then(|id| flags.get(&id).copied())
+            .unwrap_or(false);
+        view["pickup_terms_changed"] = json!(changed);
+    }
+    Ok(())
 }
 
 /// `GET /v1/orders/{id}`: a single order with its payment projection.
@@ -391,11 +416,16 @@ pub async fn get_order(
     match reviews {
         Ok(reviews) => {
             let order_reviews: Vec<&ReviewRow> = reviews.iter().collect();
-            (
-                StatusCode::OK,
-                Json(order_with_payment(&order, payment.as_ref(), &order_reviews)),
-            )
-                .into_response()
+            let mut view = order_with_payment(&order, payment.as_ref(), &order_reviews);
+            let orders = [order];
+            let mut views = [view];
+            if let Err(error) =
+                attach_pickup_terms_flags(&state.pool, &orders, &mut views).await
+            {
+                return internal_error("pickup terms flags", &error);
+            }
+            view = views.into_iter().next().expect("one view");
+            (StatusCode::OK, Json(view)).into_response()
         }
         Err(error) => internal_error("reviews", &error),
     }

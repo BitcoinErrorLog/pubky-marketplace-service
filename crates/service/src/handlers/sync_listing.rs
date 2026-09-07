@@ -101,24 +101,39 @@ pub async fn handle(
     let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
     if let Some(current) = &current {
         // Convergent no-op: the aggregate already reflects this record
-        // revision (or a newer one) — with ONE narrow healing exception.
-        // When the service's own derivation evolves (shipping was added
-        // after listings were first registered), the record hasn't changed
-        // but what the service reads out of it has. An equal-revision sync
-        // heals exactly that derived field: shipping is inventory-neutral,
-        // so nothing else (quantity, price, state) is touched.
+        // revision (or a newer one) — with narrow healing exceptions. When
+        // the service's own derivation evolves (shipping was added after
+        // listings were first registered; fulfillment_methods came with
+        // local pickup), the record hasn't changed but what the service
+        // reads out of it has. An equal-revision sync heals exactly those
+        // derived fields: both are inventory-neutral, so nothing else
+        // (quantity, price, state) is touched. Sync carries no pickup
+        // DETAILS and can never null them (§A4).
         if registration.listing_revision <= current.listing_revision {
+            let registration_methods: Vec<String> = registration
+                .fulfillment_methods
+                .iter()
+                .map(|method| method.as_str().to_string())
+                .collect();
+            // The healing exception covers both derived fields the service
+            // reads out of the record after listings were first registered:
+            // shipping (added earlier) and fulfillment_methods (added with
+            // local pickup). Both are inventory-neutral, so nothing else
+            // (quantity, price, state) is touched.
             if registration.listing_revision == current.listing_revision
-                && registration.shipping_minor != current.shipping_minor
+                && (registration.shipping_minor != current.shipping_minor
+                    || registration_methods != current.fulfillment_methods)
             {
                 let healed: crate::model::ListingRow = sqlx::query_as(&format!(
                     "UPDATE listings SET server_revision = server_revision + 1, \
-                     shipping_minor = $2, updated_at = $3 WHERE aggregate_id = $1 \
+                     shipping_minor = $2, fulfillment_methods = $3, updated_at = $4 \
+                     WHERE aggregate_id = $1 \
                      RETURNING {}",
                     crate::handlers::LISTING_COLUMNS
                 ))
                 .bind(&command.aggregate_id)
                 .bind(registration.shipping_minor)
+                .bind(&registration_methods)
                 .bind(now)
                 .fetch_one(&mut **tx)
                 .await?;

@@ -222,6 +222,12 @@ struct ListingRecord {
     #[serde(default)]
     shipping_options: Vec<RecordShippingOption>,
     sale: RecordSale,
+    /// The published fulfillment methods (§A1). Public catalog data; records
+    /// predating pickup default to shipping only. The record carries NO
+    /// pickup details — those are authored in a separate surface and sent
+    /// only to the service, so no sync path can null them (§A4).
+    #[serde(default)]
+    fulfillment_methods: Vec<String>,
 }
 
 /// The flat shipping the service will charge per order line: the cheapest
@@ -287,6 +293,22 @@ pub fn registration_payload_from_record(
     };
     let shipping_minor =
         shipping_minor_from_options(&record.shipping_options, &unit_price.currency);
+    let mut fulfillment_methods: Vec<marketplace_domain::commands::FulfillmentMethod> = record
+        .fulfillment_methods
+        .iter()
+        .filter_map(|method| match method.as_str() {
+            "shipping" => Some(marketplace_domain::commands::FulfillmentMethod::Shipping),
+            "pickup" => Some(marketplace_domain::commands::FulfillmentMethod::Pickup),
+            // An unrecognized method is not a parse failure: the record may
+            // come from a newer client vocabulary; ignoring it converges to
+            // the methods this service understands.
+            _ => None,
+        })
+        .collect();
+    fulfillment_methods.dedup();
+    if fulfillment_methods.is_empty() {
+        fulfillment_methods = marketplace_domain::commands::default_fulfillment_methods();
+    }
     Some(RegisterListingPayload {
         seller_pubky: seller_pubky.to_string(),
         listing_id: listing_id.to_string(),
@@ -305,6 +327,7 @@ pub fn registration_payload_from_record(
         shipping_minor,
         sale_format,
         auction_terms,
+        fulfillment_methods,
     })
 }
 

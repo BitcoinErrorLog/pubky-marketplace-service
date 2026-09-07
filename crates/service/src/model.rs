@@ -79,6 +79,10 @@ pub struct ListingRow {
     pub shipping_minor: i64,
     pub sale_format: String,
     pub auction: Option<Value>,
+    /// The fulfillment methods the owner-signed listing record publishes
+    /// (`fulfillmentMethods`, §A1): any of `shipping`/`pickup`, at least one.
+    /// Public catalog data, like the rest of the listing view.
+    pub fulfillment_methods: Vec<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -113,6 +117,7 @@ impl ListingRow {
             ),
             "sale_format": self.sale_format,
             "auction": self.auction.clone().unwrap_or(Value::Null),
+            "fulfillment_methods": self.fulfillment_methods,
             "updated_at": format_timestamp(self.updated_at),
         })
     }
@@ -336,6 +341,14 @@ pub struct OrderRow {
     pub paykit_request_state: Option<String>,
     /// Poll stamp for the paykit verification worker; never serialized.
     pub paykit_last_checked_at: Option<DateTime<Utc>>,
+    /// How this order reaches the buyer (§A2): exactly one of `shipping` |
+    /// `pickup`. Required, not derivable: checkout splits one order per
+    /// (seller, fulfillment), so reveal, shipping charge, and packing slip
+    /// logic stay uniform per order.
+    pub fulfillment: String,
+    /// The first successful buyer reveal of the pickup details stamps the
+    /// bounded withdrawal window (§A3); NULL until then.
+    pub first_revealed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -380,8 +393,13 @@ impl OrderRow {
     pub fn next_actor(&self) -> Option<&'static str> {
         match self.state.as_str() {
             "pending_payment" | "shipped" | "delivered" => Some("buyer"),
+            // A pickup order in `paid` waits on the seller (mark ready, or
+            // confirm the handover); in `ready_for_pickup` on the buyer
+            // (confirm on receipt). Shipped orders keep today's mapping.
+            // The value set stays 'buyer' | 'seller' (§A6).
             "paid" | "processing" | "cancel_requested" | "return_requested" | "return_approved"
             | "return_received" => Some("seller"),
+            "ready_for_pickup" => Some("buyer"),
             _ => None,
         }
     }
@@ -418,10 +436,66 @@ impl OrderRow {
             "fiat_transaction_ref": self.fiat_transaction_ref,
             "paykit_request_reference": self.paykit_request_reference,
             "paykit_request_state": self.paykit_request_state,
+            "fulfillment": self.fulfillment,
+            "first_revealed_at": self.first_revealed_at.map(format_timestamp),
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
         })
     }
+}
+
+/// A sealed pickup-details version row (§A1/§A3). Like the Locks
+/// correlation row, this is internal state: it has NO `view()` — the
+/// plaintext exists only inside `details_ciphertext`, and only the two
+/// entitled reads (the seller's owner read and the paying buyer's reveal)
+/// ever open the seal. A derived Debug prints bytes, never the secret.
+#[derive(Debug, Clone, FromRow)]
+pub struct PickupDetailsRow {
+    pub aggregate_id: String,
+    pub seller_pubky: String,
+    pub version: i64,
+    pub details_ciphertext: Vec<u8>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The per-listing monotonic version counter in its own row (§A3): it
+/// survives `pickup_details.clear`, so versions never restart and
+/// terms-change detection cannot be fooled by a delete-and-recreate.
+#[derive(Debug, Clone, FromRow)]
+pub struct PickupVersionCounterRow {
+    pub aggregate_id: String,
+    pub seller_pubky: String,
+    pub last_version: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A sealed per-line pinned snapshot written inside `confirm_order`'s
+/// receipt transaction (§A3): the details as shown at payment plus the
+/// adapter that confirmed the payment. No `view()`: the buyer's reveal read
+/// is the only open path, and it refuses snapshots pinned under
+/// `payment.sandbox_advance` regardless of the current sandbox flag.
+#[derive(Debug, Clone, FromRow)]
+pub struct PickupLineSnapshotRow {
+    pub order_id: Uuid,
+    pub line_index: i32,
+    pub listing_aggregate_id: String,
+    pub version: i64,
+    pub snapshot_ciphertext: Vec<u8>,
+    pub confirming_adapter: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The pickup handover record (§A6): one row per order (PRIMARY KEY on
+/// `order_id`), carrying who confirmed and the server instant. A
+/// `confirmed_by = 'seller'` row is a seller-attested handover: reputation
+/// counts the completion only on a buyer confirm or a dispute-free
+/// auto-complete.
+#[derive(Debug, Clone, FromRow)]
+pub struct PickupHandoverRow {
+    pub order_id: Uuid,
+    pub confirmed_by: String,
+    pub confirmed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, FromRow)]
