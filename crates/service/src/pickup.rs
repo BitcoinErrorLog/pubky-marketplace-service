@@ -190,18 +190,44 @@ async fn sealed_rows_exist(pool: &PgPool) -> Result<bool, sqlx::Error> {
 
 const PROBE_BATCH_SIZE: i64 = 100;
 
+/// The probe is a BOOT check, not a table scan: at most this many batches
+/// per family. In the steady state every row opens under the current key
+/// and the "still under previous" class never appears, so an unbounded
+/// probe would page the whole table — one AEAD open per row — on every
+/// start. When a previous key IS configured, stragglers past the bound are
+/// the re-seal job's responsibility, not the probe's.
+const PROBE_MAX_BATCHES: u32 = 3;
+
+/// The outcome of probing one sealed family: one row per key class found
+/// within the bound, plus the number of rows scanned (the observability
+/// counter proving the probe stays bounded).
+struct ProbeScan {
+    rows: Vec<ProbeRow>,
+    scanned: u64,
+}
+
+/// Whether the probe may stop paging: both key classes were found, or no
+/// previous key is configured and the current-key class is already
+/// confirmed — without a rotation window there is no legitimate straggler
+/// class to hunt for (a same-batch straggler still surfaces, because the
+/// batch is always classified in full before this check runs).
+fn probe_scan_complete(probes: &[Option<ProbeRow>; 2], keys: &PickupKeys, batches: u32) -> bool {
+    probes.iter().all(Option::is_some)
+        || (!keys.has_previous() && probes[0].is_some())
+        || batches >= PROBE_MAX_BATCHES
+}
+
 /// One probe row per KEY CLASS of the details family: the first row that
 /// opens under the current key and the first that does not (still sealed
 /// under the previous key). Probing only the first row of the family could
 /// miss a half-rotated table whose previous key was dropped — the straggler
 /// class must be probed too, or it would fail the first buyer's reveal
-/// instead of the boot (§A8).
-async fn details_probe_rows(
-    pool: &PgPool,
-    keys: &PickupKeys,
-) -> Result<Vec<ProbeRow>, sqlx::Error> {
+/// instead of the boot (§A8). Bounded to [`PROBE_MAX_BATCHES`] batches.
+async fn details_probe_rows(pool: &PgPool, keys: &PickupKeys) -> Result<ProbeScan, sqlx::Error> {
     // [opens under the current key, does not] — one probe row each.
     let mut probes: [Option<ProbeRow>; 2] = [None, None];
+    let mut scanned = 0u64;
+    let mut batches = 0u32;
     let mut cursor: Option<(String, i64)> = None;
     loop {
         let rows: Vec<(String, i64, Vec<u8>)> =
@@ -227,30 +253,34 @@ async fn details_probe_rows(
         if rows.is_empty() {
             break;
         }
+        batches += 1;
         cursor = rows
             .last()
             .map(|(aggregate_id, version, _)| (aggregate_id.clone(), *version));
         for (aggregate_id, version, ciphertext) in rows {
+            scanned += 1;
             let aad = details_aad(&aggregate_id, version);
             let class = usize::from(!keys.opens_under_current(&aad, &ciphertext));
             if probes[class].is_none() {
                 probes[class] = Some(ProbeRow { aad, ciphertext });
             }
         }
-        if probes.iter().all(Option::is_some) {
+        if probe_scan_complete(&probes, keys, batches) {
             break;
         }
     }
-    Ok(probes.into_iter().flatten().collect())
+    Ok(ProbeScan {
+        rows: probes.into_iter().flatten().collect(),
+        scanned,
+    })
 }
 
 /// The snapshot family's [`details_probe_rows`]: one probe row per key
-/// class, paged on (order_id, line_index).
-async fn snapshot_probe_rows(
-    pool: &PgPool,
-    keys: &PickupKeys,
-) -> Result<Vec<ProbeRow>, sqlx::Error> {
+/// class, paged on (order_id, line_index), under the same batch bound.
+async fn snapshot_probe_rows(pool: &PgPool, keys: &PickupKeys) -> Result<ProbeScan, sqlx::Error> {
     let mut probes: [Option<ProbeRow>; 2] = [None, None];
+    let mut scanned = 0u64;
+    let mut batches = 0u32;
     let mut cursor: Option<(Uuid, i32)> = None;
     loop {
         let rows: Vec<(Uuid, i32, i64, Vec<u8>)> = match &cursor {
@@ -280,21 +310,26 @@ async fn snapshot_probe_rows(
         if rows.is_empty() {
             break;
         }
+        batches += 1;
         cursor = rows
             .last()
             .map(|(order_id, line_index, _, _)| (*order_id, *line_index));
         for (order_id, line_index, version, ciphertext) in rows {
+            scanned += 1;
             let aad = snapshot_aad(order_id, line_index, version);
             let class = usize::from(!keys.opens_under_current(&aad, &ciphertext));
             if probes[class].is_none() {
                 probes[class] = Some(ProbeRow { aad, ciphertext });
             }
         }
-        if probes.iter().all(Option::is_some) {
+        if probe_scan_complete(&probes, keys, batches) {
             break;
         }
     }
-    Ok(probes.into_iter().flatten().collect())
+    Ok(ProbeScan {
+        rows: probes.into_iter().flatten().collect(),
+        scanned,
+    })
 }
 
 /// The all-or-none boot check, run at startup AFTER migrations (the schema
@@ -317,11 +352,16 @@ pub async fn assert_pickup_sealing_coherent(
             "sealed pickup rows exist but {ENV_PICKUP_DETAILS_ENCRYPTION_KEY} is not configured"
         );
     };
-    for (family, rows) in [
+    for (family, scan) in [
         ("details", details_probe_rows(pool, keys).await?),
         ("snapshot", snapshot_probe_rows(pool, keys).await?),
     ] {
-        for row in rows {
+        tracing::debug!(
+            family,
+            scanned = scan.scanned,
+            "pickup boot probe scanned the sealed family (bounded)"
+        );
+        for row in scan.rows {
             keys.open(&row.aad, &row.ciphertext).map_err(|_| {
                 anyhow::anyhow!(
                     "sealed pickup {family} rows do not open under the configured \
@@ -641,6 +681,58 @@ mod tests {
         PickupKeys::from_hex(CURRENT_KEY, Some("abcd")).expect_err("short previous key rejected");
         PickupKeys::from_hex(CURRENT_KEY, Some(CURRENT_KEY))
             .expect_err("identical current/previous keys rejected");
+    }
+
+    // The boot probe is a bounded check, not a table scan: on a large
+    // all-current table it must not page every row (one AEAD open per row)
+    // on every start. With no previous key configured the first all-current
+    // batch settles the family; with a previous key configured the hunt for
+    // the straggler class stops at PROBE_MAX_BATCHES (stragglers beyond the
+    // bound are the re-seal job's responsibility).
+    #[sqlx::test]
+    async fn boot_probe_stays_bounded_on_a_large_all_current_table(pool: PgPool) {
+        let keys = keys();
+        let rotated =
+            PickupKeys::from_hex(CURRENT_KEY, Some(PREVIOUS_KEY)).expect("rotated keys parse");
+        let aggregate = "listing:probe_bound";
+        let now = Utc::now();
+        let row_count = PROBE_BATCH_SIZE * i64::from(PROBE_MAX_BATCHES) + 1;
+        for version in 1..=row_count {
+            let ciphertext = keys.seal(&details_aad(aggregate, version), b"spot");
+            sqlx::query(
+                "INSERT INTO listing_pickup_details (aggregate_id, seller_pubky, version, \
+                 details_ciphertext, created_at, updated_at) VALUES ($1, 's', $2, $3, $4, $4)",
+            )
+            .bind(aggregate)
+            .bind(version)
+            .bind(&ciphertext)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("seed details");
+        }
+
+        // No previous key: one batch (the first all-current one) settles
+        // the family — the remaining rows are never paged, let alone opened.
+        let scan = details_probe_rows(&pool, &keys).await.expect("probe runs");
+        assert_eq!(scan.scanned, PROBE_BATCH_SIZE as u64);
+        assert_eq!(scan.rows.len(), 1, "only the current key class exists");
+        assert_pickup_sealing_coherent(&pool, Some(&keys))
+            .await
+            .expect("all-current table without a previous key boots");
+
+        // A configured previous key keeps hunting the straggler class, but
+        // the hunt is capped at PROBE_MAX_BATCHES batches.
+        let scan = details_probe_rows(&pool, &rotated)
+            .await
+            .expect("probe runs");
+        assert_eq!(
+            scan.scanned,
+            PROBE_BATCH_SIZE as u64 * u64::from(PROBE_MAX_BATCHES)
+        );
+        assert_pickup_sealing_coherent(&pool, Some(&rotated))
+            .await
+            .expect("all-current table with a previous key boots");
     }
 
     struct NoLocksClient;
