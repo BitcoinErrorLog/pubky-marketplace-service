@@ -73,6 +73,10 @@ pub enum CommandPayload {
     ApproveCancellation(OrderActionPayload),
     ShipOrder(ShipOrderPayload),
     ConfirmDelivery(OrderActionPayload),
+    SetPickupDetails(SetPickupDetailsPayload),
+    ClearPickupDetails(ClearPickupDetailsPayload),
+    MarkReadyForPickup(OrderActionPayload),
+    ConfirmPickup(OrderActionPayload),
     RequestReturn(RequestReturnPayload),
     ApproveReturn(OrderActionPayload),
     ReceiveReturn(OrderActionPayload),
@@ -105,6 +109,10 @@ impl Command {
             CommandPayload::ApproveCancellation(_) => "order.cancel_approve",
             CommandPayload::ShipOrder(_) => "fulfillment.ship",
             CommandPayload::ConfirmDelivery(_) => "fulfillment.confirm_delivery",
+            CommandPayload::SetPickupDetails(_) => "pickup_details.set",
+            CommandPayload::ClearPickupDetails(_) => "pickup_details.clear",
+            CommandPayload::MarkReadyForPickup(_) => "fulfillment.mark_ready",
+            CommandPayload::ConfirmPickup(_) => "fulfillment.confirm_pickup",
             CommandPayload::RequestReturn(_) => "return.request",
             CommandPayload::ApproveReturn(_) => "return.approve",
             CommandPayload::ReceiveReturn(_) => "return.receive",
@@ -138,10 +146,14 @@ impl Command {
             CommandPayload::RegisterLocks(p) => serde_json::to_value(p),
             CommandPayload::RequestCancellation(p) => serde_json::to_value(p),
             CommandPayload::ShipOrder(p) => serde_json::to_value(p),
+            CommandPayload::SetPickupDetails(p) => serde_json::to_value(p),
+            CommandPayload::ClearPickupDetails(p) => serde_json::to_value(p),
             CommandPayload::ConfirmDelivery(p)
             | CommandPayload::ApproveCancellation(p)
             | CommandPayload::ApproveReturn(p)
-            | CommandPayload::ReceiveReturn(p) => serde_json::to_value(p),
+            | CommandPayload::ReceiveReturn(p)
+            | CommandPayload::MarkReadyForPickup(p)
+            | CommandPayload::ConfirmPickup(p) => serde_json::to_value(p),
             CommandPayload::RequestReturn(p) => serde_json::to_value(p),
             CommandPayload::RecordExternalRefund(p) => serde_json::to_value(p),
             CommandPayload::CreateReview(p) | CommandPayload::UpdateReview(p) => {
@@ -176,6 +188,36 @@ pub enum SaleFormat {
     #[default]
     FixedPrice,
     Auction,
+}
+
+/// How a physical order reaches the buyer (local pickup design §A2): the
+/// seller-signed flat-rate shipping path, or an in-person handover at the
+/// seller's published meeting point. Distinct from the listing's item type —
+/// fulfillment is meaningful only for physical items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FulfillmentMethod {
+    Shipping,
+    Pickup,
+}
+
+impl FulfillmentMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FulfillmentMethod::Shipping => "shipping",
+            FulfillmentMethod::Pickup => "pickup",
+        }
+    }
+}
+
+/// The default published methods for listings (and clients) that predate
+/// pickup: shipping only.
+pub fn default_fulfillment_methods() -> Vec<FulfillmentMethod> {
+    vec![FulfillmentMethod::Shipping]
+}
+
+fn is_default_fulfillment_methods(methods: &[FulfillmentMethod]) -> bool {
+    methods == [FulfillmentMethod::Shipping]
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -215,6 +257,16 @@ pub struct RegisterListingPayload {
     pub sale_format: SaleFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auction_terms: Option<AuctionTerms>,
+    /// The fulfillment methods the owner-signed listing record publishes
+    /// (`fulfillmentMethods`, local pickup design §A1). Public catalog data
+    /// echoed at `listing.register`/`listing.sync`; defaults to shipping
+    /// only. Serialized only when non-default so pre-pickup clients keep
+    /// byte-identical canonical JSON (the idempotency hash input).
+    #[serde(
+        default = "default_fulfillment_methods",
+        skip_serializing_if = "is_default_fulfillment_methods"
+    )]
+    pub fulfillment_methods: Vec<FulfillmentMethod>,
 }
 
 /// `listing.sync` (any authenticated actor): asks the service to fetch the
@@ -301,6 +353,12 @@ pub struct CheckoutLine {
     /// three, matching the listing record contract). Requires `variant_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant_options: Option<Vec<VariantOption>>,
+    /// The buyer's fulfillment choice for this line (local pickup design
+    /// §A2). Absent means `shipping` — old clients are unaffected. The
+    /// service validates the choice against the methods the line's listing
+    /// publishes and never silently rewrites it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulfillment: Option<FulfillmentMethod>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -319,7 +377,12 @@ pub struct DeliveryAddress {
 #[serde(deny_unknown_fields)]
 pub struct CreateCheckoutPayload {
     pub lines: Vec<CheckoutLine>,
-    pub delivery_address: DeliveryAddress,
+    /// The buyer's delivery address. Required when any seller group ships;
+    /// absent when every group is pickup — a pickup-only checkout that
+    /// PRESENTS an address is rejected with `INVALID_COMMAND` so a buggy or
+    /// malicious client cannot smuggle one into storage (§A2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_address: Option<DeliveryAddress>,
     pub guarantee_policy_version: u32,
 }
 
@@ -477,6 +540,114 @@ pub struct ShipOrderPayload {
     /// else (rendered as plain text, no tracking link).
     pub carrier: String,
     pub tracking_number: String,
+}
+
+/// Whether the seller's pickup details name a full address or a free-text
+/// pickup spot (local pickup design §A1: the seller never has to publish
+/// their home).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickupDetailsKind {
+    Address,
+    Spot,
+}
+
+/// One recurring weekly availability window, authored in the pickup
+/// location's local wall clock (`day` + `HH:MM` start/end). Wave 7 serves
+/// windows READ-ONLY to the paying buyer — there is no propose path (§A3).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PickupWindow {
+    pub day: String,
+    pub start: String,
+    pub end: String,
+}
+
+impl std::fmt::Debug for PickupWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PickupWindow(<redacted>)")
+    }
+}
+
+/// The seller's availability: recurring weekly windows with the pickup
+/// location's IANA zone, or arrange-after-payment when `windows` is absent.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PickupAvailability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<Vec<PickupWindow>>,
+    /// IANA timezone the windows are authored in (e.g. `Europe/Berlin`).
+    pub zone: String,
+}
+
+impl std::fmt::Debug for PickupAvailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PickupAvailability(<redacted>)")
+    }
+}
+
+/// The seller-authored pickup details: a full address OR a free-text pickup
+/// spot, instructions, and availability. This is restricted personal data:
+/// it is sealed at rest in the service, revealed only to the seller and the
+/// paying buyer, and redacted from Debug so it cannot reach logs, traces,
+/// or Sentry (§A1, the `locks.rs` pattern).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PickupDetails {
+    pub kind: PickupDetailsKind,
+    /// The full pickup address; required when `kind` is `address`, rejected
+    /// otherwise. Mirrors the `DeliveryAddress` field limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<DeliveryAddress>,
+    /// The free-text meeting point (e.g. "Central Station, north
+    /// entrance"); required when `kind` is `spot`, rejected otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot: Option<String>,
+    #[serde(default)]
+    pub instructions: String,
+    pub availability: PickupAvailability,
+}
+
+impl std::fmt::Debug for PickupDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PickupDetails")
+            .field("kind", &self.kind)
+            .field("address", &self.address.as_ref().map(|_| "<redacted>"))
+            .field("spot", &self.spot.as_ref().map(|_| "<redacted>"))
+            .field("instructions", &"<redacted>")
+            .field("availability", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `pickup_details.set` (seller, own listing only): sealed whole-payload
+/// upsert of the listing's pickup details. Versions are monotonic per
+/// listing via the separate counters row (§A3); `expected_version` is the
+/// compare-and-swap against lost updates, 0 when no details exist yet.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetPickupDetailsPayload {
+    pub expected_version: i64,
+    pub details: PickupDetails,
+}
+
+impl std::fmt::Debug for SetPickupDetailsPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetPickupDetailsPayload")
+            .field("expected_version", &self.expected_version)
+            .field("details", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `pickup_details.clear` (seller, own listing only): removes the details.
+/// Versions referenced as `version_at_payment` by a paid, non-terminal
+/// order are retained (§A3); the per-listing version counter survives so
+/// versions never restart. `expected_version` CASes against that counter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClearPickupDetailsPayload {
+    pub expected_version: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -643,6 +814,18 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         "fulfillment.ship" => parse_payload(&envelope.payload).and_then(validate_ship_order)?,
         "fulfillment.confirm_delivery" => {
             parse_payload(&envelope.payload).map(CommandPayload::ConfirmDelivery)?
+        }
+        "pickup_details.set" => {
+            parse_payload(&envelope.payload).and_then(validate_set_pickup_details)?
+        }
+        "pickup_details.clear" => {
+            parse_payload(&envelope.payload).and_then(validate_clear_pickup_details)?
+        }
+        "fulfillment.mark_ready" => {
+            parse_payload(&envelope.payload).map(CommandPayload::MarkReadyForPickup)?
+        }
+        "fulfillment.confirm_pickup" => {
+            parse_payload(&envelope.payload).map(CommandPayload::ConfirmPickup)?
         }
         "return.request" => parse_payload(&envelope.payload).and_then(validate_request_return)?,
         "return.approve" => parse_payload(&envelope.payload).map(CommandPayload::ApproveReturn)?,
@@ -873,6 +1056,33 @@ pub fn validate_register_listing_payload(
                 "Expected an extension between 0 and 3600 seconds",
             ));
         }
+    }
+
+    if payload.fulfillment_methods.is_empty() {
+        issues.push(issue(
+            "payload.fulfillment_methods",
+            "Expected at least one fulfillment method",
+        ));
+    }
+    let mut methods = std::collections::HashSet::new();
+    for method in &payload.fulfillment_methods {
+        if !methods.insert(method) {
+            issues.push(issue(
+                "payload.fulfillment_methods",
+                "Fulfillment methods must be unique",
+            ));
+        }
+    }
+    // Auction listings are shipping-only (§A2 v1 scope): an auction order
+    // carries no address and no checkout step, so a pickup choice could
+    // never be expressed for it.
+    if payload.sale_format == SaleFormat::Auction
+        && payload.fulfillment_methods != [FulfillmentMethod::Shipping]
+    {
+        issues.push(issue(
+            "payload.fulfillment_methods",
+            "Auction listings are shipping-only",
+        ));
     }
 
     if issues.is_empty() {
@@ -1122,6 +1332,173 @@ fn validate_review_terms(
     }
 }
 
+fn validate_delivery_address(
+    path: &str,
+    address: &mut DeliveryAddress,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    validate_trimmed(&format!("{path}.name"), &mut address.name, 1, 100, issues);
+    validate_trimmed(&format!("{path}.line1"), &mut address.line1, 1, 200, issues);
+    validate_trimmed(&format!("{path}.line2"), &mut address.line2, 0, 200, issues);
+    validate_trimmed(&format!("{path}.city"), &mut address.city, 1, 100, issues);
+    validate_trimmed(
+        &format!("{path}.region"),
+        &mut address.region,
+        1,
+        100,
+        issues,
+    );
+    validate_trimmed(
+        &format!("{path}.postal_code"),
+        &mut address.postal_code,
+        1,
+        32,
+        issues,
+    );
+    if !country_code_regex().is_match(&address.country_code) {
+        issues.push(issue(
+            &format!("{path}.country_code"),
+            "Expected an ISO 3166-1 alpha-2 country code",
+        ));
+    }
+}
+
+fn hhmm_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^([01][0-9]|2[0-3]):[0-5][0-9]$").expect("valid regex"))
+}
+
+/// Weekday vocabulary for availability windows (the client's contract uses
+/// the three-letter lowercase English abbreviations).
+const WEEKDAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+fn validate_pickup_details(details: &mut PickupDetails, issues: &mut Vec<ValidationIssue>) {
+    match details.kind {
+        PickupDetailsKind::Address => {
+            if let Some(address) = &mut details.address {
+                validate_delivery_address("payload.details.address", address, issues);
+            } else {
+                issues.push(issue(
+                    "payload.details.address",
+                    "Address-kind pickup details require an address",
+                ));
+            }
+            if details.spot.is_some() {
+                issues.push(issue(
+                    "payload.details.spot",
+                    "Address-kind pickup details cannot carry a spot",
+                ));
+            }
+        }
+        PickupDetailsKind::Spot => {
+            if let Some(spot) = &mut details.spot {
+                validate_trimmed("payload.details.spot", spot, 1, 200, issues);
+                validate_printable("payload.details.spot", spot, issues);
+            } else {
+                issues.push(issue(
+                    "payload.details.spot",
+                    "Spot-kind pickup details require a meeting point",
+                ));
+            }
+            if details.address.is_some() {
+                issues.push(issue(
+                    "payload.details.address",
+                    "Spot-kind pickup details cannot carry an address",
+                ));
+            }
+        }
+    }
+    validate_trimmed(
+        "payload.details.instructions",
+        &mut details.instructions,
+        0,
+        1_000,
+        issues,
+    );
+    validate_printable(
+        "payload.details.instructions",
+        &details.instructions,
+        issues,
+    );
+    let zone = &mut details.availability.zone;
+    validate_trimmed("payload.details.availability.zone", zone, 3, 64, issues);
+    validate_printable("payload.details.availability.zone", zone, issues);
+    if !zone.contains('/') {
+        issues.push(issue(
+            "payload.details.availability.zone",
+            "Expected an IANA timezone (Area/City)",
+        ));
+    }
+    if let Some(windows) = &mut details.availability.windows {
+        if windows.is_empty() || windows.len() > 14 {
+            issues.push(issue(
+                "payload.details.availability.windows",
+                "Expected between 1 and 14 availability windows",
+            ));
+        }
+        for (index, window) in windows.iter_mut().enumerate() {
+            let path = format!("payload.details.availability.windows.{index}");
+            if !WEEKDAYS.contains(&window.day.as_str()) {
+                issues.push(issue(
+                    &format!("{path}.day"),
+                    "Expected a weekday (mon..sun)",
+                ));
+            }
+            for (field, value) in [("start", &window.start), ("end", &window.end)] {
+                if !hhmm_regex().is_match(value) {
+                    issues.push(issue(
+                        &format!("{path}.{field}"),
+                        "Expected a 24-hour HH:MM wall-clock time",
+                    ));
+                }
+            }
+            if hhmm_regex().is_match(&window.start)
+                && hhmm_regex().is_match(&window.end)
+                && window.start >= window.end
+            {
+                issues.push(issue(&format!("{path}.end"), "Window end must follow start"));
+            }
+        }
+    }
+}
+
+/// Issues never echo payload values; for pickup details that rule protects
+/// the seller's meeting point, so messages describe only the expected shape.
+fn validate_set_pickup_details(
+    mut payload: SetPickupDetailsPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if !(0..=MAX_SAFE_INTEGER).contains(&payload.expected_version) {
+        issues.push(issue(
+            "payload.expected_version",
+            "Expected a non-negative details version",
+        ));
+    }
+    validate_pickup_details(&mut payload.details, &mut issues);
+    if issues.is_empty() {
+        Ok(CommandPayload::SetPickupDetails(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_clear_pickup_details(
+    payload: ClearPickupDetailsPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if !(0..=MAX_SAFE_INTEGER).contains(&payload.expected_version) {
+        issues.push(issue(
+            "payload.expected_version",
+            "Expected a non-negative details version",
+        ));
+    }
+    if issues.is_empty() {
+        Ok(CommandPayload::ClearPickupDetails(payload))
+    } else {
+        Err(issues)
+    }
+}
+
 fn validate_create_checkout(
     mut payload: CreateCheckoutPayload,
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
@@ -1203,54 +1580,34 @@ fn validate_create_checkout(
         }
     }
 
-    let address = &mut payload.delivery_address;
-    validate_trimmed(
-        "payload.delivery_address.name",
-        &mut address.name,
-        1,
-        100,
-        &mut issues,
-    );
-    validate_trimmed(
-        "payload.delivery_address.line1",
-        &mut address.line1,
-        1,
-        200,
-        &mut issues,
-    );
-    validate_trimmed(
-        "payload.delivery_address.line2",
-        &mut address.line2,
-        0,
-        200,
-        &mut issues,
-    );
-    validate_trimmed(
-        "payload.delivery_address.city",
-        &mut address.city,
-        1,
-        100,
-        &mut issues,
-    );
-    validate_trimmed(
-        "payload.delivery_address.region",
-        &mut address.region,
-        1,
-        100,
-        &mut issues,
-    );
-    validate_trimmed(
-        "payload.delivery_address.postal_code",
-        &mut address.postal_code,
-        1,
-        32,
-        &mut issues,
-    );
-    if !country_code_regex().is_match(&address.country_code) {
-        issues.push(issue(
-            "payload.delivery_address.country_code",
-            "Expected an ISO 3166-1 alpha-2 country code",
-        ));
+    // The address rule of §A2: required when any line ships, forbidden when
+    // every line is pickup (a pickup-only checkout that PRESENTS an address
+    // is rejected, so a buggy or malicious client cannot smuggle one into
+    // storage). The service re-checks the fulfillment choice against what
+    // each listing publishes handler-side.
+    let any_shipping = payload
+        .lines
+        .iter()
+        .any(|line| line.fulfillment != Some(FulfillmentMethod::Pickup));
+    match (&mut payload.delivery_address, any_shipping) {
+        (Some(address), true) => validate_delivery_address(
+            "payload.delivery_address",
+            address,
+            &mut issues,
+        ),
+        (Some(_), false) => {
+            issues.push(issue(
+                "payload.delivery_address",
+                "A pickup-only checkout must not carry a delivery address",
+            ));
+        }
+        (None, true) => {
+            issues.push(issue(
+                "payload.delivery_address",
+                "A delivery address is required when any checkout line ships",
+            ));
+        }
+        (None, false) => {}
     }
     if payload.guarantee_policy_version != 1 {
         issues.push(issue(

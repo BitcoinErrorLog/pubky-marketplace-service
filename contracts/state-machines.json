@@ -72,6 +72,10 @@
             {
               "trigger": "command",
               "name": "order.cancel_approve"
+            },
+            {
+              "trigger": "command",
+              "name": "order.cancel_request"
             }
           ]
         }
@@ -326,6 +330,7 @@
       "states": [
         "pending_payment",
         "paid",
+        "ready_for_pickup",
         "processing",
         "shipped",
         "delivered",
@@ -375,6 +380,66 @@
             {
               "trigger": "command",
               "name": "fulfillment.ship"
+            }
+          ]
+        },
+        {
+          "from": "paid",
+          "to": "ready_for_pickup",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "fulfillment.mark_ready"
+            }
+          ]
+        },
+        {
+          "from": "paid",
+          "to": "delivered",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "fulfillment.confirm_pickup"
+            }
+          ]
+        },
+        {
+          "from": "ready_for_pickup",
+          "to": "delivered",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "fulfillment.confirm_pickup"
+            }
+          ]
+        },
+        {
+          "from": "ready_for_pickup",
+          "to": "cancel_requested",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "order.cancel_request"
+            }
+          ]
+        },
+        {
+          "from": "paid",
+          "to": "cancelled",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "order.cancel_request"
+            }
+          ]
+        },
+        {
+          "from": "ready_for_pickup",
+          "to": "cancelled",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "order.cancel_request"
             }
           ]
         },
@@ -514,6 +579,8 @@
         "order.cancel_approve",
         "fulfillment.ship",
         "fulfillment.confirm_delivery",
+        "fulfillment.mark_ready",
+        "fulfillment.confirm_pickup",
         "return.request",
         "return.approve",
         "return.receive",

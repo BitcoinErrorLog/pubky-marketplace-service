@@ -89,8 +89,18 @@ pub fn listing_machine() -> AggregateMachine {
             // payment confirmation moved the quantities reserved -> sold on
             // this durable ledger (the prototype engine left them reserved),
             // so returning the cancelled order's stock necessarily moves
-            // sold -> available. See the README divergence table.
-            t("sold", "available", vec![Command("order.cancel_approve")]),
+            // sold -> available. See the README divergence table. The
+            // unilateral buyer exits (post-payment pickup terms change and
+            // the bounded post-reveal withdrawal, local pickup design §A3)
+            // release through the same path via `order.cancel_request`.
+            t(
+                "sold",
+                "available",
+                vec![
+                    Command("order.cancel_approve"),
+                    Command("order.cancel_request"),
+                ],
+            ),
         ],
         commands: vec![
             "listing.register",
@@ -197,6 +207,7 @@ pub fn order_machine() -> AggregateMachine {
         states: vec![
             "pending_payment",
             "paid",
+            "ready_for_pickup",
             "processing",
             "shipped",
             "delivered",
@@ -228,6 +239,46 @@ pub fn order_machine() -> AggregateMachine {
                 vec![Command("order.cancel_request"), Server("payment_window")],
             ),
             t("paid", "shipped", vec![Command("fulfillment.ship")]),
+            // The pickup path (local pickup design §A6): the seller arms
+            // pickup readiness, and EITHER party confirms the handover from
+            // `paid` or `ready_for_pickup` — the same `delivered` fact a
+            // shipped order's confirmation produces.
+            t(
+                "paid",
+                "ready_for_pickup",
+                vec![Command("fulfillment.mark_ready")],
+            ),
+            t(
+                "paid",
+                "delivered",
+                vec![Command("fulfillment.confirm_pickup")],
+            ),
+            t(
+                "ready_for_pickup",
+                "delivered",
+                vec![Command("fulfillment.confirm_pickup")],
+            ),
+            t(
+                "ready_for_pickup",
+                "cancel_requested",
+                vec![Command("order.cancel_request")],
+            ),
+            // The unilateral buyer exits (§A3): while a post-payment pickup
+            // terms change exists, or while the bounded post-reveal
+            // withdrawal window is open, `order.cancel_request` moves the
+            // order straight to `cancelled` with no seller approval. The
+            // contract format has no actor or condition field; the handlers
+            // enforce both.
+            t(
+                "paid",
+                "cancelled",
+                vec![Command("order.cancel_request")],
+            ),
+            t(
+                "ready_for_pickup",
+                "cancelled",
+                vec![Command("order.cancel_request")],
+            ),
             t(
                 "paid",
                 "cancel_requested",
@@ -305,6 +356,8 @@ pub fn order_machine() -> AggregateMachine {
             "order.cancel_approve",
             "fulfillment.ship",
             "fulfillment.confirm_delivery",
+            "fulfillment.mark_ready",
+            "fulfillment.confirm_pickup",
             "return.request",
             "return.approve",
             "return.receive",
@@ -563,8 +616,11 @@ mod tests {
         assert!(can_transition(&machine, "reserved", "sold"));
         assert!(can_transition(&machine, "available", "available"));
         assert!(!can_transition(&machine, "available", "sold"));
-        // A cancelled paid order returns its sold quantities to available;
-        // order.cancel_approve is the only trigger for this reversal.
+        // A cancelled paid order returns its sold quantities to available.
+        // The reversal fires on the seller's approval AND on the unilateral
+        // buyer exits of the pickup design (§A3/§A6: post-payment terms
+        // change, bounded post-reveal withdrawal), which release inventory
+        // through approve's path via `order.cancel_request`.
         assert!(can_transition(&machine, "sold", "available"));
         assert_eq!(
             listing_machine()
@@ -572,8 +628,38 @@ mod tests {
                 .iter()
                 .find(|t| t.from == "sold" && t.to == "available")
                 .map(|t| t.via.clone()),
-            Some(vec![Command("order.cancel_approve")])
+            Some(vec![
+                Command("order.cancel_approve"),
+                Command("order.cancel_request")
+            ])
         );
+    }
+
+    #[test]
+    fn order_machine_declares_the_pickup_path() {
+        let machine = order_machine();
+        assert!(machine.states.contains(&"ready_for_pickup"));
+        assert_eq!(machine.initial, "pending_payment");
+        // The handover path: the seller arms readiness, and either party
+        // confirms the pickup from `paid` or `ready_for_pickup`.
+        assert!(can_transition(&machine, "paid", "ready_for_pickup"));
+        assert!(can_transition(&machine, "paid", "delivered"));
+        assert!(can_transition(&machine, "ready_for_pickup", "delivered"));
+        // Cancellation: the ordinary request from `ready_for_pickup`, plus
+        // the unilateral exits straight to `cancelled` from `paid` and
+        // `ready_for_pickup` (conditions enforced handler-side, §A6).
+        assert!(can_transition(&machine, "ready_for_pickup", "cancel_requested"));
+        assert!(can_transition(&machine, "paid", "cancelled"));
+        assert!(can_transition(&machine, "ready_for_pickup", "cancelled"));
+        // Shipped-order behavior is unchanged: no pickup edges leak onto it.
+        assert!(!can_transition(&machine, "ready_for_pickup", "shipped"));
+        assert!(!can_transition(&machine, "shipped", "ready_for_pickup"));
+        assert!(machine
+            .commands
+            .contains(&"fulfillment.mark_ready"));
+        assert!(machine
+            .commands
+            .contains(&"fulfillment.confirm_pickup"));
     }
 
     #[test]
