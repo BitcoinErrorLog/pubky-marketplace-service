@@ -47,6 +47,19 @@ async fn main() -> anyhow::Result<()> {
         ),
         None => tracing::info!("payment methods disabled (no Stripe key encryption key)"),
     }
+    // All-or-none for local pickup (§A8): PICKUP_DETAILS_ENCRYPTION_KEY
+    // enables the sealed pickup-details store; absent, pickup is OFF and
+    // `pickup_details.set` is refused. The key must be distinct from the
+    // Locks key material.
+    let pickup = marketplace_service::pickup::pickup_keys_from_env(locks.as_deref())?;
+    tracing::info!(
+        pickup = if pickup.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        "pickup details sealing mode resolved"
+    );
     // HOMESERVER_URL is required: `listing.sync` fetches canonical
     // seller-signed records from it, and running without the sync path would
     // silently re-open the unregistered-listing dead-end it exists to fix.
@@ -66,12 +79,20 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("database migrations applied");
 
+    // The pickup sealing boot probe runs AFTER migrations (the schema must
+    // exist first) and attempts one real open — current key, then previous —
+    // across both sealed families, so a wrong or half-rotated key fails the
+    // boot rather than the first buyer's reveal (§A8).
+    marketplace_service::pickup::assert_pickup_sealing_coherent(&pool, pickup.as_deref()).await?;
+    tracing::info!("pickup sealing coherence probe passed");
+
     let bind_addr = config.bind_addr;
     let state = AppState::new(pool, Arc::new(SystemClock), config)
         .with_locks(locks)
         .with_attestor(attestor)
         .with_homeserver(Some(homeserver))
-        .with_payments(payments);
+        .with_payments(payments)
+        .with_pickup(pickup);
     workers::spawn(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

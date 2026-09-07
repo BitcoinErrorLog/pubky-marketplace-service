@@ -25,13 +25,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
-use rand::RngCore;
 use serde::Deserialize;
 use sha2::Sha256;
 use uuid::Uuid;
+
+use crate::seal::{self, KEY_LEN};
+#[cfg(test)]
+use crate::seal::XNONCE_LEN;
 
 /// Environment variable naming the Lock Server base URL. Setting it enables
 /// Locks verification and makes both keys mandatory (fail closed).
@@ -41,8 +42,6 @@ pub const ENV_BUNDLE_ENCRYPTION_KEY: &str = "LOCKS_BUNDLE_ENCRYPTION_KEY";
 /// Environment variable holding the 32-byte hex HMAC lookup-token key.
 pub const ENV_LOOKUP_HMAC_KEY: &str = "LOCKS_LOOKUP_HMAC_KEY";
 
-const XNONCE_LEN: usize = 24;
-const KEY_LEN: usize = 32;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The configured Locks secret material. Both keys are required together
@@ -74,45 +73,29 @@ impl LocksKeys {
         })
     }
 
+    /// The raw bundle-id encryption key, exposed within the crate so the
+    /// pickup-details key can be checked distinct from it (§A1).
+    pub(crate) fn encryption_bytes(&self) -> &[u8; KEY_LEN] {
+        &self.encryption
+    }
+
+    /// The raw lookup-HMAC key, exposed within the crate for the same
+    /// distinctness check as [`Self::encryption_bytes`].
+    pub(crate) fn lookup_hmac_bytes(&self) -> &[u8; KEY_LEN] {
+        &self.lookup_hmac
+    }
+
     /// Seals a bundle id for storage: a random 24-byte nonce followed by the
     /// XChaCha20-Poly1305 ciphertext, with the owning payment id as
     /// associated data so ciphertexts cannot be transplanted between rows.
     pub fn encrypt_bundle_id(&self, payment_id: Uuid, bundle_id: &str) -> Vec<u8> {
-        let cipher = XChaCha20Poly1305::new((&self.encryption).into());
-        let mut nonce_bytes = [0u8; XNONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(
-                nonce,
-                Payload {
-                    msg: bundle_id.as_bytes(),
-                    aad: payment_id.as_bytes(),
-                },
-            )
-            .expect("XChaCha20-Poly1305 encryption is infallible for in-memory buffers");
-        let mut sealed = Vec::with_capacity(XNONCE_LEN + ciphertext.len());
-        sealed.extend_from_slice(&nonce_bytes);
-        sealed.extend_from_slice(&ciphertext);
-        sealed
+        seal::seal(&self.encryption, payment_id.as_bytes(), bundle_id.as_bytes())
     }
 
     /// Opens a sealed bundle id. Fails when the ciphertext was not produced
     /// under this key for this payment (wrong key configured, or tampering).
     pub fn decrypt_bundle_id(&self, payment_id: Uuid, sealed: &[u8]) -> anyhow::Result<String> {
-        if sealed.len() <= XNONCE_LEN {
-            anyhow::bail!("sealed bundle id is too short");
-        }
-        let (nonce_bytes, ciphertext) = sealed.split_at(XNONCE_LEN);
-        let cipher = XChaCha20Poly1305::new((&self.encryption).into());
-        let plaintext = cipher
-            .decrypt(
-                XNonce::from_slice(nonce_bytes),
-                Payload {
-                    msg: ciphertext,
-                    aad: payment_id.as_bytes(),
-                },
-            )
+        let plaintext = seal::open(&self.encryption, payment_id.as_bytes(), sealed)
             .map_err(|_| {
                 anyhow::anyhow!(
                     "bundle id ciphertext did not authenticate under the configured key"
@@ -134,10 +117,7 @@ impl LocksKeys {
 }
 
 fn parse_key(name: &str, hex_value: &str) -> anyhow::Result<[u8; KEY_LEN]> {
-    let bytes = hex::decode(hex_value.trim())
-        .map_err(|_| anyhow::anyhow!("{name} must be 64 hexadecimal characters"))?;
-    <[u8; KEY_LEN]>::try_from(bytes)
-        .map_err(|_| anyhow::anyhow!("{name} must decode to exactly 32 bytes"))
+    seal::parse_key(name, hex_value)
 }
 
 /// The Locks verification-task lifecycle statuses (Locks `docs/API.md` at

@@ -87,8 +87,16 @@ pub struct Config {
     /// deployment handling real orders that is a self-serve path to `paid`
     /// without money moving, so it must be opt-in per deployment. The
     /// client-side transport allowlist is a UX courtesy, not a boundary —
-    /// this flag is the boundary.
+    /// this flag is the boundary. When on, `pickup_details.set` and the
+    /// buyer pickup reveal are refused outright (local pickup design §A8):
+    /// no real meeting point can be stored against — or revealed under —
+    /// fake money.
     pub sandbox_payments_enabled: bool,
+    /// Days a cancelled-after-payment order's pinned pickup snapshot is
+    /// retained as the dispute exhibit when no refund evidence ever lands,
+    /// before the ordinary terminal-order purge takes it
+    /// (`PICKUP_DISPUTE_RETENTION_DAYS`, default 30, minimum 1; §A3).
+    pub pickup_dispute_retention_days: i64,
 }
 
 impl Config {
@@ -143,6 +151,7 @@ impl Config {
             DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
         )?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
+        let pickup_dispute_retention_days = env_days("PICKUP_DISPUTE_RETENTION_DAYS", 30)?;
         let public_app_origin = env_origin("PUBLIC_APP_ORIGIN")?;
         let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
         Ok(Self {
@@ -165,6 +174,7 @@ impl Config {
             public_app_origin,
             public_service_origin,
             sandbox_payments_enabled,
+            pickup_dispute_retention_days,
         })
     }
 
@@ -190,6 +200,7 @@ impl Config {
             public_app_origin: Some("https://app.test".to_string()),
             public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
+            pickup_dispute_retention_days: 30,
         }
     }
 }

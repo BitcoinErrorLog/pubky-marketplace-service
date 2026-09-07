@@ -17,8 +17,10 @@ pub mod locks;
 pub mod model;
 pub mod payment_methods;
 pub mod payments;
+pub mod pickup;
 pub mod queries;
 pub mod result;
+pub mod seal;
 pub mod shipping;
 pub mod workers;
 
@@ -32,6 +34,7 @@ use crate::config::Config;
 use crate::homeserver::HomeserverListingClient;
 use crate::locks::LocksRuntime;
 use crate::payments::PaymentsRuntime;
+use crate::pickup::PickupKeys;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -57,6 +60,21 @@ pub struct AppState {
     /// unset: the whole `/v0` payment-methods surface is refused (fail
     /// closed; see [`payments::payments_runtime_from_env`]).
     pub payments: Option<Arc<PaymentsRuntime>>,
+    /// The pickup-details sealing keys (local pickup design §A1). `None`
+    /// when `PICKUP_DETAILS_ENCRYPTION_KEY` is unset: pickup is OFF —
+    /// `pickup_details.set` is refused, no details are ever stored
+    /// plaintext, and `pickup_available` reports false (all-or-none gating;
+    /// see [`pickup::pickup_keys_from_env`]).
+    pub pickup: Option<Arc<PickupKeys>>,
+}
+
+impl AppState {
+    /// The public capability flag (§A7): pickup is available only when the
+    /// sealing key is configured AND sandbox payments are disabled on this
+    /// deployment.
+    pub fn pickup_available(&self) -> bool {
+        self.pickup.is_some() && !self.config.sandbox_payments_enabled
+    }
 }
 
 impl AppState {
@@ -69,6 +87,7 @@ impl AppState {
             attestor: None,
             homeserver: None,
             payments: None,
+            pickup: None,
         }
     }
 
@@ -89,6 +108,11 @@ impl AppState {
 
     pub fn with_payments(mut self, payments: Option<Arc<PaymentsRuntime>>) -> Self {
         self.payments = payments;
+        self
+    }
+
+    pub fn with_pickup(mut self, pickup: Option<Arc<PickupKeys>>) -> Self {
+        self.pickup = pickup;
         self
     }
 }

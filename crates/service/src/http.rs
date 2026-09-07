@@ -32,6 +32,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/offers", get(queries::list_offers))
         .route("/v1/orders", get(queries::list_orders))
         .route("/v1/orders/{id}", get(queries::get_order))
+        // The two entitled pickup-details reads (§A3/§A4): the ONLY paths
+        // that ever open the seal. Both answer `Cache-Control: no-store`;
+        // the TraceLayer logs no bodies, so the plaintext cannot reach logs.
+        .route(
+            "/v1/orders/{id}/pickup-details",
+            get(crate::handlers::pickup::get_order_pickup_details),
+        )
+        .route(
+            "/v1/listings/{aggregate_id}/pickup-details",
+            get(crate::handlers::pickup::get_listing_pickup_details),
+        )
         .route(
             "/v1/orders/{id}/review-attestation",
             get(queries::get_review_attestation),
@@ -114,8 +125,15 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+/// Public health/capability surface. `pickup_available` tells clients
+/// whether local pickup can be used on this deployment (the sealing key is
+/// configured AND sandbox payments are disabled, §A7); clients hide the
+/// pickup option everywhere when it is off.
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "pickup_available": state.pickup_available(),
+    }))
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
