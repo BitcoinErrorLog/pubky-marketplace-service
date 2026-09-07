@@ -1456,7 +1456,10 @@ fn validate_pickup_details(details: &mut PickupDetails, issues: &mut Vec<Validat
                 && hhmm_regex().is_match(&window.end)
                 && window.start >= window.end
             {
-                issues.push(issue(&format!("{path}.end"), "Window end must follow start"));
+                issues.push(issue(
+                    &format!("{path}.end"),
+                    "Window end must follow start",
+                ));
             }
         }
     }
@@ -1590,11 +1593,9 @@ fn validate_create_checkout(
         .iter()
         .any(|line| line.fulfillment != Some(FulfillmentMethod::Pickup));
     match (&mut payload.delivery_address, any_shipping) {
-        (Some(address), true) => validate_delivery_address(
-            "payload.delivery_address",
-            address,
-            &mut issues,
-        ),
+        (Some(address), true) => {
+            validate_delivery_address("payload.delivery_address", address, &mut issues)
+        }
         (Some(_), false) => {
             issues.push(issue(
                 "payload.delivery_address",
@@ -2191,6 +2192,161 @@ mod tests {
         let issues = parse_command(&extra_field).expect_err("unknown payload field invalid");
         let serialized = serde_json::to_string(&issues).expect("issues serialize");
         assert!(!serialized.contains("secret-address"));
+    }
+
+    fn pickup_set_command_json() -> Value {
+        json!({
+            "version": 1,
+            "command_id": "00000000-0000-4000-9000-000000000901",
+            "aggregate_id": format!("listing:{}_boots_01", "y".repeat(52)),
+            "expected_revision": 0,
+            "issued_at": "2026-08-19T22:00:00.000Z",
+            "kind": "pickup_details.set",
+            "payload": {
+                "expected_version": 0,
+                "details": {
+                    "kind": "spot",
+                    "spot": "Central Station, north entrance",
+                    "instructions": "Ask for the blue backpack.",
+                    "availability": {
+                        "windows": [{ "day": "sat", "start": "10:00", "end": "14:00" }],
+                        "zone": "Europe/Berlin",
+                    },
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn parses_pickup_commands_and_redacts_details() {
+        let command = parse_command(&pickup_set_command_json()).expect("valid set");
+        assert_eq!(command.kind(), "pickup_details.set");
+        let debug = format!("{:?}", command.payload);
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("Central Station"));
+        assert!(!debug.contains("blue backpack"));
+        assert!(!debug.contains("Europe/Berlin"));
+        // Validation issues never echo the details either.
+        let mut invalid = pickup_set_command_json();
+        invalid["payload"]["details"]["availability"]["zone"] = json!("not-a-zone");
+        let issues = parse_command(&invalid).expect_err("non-IANA zone rejected");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.details.availability.zone"));
+        let serialized = serde_json::to_string(&issues).expect("issues serialize");
+        assert!(!serialized.contains("not-a-zone"));
+
+        let mut clear = pickup_set_command_json();
+        clear["kind"] = json!("pickup_details.clear");
+        clear["payload"] = json!({ "expected_version": 3 });
+        assert_eq!(
+            parse_command(&clear).expect("valid clear").kind(),
+            "pickup_details.clear"
+        );
+
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        for kind in ["fulfillment.mark_ready", "fulfillment.confirm_pickup"] {
+            let command = order_command_json(kind, json!({ "order_id": order_id }));
+            assert_eq!(parse_command(&command).expect("valid").kind(), kind);
+        }
+    }
+
+    #[test]
+    fn validates_pickup_details_shape() {
+        // Kind/fields pairing.
+        let mut mismatch = pickup_set_command_json();
+        mismatch["payload"]["details"]["address"] = json!({
+            "name": "Seller", "line1": "1 Street", "line2": "", "city": "Town",
+            "region": "TS", "postal_code": "12345", "country_code": "US",
+        });
+        let issues = parse_command(&mismatch).expect_err("spot kind cannot carry an address");
+        assert!(issues.iter().any(|i| i.path == "payload.details.address"));
+
+        let mut missing_spot = pickup_set_command_json();
+        missing_spot["payload"]["details"]["kind"] = json!("address");
+        let issues = parse_command(&missing_spot).expect_err("address kind requires an address");
+        assert!(issues.iter().any(|i| i.path == "payload.details.address"));
+
+        // Window shape: weekday vocabulary, HH:MM, end after start.
+        let mut bad_day = pickup_set_command_json();
+        bad_day["payload"]["details"]["availability"]["windows"][0]["day"] = json!("saturday");
+        let issues = parse_command(&bad_day).expect_err("weekday vocabulary enforced");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.details.availability.windows.0.day"));
+
+        let mut inverted = pickup_set_command_json();
+        inverted["payload"]["details"]["availability"]["windows"][0]["start"] = json!("14:00");
+        inverted["payload"]["details"]["availability"]["windows"][0]["end"] = json!("10:00");
+        let issues = parse_command(&inverted).expect_err("window end must follow start");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.details.availability.windows.0.end"));
+
+        // Arrange-after-payment: no windows key at all.
+        let mut arrange = pickup_set_command_json();
+        arrange["payload"]["details"]["availability"] = json!({ "zone": "Europe/Berlin" });
+        parse_command(&arrange).expect("arrange-after-payment is valid");
+    }
+
+    #[test]
+    fn validates_fulfillment_methods_on_registration() {
+        let mut raw = register_command_json();
+        raw["payload"]["fulfillment_methods"] = json!(["shipping", "pickup"]);
+        parse_command(&raw).expect("both methods valid");
+
+        let mut empty = register_command_json();
+        empty["payload"]["fulfillment_methods"] = json!([]);
+        parse_command(&empty).expect_err("at least one method required");
+
+        let mut dup = register_command_json();
+        dup["payload"]["fulfillment_methods"] = json!(["pickup", "pickup"]);
+        parse_command(&dup).expect_err("methods must be unique");
+
+        let mut auction = register_command_json();
+        auction["payload"]["sale_format"] = json!("auction");
+        auction["payload"]["fulfillment_methods"] = json!(["shipping", "pickup"]);
+        auction["payload"]["auction_terms"] = json!({
+            "starts_at": "2026-08-19T22:00:00.000Z",
+            "ends_at": "2026-08-19T22:10:00.000Z",
+            "minimum_increment": { "amount_minor": 500, "currency": "USD", "exponent": 2 },
+            "anti_sniping_window_seconds": 60,
+            "anti_sniping_extension_seconds": 120,
+        });
+        let issues = parse_command(&auction).expect_err("auctions are shipping-only");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "payload.fulfillment_methods"));
+    }
+
+    #[test]
+    fn validates_checkout_address_rules_by_fulfillment() {
+        // A pickup-only checkout with no address parses.
+        let mut pickup_only = checkout_command_json();
+        pickup_only["payload"]["lines"][0]["fulfillment"] = json!("pickup");
+        pickup_only["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery_address");
+        parse_command(&pickup_only).expect("pickup-only checkout needs no address");
+
+        // ...but PRESENTING one is rejected without echoing it.
+        let mut smuggled = checkout_command_json();
+        smuggled["payload"]["lines"][0]["fulfillment"] = json!("pickup");
+        smuggled["payload"]["delivery_address"]["line1"] = json!("secret-address");
+        let issues = parse_command(&smuggled).expect_err("pickup-only checkout rejects an address");
+        assert!(issues.iter().any(|i| i.path == "payload.delivery_address"));
+        let serialized = serde_json::to_string(&issues).expect("issues serialize");
+        assert!(!serialized.contains("secret-address"));
+
+        // A shipped checkout missing the address is rejected too.
+        let mut missing = checkout_command_json();
+        missing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery_address");
+        let issues = parse_command(&missing).expect_err("shipped checkout requires an address");
+        assert!(issues.iter().any(|i| i.path == "payload.delivery_address"));
     }
 
     #[test]

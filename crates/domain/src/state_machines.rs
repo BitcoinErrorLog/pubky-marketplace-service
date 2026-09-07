@@ -269,11 +269,7 @@ pub fn order_machine() -> AggregateMachine {
             // order straight to `cancelled` with no seller approval. The
             // contract format has no actor or condition field; the handlers
             // enforce both.
-            t(
-                "paid",
-                "cancelled",
-                vec![Command("order.cancel_request")],
-            ),
+            t("paid", "cancelled", vec![Command("order.cancel_request")]),
             t(
                 "ready_for_pickup",
                 "cancelled",
@@ -648,18 +644,18 @@ mod tests {
         // Cancellation: the ordinary request from `ready_for_pickup`, plus
         // the unilateral exits straight to `cancelled` from `paid` and
         // `ready_for_pickup` (conditions enforced handler-side, §A6).
-        assert!(can_transition(&machine, "ready_for_pickup", "cancel_requested"));
+        assert!(can_transition(
+            &machine,
+            "ready_for_pickup",
+            "cancel_requested"
+        ));
         assert!(can_transition(&machine, "paid", "cancelled"));
         assert!(can_transition(&machine, "ready_for_pickup", "cancelled"));
         // Shipped-order behavior is unchanged: no pickup edges leak onto it.
         assert!(!can_transition(&machine, "ready_for_pickup", "shipped"));
         assert!(!can_transition(&machine, "shipped", "ready_for_pickup"));
-        assert!(machine
-            .commands
-            .contains(&"fulfillment.mark_ready"));
-        assert!(machine
-            .commands
-            .contains(&"fulfillment.confirm_pickup"));
+        assert!(machine.commands.contains(&"fulfillment.mark_ready"));
+        assert!(machine.commands.contains(&"fulfillment.confirm_pickup"));
     }
 
     #[test]
