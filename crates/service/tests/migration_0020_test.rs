@@ -3,10 +3,11 @@
 //! schema". This test drives the migration files directly against the
 //! throwaway Postgres from `DATABASE_URL`: apply 0001..=0019, seed a listing
 //! and a shipped order on the pre-0020 schema, apply 0020 twice
-//! (idempotent), and assert the backfill (`fulfillment = 'shipping'` on
-//! pre-existing rows, `fulfillment_methods = '{shipping}'` on pre-existing
-//! listings), the widened state vocabulary, and the new pickup tables. The
-//! scratch database is dropped at the end.
+//! (idempotent), apply 0021 twice (the follow-up VALIDATE for the listings
+//! check 0020 left NOT VALID), and assert the backfill (`fulfillment =
+//! 'shipping'` on pre-existing rows, `fulfillment_methods = '{shipping}'`
+//! on pre-existing listings), the widened state vocabulary, and the new
+//! pickup tables. The scratch database is dropped at the end.
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
@@ -121,6 +122,28 @@ async fn migration_0020_backfills_shipping_and_adds_the_pickup_schema() {
     // The migration applies twice (idempotent).
     apply(&pool, 20).await;
     apply(&pool, 20).await;
+
+    // 0020 left the listings check NOT VALID (its sibling orders checks
+    // validate in-line); 0021 — a separate migration because 0020 already
+    // shipped to staging — supplies the missing VALIDATE.
+    let validated: bool = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint \
+         WHERE conname = 'listings_fulfillment_methods_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("constraint row exists");
+    assert!(!validated, "0020 alone leaves the listings check NOT VALID");
+    apply(&pool, 21).await;
+    apply(&pool, 21).await;
+    let validated: bool = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint \
+         WHERE conname = 'listings_fulfillment_methods_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("constraint row exists");
+    assert!(validated, "0021 validates the listings check");
 
     // Pre-existing rows backfill to shipping.
     let order = sqlx::query("SELECT fulfillment, first_revealed_at FROM orders WHERE id = $1")
