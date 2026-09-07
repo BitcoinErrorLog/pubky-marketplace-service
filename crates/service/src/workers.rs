@@ -69,6 +69,8 @@ pub const TASK_PAYKIT_VERIFICATION: &str = "paykit_verification";
 pub const TASK_PAYMENT_WINDOW: &str = "payment_window";
 pub const TASK_STAT_ATTESTATIONS: &str = "stat_attestations";
 pub const TASK_DELIVERY_AUTOCOMPLETE: &str = "delivery_autocomplete";
+pub const TASK_PICKUP_RESEAL: &str = "pickup_reseal";
+pub const TASK_PICKUP_RETENTION: &str = "pickup_retention";
 
 /// The actor stamped on server-time post-purchase events and their
 /// notifications: the system, never a peer (ADR-0019).
@@ -534,6 +536,7 @@ async fn apply_manual_review(
 async fn apply_completed_lifecycle(
     pool: &PgPool,
     row: &ClaimedCorrelation,
+    pickup: Option<&crate::pickup::PickupKeys>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
@@ -552,7 +555,8 @@ async fn apply_completed_lifecycle(
             let Some(order) = fetch_order_for_update(&mut tx, payment.order_id).await? else {
                 anyhow::bail!("correlation {} references a missing order", row.id);
             };
-            match confirm_order(&mut tx, &payment.buyer_pubky, row.id, &payment, order, now).await?
+            match confirm_order(&mut tx, &payment.buyer_pubky, row.id, &payment, order, pickup, now)
+                .await?
             {
                 Ok((order, _receipt, _receipt_event_id)) => {
                     let (revision,): (i64,) = sqlx::query_as(
@@ -648,7 +652,9 @@ pub async fn verify_due_locks_lifecycles(
         let outcome = locks.client.lookup(&row.creator_pubky, &bundle_id).await;
         match outcome {
             LocksLookupOutcome::Status(LocksTaskStatus::Completed) => {
-                if apply_completed_lifecycle(&state.pool, row, now).await? {
+                if apply_completed_lifecycle(&state.pool, row, state.pickup.as_deref(), now)
+                    .await?
+                {
                     applied += 1;
                 }
             }
@@ -732,6 +738,7 @@ async fn apply_confirmed_paykit_payment(
     pool: &PgPool,
     row: &ClaimedPaykitOrder,
     amount_matched: bool,
+    pickup: Option<&crate::pickup::PickupKeys>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
@@ -821,7 +828,7 @@ async fn apply_confirmed_paykit_payment(
     let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
         anyhow::bail!("paykit order {} is missing", row.id);
     };
-    match confirm_order(&mut tx, &row.buyer_pubky, row.id, &payment, order, now).await? {
+    match confirm_order(&mut tx, &row.buyer_pubky, row.id, &payment, order, pickup, now).await? {
         Ok((order, _receipt, _receipt_event_id)) => {
             let (revision,): (i64,) = sqlx::query_as(
                 "UPDATE payments SET state = 'confirmed', revision = revision + 1, \
@@ -927,7 +934,15 @@ pub async fn verify_due_paykit_payments(
             .await
         {
             PaykitStatusOutcome::Confirmed { amount_matched } => {
-                if apply_confirmed_paykit_payment(&state.pool, row, amount_matched, now).await? {
+                if apply_confirmed_paykit_payment(
+                    &state.pool,
+                    row,
+                    amount_matched,
+                    state.pickup.as_deref(),
+                    now,
+                )
+                .await?
+                {
                     applied += 1;
                 }
             }
@@ -1124,6 +1139,19 @@ struct DeliverySweepClaim {
     processed: u64,
 }
 
+/// One claimed `delivered` order for the auto-complete sweep, with both
+/// candidate delivery instants (shipment JSON for shipped orders, the
+/// handover row for pickups) coalesced by the claim query.
+#[derive(Debug, sqlx::FromRow)]
+struct DeliveredOrderClaim {
+    id: Uuid,
+    buyer_pubky: String,
+    seller_pubky: String,
+    fulfillment: String,
+    delivered_at: Option<String>,
+    handover_at: Option<DateTime<Utc>>,
+}
+
 /// Marks `shipped` orders `delivered` once `assume_days` have elapsed since
 /// the ship timestamp — the `delivery_assume` server trigger on the
 /// machine's shipped → delivered edge, standing in for the carrier
@@ -1297,33 +1325,67 @@ async fn complete_due_delivered_orders_batch(
     batch_size: i64,
 ) -> anyhow::Result<DeliverySweepClaim> {
     let mut tx = pool.begin().await?;
-    let due: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, buyer_pubky, seller_pubky, shipment->>'delivered_at' \
-         FROM orders \
-         WHERE state = 'delivered' \
-         AND (shipment->>'delivered_at' IS NULL \
-              OR shipment->>'delivered_at' !~ $2 \
-              OR left(shipment->>'delivered_at', 19) <= left($1, 19)) \
-         ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED",
-    )
-    .bind(cutoff_text)
-    .bind(SHIPMENT_INSTANT_PREFIX)
-    .bind(batch_size)
-    .fetch_all(&mut *tx)
-    .await?;
+    // The delivery instant COALESCES the two sources (§A6): the handover
+    // record's server instant for pickup orders, the shipment
+    // `delivered_at` for shipped ones. The join locks `FOR UPDATE OF o`
+    // (orders only — never the handover row), so the coalescing read cannot
+    // deadlock against concurrent order writers.
+    let due: Vec<DeliveredOrderClaim> = sqlx::query_as(
+            "SELECT o.id, o.buyer_pubky, o.seller_pubky, o.fulfillment, \
+                    o.shipment->>'delivered_at' AS delivered_at, \
+                    h.confirmed_at AS handover_at \
+             FROM orders o LEFT JOIN pickup_handovers h ON h.order_id = o.id \
+             WHERE o.state = 'delivered' \
+             AND ( \
+               (o.fulfillment = 'pickup' AND (h.confirmed_at IS NULL OR h.confirmed_at <= $1)) \
+               OR (o.fulfillment <> 'pickup' AND ( \
+                    o.shipment->>'delivered_at' IS NULL \
+                    OR o.shipment->>'delivered_at' !~ $3 \
+                    OR left(o.shipment->>'delivered_at', 19) <= left($2, 19))) \
+             ) \
+             ORDER BY o.id LIMIT $4 FOR UPDATE OF o SKIP LOCKED",
+        )
+        .bind(cutoff)
+        .bind(cutoff_text)
+        .bind(SHIPMENT_INSTANT_PREFIX)
+        .bind(batch_size)
+        .fetch_all(&mut *tx)
+        .await?;
 
     let claimed = due.len() as u64;
     let mut processed = 0u64;
-    for (order_id, buyer_pubky, seller_pubky, delivered_at) in due {
-        let Some(delivered_at) = parse_shipment_instant(delivered_at.as_deref()) else {
-            tracing::warn!(
-                order_id = %order_id,
-                "skipping delivered order with malformed shipment timestamp"
-            );
-            continue;
-        };
-        if delivered_at > cutoff {
-            continue;
+    for claim in due {
+        let DeliveredOrderClaim {
+            id: order_id,
+            buyer_pubky,
+            seller_pubky,
+            fulfillment,
+            delivered_at: shipment_delivered_at,
+            handover_at,
+        } = claim;
+        if fulfillment == "pickup" {
+            // A delivered pickup order always carries its handover row
+            // (written in the confirm transaction). A missing row is an
+            // anomaly to skip — never the warn-and-skip-forever loop the
+            // shipment-only sweep would have emitted for pickup rows (§A6).
+            let Some(delivered_at) = handover_at else {
+                continue;
+            };
+            if delivered_at > cutoff {
+                continue;
+            }
+        } else {
+            let Some(delivered_at) = parse_shipment_instant(shipment_delivered_at.as_deref())
+            else {
+                tracing::warn!(
+                    order_id = %order_id,
+                    "skipping delivered order with malformed shipment timestamp"
+                );
+                continue;
+            };
+            if delivered_at > cutoff {
+                continue;
+            }
         }
         debug_assert!(marketplace_domain::state_machines::can_transition(
             &marketplace_domain::state_machines::order_machine(),
@@ -1385,6 +1447,9 @@ pub struct WorkerSummary {
     pub stat_attestations_signed: u64,
     pub deliveries_assumed: u64,
     pub orders_auto_completed: u64,
+    pub pickup_rows_resealed: u64,
+    pub pickup_snapshots_purged: u64,
+    pub pickup_versions_purged: u64,
 }
 
 /// One worker pass: for each task, take the lease, drain, release. Tasks
@@ -1506,6 +1571,44 @@ pub async fn run_once(
         .await?;
         release_lease(&state.pool, TASK_DELIVERY_AUTOCOMPLETE, holder, now).await?;
     }
+    // Pickup maintenance runs only when the sealing keys are configured:
+    // the retention purge of pinned versions/snapshots whose referencing
+    // orders went terminal, and — while a previous key is configured — the
+    // dual-key re-seal job across BOTH sealed families (§A1/§A3).
+    if let Some(pickup) = &state.pickup {
+        if try_acquire_lease(&state.pool, TASK_PICKUP_RETENTION, holder, now, lease_seconds)
+            .await?
+        {
+            let (snapshots_purged, versions_purged) =
+                crate::pickup::purge_terminal_pickup_retention(
+                    &state.pool,
+                    now,
+                    state.config.pickup_dispute_retention_days,
+                )
+                .await?;
+            summary.pickup_snapshots_purged = snapshots_purged;
+            summary.pickup_versions_purged = versions_purged;
+            release_lease(&state.pool, TASK_PICKUP_RETENTION, holder, now).await?;
+        }
+        if pickup.has_previous()
+            && try_acquire_lease(&state.pool, TASK_PICKUP_RESEAL, holder, now, lease_seconds)
+                .await?
+        {
+            let progress =
+                crate::pickup::reseal_previous_key_batch(&state.pool, pickup, now).await?;
+            summary.pickup_rows_resealed = progress.details_resealed + progress.snapshots_resealed;
+            if progress.remaining_under_previous == 0
+                && summary.pickup_rows_resealed > 0
+            {
+                tracing::info!(
+                    resealed = summary.pickup_rows_resealed,
+                    "pickup key rotation complete: zero rows remain under the previous key \
+                     across both sealed families"
+                );
+            }
+            release_lease(&state.pool, TASK_PICKUP_RESEAL, holder, now).await?;
+        }
+    }
     // Weekly seller stat attestations (ratified D3) run only when the
     // deployment holds the attestor key: unsigned stats would be worthless.
     if let Some(attestor) = &state.attestor {
@@ -1534,6 +1637,19 @@ struct SellerOrderStats {
     delivered_at: Option<DateTime<Utc>>,
     cancelled: Option<bool>,
     refunded: Option<bool>,
+    /// The order's terminal cancel was a buyer-protection exit (§A3):
+    /// `order.cancelled_terms_change` excludes the WHOLE order from
+    /// `terminated_badly`, including any `refund.recorded_external` leg.
+    terms_change_cancelled: Option<bool>,
+    /// The order completed on server time (the `order_auto_complete`
+    /// sweep), as opposed to a buyer review.
+    auto_completed: Option<bool>,
+    /// The buyer opened a cancel or return request on the order.
+    buyer_disputed: Option<bool>,
+    fulfillment: String,
+    /// Who confirmed the pickup handover (`buyer` | `seller`), when one
+    /// exists; NULL for shipped orders and unconfirmed pickups.
+    handover_confirmed_by: Option<String>,
 }
 
 /// Computes and signs the weekly per-seller stat attestations (ratified D3:
@@ -1576,7 +1692,15 @@ pub async fn generate_due_stat_attestations(
                MIN(CASE WHEN e.kind = 'fulfillment.shipped' THEN e.occurred_at END) AS shipped_at, \
                MIN(CASE WHEN e.kind = 'fulfillment.delivered' THEN e.occurred_at END) AS delivered_at, \
                BOOL_OR(e.kind = 'order.cancelled') AS cancelled, \
-               BOOL_OR(e.kind = 'refund.recorded_external') AS refunded \
+               BOOL_OR(e.kind = 'refund.recorded_external') AS refunded, \
+               BOOL_OR(e.kind = 'order.cancelled_terms_change') AS terms_change_cancelled, \
+               BOOL_OR(e.kind = 'order.completed') AS auto_completed, \
+               BOOL_OR(e.kind IN ('order.cancel_requested', 'order.cancelled', \
+                                  'order.cancelled_terms_change', 'return.requested')) \
+                 AS buyer_disputed, \
+               o.fulfillment AS fulfillment, \
+               (SELECT h.confirmed_by FROM pickup_handovers h WHERE h.order_id = o.id) \
+                 AS handover_confirmed_by \
              FROM orders o JOIN events e ON e.aggregate_id = 'order:' || o.id::text \
              WHERE o.seller_pubky = $1 AND e.occurred_at >= $2 AND e.occurred_at <= $3 \
              GROUP BY o.id",
@@ -1587,16 +1711,40 @@ pub async fn generate_due_stat_attestations(
         .fetch_all(pool)
         .await?;
 
+        // The confirming-actor rule (§A6): a pickup completion counts only
+        // when the BUYER confirmed the handover, or when the order
+        // auto-completed with no buyer cancel or return in the window. A
+        // seller-unilateral confirm is never reputation-positive on its
+        // own — the seller is paid at payment time, so a self-confirm that
+        // also minted completion reputation would pay a fraudulent seller
+        // twice. Shipped orders count on delivery, as today.
         let completed = per_order
             .iter()
-            .filter(|order| order.delivered_at.is_some())
+            .filter(|order| {
+                if order.delivered_at.is_none() {
+                    return false;
+                }
+                if order.fulfillment != "pickup" {
+                    return true;
+                }
+                order.handover_confirmed_by.as_deref() == Some("buyer")
+                    || (order.auto_completed.unwrap_or(false)
+                        && !order.buyer_disputed.unwrap_or(false))
+            })
             .count() as i64;
         if completed < 1 {
             continue;
         }
+        // `order.cancelled_terms_change` excludes the WHOLE order from
+        // `terminated_badly` (§A3): a buyer can never ding the seller's
+        // completion rate by exercising a buyer-protection exit, even when
+        // a refund was recorded on the same order.
         let terminated_badly = per_order
             .iter()
-            .filter(|order| order.cancelled.unwrap_or(false) || order.refunded.unwrap_or(false))
+            .filter(|order| {
+                (order.cancelled.unwrap_or(false) || order.refunded.unwrap_or(false))
+                    && !order.terms_change_cancelled.unwrap_or(false)
+            })
             .count() as i64;
         let mut ship_hours: Vec<i64> = per_order
             .iter()
@@ -1686,6 +1834,9 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             stat_attestations_signed = summary.stat_attestations_signed,
                             deliveries_assumed = summary.deliveries_assumed,
                             orders_auto_completed = summary.orders_auto_completed,
+                            pickup_rows_resealed = summary.pickup_rows_resealed,
+                            pickup_snapshots_purged = summary.pickup_snapshots_purged,
+                            pickup_versions_purged = summary.pickup_versions_purged,
                             "worker pass completed"
                         );
                     }
