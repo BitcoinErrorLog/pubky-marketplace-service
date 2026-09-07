@@ -640,9 +640,60 @@ async fn apply_completed_lifecycle(
     }
 }
 
+/// Applies the independently verified lifecycle outcome for ONE claimed
+/// correlation. Errors propagate to the caller's per-item handler — one
+/// bad row must never stall the rest of the claimed batch.
+async fn apply_locks_lookup_outcome(
+    state: &AppState,
+    locks: &LocksRuntime,
+    row: &ClaimedCorrelation,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let bundle_id = locks
+        .keys
+        .decrypt_bundle_id(row.payment_id, &row.bundle_id_ciphertext)
+        .map_err(|error| anyhow::anyhow!("correlation {} cannot be decrypted: {error}", row.id))?;
+    let outcome = locks.client.lookup(&row.creator_pubky, &bundle_id).await;
+    match outcome {
+        LocksLookupOutcome::Status(LocksTaskStatus::Completed) => {
+            apply_completed_lifecycle(&state.pool, row, state.pickup.as_deref(), now).await
+        }
+        LocksLookupOutcome::Status(LocksTaskStatus::Failed) => {
+            record_upstream_terminal(&state.pool, row, "failed", "upstream_failed", now).await?;
+            Ok(false)
+        }
+        LocksLookupOutcome::Status(LocksTaskStatus::Expired) => {
+            record_upstream_terminal(&state.pool, row, "expired", "upstream_expired", now).await?;
+            Ok(false)
+        }
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending) => {
+            record_status_observation(&state.pool, row, "pending", now).await?;
+            Ok(false)
+        }
+        LocksLookupOutcome::Status(LocksTaskStatus::InProgress) => {
+            record_status_observation(&state.pool, row, "in_progress", now).await?;
+            Ok(false)
+        }
+        LocksLookupOutcome::NotFound => {
+            record_status_observation(&state.pool, row, "not_found", now).await?;
+            Ok(false)
+        }
+        LocksLookupOutcome::Unavailable => {
+            // Transport/status trouble stays pending and retryable
+            // (Locks v1 has no terminal payment failure); the claim
+            // stamp already deferred the next attempt.
+            Ok(false)
+        }
+    }
+}
+
 /// One Locks verification pass: claims due pending correlations, performs
 /// the independent lifecycle lookup for each, and applies the outcome.
 /// Returns the number of payments advanced (confirmed or manual review).
+/// A per-item failure (an undecryptable bundle id, an unopenable sealed
+/// pickup row, a database error mid-effect) is logged with the correlation
+/// identity and the pass CONTINUES with the rest of the claimed batch —
+/// one bad row is never head-of-line for the others.
 pub async fn verify_due_locks_lifecycles(
     state: &AppState,
     locks: &LocksRuntime,
@@ -651,41 +702,16 @@ pub async fn verify_due_locks_lifecycles(
     let claimed = claim_due_correlations(&state.pool, now, state.config.locks_poll_seconds).await?;
     let mut applied = 0u64;
     for row in &claimed {
-        let bundle_id = locks
-            .keys
-            .decrypt_bundle_id(row.payment_id, &row.bundle_id_ciphertext)
-            .map_err(|error| {
-                anyhow::anyhow!("correlation {} cannot be decrypted: {error}", row.id)
-            })?;
-        let outcome = locks.client.lookup(&row.creator_pubky, &bundle_id).await;
-        match outcome {
-            LocksLookupOutcome::Status(LocksTaskStatus::Completed) => {
-                if apply_completed_lifecycle(&state.pool, row, state.pickup.as_deref(), now).await?
-                {
-                    applied += 1;
-                }
-            }
-            LocksLookupOutcome::Status(LocksTaskStatus::Failed) => {
-                record_upstream_terminal(&state.pool, row, "failed", "upstream_failed", now)
-                    .await?;
-            }
-            LocksLookupOutcome::Status(LocksTaskStatus::Expired) => {
-                record_upstream_terminal(&state.pool, row, "expired", "upstream_expired", now)
-                    .await?;
-            }
-            LocksLookupOutcome::Status(LocksTaskStatus::Pending) => {
-                record_status_observation(&state.pool, row, "pending", now).await?;
-            }
-            LocksLookupOutcome::Status(LocksTaskStatus::InProgress) => {
-                record_status_observation(&state.pool, row, "in_progress", now).await?;
-            }
-            LocksLookupOutcome::NotFound => {
-                record_status_observation(&state.pool, row, "not_found", now).await?;
-            }
-            LocksLookupOutcome::Unavailable => {
-                // Transport/status trouble stays pending and retryable
-                // (Locks v1 has no terminal payment failure); the claim
-                // stamp already deferred the next attempt.
+        match apply_locks_lookup_outcome(state, locks, row, now).await {
+            Ok(true) => applied += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    correlation_id = %row.id,
+                    payment_id = %row.payment_id,
+                    error = %error,
+                    "locks verification failed for a claimed correlation; continuing the batch"
+                );
             }
         }
     }
@@ -934,9 +960,57 @@ async fn apply_confirmed_paykit_payment(
     }
 }
 
+/// Applies the polled paykit status for ONE claimed order. Errors
+/// propagate to the caller's per-item handler — one bad row must never
+/// stall the rest of the claimed batch.
+async fn apply_paykit_status_outcome(
+    state: &AppState,
+    source: &dyn PaykitStatusSource,
+    row: &ClaimedPaykitOrder,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    match source
+        .status(&row.seller_pubky, &row.paykit_request_reference)
+        .await
+    {
+        PaykitStatusOutcome::Confirmed { amount_matched } => {
+            apply_confirmed_paykit_payment(
+                &state.pool,
+                row,
+                amount_matched,
+                state.pickup.as_deref(),
+                now,
+            )
+            .await
+        }
+        PaykitStatusOutcome::Detected => {
+            if row.paykit_request_state != "detected" {
+                sqlx::query(
+                    "UPDATE orders SET paykit_request_state = 'detected', updated_at = $2 \
+                     WHERE id = $1 AND paykit_request_state = 'pending'",
+                )
+                .bind(row.id)
+                .bind(now)
+                .execute(&state.pool)
+                .await?;
+            }
+            Ok(false)
+        }
+        // Not yet visible, or the request never reached paykit-server
+        // (NotFound stays retryable: creation is idempotent and the
+        // binding transaction only commits after a successful create).
+        PaykitStatusOutcome::Undetected
+        | PaykitStatusOutcome::NotFound
+        | PaykitStatusOutcome::Unavailable => Ok(false),
+    }
+}
+
 /// One paykit verification pass: claims due bitcoin orders, polls the
 /// paykit-server status for each, and applies the outcome. Returns the
-/// number of payments advanced (confirmed or manual review).
+/// number of payments advanced (confirmed or manual review). A per-item
+/// failure is logged with the order identity and the pass CONTINUES with
+/// the rest of the claimed batch — one bad row is never head-of-line for
+/// the others.
 pub async fn verify_due_paykit_payments(
     state: &AppState,
     source: &dyn PaykitStatusSource,
@@ -946,41 +1020,17 @@ pub async fn verify_due_paykit_payments(
         claim_due_paykit_orders(&state.pool, now, state.config.paykit_poll_seconds).await?;
     let mut applied = 0u64;
     for row in &claimed {
-        match source
-            .status(&row.seller_pubky, &row.paykit_request_reference)
-            .await
-        {
-            PaykitStatusOutcome::Confirmed { amount_matched } => {
-                if apply_confirmed_paykit_payment(
-                    &state.pool,
-                    row,
-                    amount_matched,
-                    state.pickup.as_deref(),
-                    now,
-                )
-                .await?
-                {
-                    applied += 1;
-                }
+        match apply_paykit_status_outcome(state, source, row, now).await {
+            Ok(true) => applied += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    order_id = %row.id,
+                    payment_id = %row.payment_id,
+                    error = %error,
+                    "paykit verification failed for a claimed order; continuing the batch"
+                );
             }
-            PaykitStatusOutcome::Detected => {
-                if row.paykit_request_state != "detected" {
-                    sqlx::query(
-                        "UPDATE orders SET paykit_request_state = 'detected', updated_at = $2 \
-                         WHERE id = $1 AND paykit_request_state = 'pending'",
-                    )
-                    .bind(row.id)
-                    .bind(now)
-                    .execute(&state.pool)
-                    .await?;
-                }
-            }
-            // Not yet visible, or the request never reached paykit-server
-            // (NotFound stays retryable: creation is idempotent and the
-            // binding transaction only commits after a successful create).
-            PaykitStatusOutcome::Undetected
-            | PaykitStatusOutcome::NotFound
-            | PaykitStatusOutcome::Unavailable => {}
         }
     }
     Ok(applied)
@@ -1470,7 +1520,9 @@ pub struct WorkerSummary {
 }
 
 /// One worker pass: for each task, take the lease, drain, release. Tasks
-/// whose lease is held by another live instance are skipped.
+/// whose lease is held by another live instance are skipped. The lease is
+/// released on EVERY exit path — a drain error propagates only after the
+/// release, so a failing task never squats on its lease until expiry.
 pub async fn run_once(
     state: &AppState,
     holder: Uuid,
@@ -1488,8 +1540,9 @@ pub async fn run_once(
     )
     .await?
     {
-        summary.reservations_expired = expiry::expire_due_reservations(&state.pool, now).await?;
+        let result = expiry::expire_due_reservations(&state.pool, now).await;
         release_lease(&state.pool, TASK_RESERVATION_EXPIRY, holder, now).await?;
+        summary.reservations_expired = result?;
     }
     if try_acquire_lease(
         &state.pool,
@@ -1500,20 +1553,24 @@ pub async fn run_once(
     )
     .await?
     {
-        summary.drops_transitioned = transition_due_drops(&state.pool, now).await?;
+        let result = transition_due_drops(&state.pool, now).await;
         release_lease(&state.pool, TASK_DROP_TRANSITIONS, holder, now).await?;
+        summary.drops_transitioned = result?;
     }
     if try_acquire_lease(&state.pool, TASK_OFFER_EXPIRY, holder, now, lease_seconds).await? {
-        summary.offers_expired = expire_due_offers(&state.pool, now).await?;
+        let result = expire_due_offers(&state.pool, now).await;
         release_lease(&state.pool, TASK_OFFER_EXPIRY, holder, now).await?;
+        summary.offers_expired = result?;
     }
     if try_acquire_lease(&state.pool, TASK_AUCTION_CLOSE, holder, now, lease_seconds).await? {
-        summary.auctions_closed = close_due_auctions(&state.pool, now).await?;
+        let result = close_due_auctions(&state.pool, now).await;
         release_lease(&state.pool, TASK_AUCTION_CLOSE, holder, now).await?;
+        summary.auctions_closed = result?;
     }
     if try_acquire_lease(&state.pool, TASK_OUTBOX, holder, now, lease_seconds).await? {
-        summary.outbox_delivered = drain_outbox(&state.pool, now, lease_seconds).await?;
+        let result = drain_outbox(&state.pool, now, lease_seconds).await;
         release_lease(&state.pool, TASK_OUTBOX, holder, now).await?;
+        summary.outbox_delivered = result?;
     }
     // Verification runs only when the deployment has Locks configured (fail
     // closed); the window sweep is a marketplace-time transition and always
@@ -1528,9 +1585,9 @@ pub async fn run_once(
         )
         .await?
         {
-            summary.locks_completions_applied =
-                verify_due_locks_lifecycles(state, locks, now).await?;
+            let result = verify_due_locks_lifecycles(state, locks, now).await;
             release_lease(&state.pool, TASK_LOCKS_VERIFICATION, holder, now).await?;
+            summary.locks_completions_applied = result?;
         }
     }
     // Paykit verification runs only when the deployment carries the signed
@@ -1549,14 +1606,15 @@ pub async fn run_once(
         )
         .await?
         {
-            summary.paykit_payments_applied =
-                verify_due_paykit_payments(state, paykit, now).await?;
+            let result = verify_due_paykit_payments(state, paykit, now).await;
             release_lease(&state.pool, TASK_PAYKIT_VERIFICATION, holder, now).await?;
+            summary.paykit_payments_applied = result?;
         }
     }
     if try_acquire_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now, lease_seconds).await? {
-        summary.payment_windows_expired = expire_due_payment_windows(&state.pool, now).await?;
+        let result = expire_due_payment_windows(&state.pool, now).await;
         release_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now).await?;
+        summary.payment_windows_expired = result?;
     }
     // Post-purchase liveness is server time (no carrier tracking feed):
     // assume delivery after DELIVERY_ASSUME_DAYS, then auto-complete after
@@ -1570,23 +1628,28 @@ pub async fn run_once(
     )
     .await?
     {
-        summary.deliveries_assumed = assume_due_deliveries(
-            &state.pool,
-            now,
-            state.config.delivery_assume_days,
-            state.config.delivery_sweep_batch_size,
-            DELIVERY_SWEEP_MAX_BATCHES,
-        )
-        .await?;
-        summary.orders_auto_completed = complete_due_delivered_orders(
-            &state.pool,
-            now,
-            state.config.auto_complete_days,
-            state.config.delivery_sweep_batch_size,
-            DELIVERY_SWEEP_MAX_BATCHES,
-        )
-        .await?;
+        let result = async {
+            summary.deliveries_assumed = assume_due_deliveries(
+                &state.pool,
+                now,
+                state.config.delivery_assume_days,
+                state.config.delivery_sweep_batch_size,
+                DELIVERY_SWEEP_MAX_BATCHES,
+            )
+            .await?;
+            summary.orders_auto_completed = complete_due_delivered_orders(
+                &state.pool,
+                now,
+                state.config.auto_complete_days,
+                state.config.delivery_sweep_batch_size,
+                DELIVERY_SWEEP_MAX_BATCHES,
+            )
+            .await?;
+            anyhow::Ok(())
+        }
+        .await;
         release_lease(&state.pool, TASK_DELIVERY_AUTOCOMPLETE, holder, now).await?;
+        result?;
     }
     // Pickup maintenance runs only when the sealing keys are configured:
     // the retention purge of pinned versions/snapshots whose referencing
@@ -1602,23 +1665,24 @@ pub async fn run_once(
         )
         .await?
         {
-            let (snapshots_purged, versions_purged) =
-                crate::pickup::purge_terminal_pickup_retention(
-                    &state.pool,
-                    now,
-                    state.config.pickup_dispute_retention_days,
-                )
-                .await?;
+            let result = crate::pickup::purge_terminal_pickup_retention(
+                &state.pool,
+                now,
+                state.config.pickup_dispute_retention_days,
+            )
+            .await;
+            release_lease(&state.pool, TASK_PICKUP_RETENTION, holder, now).await?;
+            let (snapshots_purged, versions_purged) = result?;
             summary.pickup_snapshots_purged = snapshots_purged;
             summary.pickup_versions_purged = versions_purged;
-            release_lease(&state.pool, TASK_PICKUP_RETENTION, holder, now).await?;
         }
         if pickup.has_previous()
             && try_acquire_lease(&state.pool, TASK_PICKUP_RESEAL, holder, now, lease_seconds)
                 .await?
         {
-            let progress =
-                crate::pickup::reseal_previous_key_batch(&state.pool, pickup, now).await?;
+            let result = crate::pickup::reseal_previous_key_batch(&state.pool, pickup, now).await;
+            release_lease(&state.pool, TASK_PICKUP_RESEAL, holder, now).await?;
+            let progress = result?;
             summary.pickup_rows_resealed = progress.details_resealed + progress.snapshots_resealed;
             if progress.remaining_under_previous == 0 && summary.pickup_rows_resealed > 0 {
                 tracing::info!(
@@ -1627,7 +1691,6 @@ pub async fn run_once(
                      across both sealed families"
                 );
             }
-            release_lease(&state.pool, TASK_PICKUP_RESEAL, holder, now).await?;
         }
     }
     // Weekly seller stat attestations (ratified D3) run only when the
@@ -1642,9 +1705,9 @@ pub async fn run_once(
         )
         .await?
         {
-            summary.stat_attestations_signed =
-                generate_due_stat_attestations(&state.pool, attestor, now).await?;
+            let result = generate_due_stat_attestations(&state.pool, attestor, now).await;
             release_lease(&state.pool, TASK_STAT_ATTESTATIONS, holder, now).await?;
+            summary.stat_attestations_signed = result?;
         }
     }
     Ok(summary)

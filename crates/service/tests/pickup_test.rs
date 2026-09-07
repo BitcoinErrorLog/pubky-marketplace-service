@@ -3363,8 +3363,9 @@ async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
     .await
     .expect("details row");
 
-    // A completed Locks outcome arrives; the pass fails on the unopenable
-    // row — an Err the worker loop logs, NOT a panic that kills the loop.
+    // A completed Locks outcome arrives; the pass logs the unopenable row
+    // and continues the batch — an Err per item, NOT a panic that kills
+    // the loop and not an Err out of run_once.
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -3382,10 +3383,12 @@ async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
         TEST_BUNDLE_ID,
         LocksLookupOutcome::Status(LocksTaskStatus::Completed),
     );
-    let result = run_once(&app.state, Uuid::new_v4(), app.clock.now()).await;
-    assert!(
-        result.is_err(),
-        "the pass reports the unopenable row instead of panicking"
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("the pass logs the unopenable row instead of failing the tick");
+    assert_eq!(
+        summary.locks_completions_applied, 0,
+        "the failed item is not applied"
     );
     let (state,): (String,) = sqlx::query_as("SELECT state FROM orders WHERE id = $1::uuid")
         .bind(&order.order_id)
@@ -3416,6 +3419,161 @@ async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
         count(&app.pool, "SELECT COUNT(*) FROM pickup_line_snapshots").await,
         1,
         "the repaired row pins on the next pass"
+    );
+}
+
+// Two claimed correlations in one tick: the FIRST fails (its listing's
+// details row opens under no configured key), the SECOND still confirms in
+// the same pass — a per-item error is logged, never head-of-line for the
+// rest of the batch — and the task lease is released for the next holder.
+#[sqlx::test]
+async fn a_failed_claimed_item_does_not_stall_the_rest_of_the_batch(pool: PgPool) {
+    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+
+    // Order A on boots_01: its details row will be unopenable (seeded under
+    // an unknown key, the operator-mishap fixture).
+    let failing = create_pickup_order(
+        &app,
+        &seller,
+        &buyer,
+        "boots_01",
+        0x851,
+        "00000000-0000-4000-9000-000000000851",
+    )
+    .await;
+    let aggregate = listing_agg(&seller.pubky, "boots_01");
+    let unknown = PickupKeys::from_hex(
+        "9999999999999999999999999999999999999999999999999999999999999999",
+        None,
+    )
+    .expect("unknown key parses");
+    let ciphertext = unknown.seal(&pickup::details_aad(&aggregate, 1), SPOT.as_bytes());
+    sqlx::query(
+        "INSERT INTO listing_pickup_version_counters (aggregate_id, seller_pubky, last_version, \
+         updated_at) VALUES ($1, $2, 1, $3)",
+    )
+    .bind(&aggregate)
+    .bind(&seller.pubky)
+    .bind(app.clock.now())
+    .execute(&app.pool)
+    .await
+    .expect("counter row");
+    sqlx::query(
+        "INSERT INTO listing_pickup_details (aggregate_id, seller_pubky, version, \
+         details_ciphertext, created_at, updated_at) VALUES ($1, $2, 1, $3, $4, $4)",
+    )
+    .bind(&aggregate)
+    .bind(&seller.pubky)
+    .bind(&ciphertext)
+    .bind(app.clock.now())
+    .execute(&app.pool)
+    .await
+    .expect("details row");
+
+    // Order B on boots_02: healthy details set through the command surface.
+    let healthy = create_pickup_order(
+        &app,
+        &seller,
+        &buyer,
+        "boots_02",
+        0x852,
+        "00000000-0000-4000-9000-000000000852",
+    )
+    .await;
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &set_details(&seller.pubky, "boots_02", 0, SPOT, 0x853),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Both payments register Locks correlations with a completed outcome.
+    for (order, bundle, n) in [
+        (&failing, TEST_BUNDLE_ID, 0x854),
+        (&healthy, BUNDLE_2, 0x855),
+    ] {
+        let (status, body) = execute(
+            &app,
+            &buyer.token,
+            &common::register_locks_command(
+                &order.payment_id,
+                1,
+                bundle,
+                &lock_resource_for(&seller.pubky),
+                n,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        fake.set_outcome(
+            bundle,
+            LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+        );
+    }
+    // Deterministic claim order (last_checked_at ASC): the FAILING
+    // correlation is claimed first, well past the poll interval.
+    sqlx::query(
+        "UPDATE payment_locks_correlations SET last_checked_at = $2 WHERE order_id = $1::uuid",
+    )
+    .bind(&failing.order_id)
+    .bind(app.clock.now() - chrono::Duration::seconds(3600))
+    .execute(&app.pool)
+    .await
+    .expect("age the failing claim");
+    sqlx::query(
+        "UPDATE payment_locks_correlations SET last_checked_at = $2 WHERE order_id = $1::uuid",
+    )
+    .bind(&healthy.order_id)
+    .bind(app.clock.now() - chrono::Duration::seconds(1800))
+    .execute(&app.pool)
+    .await
+    .expect("age the healthy claim");
+
+    // One tick: the first item fails, the second still processes.
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("one bad item does not fail the tick");
+    assert_eq!(
+        summary.locks_completions_applied, 1,
+        "the healthy item confirms in the same tick as the failing one"
+    );
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM orders WHERE id = $1::uuid")
+        .bind(&failing.order_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("order row");
+    assert_eq!(
+        state, "pending_payment",
+        "the failing item's confirmation rolled back"
+    );
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM orders WHERE id = $1::uuid")
+        .bind(&healthy.order_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("order row");
+    assert_eq!(state, "paid", "the healthy item confirmed");
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM pickup_line_snapshots").await,
+        1,
+        "the healthy order pinned its snapshot"
+    );
+
+    // The task lease was released at the end of the pass: another holder
+    // takes it immediately, without waiting out the lease window.
+    assert!(
+        workers::try_acquire_lease(
+            &app.pool,
+            workers::TASK_LOCKS_VERIFICATION,
+            Uuid::new_v4(),
+            app.clock.now(),
+            30,
+        )
+        .await
+        .expect("lease query runs"),
+        "the verification lease is free right after the pass"
     );
 }
 
