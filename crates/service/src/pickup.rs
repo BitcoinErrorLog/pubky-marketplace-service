@@ -170,53 +170,146 @@ pub(crate) fn ensure_distinct_from_locks(
     Ok(())
 }
 
-/// One boot-probe row per sealed family: the AAD inputs and the ciphertext.
+/// One boot-probe row: the AAD inputs and the ciphertext.
 struct ProbeRow {
     aad: Vec<u8>,
     ciphertext: Vec<u8>,
 }
 
-async fn first_details_probe_row(pool: &PgPool) -> Result<Option<ProbeRow>, sqlx::Error> {
-    let row: Option<(String, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT aggregate_id, version, details_ciphertext FROM listing_pickup_details \
-         ORDER BY aggregate_id, version LIMIT 1",
+/// Whether any sealed pickup rows exist at all (the probe is vacuous on an
+/// empty store, and an unkeyed deployment may start only then).
+async fn sealed_rows_exist(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    let (exists,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM listing_pickup_details) \
+            OR EXISTS(SELECT 1 FROM pickup_line_snapshots)",
     )
-    .fetch_optional(pool)
+    .fetch_one(pool)
     .await?;
-    Ok(row.map(|(aggregate_id, version, ciphertext)| ProbeRow {
-        aad: details_aad(&aggregate_id, version),
-        ciphertext,
-    }))
+    Ok(exists)
 }
 
-async fn first_snapshot_probe_row(pool: &PgPool) -> Result<Option<ProbeRow>, sqlx::Error> {
-    let row: Option<(Uuid, i32, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT order_id, line_index, version, snapshot_ciphertext FROM pickup_line_snapshots \
-         ORDER BY order_id, line_index LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(
-        row.map(|(order_id, line_index, version, ciphertext)| ProbeRow {
-            aad: snapshot_aad(order_id, line_index, version),
-            ciphertext,
-        }),
-    )
+const PROBE_BATCH_SIZE: i64 = 100;
+
+/// One probe row per KEY CLASS of the details family: the first row that
+/// opens under the current key and the first that does not (still sealed
+/// under the previous key). Probing only the first row of the family could
+/// miss a half-rotated table whose previous key was dropped — the straggler
+/// class must be probed too, or it would fail the first buyer's reveal
+/// instead of the boot (§A8).
+async fn details_probe_rows(
+    pool: &PgPool,
+    keys: &PickupKeys,
+) -> Result<Vec<ProbeRow>, sqlx::Error> {
+    // [opens under the current key, does not] — one probe row each.
+    let mut probes: [Option<ProbeRow>; 2] = [None, None];
+    let mut cursor: Option<(String, i64)> = None;
+    loop {
+        let rows: Vec<(String, i64, Vec<u8>)> =
+            match &cursor {
+                None => sqlx::query_as(
+                    "SELECT aggregate_id, version, details_ciphertext FROM listing_pickup_details \
+                     ORDER BY aggregate_id, version LIMIT $1",
+                )
+                .bind(PROBE_BATCH_SIZE)
+                .fetch_all(pool)
+                .await?,
+                Some((after_id, after_version)) => sqlx::query_as(
+                    "SELECT aggregate_id, version, details_ciphertext FROM listing_pickup_details \
+                     WHERE (aggregate_id, version) > ($1, $2) \
+                     ORDER BY aggregate_id, version LIMIT $3",
+                )
+                .bind(after_id)
+                .bind(after_version)
+                .bind(PROBE_BATCH_SIZE)
+                .fetch_all(pool)
+                .await?,
+            };
+        if rows.is_empty() {
+            break;
+        }
+        cursor = rows
+            .last()
+            .map(|(aggregate_id, version, _)| (aggregate_id.clone(), *version));
+        for (aggregate_id, version, ciphertext) in rows {
+            let aad = details_aad(&aggregate_id, version);
+            let class = usize::from(!keys.opens_under_current(&aad, &ciphertext));
+            if probes[class].is_none() {
+                probes[class] = Some(ProbeRow { aad, ciphertext });
+            }
+        }
+        if probes.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    Ok(probes.into_iter().flatten().collect())
+}
+
+/// The snapshot family's [`details_probe_rows`]: one probe row per key
+/// class, paged on (order_id, line_index).
+async fn snapshot_probe_rows(
+    pool: &PgPool,
+    keys: &PickupKeys,
+) -> Result<Vec<ProbeRow>, sqlx::Error> {
+    let mut probes: [Option<ProbeRow>; 2] = [None, None];
+    let mut cursor: Option<(Uuid, i32)> = None;
+    loop {
+        let rows: Vec<(Uuid, i32, i64, Vec<u8>)> = match &cursor {
+            None => {
+                sqlx::query_as(
+                    "SELECT order_id, line_index, version, snapshot_ciphertext \
+                     FROM pickup_line_snapshots ORDER BY order_id, line_index LIMIT $1",
+                )
+                .bind(PROBE_BATCH_SIZE)
+                .fetch_all(pool)
+                .await?
+            }
+            Some((after_order, after_line)) => {
+                sqlx::query_as(
+                    "SELECT order_id, line_index, version, snapshot_ciphertext \
+                     FROM pickup_line_snapshots \
+                     WHERE (order_id, line_index) > ($1, $2) \
+                     ORDER BY order_id, line_index LIMIT $3",
+                )
+                .bind(after_order)
+                .bind(after_line)
+                .bind(PROBE_BATCH_SIZE)
+                .fetch_all(pool)
+                .await?
+            }
+        };
+        if rows.is_empty() {
+            break;
+        }
+        cursor = rows
+            .last()
+            .map(|(order_id, line_index, _, _)| (*order_id, *line_index));
+        for (order_id, line_index, version, ciphertext) in rows {
+            let aad = snapshot_aad(order_id, line_index, version);
+            let class = usize::from(!keys.opens_under_current(&aad, &ciphertext));
+            if probes[class].is_none() {
+                probes[class] = Some(ProbeRow { aad, ciphertext });
+            }
+        }
+        if probes.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    Ok(probes.into_iter().flatten().collect())
 }
 
 /// The all-or-none boot check, run at startup AFTER migrations (the schema
 /// must exist first): refuses to start when sealed pickup rows exist
-/// without `PICKUP_DETAILS_ENCRYPTION_KEY` configured, and attempts ONE
-/// real open — current key, then previous — across BOTH sealed families (a
-/// details version and a pinned snapshot), so a wrong or half-rotated key
-/// fails the boot rather than the first buyer's reveal (§A8).
+/// without `PICKUP_DETAILS_ENCRYPTION_KEY` configured, and attempts real
+/// opens — current key, then previous — across BOTH sealed families and
+/// BOTH key classes of each (a row already under the current key AND a row
+/// still under the previous one, when such rows exist), so a wrong key or a
+/// half-rotated table whose previous key was dropped fails the boot rather
+/// than the first buyer's reveal (§A8).
 pub async fn assert_pickup_sealing_coherent(
     pool: &PgPool,
     keys: Option<&PickupKeys>,
 ) -> anyhow::Result<()> {
-    let details_row = first_details_probe_row(pool).await?;
-    let snapshot_row = first_snapshot_probe_row(pool).await?;
-    if details_row.is_none() && snapshot_row.is_none() {
+    if !sealed_rows_exist(pool).await? {
         return Ok(());
     }
     let Some(keys) = keys else {
@@ -224,8 +317,11 @@ pub async fn assert_pickup_sealing_coherent(
             "sealed pickup rows exist but {ENV_PICKUP_DETAILS_ENCRYPTION_KEY} is not configured"
         );
     };
-    for (family, row) in [("details", details_row), ("snapshot", snapshot_row)] {
-        if let Some(row) = row {
+    for (family, rows) in [
+        ("details", details_probe_rows(pool, keys).await?),
+        ("snapshot", snapshot_probe_rows(pool, keys).await?),
+    ] {
+        for row in rows {
             keys.open(&row.aad, &row.ciphertext).map_err(|_| {
                 anyhow::anyhow!(
                     "sealed pickup {family} rows do not open under the configured \
@@ -249,13 +345,15 @@ pub struct ResealProgress {
 
 const RESEAL_BATCH_SIZE: i64 = 100;
 
-/// One re-seal pass: walks a batch of rows in each sealed family, opens
-/// each under the current key (rows already rotated are skipped), opens
-/// stragglers under the PREVIOUS key and re-seals them under the current
-/// one, then counts what remains under the previous key across both
-/// families. Runs on server time through the worker runtime; rows that
-/// authenticate under NEITHER key abort the pass loudly — a wrong key must
-/// never be silently skipped.
+/// One re-seal pass: keyset-paginates EVERY row of each sealed family in
+/// primary-key order (a bare `LIMIT` batch would re-read the same already
+/// rotated rows on every pass and never reach the rows past it, so the job
+/// could never report completion), opens each under the current key (rows
+/// already rotated are skipped), opens stragglers under the PREVIOUS key
+/// and re-seals them under the current one, then counts what remains under
+/// the previous key across both families. Runs on server time through the
+/// worker runtime; rows that authenticate under NEITHER key abort the pass
+/// loudly — a wrong key must never be silently skipped.
 pub async fn reseal_previous_key_batch(
     pool: &PgPool,
     keys: &PickupKeys,
@@ -266,70 +364,118 @@ pub async fn reseal_previous_key_batch(
     }
     let mut progress = ResealProgress::default();
 
-    // Family 1: details versions.
-    let details: Vec<(String, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT aggregate_id, version, details_ciphertext FROM listing_pickup_details \
-         ORDER BY aggregate_id, version LIMIT $1",
-    )
-    .bind(RESEAL_BATCH_SIZE)
-    .fetch_all(pool)
-    .await?;
-    for (aggregate_id, version, ciphertext) in &details {
-        let aad = details_aad(aggregate_id, *version);
-        if keys.opens_under_current(&aad, ciphertext) {
-            continue;
+    // Family 1: details versions, paged on (aggregate_id, version).
+    let mut cursor: Option<(String, i64)> = None;
+    loop {
+        let details: Vec<(String, i64, Vec<u8>)> =
+            match &cursor {
+                None => sqlx::query_as(
+                    "SELECT aggregate_id, version, details_ciphertext FROM listing_pickup_details \
+                     ORDER BY aggregate_id, version LIMIT $1",
+                )
+                .bind(RESEAL_BATCH_SIZE)
+                .fetch_all(pool)
+                .await?,
+                Some((after_id, after_version)) => sqlx::query_as(
+                    "SELECT aggregate_id, version, details_ciphertext FROM listing_pickup_details \
+                     WHERE (aggregate_id, version) > ($1, $2) \
+                     ORDER BY aggregate_id, version LIMIT $3",
+                )
+                .bind(after_id)
+                .bind(after_version)
+                .bind(RESEAL_BATCH_SIZE)
+                .fetch_all(pool)
+                .await?,
+            };
+        if details.is_empty() {
+            break;
         }
-        let plaintext = keys.open_under_previous(&aad, ciphertext).map_err(|_| {
-            anyhow::anyhow!(
-                "listing_pickup_details ({aggregate_id}, v{version}) opens under neither the \
-                 current nor the previous pickup key"
+        cursor = details
+            .last()
+            .map(|(aggregate_id, version, _)| (aggregate_id.clone(), *version));
+        for (aggregate_id, version, ciphertext) in &details {
+            let aad = details_aad(aggregate_id, *version);
+            if keys.opens_under_current(&aad, ciphertext) {
+                continue;
+            }
+            let plaintext = keys.open_under_previous(&aad, ciphertext).map_err(|_| {
+                anyhow::anyhow!(
+                    "listing_pickup_details ({aggregate_id}, v{version}) opens under neither the \
+                     current nor the previous pickup key"
+                )
+            })?;
+            let resealed = keys.seal(&aad, &plaintext);
+            sqlx::query(
+                "UPDATE listing_pickup_details SET details_ciphertext = $3, updated_at = $4 \
+                 WHERE aggregate_id = $1 AND version = $2",
             )
-        })?;
-        let resealed = keys.seal(&aad, &plaintext);
-        sqlx::query(
-            "UPDATE listing_pickup_details SET details_ciphertext = $3, updated_at = $4 \
-             WHERE aggregate_id = $1 AND version = $2",
-        )
-        .bind(aggregate_id)
-        .bind(version)
-        .bind(&resealed)
-        .bind(now)
-        .execute(pool)
-        .await?;
-        progress.details_resealed += 1;
+            .bind(aggregate_id)
+            .bind(version)
+            .bind(&resealed)
+            .bind(now)
+            .execute(pool)
+            .await?;
+            progress.details_resealed += 1;
+        }
     }
 
-    // Family 2: pinned payment snapshots.
-    let snapshots: Vec<(Uuid, i32, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT order_id, line_index, version, snapshot_ciphertext FROM pickup_line_snapshots \
-         ORDER BY order_id, line_index LIMIT $1",
-    )
-    .bind(RESEAL_BATCH_SIZE)
-    .fetch_all(pool)
-    .await?;
-    for (order_id, line_index, version, ciphertext) in &snapshots {
-        let aad = snapshot_aad(*order_id, *line_index, *version);
-        if keys.opens_under_current(&aad, ciphertext) {
-            continue;
+    // Family 2: pinned payment snapshots, paged on (order_id, line_index).
+    let mut cursor: Option<(Uuid, i32)> = None;
+    loop {
+        let snapshots: Vec<(Uuid, i32, i64, Vec<u8>)> = match &cursor {
+            None => {
+                sqlx::query_as(
+                    "SELECT order_id, line_index, version, snapshot_ciphertext \
+                     FROM pickup_line_snapshots ORDER BY order_id, line_index LIMIT $1",
+                )
+                .bind(RESEAL_BATCH_SIZE)
+                .fetch_all(pool)
+                .await?
+            }
+            Some((after_order, after_line)) => {
+                sqlx::query_as(
+                    "SELECT order_id, line_index, version, snapshot_ciphertext \
+                     FROM pickup_line_snapshots \
+                     WHERE (order_id, line_index) > ($1, $2) \
+                     ORDER BY order_id, line_index LIMIT $3",
+                )
+                .bind(after_order)
+                .bind(after_line)
+                .bind(RESEAL_BATCH_SIZE)
+                .fetch_all(pool)
+                .await?
+            }
+        };
+        if snapshots.is_empty() {
+            break;
         }
-        let plaintext = keys.open_under_previous(&aad, ciphertext).map_err(|_| {
-            anyhow::anyhow!(
-                "pickup_line_snapshots ({order_id}, line {line_index}, v{version}) opens under \
-                 neither the current nor the previous pickup key"
+        cursor = snapshots
+            .last()
+            .map(|(order_id, line_index, _, _)| (*order_id, *line_index));
+        for (order_id, line_index, version, ciphertext) in &snapshots {
+            let aad = snapshot_aad(*order_id, *line_index, *version);
+            if keys.opens_under_current(&aad, ciphertext) {
+                continue;
+            }
+            let plaintext = keys.open_under_previous(&aad, ciphertext).map_err(|_| {
+                anyhow::anyhow!(
+                    "pickup_line_snapshots ({order_id}, line {line_index}, v{version}) opens \
+                     under neither the current nor the previous pickup key"
+                )
+            })?;
+            let resealed = keys.seal(&aad, &plaintext);
+            sqlx::query(
+                "UPDATE pickup_line_snapshots SET snapshot_ciphertext = $4 \
+                 WHERE order_id = $1 AND line_index = $2 AND version = $3",
             )
-        })?;
-        let resealed = keys.seal(&aad, &plaintext);
-        sqlx::query(
-            "UPDATE pickup_line_snapshots SET snapshot_ciphertext = $4 \
-             WHERE order_id = $1 AND line_index = $2 AND version = $3",
-        )
-        .bind(order_id)
-        .bind(line_index)
-        .bind(version)
-        .bind(&resealed)
-        .execute(pool)
-        .await?;
-        progress.snapshots_resealed += 1;
+            .bind(order_id)
+            .bind(line_index)
+            .bind(version)
+            .bind(&resealed)
+            .execute(pool)
+            .await?;
+            progress.snapshots_resealed += 1;
+        }
     }
 
     // The completion criterion spans BOTH families: rotation is complete

@@ -305,7 +305,12 @@ pub fn registration_payload_from_record(
             _ => None,
         })
         .collect();
-    fulfillment_methods.dedup();
+    // Set-based dedup preserving first-seen order: `Vec::dedup` only
+    // collapses ADJACENT duplicates, so `["shipping", "pickup", "shipping"]`
+    // would survive derivation and then fail registration validation,
+    // permanently blocking the sync for that listing.
+    let mut seen = std::collections::HashSet::new();
+    fulfillment_methods.retain(|method| seen.insert(*method));
     if fulfillment_methods.is_empty() {
         fulfillment_methods = marketplace_domain::commands::default_fulfillment_methods();
     }

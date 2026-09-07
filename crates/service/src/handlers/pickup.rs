@@ -162,11 +162,15 @@ async fn current_details(
 }
 
 /// Notifies the buyers of every PAID, non-terminal pickup order touching
-/// this listing (§A3: an edit or a clear is never silent). One intent per
-/// buyer per event; the outbox dedups delivery by (event id, recipient).
+/// this listing (§A3: an edit or a clear is never silent). One fan-out
+/// event per ORDER on the details aggregate: the notifications table
+/// dedups delivery on (event id, recipient) and event ids must reference
+/// real events, so each paid order gets its own `buyer_notified` event —
+/// a buyer with two paid orders on the listing receives one notification
+/// naming each order, not one naming whichever inserted first.
 async fn notify_paid_buyers(
     tx: &mut Transaction<'_, Postgres>,
-    event_id: Uuid,
+    command: &Command,
     notification_type: &str,
     listing: &crate::model::ListingRow,
     actor: &str,
@@ -183,7 +187,23 @@ async fn notify_paid_buyers(
     .bind(&listing.aggregate_id)
     .fetch_all(&mut **tx)
     .await?;
+    if buyers.is_empty() {
+        return Ok(());
+    }
+    let details_aggregate = details_aggregate_id(&listing.aggregate_id);
+    let mut revision = next_details_event_revision(tx, &details_aggregate).await?;
     for (buyer, order_id) in buyers {
+        let event_id = insert_event(
+            tx,
+            command.command_id,
+            &details_aggregate,
+            revision,
+            actor,
+            "pickup_details.buyer_notified",
+            now,
+        )
+        .await?;
+        revision += 1;
         insert_notification_intent(
             tx,
             event_id,
@@ -216,6 +236,20 @@ pub async fn set(
             Ok(listing) => listing,
             Err(failure) => return Ok(Err(failure)),
         };
+    // A listing that does not publish pickup cannot gain sealed details:
+    // no checkout could ever reach them, so the write would seal
+    // unreachable data. (`clear` is NOT gated on this — stale details must
+    // remain removable after a listing drops the pickup method.)
+    if !listing
+        .fulfillment_methods
+        .iter()
+        .any(|method| method == "pickup")
+    {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The listing does not publish pickup.",
+        )));
+    }
     let keys = pickup.expect("the gate refuses the command without keys");
     let counter = match lock_counter_cas(tx, &listing, payload.expected_version, now).await? {
         Ok(counter) => counter,
@@ -260,7 +294,7 @@ pub async fn set(
         now,
     )
     .await?;
-    notify_paid_buyers(tx, event_id, "pickup_details_updated", &listing, actor, now).await?;
+    notify_paid_buyers(tx, command, "pickup_details_updated", &listing, actor, now).await?;
 
     Ok(Ok(HandlerSuccess {
         revision: new_version,
@@ -336,7 +370,7 @@ pub async fn clear(
         now,
     )
     .await?;
-    notify_paid_buyers(tx, event_id, "pickup_details_cleared", &listing, actor, now).await?;
+    notify_paid_buyers(tx, command, "pickup_details_cleared", &listing, actor, now).await?;
 
     Ok(Ok(HandlerSuccess {
         revision: counter.last_version,
@@ -390,14 +424,22 @@ pub(crate) async fn pin_pickup_lines(
             continue;
         };
         let line_index = i32::try_from(index).expect("checkout caps lines at 50");
+        // A row that fails to open must FAIL the confirmation cleanly (the
+        // receipt transaction rolls back and the worker pass logs the
+        // error), never panic: on the worker path a panic would unwind
+        // through `run_once` and kill the whole worker loop.
         let plaintext = keys
             .open(
                 &details_aad(&aggregate_id, details.version),
                 &details.details_ciphertext,
             )
-            .unwrap_or_else(|_| {
-                panic!("pickup details sealed by this service must open under its key")
-            });
+            .map_err(|_| {
+                sqlx::Error::Protocol(format!(
+                    "sealed pickup details ({aggregate_id}, v{}) did not authenticate under \
+                     the configured pickup key",
+                    details.version
+                ))
+            })?;
         let snapshot = keys.seal(
             &snapshot_aad(order_id, line_index, details.version),
             &plaintext,
@@ -465,12 +507,47 @@ pub(crate) async fn order_has_unresolved_terms_change(
 }
 
 /// The batch variant for read projections (§A3: the order view flags
-/// "meeting point updated since you ordered"). One query per distinct
-/// listing referenced by pickup lines with a pinned version.
+/// "meeting point updated since you ordered"). One grouped query covers
+/// every distinct listing referenced by a pinned pickup line across all
+/// the orders, instead of one query per pinned line per order.
 pub async fn pickup_terms_changed_flags(
     pool: &sqlx::PgPool,
     orders: &[OrderRow],
 ) -> Result<std::collections::HashMap<Uuid, bool>, sqlx::Error> {
+    // Every distinct listing a pinned pickup line references, batched into
+    // a single current-version lookup (absent from the map means cleared).
+    let mut referenced: Vec<&str> = orders
+        .iter()
+        .filter(|order| order.fulfillment == "pickup" && order.receipt_id.is_some())
+        .filter_map(|order| order.lines.as_array())
+        .flatten()
+        .filter(|line| {
+            line.get("version_at_payment")
+                .and_then(Value::as_i64)
+                .is_some()
+        })
+        .filter_map(|line| line.get("listing_aggregate_id").and_then(Value::as_str))
+        .collect();
+    referenced.sort_unstable();
+    referenced.dedup();
+    let mut current_versions = std::collections::HashMap::new();
+    if !referenced.is_empty() {
+        let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT d.aggregate_id, MAX(d.version) FROM listing_pickup_details d \
+                LEFT JOIN listing_pickup_version_counters c \
+                  ON c.aggregate_id = d.aggregate_id \
+                WHERE d.aggregate_id = ANY($1) AND c.cleared_at IS NULL \
+                GROUP BY d.aggregate_id",
+        )
+        .bind(&referenced)
+        .fetch_all(pool)
+        .await?;
+        current_versions = rows
+            .into_iter()
+            .filter_map(|(aggregate_id, version)| version.map(|v| (aggregate_id, v)))
+            .collect();
+    }
+
     let mut flags = std::collections::HashMap::new();
     for order in orders {
         if order.fulfillment != "pickup" || order.receipt_id.is_none() {
@@ -489,18 +566,9 @@ pub async fn pickup_terms_changed_flags(
             else {
                 continue;
             };
-            let current: Option<(Option<i64>,)> = sqlx::query_as(
-                "SELECT MAX(d.version) FROM listing_pickup_details d \
-                LEFT JOIN listing_pickup_version_counters c \
-                  ON c.aggregate_id = d.aggregate_id \
-                WHERE d.aggregate_id = $1 AND c.cleared_at IS NULL",
-            )
-            .bind(aggregate_id)
-            .fetch_optional(pool)
-            .await?;
-            match current.and_then(|(version,)| version) {
+            match current_versions.get(aggregate_id) {
                 None => changed = true, // cleared after payment
-                Some(current_version) if current_version > version_at_payment => changed = true,
+                Some(&current_version) if current_version > version_at_payment => changed = true,
                 Some(_) => {}
             }
         }
@@ -726,6 +794,43 @@ pub async fn get_order_pickup_details(
             "This order was confirmed by a sandbox payment; its pickup details are never revealed.",
         );
     }
+    // An order that pinned nothing (the listing's details were never set,
+    // or were cleared before checkout) carries no meeting point: refuse
+    // rather than serve an empty line set, and NEVER stamp
+    // `first_revealed_at` — the stamp would open the bounded withdrawal
+    // window (the buyer's unilateral cancel with its reputation shielding)
+    // on an order that never had pickup terms (§A3/§A6).
+    if snapshots.is_empty() {
+        return read_error(
+            ErrorCode::InvalidState,
+            "This order carries no pinned pickup details.",
+        );
+    }
+
+    // The current version of every referenced listing, batched into one
+    // query grouped by listing: absent from the map means cleared (the
+    // pinned snapshot then stands in place of the current details, §A3).
+    let referenced: Vec<&str> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.listing_aggregate_id.as_str())
+        .collect();
+    let current_rows: Result<Vec<(String, Option<i64>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT d.aggregate_id, MAX(d.version) FROM listing_pickup_details d \
+            LEFT JOIN listing_pickup_version_counters c \
+              ON c.aggregate_id = d.aggregate_id \
+            WHERE d.aggregate_id = ANY($1) AND c.cleared_at IS NULL \
+            GROUP BY d.aggregate_id",
+    )
+    .bind(&referenced)
+    .fetch_all(&state.pool)
+    .await;
+    let current_versions: std::collections::HashMap<String, i64> = match current_rows {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|(aggregate_id, version)| version.map(|v| (aggregate_id, v)))
+            .collect(),
+        Err(error) => return internal_error("pickup current details", &error),
+    };
 
     let mut lines = Vec::with_capacity(snapshots.len());
     for snapshot in &snapshots {
@@ -754,19 +859,9 @@ pub async fn get_order_pickup_details(
         };
         // Withdrawn-by-seller: the pinned snapshot stands in place of the
         // current details when a `pickup_details.clear` removed them (§A3).
-        let current: Result<Option<(Option<i64>,)>, sqlx::Error> = sqlx::query_as(
-            "SELECT MAX(d.version) FROM listing_pickup_details d \
-                LEFT JOIN listing_pickup_version_counters c \
-                  ON c.aggregate_id = d.aggregate_id \
-                WHERE d.aggregate_id = $1 AND c.cleared_at IS NULL",
-        )
-        .bind(&snapshot.listing_aggregate_id)
-        .fetch_optional(&state.pool)
-        .await;
-        let current_version = match current {
-            Ok(row) => row.and_then(|(version,)| version),
-            Err(error) => return internal_error("pickup current details", &error),
-        };
+        let current_version = current_versions
+            .get(&snapshot.listing_aggregate_id)
+            .copied();
         lines.push(json!({
             "line_index": snapshot.line_index,
             "listing_aggregate_id": snapshot.listing_aggregate_id,

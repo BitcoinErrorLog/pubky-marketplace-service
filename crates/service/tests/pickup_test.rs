@@ -2868,3 +2868,628 @@ async fn boot_probe_and_two_family_rotation(pool: PgPool) {
     assert_eq!(progress.details_resealed + progress.snapshots_resealed, 0);
     assert_eq!(progress.remaining_under_previous, 0);
 }
+
+// Rotation past the first batch: 130 details rows sealed under the previous
+// key must ALL rotate in one job run — a first-100-only batch would re-read
+// the same rotated rows on every pass and never report completion.
+#[sqlx::test]
+async fn rotation_walks_past_the_first_batch_and_reports_completion(pool: PgPool) {
+    let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
+    let current = common::test_pickup_keys();
+    let previous_only = PickupKeys::from_hex(common::TEST_PICKUP_PREVIOUS_ENCRYPTION_KEY, None)
+        .expect("previous key parses");
+    let rotated = common::test_pickup_keys_with_previous();
+    let aggregate = listing_agg(&"s".repeat(52), "boots_01");
+
+    // 130 rows in ONE family, all sealed under the previous key.
+    for version in 1..=130i64 {
+        let ciphertext = previous_only.seal(
+            &pickup::details_aad(&aggregate, version),
+            format!("spot-{version}").as_bytes(),
+        );
+        sqlx::query(
+            "INSERT INTO listing_pickup_details (aggregate_id, seller_pubky, version, \
+             details_ciphertext, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $5)",
+        )
+        .bind(&aggregate)
+        .bind("s".repeat(52))
+        .bind(version)
+        .bind(&ciphertext)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed details");
+    }
+
+    // One run of the re-seal job rotates ALL of them and reports completion.
+    let progress = pickup::reseal_previous_key_batch(&pool, &rotated, now)
+        .await
+        .expect("re-seal runs");
+    assert_eq!(progress.details_resealed, 130, "every row rotates");
+    assert_eq!(
+        progress.remaining_under_previous, 0,
+        "rotation completes past row 100"
+    );
+    // Every row opens under the current key alone, with its own plaintext.
+    let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, details_ciphertext FROM listing_pickup_details ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("rows");
+    assert_eq!(rows.len(), 130);
+    for (version, ciphertext) in rows {
+        let plaintext = current
+            .open(&pickup::details_aad(&aggregate, version), &ciphertext)
+            .expect("rotated row opens under the current key");
+        assert_eq!(plaintext, format!("spot-{version}").into_bytes());
+    }
+    // A second pass is a no-op.
+    let progress = pickup::reseal_previous_key_batch(&pool, &rotated, now)
+        .await
+        .expect("re-seal runs");
+    assert_eq!(progress.details_resealed, 0);
+    assert_eq!(progress.remaining_under_previous, 0);
+}
+
+// The boot probe must catch a HALF-rotated table whose previous key was
+// dropped: probing only the first row per family would sample the rotated
+// row and pass, leaving the straggler to fail the first buyer's reveal.
+#[sqlx::test]
+async fn boot_probe_catches_a_half_rotated_table_with_the_previous_key_dropped(pool: PgPool) {
+    let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
+    let current = common::test_pickup_keys();
+    let previous_only = PickupKeys::from_hex(common::TEST_PICKUP_PREVIOUS_ENCRYPTION_KEY, None)
+        .expect("previous key parses");
+    let rotated = common::test_pickup_keys_with_previous();
+    let seller = "s".repeat(52);
+
+    // The row that sorts FIRST opens under the current key; the later row
+    // is still sealed under the previous one.
+    for (listing_id, keys) in [("aaa", current.clone()), ("zzz", Arc::new(previous_only))] {
+        let aggregate = listing_agg(&seller, listing_id);
+        let ciphertext = keys.seal(&pickup::details_aad(&aggregate, 1), b"spot");
+        sqlx::query(
+            "INSERT INTO listing_pickup_details (aggregate_id, seller_pubky, version, \
+             details_ciphertext, created_at, updated_at) VALUES ($1, $2, 1, $3, $4, $4)",
+        )
+        .bind(&aggregate)
+        .bind(&seller)
+        .bind(&ciphertext)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed details");
+    }
+
+    // The previous key dropped from the configuration: the boot probe must
+    // FAIL even though the family's first row opens under the current key.
+    pickup::assert_pickup_sealing_coherent(&pool, Some(&current))
+        .await
+        .expect_err("a straggler under the dropped previous key must fail the boot");
+    // The dual-key window still boots: both key classes open.
+    pickup::assert_pickup_sealing_coherent(&pool, Some(&rotated))
+        .await
+        .expect("the dual-key window opens both key classes");
+}
+
+// An order that pinned NOTHING (the listing's details were cleared before
+// checkout) has no meeting point: the reveal is a typed refusal and never
+// stamps first_revealed_at, so the buyer's cancel stays on the ordinary
+// path while the seller can still complete the handover.
+#[sqlx::test]
+async fn reveal_refuses_an_order_that_pinned_nothing(pool: PgPool) {
+    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+
+    // One pickup listing whose details are set and CLEARED before checkout.
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &register_pickup_listing(&seller.pubky, "boots_01", 5, 0x601),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &set_details(&seller.pubky, "boots_01", 0, SPOT, 0x602),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &clear_details(&seller.pubky, "boots_01", 1, 0x603),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Two pickup orders on the cleared listing, both paid via Locks.
+    let mut orders = Vec::new();
+    for (index, checkout_id) in [
+        "00000000-0000-4000-9000-000000000604",
+        "00000000-0000-4000-9000-000000000605",
+    ]
+    .iter()
+    .enumerate()
+    {
+        // Each confirmed order bumps the listing's server revision.
+        let (listing_revision,): (i64,) =
+            sqlx::query_as("SELECT server_revision FROM listings WHERE aggregate_id = $1")
+                .bind(listing_agg(&seller.pubky, "boots_01"))
+                .fetch_one(&app.pool)
+                .await
+                .expect("listing");
+        let (status, body) = execute(
+            &app,
+            &buyer.token,
+            &checkout_lines(
+                vec![line(&seller.pubky, "boots_01", listing_revision, "pickup")],
+                false,
+                checkout_id,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
+        let order = PickupOrder {
+            order_id: body["result"]["orders"][0]["id"]
+                .as_str()
+                .expect("order id")
+                .to_string(),
+            payment_id: body["result"]["payments"][0]["id"]
+                .as_str()
+                .expect("payment id")
+                .to_string(),
+        };
+        let bundle = [TEST_BUNDLE_ID, BUNDLE_2][index];
+        confirm_via_locks(
+            &app,
+            &fake,
+            &buyer,
+            &order,
+            &seller,
+            bundle,
+            0x606 + index as u64,
+        )
+        .await;
+        orders.push(order);
+    }
+
+    // The reveal is refused with the typed error — no empty 200 — and the
+    // withdrawal stamp is never written.
+    let (status, body) = reveal(&app, &buyer.token, &orders[0].order_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("This order carries no pinned pickup details.")
+    );
+    let (stamped,): (Option<DateTime<Utc>>,) =
+        sqlx::query_as("SELECT first_revealed_at FROM orders WHERE id = $1::uuid")
+            .bind(&orders[0].order_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("order row");
+    assert!(
+        stamped.is_none(),
+        "no first_revealed_at without a pinned snapshot"
+    );
+
+    // The buyer's cancel_request follows the NORMAL path (cancel_requested,
+    // awaiting the seller) — never the unilateral terms-change exit.
+    let (_, revision) = order_row(&app.pool, &orders[0].order_id).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &order_command(
+            "order.cancel_request",
+            &orders[0].order_id,
+            revision,
+            json!({ "reason": "changed my mind" }),
+            0x608,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["order"]["state"], json!("cancel_requested"));
+    assert_eq!(
+        count(
+            &app.pool,
+            &format!(
+                "SELECT COUNT(*) FROM events WHERE aggregate_id = 'order:{}' \
+                 AND kind = 'order.cancelled_terms_change'",
+                orders[0].order_id
+            )
+        )
+        .await,
+        0,
+        "no terms-change cancel on an order that never had terms"
+    );
+
+    // The seller can still complete the handover on the second order: no
+    // pinned terms means no unresolved terms change blocks the confirm.
+    let (_, revision) = order_row(&app.pool, &orders[1].order_id).await;
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &order_command(
+            "fulfillment.confirm_pickup",
+            &orders[1].order_id,
+            revision,
+            json!({}),
+            0x609,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["order"]["state"], json!("delivered"));
+}
+
+// A details row that fails to open (sealed under an unknown key) must FAIL
+// the confirmation cleanly — receipt transaction rolled back, no panic.
+#[sqlx::test]
+async fn confirm_order_fails_cleanly_on_an_unopenable_details_row(pool: PgPool) {
+    // Sandbox on (so payment.sandbox_advance confirms) with pickup keys
+    // configured; the corrupted row is seeded directly, as an operator
+    // mishap would leave it.
+    let app = test_app_with_pickup(pool, true).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pickup_order(
+        &app,
+        &seller,
+        &buyer,
+        "boots_01",
+        0x701,
+        "00000000-0000-4000-9000-000000000701",
+    )
+    .await;
+
+    // Seed details v1 sealed under an UNKNOWN key, with its counter row.
+    let aggregate = listing_agg(&seller.pubky, "boots_01");
+    let unknown = PickupKeys::from_hex(
+        "9999999999999999999999999999999999999999999999999999999999999999",
+        None,
+    )
+    .expect("unknown key parses");
+    let ciphertext = unknown.seal(&pickup::details_aad(&aggregate, 1), SPOT.as_bytes());
+    sqlx::query(
+        "INSERT INTO listing_pickup_version_counters (aggregate_id, seller_pubky, last_version, \
+         updated_at) VALUES ($1, $2, 1, $3)",
+    )
+    .bind(&aggregate)
+    .bind(&seller.pubky)
+    .bind(app.clock.now())
+    .execute(&app.pool)
+    .await
+    .expect("counter row");
+    sqlx::query(
+        "INSERT INTO listing_pickup_details (aggregate_id, seller_pubky, version, \
+         details_ciphertext, created_at, updated_at) VALUES ($1, $2, 1, $3, $4, $4)",
+    )
+    .bind(&aggregate)
+    .bind(&seller.pubky)
+    .bind(&ciphertext)
+    .bind(app.clock.now())
+    .execute(&app.pool)
+    .await
+    .expect("details row");
+
+    // The confirmation returns an error — no panic — and rolls back.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::payment_command(&order.payment_id, 1, "confirmed", 1, 0x702),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"]["code"], json!("INTERNAL"));
+    let (state, receipt): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state, receipt_id FROM orders WHERE id = $1::uuid")
+            .bind(&order.order_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("order row");
+    assert_eq!(state, "pending_payment", "the confirmation rolled back");
+    assert!(receipt.is_none(), "no receipt was issued");
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM pickup_line_snapshots").await,
+        0,
+        "no snapshot pinned"
+    );
+}
+
+// The worker path: one unopenable details row fails the pass LOUDLY (the
+// worker loop logs and continues) instead of panicking the loop dead; once
+// the row is repaired the next pass confirms the payment.
+#[sqlx::test]
+async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
+    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pickup_order(
+        &app,
+        &seller,
+        &buyer,
+        "boots_01",
+        0x801,
+        "00000000-0000-4000-9000-000000000801",
+    )
+    .await;
+
+    // The same operator-mishap seed: details v1 sealed under an unknown key.
+    let aggregate = listing_agg(&seller.pubky, "boots_01");
+    let unknown = PickupKeys::from_hex(
+        "9999999999999999999999999999999999999999999999999999999999999999",
+        None,
+    )
+    .expect("unknown key parses");
+    let ciphertext = unknown.seal(&pickup::details_aad(&aggregate, 1), SPOT.as_bytes());
+    sqlx::query(
+        "INSERT INTO listing_pickup_version_counters (aggregate_id, seller_pubky, last_version, \
+         updated_at) VALUES ($1, $2, 1, $3)",
+    )
+    .bind(&aggregate)
+    .bind(&seller.pubky)
+    .bind(app.clock.now())
+    .execute(&app.pool)
+    .await
+    .expect("counter row");
+    sqlx::query(
+        "INSERT INTO listing_pickup_details (aggregate_id, seller_pubky, version, \
+         details_ciphertext, created_at, updated_at) VALUES ($1, $2, 1, $3, $4, $4)",
+    )
+    .bind(&aggregate)
+    .bind(&seller.pubky)
+    .bind(&ciphertext)
+    .bind(app.clock.now())
+    .execute(&app.pool)
+    .await
+    .expect("details row");
+
+    // A completed Locks outcome arrives; the pass fails on the unopenable
+    // row — an Err the worker loop logs, NOT a panic that kills the loop.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::register_locks_command(
+            &order.payment_id,
+            1,
+            TEST_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            0x802,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+    );
+    let result = run_once(&app.state, Uuid::new_v4(), app.clock.now()).await;
+    assert!(
+        result.is_err(),
+        "the pass reports the unopenable row instead of panicking"
+    );
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM orders WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("order row");
+    assert_eq!(state, "pending_payment", "the confirmation rolled back");
+
+    // Repair the row (re-seal under the configured key) and let the next
+    // pass — after the claim and lease deferrals elapse — confirm it.
+    let repaired =
+        common::test_pickup_keys().seal(&pickup::details_aad(&aggregate, 1), SPOT.as_bytes());
+    sqlx::query(
+        "UPDATE listing_pickup_details SET details_ciphertext = $2 WHERE aggregate_id = $1",
+    )
+    .bind(&aggregate)
+    .bind(&repaired)
+    .execute(&app.pool)
+    .await
+    .expect("repair details row");
+    app.clock
+        .set(app.clock.now() + chrono::Duration::seconds(61));
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("the worker loop continues after the failed pass");
+    assert_eq!(summary.locks_completions_applied, 1, "payment confirmed");
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM pickup_line_snapshots").await,
+        1,
+        "the repaired row pins on the next pass"
+    );
+}
+
+// One buyer with TWO paid orders on the same listing gets one notification
+// per order on a details update — the notifications dedup on (event id,
+// recipient) must never collapse them.
+#[sqlx::test]
+async fn details_update_notifies_each_paid_order_of_the_same_buyer(pool: PgPool) {
+    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &register_pickup_listing(&seller.pubky, "boots_01", 5, 0x901),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &set_details(&seller.pubky, "boots_01", 0, SPOT, 0x902),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut orders = Vec::new();
+    for (index, checkout_id) in [
+        "00000000-0000-4000-9000-000000000903",
+        "00000000-0000-4000-9000-000000000904",
+    ]
+    .iter()
+    .enumerate()
+    {
+        // Each confirmed order bumps the listing's server revision.
+        let (listing_revision,): (i64,) =
+            sqlx::query_as("SELECT server_revision FROM listings WHERE aggregate_id = $1")
+                .bind(listing_agg(&seller.pubky, "boots_01"))
+                .fetch_one(&app.pool)
+                .await
+                .expect("listing");
+        let (status, body) = execute(
+            &app,
+            &buyer.token,
+            &checkout_lines(
+                vec![line(&seller.pubky, "boots_01", listing_revision, "pickup")],
+                false,
+                checkout_id,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
+        let order = PickupOrder {
+            order_id: body["result"]["orders"][0]["id"]
+                .as_str()
+                .expect("order id")
+                .to_string(),
+            payment_id: body["result"]["payments"][0]["id"]
+                .as_str()
+                .expect("payment id")
+                .to_string(),
+        };
+        let bundle = [TEST_BUNDLE_ID, BUNDLE_2][index];
+        confirm_via_locks(
+            &app,
+            &fake,
+            &buyer,
+            &order,
+            &seller,
+            bundle,
+            0x905 + index as u64,
+        )
+        .await;
+        orders.push(order);
+    }
+
+    // One details edit; the worker delivers the outbox intents.
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &set_details(&seller.pubky, "boots_01", 1, SPOT_EDITED, 0x907),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("worker pass");
+    let mut notified: Vec<(String,)> = sqlx::query_as(
+        "SELECT aggregate_id FROM notifications \
+         WHERE type = 'pickup_details_updated' AND recipient_pubky = $1 ORDER BY aggregate_id",
+    )
+    .bind(&buyer.pubky)
+    .fetch_all(&app.pool)
+    .await
+    .expect("notifications");
+    notified.sort();
+    let mut expected: Vec<String> = orders
+        .iter()
+        .map(|order| format!("order:{}", order.order_id))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        notified.iter().map(|row| &row.0).collect::<Vec<_>>(),
+        expected.iter().collect::<Vec<_>>(),
+        "one notification per paid order"
+    );
+}
+
+// A sync record repeating a fulfillment method non-adjacently
+// (["shipping", "pickup", "shipping"]) must converge to the unique
+// first-seen methods — adjacent-only dedup would fail registration
+// validation and block the sync forever.
+#[sqlx::test]
+async fn sync_dedups_non_adjacent_fulfillment_methods(pool: PgPool) {
+    let homeserver = spawn_fake_homeserver().await;
+    let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let state = AppState::new(pool.clone(), clock.clone(), common::config_durable())
+        .with_homeserver(Some(homeserver.client()))
+        .with_pickup(Some(common::test_pickup_keys()));
+    let app = TestApp {
+        router: build_router(state.clone()),
+        pool: pool.clone(),
+        clock,
+        state,
+    };
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+
+    let record = json!({
+        "title": "Boots",
+        "revision": 1,
+        "media": [{ "id": "m1", "contentHash": "a".repeat(64) }],
+        "variants": [{ "id": "v1", "quantity": 3, "enabled": true }],
+        "sale": { "format": "fixed_price", "unitPrice": { "amountMinor": 12500, "currency": "USD", "exponent": 2 } },
+        "fulfillmentMethods": ["shipping", "pickup", "shipping"],
+    });
+    homeserver.put_record(&seller.pubky, "boots_01", record);
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::sync_command(&seller.pubky, "boots_01", 0xa01),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["listing"]["fulfillment_methods"],
+        json!(["shipping", "pickup"]),
+        "non-adjacent duplicates collapse, first-seen order preserved"
+    );
+}
+
+// `pickup_details.set` on a listing that does not publish pickup is refused
+// (the details would be unreachable); `clear` stays allowed so stale
+// details remain removable.
+#[sqlx::test]
+async fn set_requires_the_listing_to_publish_pickup(pool: PgPool) {
+    let app = test_app_with_pickup(pool, false).await;
+    let seller = new_actor(&app).await;
+
+    // The default registration publishes shipping only.
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &set_details(&seller.pubky, "boots_01", 0, SPOT, 0xb01),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The listing does not publish pickup.")
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM listing_pickup_details").await,
+        0,
+        "nothing sealed for a non-pickup listing"
+    );
+
+    // Clearing stale data stays possible on the same listing.
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &clear_details(&seller.pubky, "boots_01", 0, 0xb02),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
