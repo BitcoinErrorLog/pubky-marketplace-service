@@ -2932,6 +2932,120 @@ async fn rotation_walks_past_the_first_batch_and_reports_completion(pool: PgPool
     assert_eq!(progress.remaining_under_previous, 0);
 }
 
+// A row that opens under NEITHER key (an operator-mishap ciphertext) must
+// not stall the rotation: the pass records its identity, rotates every
+// other row, and returns an error naming the unopenable count — no abort
+// of the family, no spin. The re-seal also never touches `updated_at`
+// (the owner-read "details last edited" fact): a key rotation is not an
+// edit.
+#[sqlx::test]
+async fn reseal_skips_an_unopenable_row_and_reports_it(pool: PgPool) {
+    let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
+    let sealed_at = now - chrono::Duration::days(30);
+    let current = common::test_pickup_keys();
+    let previous_only = PickupKeys::from_hex(common::TEST_PICKUP_PREVIOUS_ENCRYPTION_KEY, None)
+        .expect("previous key parses");
+    let unknown = PickupKeys::from_hex(
+        "9999999999999999999999999999999999999999999999999999999999999999",
+        None,
+    )
+    .expect("unknown key parses");
+    let rotated = common::test_pickup_keys_with_previous();
+    let aggregate = listing_agg(&"s".repeat(52), "boots_01");
+
+    // Three rows under the previous key; the MIDDLE one is then corrupted
+    // (re-sealed under an unknown key, as an operator mishap leaves it).
+    for version in 1..=3i64 {
+        let ciphertext = previous_only.seal(
+            &pickup::details_aad(&aggregate, version),
+            format!("spot-{version}").as_bytes(),
+        );
+        sqlx::query(
+            "INSERT INTO listing_pickup_details (aggregate_id, seller_pubky, version, \
+             details_ciphertext, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $5)",
+        )
+        .bind(&aggregate)
+        .bind("s".repeat(52))
+        .bind(version)
+        .bind(&ciphertext)
+        .bind(sealed_at)
+        .execute(&pool)
+        .await
+        .expect("seed details");
+    }
+    let corrupted = unknown.seal(&pickup::details_aad(&aggregate, 2), b"spot-2");
+    sqlx::query(
+        "UPDATE listing_pickup_details SET details_ciphertext = $3 \
+         WHERE aggregate_id = $1 AND version = $2",
+    )
+    .bind(&aggregate)
+    .bind(2i64)
+    .bind(&corrupted)
+    .execute(&pool)
+    .await
+    .expect("corrupt the middle row");
+
+    // The pass rotates the two healthy rows, skips the corrupt one, and
+    // returns an error naming exactly 1 unopenable row.
+    let error = pickup::reseal_previous_key_batch(&pool, &rotated, now)
+        .await
+        .expect_err("the pass reports the unopenable row");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains('1') && message.contains("open under neither"),
+        "the error names the unopenable count: {message}"
+    );
+    for (version, expected) in [(1i64, "spot-1"), (3, "spot-3")] {
+        let (stored,): (Vec<u8>,) = sqlx::query_as(
+            "SELECT details_ciphertext FROM listing_pickup_details \
+             WHERE aggregate_id = $1 AND version = $2",
+        )
+        .bind(&aggregate)
+        .bind(version)
+        .fetch_one(&pool)
+        .await
+        .expect("row");
+        assert_eq!(
+            current
+                .open(&pickup::details_aad(&aggregate, version), &stored)
+                .expect("rotated row opens under the current key"),
+            expected.as_bytes(),
+            "the healthy rows rotated past the corrupt one"
+        );
+    }
+    let (untouched,): (DateTime<Utc>,) = sqlx::query_as(
+        "SELECT updated_at FROM listing_pickup_details WHERE aggregate_id = $1 AND version = 1",
+    )
+    .bind(&aggregate)
+    .fetch_one(&pool)
+    .await
+    .expect("row");
+    assert_eq!(
+        untouched, sealed_at,
+        "the re-seal does not touch the owner-read updated_at"
+    );
+
+    // Repair the corrupt row (re-seal under the previous key, as an
+    // operator would) and the next pass completes the rotation — the job
+    // terminates instead of spinning on the corrupt row.
+    let repaired = previous_only.seal(&pickup::details_aad(&aggregate, 2), b"spot-2");
+    sqlx::query(
+        "UPDATE listing_pickup_details SET details_ciphertext = $3 \
+         WHERE aggregate_id = $1 AND version = $2",
+    )
+    .bind(&aggregate)
+    .bind(2i64)
+    .bind(&repaired)
+    .execute(&pool)
+    .await
+    .expect("repair the middle row");
+    let progress = pickup::reseal_previous_key_batch(&pool, &rotated, now)
+        .await
+        .expect("the pass completes after the repair");
+    assert_eq!(progress.details_resealed, 1);
+    assert_eq!(progress.remaining_under_previous, 0, "rotation complete");
+}
+
 // The boot probe must catch a HALF-rotated table whose previous key was
 // dropped: probing only the first row per family would sample the rotated
 // row and pass, leaving the straggler to fail the first buyer's reveal.

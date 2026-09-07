@@ -390,19 +390,35 @@ const RESEAL_BATCH_SIZE: i64 = 100;
 /// rotated rows on every pass and never reach the rows past it, so the job
 /// could never report completion), opens each under the current key (rows
 /// already rotated are skipped), opens stragglers under the PREVIOUS key
-/// and re-seals them under the current one, then counts what remains under
-/// the previous key across both families. Runs on server time through the
-/// worker runtime; rows that authenticate under NEITHER key abort the pass
-/// loudly — a wrong key must never be silently skipped.
+/// and re-seals them under the current one. Runs on server time through
+/// the worker runtime.
+///
+/// A row that authenticates under NEITHER key no longer aborts the pass:
+/// its identity (aggregate id/version or order id/line index — never
+/// plaintext) is recorded, the pass continues over the remaining rows, and
+/// the pass returns an error at the end naming how many rows were
+/// unopenable — a wrong key must never be silently skipped, but one
+/// corrupt row must not stall the rotation of every row after it.
+///
+/// The completion criterion is folded into the same streamed pass rather
+/// than a second fetch-all sweep: the pass already classifies every row of
+/// both families exactly once, so `remaining_under_previous` is the rows
+/// that failed the current-key open minus the rows this pass re-sealed —
+/// unopenable rows are NOT counted as "under previous" (they open under
+/// neither key). Rotation is complete only when it reaches zero (§A1).
 pub async fn reseal_previous_key_batch(
     pool: &PgPool,
     keys: &PickupKeys,
-    now: DateTime<Utc>,
+    _now: DateTime<Utc>,
 ) -> anyhow::Result<ResealProgress> {
     if !keys.has_previous() {
         return Ok(ResealProgress::default());
     }
     let mut progress = ResealProgress::default();
+    // Rows that failed the current-key open, per family, so the completion
+    // count can be derived without re-opening a single ciphertext.
+    let mut failed_current = 0u64;
+    let mut unopenable = 0u64;
 
     // Family 1: details versions, paged on (aggregate_id, version).
     let mut cursor: Option<(String, i64)> = None;
@@ -438,21 +454,31 @@ pub async fn reseal_previous_key_batch(
             if keys.opens_under_current(&aad, ciphertext) {
                 continue;
             }
-            let plaintext = keys.open_under_previous(&aad, ciphertext).map_err(|_| {
-                anyhow::anyhow!(
-                    "listing_pickup_details ({aggregate_id}, v{version}) opens under neither the \
-                     current nor the previous pickup key"
-                )
-            })?;
+            failed_current += 1;
+            let plaintext = match keys.open_under_previous(&aad, ciphertext) {
+                Ok(plaintext) => plaintext,
+                Err(_) => {
+                    unopenable += 1;
+                    tracing::error!(
+                        aggregate_id = %aggregate_id,
+                        version = version,
+                        "listing_pickup_details row opens under neither the current nor the \
+                         previous pickup key; skipping it and continuing the re-seal pass"
+                    );
+                    continue;
+                }
+            };
             let resealed = keys.seal(&aad, &plaintext);
+            // The re-seal deliberately does NOT touch `updated_at`: that
+            // timestamp is the owner-read "details last edited" fact, and a
+            // key rotation is not an edit.
             sqlx::query(
-                "UPDATE listing_pickup_details SET details_ciphertext = $3, updated_at = $4 \
+                "UPDATE listing_pickup_details SET details_ciphertext = $3 \
                  WHERE aggregate_id = $1 AND version = $2",
             )
             .bind(aggregate_id)
             .bind(version)
             .bind(&resealed)
-            .bind(now)
             .execute(pool)
             .await?;
             progress.details_resealed += 1;
@@ -497,12 +523,21 @@ pub async fn reseal_previous_key_batch(
             if keys.opens_under_current(&aad, ciphertext) {
                 continue;
             }
-            let plaintext = keys.open_under_previous(&aad, ciphertext).map_err(|_| {
-                anyhow::anyhow!(
-                    "pickup_line_snapshots ({order_id}, line {line_index}, v{version}) opens \
-                     under neither the current nor the previous pickup key"
-                )
-            })?;
+            failed_current += 1;
+            let plaintext = match keys.open_under_previous(&aad, ciphertext) {
+                Ok(plaintext) => plaintext,
+                Err(_) => {
+                    unopenable += 1;
+                    tracing::error!(
+                        order_id = %order_id,
+                        line_index = line_index,
+                        version = version,
+                        "pickup_line_snapshots row opens under neither the current nor the \
+                         previous pickup key; skipping it and continuing the re-seal pass"
+                    );
+                    continue;
+                }
+            };
             let resealed = keys.seal(&aad, &plaintext);
             sqlx::query(
                 "UPDATE pickup_line_snapshots SET snapshot_ciphertext = $4 \
@@ -520,31 +555,19 @@ pub async fn reseal_previous_key_batch(
 
     // The completion criterion spans BOTH families: rotation is complete
     // only when zero rows in either family remain sealed under the
-    // previous key. The probe opens are cheap (AEAD over small payloads)
-    // and the job only runs while a previous key is configured.
-    let mut remaining = 0u64;
-    for (aggregate_id, version, ciphertext) in sqlx::query_as::<_, (String, i64, Vec<u8>)>(
-        "SELECT aggregate_id, version, details_ciphertext FROM listing_pickup_details",
-    )
-    .fetch_all(pool)
-    .await?
-    {
-        if !keys.opens_under_current(&details_aad(&aggregate_id, version), &ciphertext) {
-            remaining += 1;
-        }
+    // previous key. Every row that failed the current-key open was either
+    // re-sealed above (no longer under previous) or recorded unopenable
+    // (under NEITHER key — not counted here); seals only ever write the
+    // current key, so nothing new enters the previous class mid-pass.
+    progress.remaining_under_previous = failed_current
+        .saturating_sub(progress.details_resealed + progress.snapshots_resealed)
+        .saturating_sub(unopenable);
+    if unopenable > 0 {
+        anyhow::bail!(
+            "{unopenable} sealed pickup row(s) open under neither the current nor the previous \
+             pickup key (their identities were logged); the rest of the pass completed"
+        );
     }
-    for (order_id, line_index, version, ciphertext) in
-        sqlx::query_as::<_, (Uuid, i32, i64, Vec<u8>)>(
-            "SELECT order_id, line_index, version, snapshot_ciphertext FROM pickup_line_snapshots",
-        )
-        .fetch_all(pool)
-        .await?
-    {
-        if !keys.opens_under_current(&snapshot_aad(order_id, line_index, version), &ciphertext) {
-            remaining += 1;
-        }
-    }
-    progress.remaining_under_previous = remaining;
     Ok(progress)
 }
 
