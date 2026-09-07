@@ -58,6 +58,15 @@ ALTER TABLE orders
 ALTER TABLE orders
     ADD COLUMN IF NOT EXISTS first_revealed_at TIMESTAMPTZ;
 
+-- The checkout split key becomes (seller, fulfillment) (§A2): one order
+-- per seller group per fulfillment choice, so the one-order-per-checkout
+-- uniqueness follows the new key. Pre-existing rows all backfilled to
+-- 'shipping', so the widened key preserves their invariant exactly.
+DROP INDEX IF EXISTS orders_one_per_checkout_seller;
+CREATE UNIQUE INDEX IF NOT EXISTS orders_one_per_checkout_seller_fulfillment
+    ON orders (checkout_command_id, seller_pubky, fulfillment)
+    WHERE checkout_command_id IS NOT NULL;
+
 -- === Order state vocabulary: ready_for_pickup =============================
 -- Drop-then-create keeps this idempotent on a partially applied deploy;
 -- existing rows are unaffected (none can hold the new state yet).
@@ -93,11 +102,16 @@ CREATE TABLE IF NOT EXISTS listing_pickup_details (
 -- The per-listing monotonic version counter in its OWN row (§A3): it
 -- survives `pickup_details.clear`, so versions never restart and a
 -- delete-and-recreate cannot fool terms-change detection. `last_version`
--- is 0 when no details were ever set.
+-- is 0 when no details were ever set. `cleared_at` marks the cleared
+-- state: versions RETAINED for paid, non-terminal orders after a clear are
+-- dispute exhibits, not current details — the owner read returns "no
+-- details" and terms-change detection sees the clear, until the next
+-- `pickup_details.set` resets the marker.
 CREATE TABLE IF NOT EXISTS listing_pickup_version_counters (
     aggregate_id TEXT PRIMARY KEY,
     seller_pubky TEXT NOT NULL,
     last_version BIGINT NOT NULL DEFAULT 0 CHECK (last_version >= 0),
+    cleared_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL
 );
 

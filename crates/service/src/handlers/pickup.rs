@@ -105,7 +105,7 @@ async fn lock_counter_cas(
     .execute(&mut **tx)
     .await?;
     let counter: PickupVersionCounterRow = sqlx::query_as(
-        "SELECT aggregate_id, seller_pubky, last_version, updated_at \
+        "SELECT aggregate_id, seller_pubky, last_version, cleared_at, updated_at \
          FROM listing_pickup_version_counters WHERE aggregate_id = $1 FOR UPDATE",
     )
     .bind(&listing.aggregate_id)
@@ -121,16 +121,40 @@ async fn lock_counter_cas(
     Ok(Ok(counter))
 }
 
-/// The current details version of a listing: the maximum version still
-/// present (after a `clear`, none — the counter alone survives).
+/// The next event revision for the details aggregate. Details versions and
+/// clear events share one per-aggregate revision sequence, but `clear` does
+/// not issue a version — so the event revision is derived from the event
+/// log itself, monotonic across sets and clears alike. Commands touching
+/// one listing serialize through its row lock, so the read-then-write is
+/// race-free.
+async fn next_details_event_revision(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: &str,
+) -> Result<i64, sqlx::Error> {
+    let (next,): (i64,) =
+        sqlx::query_as("SELECT COALESCE(MAX(revision), 0) + 1 FROM events WHERE aggregate_id = $1")
+            .bind(aggregate_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(next)
+}
+
+/// The current details of a listing: the maximum version still present —
+/// or NOTHING while the counter carries the cleared marker, since versions
+/// retained after a `clear` are dispute exhibits, not current details (the
+/// owner read returns "no details" and terms-change detection sees the
+/// clear).
 async fn current_details(
     tx: &mut Transaction<'_, Postgres>,
     aggregate_id: &str,
 ) -> Result<Option<PickupDetailsRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT aggregate_id, seller_pubky, version, details_ciphertext, created_at, updated_at \
-         FROM listing_pickup_details WHERE aggregate_id = $1 \
-         ORDER BY version DESC LIMIT 1",
+        "SELECT d.aggregate_id, d.seller_pubky, d.version, d.details_ciphertext, \
+                d.created_at, d.updated_at \
+         FROM listing_pickup_details d \
+         LEFT JOIN listing_pickup_version_counters c ON c.aggregate_id = d.aggregate_id \
+         WHERE d.aggregate_id = $1 AND c.cleared_at IS NULL \
+         ORDER BY d.version DESC LIMIT 1",
     )
     .bind(aggregate_id)
     .fetch_optional(&mut **tx)
@@ -187,12 +211,11 @@ pub async fn set(
     sandbox_payments_enabled: bool,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let listing = match guard_details_command(tx, actor, command, pickup, sandbox_payments_enabled)
-        .await?
-    {
-        Ok(listing) => listing,
-        Err(failure) => return Ok(Err(failure)),
-    };
+    let listing =
+        match guard_details_command(tx, actor, command, pickup, sandbox_payments_enabled).await? {
+            Ok(listing) => listing,
+            Err(failure) => return Ok(Err(failure)),
+        };
     let keys = pickup.expect("the gate refuses the command without keys");
     let counter = match lock_counter_cas(tx, &listing, payload.expected_version, now).await? {
         Ok(counter) => counter,
@@ -216,8 +239,8 @@ pub async fn set(
     .execute(&mut **tx)
     .await?;
     sqlx::query(
-        "UPDATE listing_pickup_version_counters SET last_version = $2, updated_at = $3 \
-         WHERE aggregate_id = $1",
+        "UPDATE listing_pickup_version_counters SET last_version = $2, cleared_at = NULL, \
+         updated_at = $3 WHERE aggregate_id = $1",
     )
     .bind(&listing.aggregate_id)
     .bind(new_version)
@@ -225,25 +248,19 @@ pub async fn set(
     .execute(&mut **tx)
     .await?;
 
+    let details_aggregate = details_aggregate_id(&listing.aggregate_id);
+    let event_revision = next_details_event_revision(tx, &details_aggregate).await?;
     let event_id = insert_event(
         tx,
         command.command_id,
-        &details_aggregate_id(&listing.aggregate_id),
-        new_version,
+        &details_aggregate,
+        event_revision,
         actor,
         "pickup_details.set",
         now,
     )
     .await?;
-    notify_paid_buyers(
-        tx,
-        event_id,
-        "pickup_details_updated",
-        &listing,
-        actor,
-        now,
-    )
-    .await?;
+    notify_paid_buyers(tx, event_id, "pickup_details_updated", &listing, actor, now).await?;
 
     Ok(Ok(HandlerSuccess {
         revision: new_version,
@@ -271,12 +288,11 @@ pub async fn clear(
     sandbox_payments_enabled: bool,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let listing = match guard_details_command(tx, actor, command, pickup, sandbox_payments_enabled)
-        .await?
-    {
-        Ok(listing) => listing,
-        Err(failure) => return Ok(Err(failure)),
-    };
+    let listing =
+        match guard_details_command(tx, actor, command, pickup, sandbox_payments_enabled).await? {
+            Ok(listing) => listing,
+            Err(failure) => return Ok(Err(failure)),
+        };
     let counter = match lock_counter_cas(tx, &listing, payload.expected_version, now).await? {
         Ok(counter) => counter,
         Err(failure) => return Ok(Err(failure)),
@@ -297,26 +313,30 @@ pub async fn clear(
     .bind(&listing.aggregate_id)
     .execute(&mut **tx)
     .await?;
+    // The cleared marker rides the counter row: retained versions are
+    // dispute exhibits, not current details.
+    sqlx::query(
+        "UPDATE listing_pickup_version_counters SET cleared_at = $2, updated_at = $2 \
+         WHERE aggregate_id = $1",
+    )
+    .bind(&listing.aggregate_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
 
+    let details_aggregate = details_aggregate_id(&listing.aggregate_id);
+    let event_revision = next_details_event_revision(tx, &details_aggregate).await?;
     let event_id = insert_event(
         tx,
         command.command_id,
-        &details_aggregate_id(&listing.aggregate_id),
-        counter.last_version,
+        &details_aggregate,
+        event_revision,
         actor,
         "pickup_details.cleared",
         now,
     )
     .await?;
-    notify_paid_buyers(
-        tx,
-        event_id,
-        "pickup_details_cleared",
-        &listing,
-        actor,
-        now,
-    )
-    .await?;
+    notify_paid_buyers(tx, event_id, "pickup_details_cleared", &listing, actor, now).await?;
 
     Ok(Ok(HandlerSuccess {
         revision: counter.last_version,
@@ -427,7 +447,10 @@ pub(crate) async fn order_has_unresolved_terms_change(
             continue;
         };
         let (current,): (Option<i64>,) = sqlx::query_as(
-            "SELECT MAX(version) FROM listing_pickup_details WHERE aggregate_id = $1",
+            "SELECT MAX(d.version) FROM listing_pickup_details d \
+                LEFT JOIN listing_pickup_version_counters c \
+                  ON c.aggregate_id = d.aggregate_id \
+                WHERE d.aggregate_id = $1 AND c.cleared_at IS NULL",
         )
         .bind(aggregate_id)
         .fetch_one(&mut **tx)
@@ -467,7 +490,10 @@ pub async fn pickup_terms_changed_flags(
                 continue;
             };
             let current: Option<(Option<i64>,)> = sqlx::query_as(
-                "SELECT MAX(version) FROM listing_pickup_details WHERE aggregate_id = $1",
+                "SELECT MAX(d.version) FROM listing_pickup_details d \
+                LEFT JOIN listing_pickup_version_counters c \
+                  ON c.aggregate_id = d.aggregate_id \
+                WHERE d.aggregate_id = $1 AND c.cleared_at IS NULL",
             )
             .bind(aggregate_id)
             .fetch_optional(pool)
@@ -509,9 +535,10 @@ fn internal_error(context: &str, error: &sqlx::Error) -> Response {
 /// threat model WEB-03).
 fn no_store(response: Response) -> Response {
     let mut response = response;
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
     response
 }
 
@@ -596,15 +623,17 @@ pub async fn get_listing_pickup_details(
         }
         None => None,
     };
-    no_store((
-        StatusCode::OK,
-        Json(json!({
-            "listing_aggregate_id": listing.aggregate_id,
-            "current": details,
-            "last_version": last_version,
-        })),
+    no_store(
+        (
+            StatusCode::OK,
+            Json(json!({
+                "listing_aggregate_id": listing.aggregate_id,
+                "current": details,
+                "last_version": last_version,
+            })),
+        )
+            .into_response(),
     )
-        .into_response())
 }
 
 /// `GET /v1/orders/{id}/pickup-details`: the paying buyer's per-line
@@ -672,15 +701,14 @@ pub async fn get_order_pickup_details(
         );
     }
 
-    let snapshots: Result<Vec<crate::model::PickupLineSnapshotRow>, sqlx::Error> =
-        sqlx::query_as(
-            "SELECT order_id, line_index, listing_aggregate_id, version, snapshot_ciphertext, \
+    let snapshots: Result<Vec<crate::model::PickupLineSnapshotRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT order_id, line_index, listing_aggregate_id, version, snapshot_ciphertext, \
              confirming_adapter, created_at FROM pickup_line_snapshots \
              WHERE order_id = $1 ORDER BY line_index",
-        )
-        .bind(order.id)
-        .fetch_all(&state.pool)
-        .await;
+    )
+    .bind(order.id)
+    .fetch_all(&state.pool)
+    .await;
     let snapshots = match snapshots {
         Ok(snapshots) => snapshots,
         Err(error) => return internal_error("pickup snapshots", &error),
@@ -727,7 +755,10 @@ pub async fn get_order_pickup_details(
         // Withdrawn-by-seller: the pinned snapshot stands in place of the
         // current details when a `pickup_details.clear` removed them (§A3).
         let current: Result<Option<(Option<i64>,)>, sqlx::Error> = sqlx::query_as(
-            "SELECT MAX(version) FROM listing_pickup_details WHERE aggregate_id = $1",
+            "SELECT MAX(d.version) FROM listing_pickup_details d \
+                LEFT JOIN listing_pickup_version_counters c \
+                  ON c.aggregate_id = d.aggregate_id \
+                WHERE d.aggregate_id = $1 AND c.cleared_at IS NULL",
         )
         .bind(&snapshot.listing_aggregate_id)
         .fetch_optional(&state.pool)
@@ -764,13 +795,15 @@ pub async fn get_order_pickup_details(
     }
     let first_revealed_at = order.first_revealed_at.unwrap_or(now);
 
-    no_store((
-        StatusCode::OK,
-        Json(json!({
-            "order_id": order.id,
-            "first_revealed_at": format_timestamp(first_revealed_at),
-            "lines": lines,
-        })),
+    no_store(
+        (
+            StatusCode::OK,
+            Json(json!({
+                "order_id": order.id,
+                "first_revealed_at": format_timestamp(first_revealed_at),
+                "lines": lines,
+            })),
+        )
+            .into_response(),
     )
-        .into_response())
 }

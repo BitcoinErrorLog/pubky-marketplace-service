@@ -467,6 +467,9 @@ pub struct PickupVersionCounterRow {
     pub aggregate_id: String,
     pub seller_pubky: String,
     pub last_version: i64,
+    /// Set by `pickup_details.clear`, reset by the next `set`: while set,
+    /// retained versions are dispute exhibits, not current details.
+    pub cleared_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
 }
 

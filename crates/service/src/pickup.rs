@@ -140,6 +140,17 @@ pub fn pickup_keys_from_env(
         return Ok(None);
     };
     let keys = PickupKeys::from_hex(&current, previous.as_deref())?;
+    ensure_distinct_from_locks(&keys, locks)?;
+    Ok(Some(Arc::new(keys)))
+}
+
+/// The pickup key must be distinct from the Locks key material (§A1: the
+/// existing distinctness check is the template) — a shared key would let a
+/// dump of one family's ciphertext be opened for the other.
+pub(crate) fn ensure_distinct_from_locks(
+    keys: &PickupKeys,
+    locks: Option<&LocksRuntime>,
+) -> anyhow::Result<()> {
     if let Some(locks) = locks {
         if keys.current == *locks.keys.encryption_bytes() {
             anyhow::bail!(
@@ -156,7 +167,7 @@ pub fn pickup_keys_from_env(
             );
         }
     }
-    Ok(Some(Arc::new(keys)))
+    Ok(())
 }
 
 /// One boot-probe row per sealed family: the AAD inputs and the ciphertext.
@@ -185,10 +196,12 @@ async fn first_snapshot_probe_row(pool: &PgPool) -> Result<Option<ProbeRow>, sql
     )
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(order_id, line_index, version, ciphertext)| ProbeRow {
-        aad: snapshot_aad(order_id, line_index, version),
-        ciphertext,
-    }))
+    Ok(
+        row.map(|(order_id, line_index, version, ciphertext)| ProbeRow {
+            aad: snapshot_aad(order_id, line_index, version),
+            ciphertext,
+        }),
+    )
 }
 
 /// The all-or-none boot check, run at startup AFTER migrations (the schema
@@ -378,18 +391,147 @@ pub async fn purge_terminal_pickup_retention(
     .await?
     .rows_affected();
 
-    // Detail versions no remaining snapshot references, except the current
-    // (max) version of each listing, which is the live details.
+    // Detail versions no remaining snapshot references, except the live
+    // ones: the current (max) version of a non-cleared listing is never
+    // purged here; after a clear, EVERY retained version is a dispute
+    // exhibit and purges once nothing references it.
     let versions_purged = sqlx::query(
         "DELETE FROM listing_pickup_details d \
          WHERE NOT EXISTS ( \
              SELECT 1 FROM pickup_line_snapshots s \
              WHERE s.listing_aggregate_id = d.aggregate_id AND s.version = d.version) \
-           AND d.version < (SELECT MAX(latest.version) FROM listing_pickup_details latest \
-                            WHERE latest.aggregate_id = d.aggregate_id)",
+           AND (EXISTS ( \
+                    SELECT 1 FROM listing_pickup_version_counters c \
+                    WHERE c.aggregate_id = d.aggregate_id AND c.cleared_at IS NOT NULL) \
+                OR d.version < (SELECT MAX(latest.version) FROM listing_pickup_details latest \
+                                WHERE latest.aggregate_id = d.aggregate_id))",
     )
     .execute(pool)
     .await?
     .rows_affected();
     Ok((snapshots_purged, versions_purged))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CURRENT_KEY: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const PREVIOUS_KEY: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+    const OTHER_KEY: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+    const SPOT: &str = "Central Station, north entrance";
+
+    fn keys() -> PickupKeys {
+        PickupKeys::from_hex(CURRENT_KEY, None).expect("keys parse")
+    }
+
+    #[test]
+    fn details_round_trip_with_fresh_nonces_and_bound_aad() {
+        let keys = keys();
+        let aad = details_aad("listing:seller_boots_01", 1);
+        let first = keys.seal(&aad, SPOT.as_bytes());
+        let second = keys.seal(&aad, SPOT.as_bytes());
+        assert_ne!(first, second, "each seal uses a fresh random nonce");
+        assert_eq!(keys.open(&aad, &first).unwrap(), SPOT.as_bytes());
+        // Wrong AAD (another listing, another version) fails the open.
+        keys.open(&details_aad("listing:seller_boots_02", 1), &first)
+            .expect_err("a transplanted details ciphertext must not open");
+        keys.open(&details_aad("listing:seller_boots_01", 2), &first)
+            .expect_err("a different version must not open");
+        // Wrong key fails the open.
+        PickupKeys::from_hex(OTHER_KEY, None)
+            .expect("other key parses")
+            .open(&aad, &first)
+            .expect_err("a different key must not open");
+        // The ciphertext never contains the plaintext.
+        assert!(!first
+            .windows(SPOT.len())
+            .any(|window| window == SPOT.as_bytes()));
+    }
+
+    #[test]
+    fn snapshot_aad_binds_order_line_and_version() {
+        let keys = keys();
+        let order_id = Uuid::new_v4();
+        let aad = snapshot_aad(order_id, 0, 1);
+        let sealed = keys.seal(&aad, SPOT.as_bytes());
+        keys.open(&snapshot_aad(Uuid::new_v4(), 0, 1), &sealed)
+            .expect_err("a wrong order id must not open");
+        keys.open(&snapshot_aad(order_id, 1, 1), &sealed)
+            .expect_err("a wrong line index must not open");
+        keys.open(&snapshot_aad(order_id, 0, 2), &sealed)
+            .expect_err("a wrong version must not open");
+        assert_eq!(keys.open(&aad, &sealed).unwrap(), SPOT.as_bytes());
+    }
+
+    #[test]
+    fn dual_key_window_opens_previous_key_rows_and_debug_is_redacted() {
+        let rotated =
+            PickupKeys::from_hex(CURRENT_KEY, Some(PREVIOUS_KEY)).expect("rotated keys parse");
+        let previous_only = PickupKeys::from_hex(PREVIOUS_KEY, None).expect("previous key parses");
+        let aad = details_aad("listing:seller_boots_01", 3);
+        let sealed_under_previous = previous_only.seal(&aad, SPOT.as_bytes());
+        // The dual-key read window opens it; a current-only key cannot.
+        assert_eq!(
+            rotated.open(&aad, &sealed_under_previous).unwrap(),
+            SPOT.as_bytes()
+        );
+        keys()
+            .open(&aad, &sealed_under_previous)
+            .expect_err("the previous key's rows need the read window");
+        // Current-key rows open identically under the window.
+        let sealed_under_current = keys().seal(&aad, SPOT.as_bytes());
+        assert_eq!(
+            rotated.open(&aad, &sealed_under_current).unwrap(),
+            SPOT.as_bytes()
+        );
+        let debug = format!("{:?}", rotated);
+        assert!(!debug.contains(CURRENT_KEY) && !debug.contains(PREVIOUS_KEY));
+    }
+
+    #[test]
+    fn key_parsing_fails_closed() {
+        PickupKeys::from_hex("not-hex", None).expect_err("non-hex current key rejected");
+        PickupKeys::from_hex(CURRENT_KEY, Some("abcd")).expect_err("short previous key rejected");
+        PickupKeys::from_hex(CURRENT_KEY, Some(CURRENT_KEY))
+            .expect_err("identical current/previous keys rejected");
+    }
+
+    struct NoLocksClient;
+    impl crate::locks::LocksLifecycleClient for NoLocksClient {
+        fn lookup<'a>(
+            &'a self,
+            _creator: &'a str,
+            _bundle_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::locks::LocksLookupOutcome> + Send + 'a>,
+        > {
+            Box::pin(async { crate::locks::LocksLookupOutcome::Unavailable })
+        }
+    }
+
+    fn locks_runtime(encryption: &str, hmac: &str) -> LocksRuntime {
+        LocksRuntime {
+            keys: crate::locks::LocksKeys::from_hex(encryption, hmac).expect("locks keys parse"),
+            client: Arc::new(NoLocksClient),
+        }
+    }
+
+    #[test]
+    fn pickup_key_must_differ_from_locks_key_material() {
+        let locks_enc = "1111111111111111111111111111111111111111111111111111111111111111";
+        let locks_mac = "2222222222222222222222222222222222222222222222222222222222222222";
+        let locks = locks_runtime(locks_enc, locks_mac);
+        // A distinct pickup key passes.
+        ensure_distinct_from_locks(&keys(), Some(&locks)).expect("distinct keys pass");
+        // Aliasing either Locks key fails closed.
+        let alias_enc = PickupKeys::from_hex(locks_enc, None).expect("parses");
+        ensure_distinct_from_locks(&alias_enc, Some(&locks))
+            .expect_err("pickup key aliasing the Locks encryption key rejected");
+        let alias_mac = PickupKeys::from_hex(locks_mac, None).expect("parses");
+        ensure_distinct_from_locks(&alias_mac, Some(&locks))
+            .expect_err("pickup key aliasing the Locks HMAC key rejected");
+        // No Locks configured: nothing to alias.
+        ensure_distinct_from_locks(&keys(), None).expect("no locks runtime passes");
+    }
 }
