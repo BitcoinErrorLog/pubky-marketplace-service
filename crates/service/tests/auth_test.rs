@@ -7,6 +7,8 @@ mod common;
 use axum::http::StatusCode;
 use chrono::Utc;
 use marketplace_service::clock::Clock;
+use pubky_common::auth::AuthToken;
+use pubky_common::capabilities::Capability;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
@@ -42,6 +44,14 @@ async fn a_valid_auth_token_mints_a_session(pool: PgPool) {
     assert_eq!(session["capabilities"], json!("/:rw"));
     assert!(session["token"].as_str().is_some_and(|t| !t.is_empty()));
     assert!(session["expires_at"].as_str().is_some());
+
+    let stored: String =
+        sqlx::query_scalar("SELECT capabilities FROM auth_sessions WHERE pubky = $1")
+            .bind(&pubky)
+            .fetch_one(&app.pool)
+            .await
+            .expect("session row");
+    assert_eq!(stored, "");
 }
 
 #[sqlx::test]
@@ -218,6 +228,40 @@ async fn the_challenge_endpoint_is_gone(pool: PgPool) {
     .await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test]
+async fn presented_capabilities_are_returned_but_not_stored(pool: PgPool) {
+    let app = test_app(pool).await;
+    let (keypair, pubky) = random_keypair();
+    let presented = "/pub/pubky.app/:rw,/priv/pubky.app/:rw,/pub/paykit/:rw";
+    let bytes = AuthToken::sign(
+        &keypair,
+        vec![
+            Capability::read_write("/pub/pubky.app/").expect("scope"),
+            Capability::read_write("/priv/pubky.app/").expect("scope"),
+            Capability::read_write("/pub/paykit/").expect("scope"),
+        ],
+    )
+    .serialize();
+
+    let (status, session) = post_token(&app, bytes).await;
+
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "session issue failed: {session}"
+    );
+    assert_eq!(session["pubky"], json!(pubky));
+    assert_eq!(session["capabilities"], json!(presented));
+
+    let stored: String =
+        sqlx::query_scalar("SELECT capabilities FROM auth_sessions WHERE pubky = $1")
+            .bind(&pubky)
+            .fetch_one(&app.pool)
+            .await
+            .expect("session row");
+    assert_eq!(stored, "");
 }
 
 #[sqlx::test]

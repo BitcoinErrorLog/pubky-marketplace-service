@@ -188,7 +188,8 @@ pub async fn create_session(State(state): State<AppState>, body: Bytes) -> Respo
     )
     .bind(hash_token(&token))
     .bind(&verified.pubky)
-    .bind(&verified.capabilities)
+    // Intentionally empty: disclosure reduction; this column is not an ACL.
+    .bind("")
     .bind(now)
     .bind(expires_at)
     .execute(&mut *tx)
