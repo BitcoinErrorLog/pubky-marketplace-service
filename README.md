@@ -663,8 +663,11 @@ secret key. The challenge endpoint has been removed.
    [`pubky-common`](https://crates.io/crates/pubky-common) crate (pinned at
    0.11.0), built from the same `pubky/pubky-homeserver` repository as the
    `@synonymdev/pubky` SDK, so client and server share one implementation of
-   the token format. The token's public key becomes the authenticated actor;
-   its capabilities are recorded as the session's granted scope.
+   the token format. The token's public key becomes the authenticated actor.
+   The token's capabilities are echoed back to the caller in the mint response
+   but are **not** persisted: `auth_sessions.capabilities` is intentionally
+   stored empty and is not an access-control list. Authorization is per
+   command, keyed on the actor pubky.
 
    Client and server do **not** have to be on the same version. The signature
    encoding was refactored between minor versions, so this was measured rather
