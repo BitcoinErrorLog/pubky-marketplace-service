@@ -40,6 +40,24 @@ Apply the planned changes:
 railway config apply
 ```
 
+## Status in this repo
+
+`railway.toml` is still present and is still what Railway reads on a git deploy.
+Nothing here is live yet. Deleting `railway.toml` before running
+`railway config apply` would leave the service with no build or healthcheck
+configuration.
+
+Two things must be settled before anyone applies:
+
+- **This file describes only `pubky-marketplace-staging`
+  (`c991d768-4a3c-42ea-b5ed-eaa22d4916ed`).** The same service also runs in
+  `pubky-marketplace-production` (`75faa4fe-466c-4277-977f-1d8e4e31df8c`), which
+  this file does not cover. Applying it will not configure production, and
+  production would keep drifting on its own dashboard settings.
+- **The `preserve()` entries are load-bearing.** Config-as-code treats an
+  omitted variable as a deletion. Dropping any of them plans a real delete of
+  that variable on the live service, including the encryption keys.
+
 ## Notes
 
 - `railway config plan` is safe and does not change Railway.
