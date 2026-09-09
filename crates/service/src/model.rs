@@ -387,21 +387,16 @@ impl OrderRow {
     /// the order state so a projection always shows who acts next (the
     /// current return step itself is `return_request.state`). Server-time
     /// transitions (delivery assumption, auto-completion, hold expiry) fire
-    /// without either participant; `"delivered"` still reads `"buyer"`
-    /// because only the buyer's review or return request beats the
-    /// auto-complete clock. Terminal states have no next actor.
+    /// without either participant; `"delivered"` therefore has no pending
+    /// actor. A pending payment with no bound rail is waiting on the seller
+    /// to configure one, while a reported payment is waiting on seller
+    /// confirmation.
     pub fn next_actor(&self) -> Option<&'static str> {
-        match self.state.as_str() {
-            "pending_payment" | "shipped" | "delivered" => Some("buyer"),
-            // A pickup order in `paid` waits on the seller (mark ready, or
-            // confirm the handover); in `ready_for_pickup` on the buyer
-            // (confirm on receipt). Shipped orders keep today's mapping.
-            // The value set stays 'buyer' | 'seller' (§A6).
-            "paid" | "processing" | "cancel_requested" | "return_requested" | "return_approved"
-            | "return_received" => Some("seller"),
-            "ready_for_pickup" => Some("buyer"),
-            _ => None,
-        }
+        next_actor_for_order(
+            &self.state,
+            self.payment_method.is_some(),
+            self.payment_reported_at.is_some(),
+        )
     }
 
     pub fn view(&self) -> Value {
@@ -441,6 +436,60 @@ impl OrderRow {
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
         })
+    }
+}
+
+fn next_actor_for_order(
+    state: &str,
+    payment_method_bound: bool,
+    payment_reported: bool,
+) -> Option<&'static str> {
+    match state {
+        "pending_payment" if payment_reported || !payment_method_bound => Some("seller"),
+        "pending_payment" | "shipped" => Some("buyer"),
+        // A pickup order in `paid` waits on the seller (mark ready, or
+        // confirm the handover); in `ready_for_pickup` on the buyer
+        // (confirm on receipt). The value set stays 'buyer' | 'seller'.
+        "paid" | "processing" | "cancel_requested" | "return_requested" | "return_approved"
+        | "return_received" => Some("seller"),
+        "ready_for_pickup" => Some("buyer"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_actor_for_order;
+
+    #[test]
+    fn next_actor_matches_order_state_and_payment_facts() {
+        assert_eq!(
+            next_actor_for_order("pending_payment", false, false),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("pending_payment", true, false),
+            Some("buyer")
+        );
+        assert_eq!(
+            next_actor_for_order("pending_payment", true, true),
+            Some("seller")
+        );
+        assert_eq!(next_actor_for_order("shipped", true, false), Some("buyer"));
+        assert_eq!(next_actor_for_order("delivered", true, false), None);
+        assert_eq!(next_actor_for_order("paid", true, false), Some("seller"));
+        assert_eq!(
+            next_actor_for_order("processing", true, false),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("return_requested", true, false),
+            Some("seller")
+        );
+        assert_eq!(next_actor_for_order("completed", true, false), None);
+        assert_eq!(next_actor_for_order("cancelled", true, false), None);
+        assert_eq!(next_actor_for_order("refunded_external", true, false), None);
+        assert_eq!(next_actor_for_order("closed", true, false), None);
     }
 }
 
