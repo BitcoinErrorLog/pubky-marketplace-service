@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use common::*;
 use marketplace_service::clock::Clock;
 use marketplace_service::payments::{order_reference, PaykitStatusOutcome};
+use marketplace_service::workers::run_once;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -190,6 +191,7 @@ async fn payment_config_upserts_and_never_returns_the_restricted_key(pool: PgPoo
         }),
         Some(vec![
             "bitcoin_available",
+            "bitcoin_offer_available",
             "paypal_merchant_email",
             "stripe_payment_link",
         ])
@@ -252,6 +254,7 @@ async fn public_config_reports_bitcoin_availability_from_paykit(pool: PgPool) {
 
     // Claimed: available.
     paykit.set_claimed(&seller.pubky);
+    app.clock.advance_seconds(16);
     let (status, body) = get_public_config(&app, &seller.pubky).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["bitcoin_available"], json!(true));
@@ -259,6 +262,100 @@ async fn public_config_reports_bitcoin_availability_from_paykit(pool: PgPool) {
     let (status, body) = get_public_config(&app, "not-a-pubky").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["error"]["reason"], json!("invalid_pubky"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn public_config_mirrors_and_caches_the_rail_gate(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let seller = new_actor(&app).await;
+
+    paykit.set_rail_health(json!({
+        "status": "degraded",
+        "bitcoin_offer_available": false,
+    }));
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["bitcoin_offer_available"], json!(false));
+    let requests = paykit.rail_health_requests();
+
+    paykit.set_rail_health(json!({
+        "status": "ready",
+        "bitcoin_offer_available": true,
+    }));
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["bitcoin_offer_available"], json!(false));
+    assert_eq!(paykit.rail_health_requests(), requests);
+
+    app.clock.advance_seconds(16);
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["bitcoin_offer_available"], json!(true));
+    assert_eq!(paykit.rail_health_requests(), requests + 1);
+
+    paykit.set_rail_health(json!({ "status": "ready" }));
+    app.clock.advance_seconds(16);
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["bitcoin_offer_available"], json!(true));
+
+    paykit.set_rail_health(json!({ "status": "degraded" }));
+    app.clock.advance_seconds(16);
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["bitcoin_offer_available"], json!(false));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn paykit_failure_uses_last_known_then_fails_closed_without_503(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let seller = new_actor(&app).await;
+
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["bitcoin_offer_available"], json!(true));
+
+    paykit.fail_rail_health();
+    app.clock.advance_seconds(16);
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["bitcoin_offer_available"], json!(true));
+
+    app.clock.advance_seconds(61);
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["bitcoin_offer_available"], json!(false));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn account_failure_returns_ok_with_bitcoin_unavailable(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let seller = new_actor(&app).await;
+    let (status, body) = put_config(&app, &seller.token, &full_config_body()).await;
+    assert_eq!(status, StatusCode::OK, "config put failed: {body}");
+
+    paykit.fail_account_exists();
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["bitcoin_available"], json!(false));
+    assert_eq!(body["bitcoin_offer_available"], json!(true));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn worker_refreshes_paykit_rail_for_health(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    paykit.set_rail_health(json!({
+        "status": "ready",
+        "bitcoin_offer_available": true,
+    }));
+
+    run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("worker tick succeeds");
+    let (status, body) = send(app.router.clone(), "GET", "/health", None, &Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["paykit_rail"]["bitcoin_offer_available"], json!(true));
+    assert_eq!(body["paykit_rail"]["age_seconds"], json!(0));
 }
 
 #[sqlx::test(migrations = "./migrations")]

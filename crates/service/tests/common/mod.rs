@@ -1120,6 +1120,10 @@ struct FakePaykitState {
     /// Error code returned for payment-request creation, when forced.
     create_error: Option<String>,
     requests: Vec<FakePaykitRequest>,
+    rail_health: Value,
+    rail_health_requests: usize,
+    rail_health_status: u16,
+    account_status: u16,
 }
 
 /// A local paykit-server double serving the fork's marketplace surface
@@ -1133,6 +1137,28 @@ pub struct FakePaykit {
 }
 
 impl FakePaykit {
+    pub fn set_rail_health(&self, body: Value) {
+        self.state.lock().expect("fake paykit lock").rail_health = body;
+    }
+
+    pub fn rail_health_requests(&self) -> usize {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .rail_health_requests
+    }
+
+    pub fn fail_rail_health(&self) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .rail_health_status = 503;
+    }
+
+    pub fn fail_account_exists(&self) {
+        self.state.lock().expect("fake paykit lock").account_status = 503;
+    }
+
     pub fn set_claimed(&self, seller_pubky: &str) {
         self.state
             .lock()
@@ -1173,6 +1199,12 @@ async fn serve_paykit_account(
     axum::extract::Path(creator): axum::extract::Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let account_status = state.lock().expect("fake paykit lock").account_status;
+    if account_status != 200 {
+        return StatusCode::from_u16(account_status)
+            .expect("valid fake status")
+            .into_response();
+    }
     let claimed = state
         .lock()
         .expect("fake paykit lock")
@@ -1180,6 +1212,19 @@ async fn serve_paykit_account(
         .iter()
         .any(|seller| format!("pubky{seller}") == creator);
     (StatusCode::OK, axum::Json(json!({ "claimed": claimed }))).into_response()
+}
+
+async fn serve_paykit_health(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut guard = state.lock().expect("fake paykit lock");
+    guard.rail_health_requests += 1;
+    (
+        StatusCode::from_u16(guard.rail_health_status).expect("valid fake status"),
+        axum::Json(guard.rail_health.clone()),
+    )
+        .into_response()
 }
 
 async fn serve_paykit_payment_request(
@@ -1238,7 +1283,14 @@ async fn serve_paykit_payment_request(
 
 pub async fn spawn_fake_paykit() -> FakePaykit {
     let state: Arc<Mutex<FakePaykitState>> = Arc::default();
+    state.lock().expect("fake paykit lock").rail_health = json!({
+        "status": "ready",
+        "bitcoin_offer_available": true,
+    });
+    state.lock().expect("fake paykit lock").rail_health_status = 200;
+    state.lock().expect("fake paykit lock").account_status = 200;
     let router = Router::new()
+        .route("/health/ready", axum::routing::get(serve_paykit_health))
         .route(
             "/v0/accounts/{creator}",
             axum::routing::get(serve_paykit_account),

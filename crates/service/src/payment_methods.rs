@@ -278,8 +278,9 @@ pub async fn get_own_payment_config(
 
 /// `GET /v0/sellers/{pubky}/payment-config` (public): the buyer-facing rail
 /// availability. `bitcoin_available` is true only when the seller enabled it
-/// AND their watch-only account is actually claimed on paykit-server; a
-/// paykit outage is reported as 503 rather than silently `false`.
+/// AND their watch-only account is actually claimed on paykit-server.
+/// `bitcoin_offer_available` is the cached rail-wide Paykit gate. Older
+/// paykit-server responses without that field derive it from `status`.
 pub async fn get_payment_config(
     State(state): State<AppState>,
     Path(seller_pubky): Path<String>,
@@ -295,41 +296,64 @@ pub async fn get_payment_config(
         Ok(config) => config,
         Err(error) => return internal("payment config read", &error),
     };
+    let rail_health = match state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
+    {
+        Some(paykit) => {
+            state
+                .payment_availability
+                .rail_health(
+                    state.clock.as_ref(),
+                    state.config.paykit_poll_seconds,
+                    state.config.paykit_rail_stale_seconds,
+                    || async { paykit.rail_health().await },
+                )
+                .await
+        }
+        None => false,
+    };
     let Some(config) = config else {
         return (
             StatusCode::OK,
             Json(json!({
                 "bitcoin_available": false,
+                "bitcoin_offer_available": rail_health,
                 "stripe_payment_link": Value::Null,
                 "paypal_merchant_email": Value::Null,
             })),
         )
             .into_response();
     };
-    let bitcoin_available =
-        if config.bitcoin_enabled {
-            let paykit = state
-                .payments
-                .as_ref()
-                .and_then(|payments| payments.paykit.as_ref());
-            match paykit {
-                Some(paykit) => match paykit.account_exists(&seller_pubky).await {
-                    Ok(claimed) => claimed,
-                    Err(_) => return method_error(
-                        ErrorCode::UpstreamUnavailable,
-                        "paykit_unavailable",
-                        "The Paykit server could not be reached to confirm Bitcoin availability.",
-                    ),
-                },
-                None => false,
+    let bitcoin_available = if config.bitcoin_enabled {
+        let paykit = state
+            .payments
+            .as_ref()
+            .and_then(|payments| payments.paykit.as_ref());
+        match paykit {
+            Some(paykit) => {
+                state
+                    .payment_availability
+                    .seller_claimed(
+                        &seller_pubky,
+                        state.clock.as_ref(),
+                        state.config.paykit_poll_seconds,
+                        state.config.paykit_rail_stale_seconds,
+                        || async { paykit.account_exists(&seller_pubky).await },
+                    )
+                    .await
             }
-        } else {
-            false
-        };
+            None => false,
+        }
+    } else {
+        false
+    };
     (
         StatusCode::OK,
         Json(json!({
             "bitcoin_available": bitcoin_available,
+            "bitcoin_offer_available": rail_health,
             "stripe_payment_link": config.stripe_payment_link,
             "paypal_merchant_email": config.paypal_merchant_email,
         })),

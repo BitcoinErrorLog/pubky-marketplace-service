@@ -15,6 +15,7 @@ pub mod homeserver;
 pub mod http;
 pub mod locks;
 pub mod model;
+pub mod payment_availability;
 pub mod payment_methods;
 pub mod payments;
 pub mod pickup;
@@ -33,6 +34,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::homeserver::HomeserverListingClient;
 use crate::locks::LocksRuntime;
+use crate::payment_availability::PaymentAvailabilityCache;
 use crate::payments::PaymentsRuntime;
 use crate::pickup::PickupKeys;
 
@@ -60,6 +62,8 @@ pub struct AppState {
     /// unset: the whole `/v0` payment-methods surface is refused (fail
     /// closed; see [`payments::payments_runtime_from_env`]).
     pub payments: Option<Arc<PaymentsRuntime>>,
+    /// Cached Paykit rail and seller claim availability.
+    pub payment_availability: PaymentAvailabilityCache,
     /// The pickup-details sealing keys (local pickup design §A1). `None`
     /// when `PICKUP_DETAILS_ENCRYPTION_KEY` is unset: pickup is OFF —
     /// `pickup_details.set` is refused, no details are ever stored
@@ -87,6 +91,7 @@ impl AppState {
             attestor: None,
             homeserver: None,
             payments: None,
+            payment_availability: PaymentAvailabilityCache::default(),
             pickup: None,
         }
     }

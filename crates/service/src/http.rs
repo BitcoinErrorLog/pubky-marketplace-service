@@ -130,9 +130,17 @@ pub fn build_router(state: AppState) -> Router {
 /// configured AND sandbox payments are disabled, §A7); clients hide the
 /// pickup option everywhere when it is off.
 async fn health(State(state): State<AppState>) -> Json<Value> {
+    let (bitcoin_offer_available, age_seconds) = state
+        .payment_availability
+        .rail_snapshot(state.clock.now())
+        .await;
     Json(json!({
         "status": "ok",
         "pickup_available": state.pickup_available(),
+        "paykit_rail": {
+            "bitcoin_offer_available": bitcoin_offer_available,
+            "age_seconds": age_seconds,
+        },
     }))
 }
 

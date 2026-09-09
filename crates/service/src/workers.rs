@@ -1533,6 +1533,26 @@ pub async fn run_once(
     let lease_seconds = state.config.worker_lease_seconds;
     let mut summary = WorkerSummary::default();
 
+    if let Some(paykit) = state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
+    {
+        state
+            .payment_availability
+            .rail_health(
+                state.clock.as_ref(),
+                state.config.paykit_poll_seconds,
+                state.config.paykit_rail_stale_seconds,
+                || async { paykit.rail_health().await },
+            )
+            .await;
+        state
+            .payment_availability
+            .evict_stale(now, state.config.paykit_rail_stale_seconds)
+            .await;
+    }
+
     if try_acquire_lease(
         &state.pool,
         TASK_RESERVATION_EXPIRY,

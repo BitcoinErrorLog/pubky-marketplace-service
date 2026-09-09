@@ -53,6 +53,9 @@ pub struct Config {
     /// Minimum seconds between paykit-server status polls for one pending
     /// bitcoin order.
     pub paykit_poll_seconds: i64,
+    /// Seconds a failed Paykit availability refresh may serve its last
+    /// successful value (`PAYKIT_RAIL_STALE_SECONDS`, default 60).
+    pub paykit_rail_stale_seconds: i64,
     /// Days after shipment when a `shipped` order is marked `delivered` on
     /// server time (`DELIVERY_ASSUME_DAYS`, default 14, minimum 1). There is
     /// no carrier tracking feed (ADR-0019); the assumption flags
@@ -144,6 +147,10 @@ impl Config {
         if paykit_poll_seconds < 1 {
             anyhow::bail!("PAYKIT_POLL_SECONDS must be at least 1");
         }
+        let paykit_rail_stale_seconds = env_i64("PAYKIT_RAIL_STALE_SECONDS", 60)?;
+        if paykit_rail_stale_seconds < paykit_poll_seconds {
+            anyhow::bail!("PAYKIT_RAIL_STALE_SECONDS must be at least PAYKIT_POLL_SECONDS");
+        }
         let delivery_assume_days = env_days("DELIVERY_ASSUME_DAYS", DEFAULT_DELIVERY_ASSUME_DAYS)?;
         let auto_complete_days = env_days("AUTO_COMPLETE_DAYS", DEFAULT_AUTO_COMPLETE_DAYS)?;
         let delivery_sweep_batch_size = env_days(
@@ -168,6 +175,7 @@ impl Config {
             drop_claim_window_seconds,
             locks_poll_seconds,
             paykit_poll_seconds,
+            paykit_rail_stale_seconds,
             delivery_assume_days,
             auto_complete_days,
             delivery_sweep_batch_size,
@@ -194,6 +202,7 @@ impl Config {
             drop_claim_window_seconds: 600,
             locks_poll_seconds: 30,
             paykit_poll_seconds: 15,
+            paykit_rail_stale_seconds: 60,
             delivery_assume_days: DEFAULT_DELIVERY_ASSUME_DAYS,
             auto_complete_days: DEFAULT_AUTO_COMPLETE_DAYS,
             delivery_sweep_batch_size: DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,

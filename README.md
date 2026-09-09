@@ -92,6 +92,7 @@ environment-based:
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests; its pubky-formatted public key is paykit-server's `marketplace.trusted_public_key` |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
+| `PAYKIT_RAIL_STALE_SECONDS` | `60` | stale-out window for cached Paykit rail and seller claim availability; must be at least `PAYKIT_POLL_SECONDS` |
 | `DELIVERY_ASSUME_DAYS` | `14` | days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1) |
 | `AUTO_COMPLETE_DAYS` | `14` | days after delivery when the worker completes a `delivered` order on server time, unless a return/cancel request is open (≥ 1) |
 | `DELIVERY_SWEEP_BATCH_SIZE` | `100` | rows claimed per inner delivery/auto-complete sweep pass (≥ 1); the worker loops until a short batch or the per-lease cap |
@@ -103,6 +104,22 @@ environment-based:
 | `PICKUP_DETAILS_ENCRYPTION_KEY` | unset | 32-byte hex key sealing local-pickup details and pinned payment snapshots at rest (XChaCha20-Poly1305); must differ from the Locks key material; pickup is OFF without it |
 | `PICKUP_DETAILS_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous pickup key for the dual-key read window during rotation; the re-seal worker migrates both sealed families to the current key |
 | `PICKUP_DISPUTE_RETENTION_DAYS` | `30` | days a cancelled-after-payment order's pinned pickup snapshot is retained as the dispute exhibit when no refund evidence ever lands, before the ordinary terminal-order purge takes it (≥ 1) |
+
+### Public payment configuration availability
+
+`GET /v0/sellers/{pubky}/payment-config` always returns HTTP 200. Its
+`bitcoin_available` field means the seller enabled Bitcoin and has a claimed
+Paykit account; `bitcoin_offer_available` is the cached rail-wide Paykit
+creation gate. Both must be true before a client offers Bitcoin. The service
+refreshes both values every `PAYKIT_POLL_SECONDS` and serves the last known
+value during an upstream failure until `PAYKIT_RAIL_STALE_SECONDS`; after that
+it serves `false` rather than returning 503.
+A seller's new Paykit claim becomes visible to buyers within
+`PAYKIT_POLL_SECONDS`.
+
+During deployment ordering, an older paykit-server response without
+`bitcoin_offer_available` is compatible: `status: "ready"` maps to `true`,
+and any other status maps to `false`. When present, the field is authoritative.
 
 The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
 closed at startup** on a partial configuration (a URL without keys, or keys

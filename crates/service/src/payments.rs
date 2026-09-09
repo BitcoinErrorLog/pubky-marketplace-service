@@ -52,6 +52,7 @@ pub const ENV_PAYPAL_IPN_VERIFY_URL: &str = "PAYPAL_IPN_VERIFY_URL";
 const XNONCE_LEN: usize = 24;
 const KEY_LEN: usize = 32;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const AVAILABILITY_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 /// How many 100-item Checkout Session pages a verification scans before
 /// honestly reporting "not found". Payment Links have no server-side
 /// `client_reference_id` filter, so recent sessions are listed and matched.
@@ -706,6 +707,7 @@ impl PaykitClient {
                 self.base_url,
                 pubky_app_key(seller_pubky)
             ))
+            .timeout(AVAILABILITY_HTTP_TIMEOUT)
             .send()
             .await
             .map_err(|_| PaykitRequestError::Unavailable)?;
@@ -721,6 +723,32 @@ impl PaykitClient {
             .await
             .map(|existence| existence.claimed)
             .map_err(|_| PaykitRequestError::Unavailable)
+    }
+
+    /// Reads Paykit's rail-wide Bitcoin offer gate.
+    ///
+    /// During the Hop 1 rollout, older paykit-server responses omit
+    /// `bitcoin_offer_available`; in that case the top-level `status`
+    /// (`ready` means available) is the compatibility source of truth.
+    pub async fn rail_health(&self) -> Result<bool, PaykitRequestError> {
+        let response = self
+            .http
+            .get(format!("{}/health/ready", self.base_url))
+            .timeout(AVAILABILITY_HTTP_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| PaykitRequestError::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(PaykitRequestError::Unavailable);
+        }
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|_| PaykitRequestError::Unavailable)?;
+        Ok(body
+            .get("bitcoin_offer_available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| body["status"].as_str() == Some("ready")))
     }
 
     fn signed_body(&self, value: &serde_json::Value) -> anyhow::Result<(String, String)> {
