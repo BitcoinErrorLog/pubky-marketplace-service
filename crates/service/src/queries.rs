@@ -45,7 +45,13 @@ pub const DEFAULT_LIMIT: i64 = 50;
 pub const MAX_LIMIT: i64 = 200;
 
 pub const ORDER_COLUMNS: &str =
-    "id, auction_aggregate_id, drop_aggregate_id, buyer_pubky, seller_pubky, revision, \
+    "id, auction_aggregate_id, drop_aggregate_id, buyer_pubky, seller_pubky, \
+     EXISTS (SELECT 1 FROM seller_payment_configs AS seller_config \
+       WHERE seller_config.seller_pubky = orders.seller_pubky \
+       AND (seller_config.bitcoin_enabled \
+         OR (seller_config.stripe_payment_link IS NOT NULL \
+             AND seller_config.stripe_restricted_key_ciphertext IS NOT NULL) \
+         OR seller_config.paypal_merchant_email IS NOT NULL)) AS seller_has_rail, revision, \
      state, lines, delivery_address, subtotal_minor, shipping_minor, total_minor, \
      currency, exponent, guarantee_policy_version, payment_id, receipt_id, edition, \
      cancellation_reason, stock_held, hold_expires_at, \
@@ -55,6 +61,22 @@ pub const ORDER_COLUMNS: &str =
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
      state, confirmations, amount_minor, currency, exponent, created_at, updated_at";
+
+pub async fn seller_has_rail(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    seller_pubky: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM seller_payment_configs \
+         WHERE seller_pubky = $1 \
+         AND (bitcoin_enabled \
+           OR (stripe_payment_link IS NOT NULL AND stripe_restricted_key_ciphertext IS NOT NULL) \
+           OR paypal_merchant_email IS NOT NULL))",
+    )
+    .bind(seller_pubky)
+    .fetch_one(&mut **tx)
+    .await
+}
 
 pub const NOTIFICATION_COLUMNS: &str =
     "id, recipient_pubky, actor_pubky, type, aggregate_id, amount, created_at, read_at";

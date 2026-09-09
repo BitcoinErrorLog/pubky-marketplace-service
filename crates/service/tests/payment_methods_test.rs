@@ -484,6 +484,29 @@ async fn the_payment_surface_is_refused_without_the_runtime(pool: PgPool) {
 // ---------------------------------------------------------------------------
 
 #[sqlx::test(migrations = "./migrations")]
+async fn unbound_pending_order_actor_reflects_seller_rail_configuration(pool: PgPool) {
+    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let seller_with_rail = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    put_config(&app, &seller_with_rail.token, &full_config_body()).await;
+    let order = create_pending_order(&app, &seller_with_rail, &buyer).await;
+    let view = read_order(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(view["next_actor"], json!("buyer"));
+
+    let seller_without_rail = new_actor(&app).await;
+    let buyer_without_rail = new_actor(&app).await;
+    put_config(
+        &app,
+        &seller_without_rail.token,
+        &json!({ "bitcoin_enabled": false }),
+    )
+    .await;
+    let order = create_pending_order(&app, &seller_without_rail, &buyer_without_rail).await;
+    let view = read_order(&app, &buyer_without_rail.token, &order.order_id).await;
+    assert_eq!(view["next_actor"], json!("seller"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn stripe_binding_snapshots_the_checkout_url(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;

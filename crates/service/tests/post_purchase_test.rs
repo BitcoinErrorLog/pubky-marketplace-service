@@ -1220,10 +1220,10 @@ async fn return_flow_rejects_wrong_roles_and_shows_who_acts_next(pool: PgPool) {
     )
     .await;
 
-    // Delivered: the buyer acts next (review or return request).
+    // Delivered has no participant action; auto-completion owns this state.
     let (_, projected) = get(&app, &format!("/v1/orders/{order_id}"), &buyer.token).await;
     assert_eq!(projected["state"], json!("delivered"));
-    assert_eq!(projected["next_actor"], json!("buyer"));
+    assert_eq!(projected["next_actor"], Value::Null);
 
     // Only the buyer may open the return.
     let (status, body) = execute(

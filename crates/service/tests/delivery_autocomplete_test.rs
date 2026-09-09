@@ -130,13 +130,13 @@ async fn assumes_delivery_after_the_configured_window_and_flags_the_projection(p
     );
 
     // The projection tells the UI the delivery was assumed, not confirmed,
-    // and the buyer acts next (review or return request).
+    // and no participant acts next; auto-completion owns this state.
     let (status, projected) = get(&app, &format!("/v1/orders/{order_id}"), &buyer.token).await;
     assert_eq!(status, StatusCode::OK, "projection failed: {projected}");
     assert_eq!(projected["delivery_assumed"], json!(true));
     assert_eq!(projected["shipment"]["state"], json!("delivered"));
     assert!(projected["shipment"]["delivered_at"].is_string());
-    assert_eq!(projected["next_actor"], json!("buyer"));
+    assert_eq!(projected["next_actor"], Value::Null);
 
     // One system-attributed delivery event; a buyer confirmation writes the
     // same event kind with the buyer as actor.

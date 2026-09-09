@@ -415,6 +415,7 @@ pub async fn close_locked_auction(
             drop_aggregate_id: None,
             buyer_pubky: winner_pubky.clone(),
             seller_pubky: listing.seller_pubky.clone(),
+            seller_has_rail: crate::queries::seller_has_rail(tx, &listing.seller_pubky).await?,
             revision: 1,
             state: "pending_payment".to_string(),
             lines,

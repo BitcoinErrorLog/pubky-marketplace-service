@@ -251,6 +251,7 @@ pub async fn handle(
         let total_minor = subtotal_minor + shipping_minor;
         let order_id = Uuid::new_v4();
         let payment_id = Uuid::new_v4();
+        let seller_has_rail = crate::queries::seller_has_rail(tx, seller_pubky).await?;
 
         // Ordinary orders start with NO hold; a drop-bound checkout keeps
         // lock-at-claim (the gate above debited the drop; the listing moves
@@ -266,6 +267,7 @@ pub async fn handle(
             drop_aggregate_id: drop_aggregate_id.clone(),
             buyer_pubky: actor.to_string(),
             seller_pubky: seller_pubky.clone(),
+            seller_has_rail,
             revision: 1,
             state: "pending_payment".to_string(),
             lines: Value::Array(lines),

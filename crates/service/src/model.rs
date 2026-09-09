@@ -280,6 +280,7 @@ pub struct OrderRow {
     pub drop_aggregate_id: Option<String>,
     pub buyer_pubky: String,
     pub seller_pubky: String,
+    pub seller_has_rail: bool,
     pub revision: i64,
     pub state: String,
     pub lines: Value,
@@ -396,6 +397,7 @@ impl OrderRow {
             &self.state,
             self.payment_method.is_some(),
             self.payment_reported_at.is_some(),
+            self.seller_has_rail,
         )
     }
 
@@ -443,9 +445,11 @@ fn next_actor_for_order(
     state: &str,
     payment_method_bound: bool,
     payment_reported: bool,
+    seller_has_rail: bool,
 ) -> Option<&'static str> {
     match state {
-        "pending_payment" if payment_reported || !payment_method_bound => Some("seller"),
+        "pending_payment" if payment_reported => Some("seller"),
+        "pending_payment" if !payment_method_bound && !seller_has_rail => Some("seller"),
         "pending_payment" | "shipped" => Some("buyer"),
         // A pickup order in `paid` waits on the seller (mark ready, or
         // confirm the handover); in `ready_for_pickup` on the buyer
@@ -464,32 +468,65 @@ mod tests {
     #[test]
     fn next_actor_matches_order_state_and_payment_facts() {
         assert_eq!(
-            next_actor_for_order("pending_payment", false, false),
+            next_actor_for_order("pending_payment", false, false, false),
             Some("seller")
         );
         assert_eq!(
-            next_actor_for_order("pending_payment", true, false),
+            next_actor_for_order("pending_payment", false, false, true),
             Some("buyer")
         );
         assert_eq!(
-            next_actor_for_order("pending_payment", true, true),
-            Some("seller")
+            next_actor_for_order("pending_payment", true, false, false),
+            Some("buyer")
         );
-        assert_eq!(next_actor_for_order("shipped", true, false), Some("buyer"));
-        assert_eq!(next_actor_for_order("delivered", true, false), None);
-        assert_eq!(next_actor_for_order("paid", true, false), Some("seller"));
         assert_eq!(
-            next_actor_for_order("processing", true, false),
+            next_actor_for_order("pending_payment", true, true, true),
             Some("seller")
         );
         assert_eq!(
-            next_actor_for_order("return_requested", true, false),
+            next_actor_for_order("pending_payment", false, true, true),
             Some("seller")
         );
-        assert_eq!(next_actor_for_order("completed", true, false), None);
-        assert_eq!(next_actor_for_order("cancelled", true, false), None);
-        assert_eq!(next_actor_for_order("refunded_external", true, false), None);
-        assert_eq!(next_actor_for_order("closed", true, false), None);
+        assert_eq!(
+            next_actor_for_order("shipped", true, false, true),
+            Some("buyer")
+        );
+        assert_eq!(next_actor_for_order("delivered", true, false, true), None);
+        assert_eq!(
+            next_actor_for_order("paid", true, false, true),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("processing", true, false, true),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("return_requested", true, false, true),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("cancel_requested", true, false, true),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("return_approved", true, false, true),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("return_received", true, false, true),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("ready_for_pickup", true, false, true),
+            Some("buyer")
+        );
+        assert_eq!(next_actor_for_order("completed", true, false, true), None);
+        assert_eq!(next_actor_for_order("cancelled", true, false, true), None);
+        assert_eq!(
+            next_actor_for_order("refunded_external", true, false, true),
+            None
+        );
+        assert_eq!(next_actor_for_order("closed", true, false, true), None);
     }
 }
 
