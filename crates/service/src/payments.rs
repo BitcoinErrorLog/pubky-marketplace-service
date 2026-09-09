@@ -728,8 +728,9 @@ impl PaykitClient {
     /// Reads Paykit's rail-wide Bitcoin offer gate.
     ///
     /// During the Hop 1 rollout, older paykit-server responses omit
-    /// `bitcoin_offer_available`; in that case the top-level `status`
-    /// (`ready` means available) is the compatibility source of truth.
+    /// `bitcoin_offer_available`; in that case the `electrum` component is
+    /// the compatibility source of truth. It may be a `"ready"` string or
+    /// an object whose `state` is `"ready"`.
     pub async fn rail_health(&self) -> Result<bool, PaykitRequestError> {
         let response = self
             .http
@@ -748,7 +749,17 @@ impl PaykitClient {
         Ok(body
             .get("bitcoin_offer_available")
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or_else(|| body["status"].as_str() == Some("ready")))
+            .or_else(|| {
+                body.get("electrum").and_then(|electrum| match electrum {
+                    serde_json::Value::String(state) => Some(state == "ready"),
+                    serde_json::Value::Object(object) => object
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|state| state == "ready"),
+                    _ => None,
+                })
+            })
+            .unwrap_or(false))
     }
 
     fn signed_body(&self, value: &serde_json::Value) -> anyhow::Result<(String, String)> {

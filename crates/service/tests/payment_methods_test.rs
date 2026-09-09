@@ -293,7 +293,10 @@ async fn public_config_mirrors_and_caches_the_rail_gate(pool: PgPool) {
     assert_eq!(body["bitcoin_offer_available"], json!(true));
     assert_eq!(paykit.rail_health_requests(), requests + 1);
 
-    paykit.set_rail_health(json!({ "status": "ready" }));
+    paykit.set_rail_health(json!({
+        "status": "degraded",
+        "electrum": "ready",
+    }));
     app.clock.advance_seconds(16);
     let (status, body) = get_public_config(&app, &seller.pubky).await;
     assert_eq!(status, StatusCode::OK);
@@ -325,6 +328,56 @@ async fn paykit_failure_uses_last_known_then_fails_closed_without_503(pool: PgPo
     let (status, body) = get_public_config(&app, &seller.pubky).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["bitcoin_offer_available"], json!(false));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn legacy_paykit_rail_fallback_uses_electrum_component(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let seller = new_actor(&app).await;
+    let fixtures = [
+        (
+            json!({
+                "status": "degraded",
+                "postgres": "ready",
+                "electrum": "ready",
+                "paykit_delivery": "degraded",
+                "outbox": "ready",
+            }),
+            true,
+        ),
+        (
+            json!({
+                "status": "degraded",
+                "electrum": { "state": "ready" },
+            }),
+            true,
+        ),
+        (
+            json!({
+                "status": "ready",
+                "electrum": "degraded",
+            }),
+            false,
+        ),
+        (
+            json!({
+                "status": "degraded",
+                "electrum": "ready",
+                "bitcoin_offer_available": false,
+            }),
+            false,
+        ),
+    ];
+
+    for (index, (fixture, expected)) in fixtures.into_iter().enumerate() {
+        if index > 0 {
+            app.clock.advance_seconds(16);
+        }
+        paykit.set_rail_health(fixture);
+        let (status, body) = get_public_config(&app, &seller.pubky).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["bitcoin_offer_available"], json!(expected));
+    }
 }
 
 #[sqlx::test(migrations = "./migrations")]

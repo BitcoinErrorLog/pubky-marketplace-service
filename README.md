@@ -118,8 +118,9 @@ A seller's new Paykit claim becomes visible to buyers within
 `PAYKIT_POLL_SECONDS`.
 
 During deployment ordering, an older paykit-server response without
-`bitcoin_offer_available` is compatible: `status: "ready"` maps to `true`,
-and any other status maps to `false`. When present, the field is authoritative.
+`bitcoin_offer_available` is compatible: `electrum: "ready"` or
+`electrum: { "state": "ready" }` maps to `true`, and any other shape maps to
+`false`. When present, the field is authoritative.
 
 The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
 closed at startup** on a partial configuration (a URL without keys, or keys
