@@ -140,7 +140,13 @@ a local commit failure after a phase-1 success triggers one best-effort
 courtesy void (paykit's 15-minute prepare reaper is the guarantee).
 `total_sats` (`price + nonce`) is the figure the marketplace charges,
 displays and records: the order projection, the payment step and the
-receipt all carry it.
+receipt all carry it. The phase-1 response is checked against the request
+before anything is persisted: `total_sats` must equal `price + nonce`, and
+the echoed `expires_at` must equal the hold deadline exactly (the wire
+format truncates to UTC seconds, so the check is exact at second
+precision). Either mismatch is a terminal refusal — no bind, one courtesy
+void, alerted — and the persisted `paykit_expires_at` is the local hold
+deadline, never the echoed value.
 
 Activation state on the order:
 

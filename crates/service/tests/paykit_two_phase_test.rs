@@ -122,6 +122,27 @@ async fn activate_row_undelivered(pool: &PgPool) -> i64 {
     .await
 }
 
+fn voids_reaching(paykit: &FakePaykit) -> Vec<FakePaykitCall> {
+    paykit
+        .calls()
+        .into_iter()
+        .filter(|call| call.path.ends_with("/void"))
+        .collect()
+}
+
+/// Polls until `expected` void calls reached the double (courtesy voids are
+/// fire-and-forget) and returns what arrived.
+async fn await_voids(paykit: &FakePaykit, expected: usize) -> Vec<FakePaykitCall> {
+    for _ in 0..50 {
+        let voids = voids_reaching(paykit);
+        if voids.len() >= expected {
+            return voids;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    voids_reaching(paykit)
+}
+
 fn host_of(base_url: &str) -> String {
     base_url.trim_start_matches("http://").to_string()
 }
@@ -439,6 +460,81 @@ async fn phase_one_shape_violations_are_refused(pool: PgPool) {
         )
         .await,
         0
+    );
+}
+
+// 5b. Phase-1 `expires_at` echoes: only an exact echo of the hold deadline
+//     binds. A later or earlier echo is a terminal refusal in the
+//     total-mismatch class — no bind, no outbox row, one courtesy void,
+//     alerted — and the bound order persists the LOCAL hold deadline.
+#[sqlx::test(migrations = "./migrations")]
+async fn phase_one_expires_at_echo_is_verified(pool: PgPool) {
+    install_log_capture();
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin(&app, &paykit, &seller).await;
+
+    for (case, shape) in [
+        (1usize, FakePaykitCreateShape::ExpiryLater),
+        (2, FakePaykitCreateShape::ExpiryEarlier),
+    ] {
+        paykit.set_create_shape(shape);
+        let order = create_sat_order(&app, &seller, &buyer).await;
+        let (status, body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{shape:?}: {body}");
+        assert_eq!(
+            body["error"]["reason"],
+            json!("paykit_expiry_inconsistent"),
+            "{shape:?}: {body}"
+        );
+        let persisted: (Option<String>, Option<Uuid>) =
+            sqlx::query_as("SELECT payment_method, paykit_invoice_id FROM orders WHERE id = $1")
+                .bind(order_uuid(&order.order_id))
+                .fetch_one(&pool)
+                .await
+                .expect("order row exists");
+        assert_eq!(persisted.0, None, "{shape:?} wrote a bind");
+        assert_eq!(persisted.1, None, "{shape:?} persisted an invoice");
+        let voids = await_voids(&paykit, case).await;
+        assert_eq!(voids.len(), case, "{shape:?}: one courtesy void each");
+        assert_eq!(
+            voids[case - 1].body["reason"],
+            json!("marketplace_bind_rolled_back")
+        );
+    }
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate'"
+        )
+        .await,
+        0,
+        "a refused expiry wrote no activation intent"
+    );
+    assert!(
+        captured_logs()
+            .matches("ALERT paykit phase 1 expires_at != the hold deadline")
+            .count()
+            >= 2,
+        "both expiry mismatches alerted"
+    );
+
+    // (c) The exact echo binds, and the persisted expiry is the LOCAL hold
+    // deadline.
+    paykit.set_create_shape(FakePaykitCreateShape::Full);
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    let (status, body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "the exact echo binds: {body}");
+    let (persisted_expiry, hold_deadline): (DateTime<Utc>, DateTime<Utc>) =
+        sqlx::query_as("SELECT paykit_expires_at, hold_expires_at FROM orders WHERE id = $1")
+            .bind(order_uuid(&order.order_id))
+            .fetch_one(&pool)
+            .await
+            .expect("order row exists");
+    assert_eq!(
+        persisted_expiry, hold_deadline,
+        "the local hold deadline is persisted, not the echo"
     );
 }
 

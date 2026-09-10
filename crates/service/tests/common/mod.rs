@@ -1167,6 +1167,10 @@ pub enum FakePaykitCreateShape {
     MissingField,
     /// A 200 body whose `total_sats != amount_sats + nonce_sats`.
     TotalInconsistent,
+    /// A 200 body whose `expires_at` is later than the request's.
+    ExpiryLater,
+    /// A 200 body whose `expires_at` is earlier than the request's.
+    ExpiryEarlier,
 }
 
 /// A scripted reply for one `activate`/`void` call on an invoice.
@@ -1537,6 +1541,19 @@ async fn serve_paykit_payment_request(
                 }
                 FakePaykitCreateShape::TotalInconsistent => {
                     body["total_sats"] = json!(total_sats + 1);
+                }
+                FakePaykitCreateShape::ExpiryLater | FakePaykitCreateShape::ExpiryEarlier => {
+                    let shift = if guard.create_shape == FakePaykitCreateShape::ExpiryLater {
+                        600
+                    } else {
+                        -600
+                    };
+                    let echoed = body["expires_at"].as_str().expect("expires_at present");
+                    let shifted = (chrono::DateTime::parse_from_rfc3339(echoed)
+                        .expect("request expiry parses")
+                        + chrono::Duration::seconds(shift))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    body["expires_at"] = json!(shifted);
                 }
                 _ => {}
             }

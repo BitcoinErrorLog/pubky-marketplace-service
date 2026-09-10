@@ -809,11 +809,35 @@ pub async fn bind_payment_method(
             );
         }
         prepared = Some((phase1.invoice_id, phase1.stack_id.clone(), endpoint.clone()));
+        // The echoed `expires_at` must equal the hold deadline this call
+        // sent (the wire format truncates to UTC seconds, so the comparison
+        // is exact at second precision): a stack answering with a later
+        // expiry would keep the remote invoice payable past the local void
+        // at hold + 30 min, breaking the hard bound. Refuse in the same
+        // class as a total mismatch — no bind, the rollback releases the
+        // hold, one courtesy void, alerted.
+        if phase1.expires_at.timestamp() != expires_at.timestamp() {
+            tracing::error!(
+                order_id = %order.id,
+                hold_expires_at = %expires_at,
+                echoed_expires_at = %phase1.expires_at,
+                "ALERT paykit phase 1 expires_at != the hold deadline; refusing the bind"
+            );
+            let _ = tx.rollback().await;
+            spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+            return method_error(
+                ErrorCode::InvalidState,
+                "paykit_expiry_inconsistent",
+                "The Paykit server returned an inconsistent payment expiry.",
+            );
+        }
         // Persist the prepared invoice in the SAME transaction as the bind:
         // the stack identity and endpoint come from this call (never from
         // configuration read later), the total is the figure the buyer is
-        // charged and shown, and the activation intent makes phase 2
-        // durable. Any failure below rolls the whole bind back; the
+        // charged and shown, the persisted expiry is the LOCAL hold
+        // deadline (verified equal to the echo above), never a
+        // paykit-supplied timestamp, and the activation intent makes
+        // phase 2 durable. Any failure below rolls the whole bind back; the
         // courtesy void after the error return is best-effort (paykit's
         // 15-minute reaper is the guarantee).
         let persisted = async {
@@ -829,7 +853,7 @@ pub async fn bind_payment_method(
             .bind(&phase1.stack_id)
             .bind(&endpoint)
             .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
-            .bind(phase1.expires_at)
+            .bind(expires_at)
             .bind(phase1.prepare_expires_at)
             .bind(&phase1.allocation_mode)
             .bind(&phase1.derived_address_fingerprint)
