@@ -161,7 +161,10 @@ async fn phase_one_persists_the_prepared_body_and_one_activate_row(pool: PgPool)
     .await
     .expect("order row exists");
     assert_eq!(row.paykit_invoice_id, Some(invoice_id));
-    assert_eq!(row.paykit_stack_id.as_deref(), Some(paykit.stack_id().as_str()));
+    assert_eq!(
+        row.paykit_stack_id.as_deref(),
+        Some(paykit.stack_id().as_str())
+    );
     assert_eq!(
         row.paykit_stack_endpoint.as_deref(),
         Some(paykit.base_url.as_str())
