@@ -226,6 +226,10 @@ async fn phase_one_persists_the_prepared_body_and_one_activate_row(pool: PgPool)
 
 // 2. After a repoint, activation still routes to the PERSISTED endpoint;
 //    a second bind under the new URL persists the new URL per order.
+//    CALIBRATION 1 (persisted endpoint): this test FAILS if delivery
+//    dials the configured endpoint instead of the row's
+//    `paykit_stack_endpoint` (the activate then reaches B, and the
+//    "the activate went to A" assertion bites).
 #[sqlx::test(migrations = "./migrations")]
 async fn activation_routes_to_the_persisted_endpoint_after_a_repoint(pool: PgPool) {
     let (app, _stripe, paykit_a) = test_app_with_payments(pool.clone()).await;
@@ -407,6 +411,73 @@ async fn an_ambiguous_commit_with_a_durable_bind_never_voids(pool: PgPool) {
     assert_eq!(activate_row_undelivered(&pool).await, 1);
     let (_request_state, activation_state, ..) = order_paykit_row(&pool, &order_id).await;
     assert_eq!(activation_state.as_deref(), Some("preparing"));
+}
+
+// CALIBRATION 2 (bind-outbox atomicity): a failure at the outbox INSERT
+// itself (not deferred to commit) must leave NEITHER the bind NOR the
+// outbox row — the whole transaction rolls back — with one courtesy void
+// for the prepared invoice. Removing the guard (committing the bind
+// despite the failed insert) fails this test at the "no bind" assertion.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_failure_at_the_outbox_insert_leaves_neither_bind_nor_row(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    let outbox_before = count(&pool, "SELECT COUNT(*) FROM outbox").await;
+
+    // A row-level trigger raising AT the insert of the activation intent.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_paykit_activate_insert() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced insert failure'; END; $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("trigger function installs");
+    sqlx::query(
+        "CREATE TRIGGER fail_paykit_activate_insert BEFORE INSERT ON outbox \
+         FOR EACH ROW WHEN (NEW.kind = 'paykit.activate') \
+         EXECUTE FUNCTION fail_paykit_activate_insert()",
+    )
+    .execute(&pool)
+    .await
+    .expect("trigger installs");
+
+    let (status, _body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Neither half survived: no bind, no hold, no outbox rows at all.
+    let (payment_method, invoice, adapter, stock_held): (
+        Option<String>,
+        Option<Uuid>,
+        String,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT o.payment_method, o.paykit_invoice_id, p.adapter, o.stock_held \
+         FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
+    )
+    .bind(order_uuid(&order.order_id))
+    .fetch_one(&pool)
+    .await
+    .expect("order row exists");
+    assert_eq!(payment_method, None, "the bind rolled back");
+    assert_eq!(invoice, None, "the pin rolled back");
+    assert_eq!(adapter, "sandbox");
+    assert!(!stock_held);
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM outbox").await,
+        outbox_before,
+        "the failed insert left no outbox rows"
+    );
+
+    // The prepared invoice gets exactly one courtesy void.
+    let voids = await_voids(&paykit, 1).await;
+    assert_eq!(voids.len(), 1, "exactly one courtesy void: {voids:?}");
+    assert_eq!(
+        voids[0].body["reason"],
+        json!("marketplace_bind_rolled_back")
+    );
 }
 
 // 4. Phase-1 refusals keep their semantics and write nothing.
@@ -757,6 +828,77 @@ async fn activation_redelivery_cannot_apply_twice(pool: PgPool) {
     let (request_state, activation_state, ..) = order_paykit_row(&pool, &order_id).await;
     assert_eq!(activation_state.as_deref(), Some("active"));
     assert_eq!(request_state.as_deref(), Some("pending"));
+}
+
+// CALIBRATION 3 (conditional-update guard): a STALE activate delivery
+// after the order is already `voided` is a no-op — no second HTTP call,
+// no state change, no re-enqueue; the row is only re-stamped. Removing
+// the `preparing` guard in the delivery path sends a second activate to
+// paykit and fails this test at the call-count assertion.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_stale_activation_after_void_is_a_noop(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _payment_id, invoice_id) =
+        bound_preparing_order(&app, &paykit, &seller, &buyer).await;
+    paykit.script_activate(
+        invoice_id,
+        vec![FakePaykitReply::Error(409, "prepare_expired".to_string())],
+    );
+    let paykit_client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    drain_outbox(&app.pool, paykit_client, app.clock.now(), 30)
+        .await
+        .expect("drain runs");
+    let (_request_state, activation_state, ..) = order_paykit_row(&pool, &order_id).await;
+    assert_eq!(activation_state.as_deref(), Some("voided"));
+    let activations = || {
+        paykit
+            .calls()
+            .into_iter()
+            .filter(|call| call.path.ends_with("/activate"))
+            .count()
+    };
+    assert_eq!(activations(), 1, "the terminal delivery called once");
+
+    // Flush the void's notification intent so the next drain isolates the
+    // stale activate row.
+    let flushed = drain_outbox(&app.pool, paykit_client, app.clock.now(), 30)
+        .await
+        .expect("notification drain runs");
+    assert_eq!(flushed, 1, "the void notification intent delivers");
+
+    // A stale copy of the row becomes due again (a lost delivery mark).
+    sqlx::query(
+        "UPDATE outbox SET delivered_at = NULL, lease_until = NULL WHERE kind = 'paykit.activate'",
+    )
+    .execute(&pool)
+    .await
+    .expect("mark reset");
+    let redelivered = drain_outbox(&app.pool, paykit_client, app.clock.now(), 30)
+        .await
+        .expect("redelivery runs");
+    assert_eq!(redelivered, 1, "the stale row is re-stamped only");
+
+    // No-op: no second activate, no state change, no re-enqueue.
+    assert_eq!(activations(), 1, "no second activate reached paykit");
+    let (request_state, activation_state, ..) = order_paykit_row(&pool, &order_id).await;
+    assert_eq!(activation_state.as_deref(), Some("voided"));
+    assert_eq!(request_state, None);
+    assert_eq!(activate_row_undelivered(&pool).await, 0);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate'"
+        )
+        .await,
+        1,
+        "the stale delivery re-enqueued nothing"
+    );
 }
 
 // 8. Every terminal error voids the bind, releases the hold, emits the
