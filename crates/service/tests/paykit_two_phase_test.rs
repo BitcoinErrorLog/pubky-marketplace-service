@@ -366,50 +366,75 @@ async fn a_failed_commit_after_phase_one_rolls_back_and_voids(pool: PgPool) {
 
 // 3b. The other half of the ambiguous COMMIT: the commit call reports an
 //     error while the write is durable (the connection dropped after COMMIT
-//     reached the server). The re-read finds the bind, so ZERO voids may
-//     leave for paykit — the activation outbox row carries the bind
-//     forward. Driven through the store seam with the bind + outbox row
-//     committed.
+//     reached the server). Driven through the REAL HTTP bind path: the
+//     `test-faults` hook lets the bind transaction commit, then turns the
+//     `tx.commit()` result into `Err` at the call site, so the production
+//     re-read runs. It finds the bind, so ZERO voids may leave for paykit —
+//     the activation outbox row carries the bind forward.
 #[sqlx::test(migrations = "./migrations")]
 async fn an_ambiguous_commit_with_a_durable_bind_never_voids(pool: PgPool) {
+    install_log_capture();
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let (order_id, _payment_id, invoice_id) =
-        bound_preparing_order(&app, &paykit, &seller, &buyer).await;
-
-    // The bind committed; now the commit path reports an error anyway.
-    let (reference, attempt): (String, i32) = sqlx::query_as(
-        "SELECT paykit_request_reference, paykit_bind_attempt FROM orders WHERE id = $1",
-    )
-    .bind(order_uuid(&order_id))
-    .fetch_one(&pool)
-    .await
-    .expect("order row exists");
-    let payments = app.state.payments.clone().expect("payments runtime");
-    let prepared = Some((invoice_id, paykit.stack_id(), paykit.base_url.clone()));
-    marketplace_service::payment_methods::resolve_ambiguous_bind_commit(
-        &app.state,
-        &payments,
-        &prepared,
-        order_uuid(&order_id),
-        &Some((reference, attempt)),
-        &sqlx::Error::Io(std::io::Error::other("injected ambiguous commit")),
+    enable_bitcoin(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    let activates_before = count(
+        &pool,
+        "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate'",
     )
     .await;
 
-    // Nothing may leave for paykit; the bind and its outbox row stand.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(
-        paykit
-            .calls()
-            .iter()
-            .all(|call| !call.path.ends_with("/void")),
-        "no void reached paykit: {:?}",
-        paykit.calls()
+    // The bind transaction will really commit; the commit call site then
+    // observes an Err exactly once, as if the connection dropped after
+    // COMMIT reached the server.
+    marketplace_service::payment_methods::test_faults::arm_bind_commit_error(order_uuid(
+        &order.order_id,
+    ));
+
+    let (status, _body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // The bind transaction really committed: the bind is durable and
+    // visible from this second connection (the test pool).
+    let (payment_method, reference, invoice, stock_held): (
+        Option<String>,
+        Option<String>,
+        Option<Uuid>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT payment_method, paykit_request_reference, paykit_invoice_id, stock_held \
+         FROM orders WHERE id = $1",
+    )
+    .bind(order_uuid(&order.order_id))
+    .fetch_one(&pool)
+    .await
+    .expect("order row exists");
+    assert_eq!(payment_method.as_deref(), Some("bitcoin"));
+    assert!(reference.is_some(), "the request reference is durable");
+    assert!(invoice.is_some(), "the invoice pin is durable");
+    assert!(stock_held, "the hold is intact");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate'"
+        )
+        .await,
+        activates_before + 1,
+        "the activation outbox row committed with the bind"
     );
     assert_eq!(activate_row_undelivered(&pool).await, 1);
-    let (_request_state, activation_state, ..) = order_paykit_row(&pool, &order_id).await;
+
+    // The production re-read found the bind: the one alert/log line fires
+    // and NOTHING may leave for paykit — the outbox row carries phase 2.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        captured_logs().contains("bind commit reported an error but the bind is durable"),
+        "the durable-bind branch is logged"
+    );
+    let voids = voids_reaching(&paykit);
+    assert!(voids.is_empty(), "no void reached paykit: {voids:?}");
+    let (_request_state, activation_state, ..) = order_paykit_row(&pool, &order.order_id).await;
     assert_eq!(activation_state.as_deref(), Some("preparing"));
 }
 

@@ -1265,6 +1265,7 @@ dependencies = [
  "hmac",
  "http-body-util",
  "marketplace-domain",
+ "marketplace-service",
  "pubky-common",
  "rand 0.8.7",
  "reqwest",

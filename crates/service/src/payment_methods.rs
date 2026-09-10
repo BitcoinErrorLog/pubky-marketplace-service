@@ -924,7 +924,16 @@ pub async fn bind_payment_method(
             return internal("order projection", &error);
         }
     };
-    match tx.commit().await {
+    let commit = tx.commit().await;
+    #[cfg(feature = "test-faults")]
+    let commit = match commit {
+        Ok(()) => match test_faults::take_bind_commit_error(order.id) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        },
+        Err(error) => Err(error),
+    };
+    match commit {
         Ok(()) => response,
         Err(error) => {
             // Phase 1 returned 200 but the commit call reported an error:
@@ -940,6 +949,40 @@ pub async fn bind_payment_method(
     }
 }
 
+/// Test-only fault hooks for the bind path. Compiled out in release
+/// builds: the module exists only under the `test-faults` cargo feature,
+/// which is enabled solely for integration tests (the crate's
+/// dev-dependency on itself); without the feature the COMMIT result is
+/// used untouched.
+#[cfg(feature = "test-faults")]
+pub mod test_faults {
+    use std::sync::Mutex;
+
+    /// The order whose next successful bind COMMIT is reported as failed.
+    static ARMED_BIND_COMMIT: Mutex<Option<uuid::Uuid>> = Mutex::new(None);
+
+    /// Arms a one-shot fault: the bind transaction for `order_id` still
+    /// commits for real, but the bind path's `commit()` call site then
+    /// observes an `Err`, driving the ambiguous-commit re-read through
+    /// the real HTTP bind path.
+    pub fn arm_bind_commit_error(order_id: uuid::Uuid) {
+        *ARMED_BIND_COMMIT.lock().expect("fault hook mutex") = Some(order_id);
+    }
+
+    /// Consumes the fault armed for `order_id` (exactly once).
+    pub(super) fn take_bind_commit_error(order_id: uuid::Uuid) -> Option<sqlx::Error> {
+        let mut armed = ARMED_BIND_COMMIT.lock().expect("fault hook mutex");
+        if *armed == Some(order_id) {
+            *armed = None;
+            Some(sqlx::Error::Io(std::io::Error::other(
+                "injected ambiguous bind commit",
+            )))
+        } else {
+            None
+        }
+    }
+}
+
 /// Resolves an ambiguous bind COMMIT (§B.11.4): `commit()` reported
 /// `commit_error`, but PostgreSQL may still have durably committed (the
 /// connection can drop after COMMIT reached the server). The bind is
@@ -948,7 +991,7 @@ pub async fn bind_payment_method(
 /// `paykit.activate` outbox row (voiding it would cancel a live bind), and
 /// a failed re-read enqueues nothing and alerts, leaving the hold-expiry
 /// path on `preparing` to settle the invoice against paykit's truth.
-pub async fn resolve_ambiguous_bind_commit(
+async fn resolve_ambiguous_bind_commit(
     state: &AppState,
     payments: &std::sync::Arc<PaymentsRuntime>,
     prepared: &Option<(uuid::Uuid, String, String)>,

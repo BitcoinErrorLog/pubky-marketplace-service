@@ -32,6 +32,13 @@ tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
 
+[features]
+# Test-only fault hooks (e.g. the ambiguous bind-COMMIT injection in
+# `payment_methods::test_faults`). Enabled only for integration tests via
+# the self dev-dependency below; compiled out otherwise.
+test-faults = []
+
 [dev-dependencies]
 http-body-util.workspace = true
 tower.workspace = true
+marketplace-service = { path = ".", features = ["test-faults"] }
