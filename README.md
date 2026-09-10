@@ -122,6 +122,61 @@ During deployment ordering, an older paykit-server response without
 `electrum: { "state": "ready" }` maps to `true`, and any other shape maps to
 `false`. When present, the field is authoritative.
 
+### Two-phase Paykit payment requests
+
+Bitcoin binding is a two-phase protocol with paykit-server (the message
+contract is design §B.11.3, verbatim; this section describes the
+marketplace side only). Phase 1 (`POST /v0/payment-requests`) runs inside
+the bind transaction and returns the prepared invoice — invoice id, the
+issuing stack's `stack_id`, the minted nonce and `total_sats`, the expiry
+pair, the allocation mode, and a fingerprint of the derived address (never
+the address; §B.0). The bind persists that pin in the same transaction —
+including `paykit_stack_endpoint`, the base URL the phase-1 call used, so
+later messages route back to the issuing stack even after
+`PAYKIT_SERVER_URL` is repointed — together with a durable
+`paykit.activate` outbox row. Bind and activation intent commit atomically
+or not at all; a phase-1 refusal rolls everything back (fail-closed), and
+a local commit failure after a phase-1 success triggers one best-effort
+courtesy void (paykit's 15-minute prepare reaper is the guarantee).
+`total_sats` (`price + nonce`) is the figure the marketplace charges,
+displays and records: the order projection, the payment step and the
+receipt all carry it.
+
+Activation state on the order:
+
+| State | Meaning | Buyer sees |
+| --- | --- | --- |
+| `preparing` | phase 1 returned, bind committed, activation not yet confirmed | "Preparing your Bitcoin payment…" |
+| `active` | `activate` returned 2xx | the Payment Request in their wallet |
+| `voided` | prepare voided or reaped; the bind is released | "Bitcoin payment could not be prepared — choose a payment method again" |
+
+While `preparing`, `paykit_request_state` is also `preparing` and the
+verification poll does not claim the order; the activation delivery flips
+it to `active`/`pending` in one transaction with the outbox mark, so a
+redelivered row cannot apply twice. Terminal activation errors
+(`prepare_expired`, `invoice_finalized`, `unknown_invoice`, and the
+mismatch 409s) void the bind atomically — hold released, payment row
+restored to its pre-bind state, `payment.bitcoin_prepare_voided` emitted —
+and the mismatch and unknown-invoice cases alert; transient failures retry
+under the ordinary outbox lease.
+
+**Hold expiry of a `preparing` order** (coordinator decision; design
+§B.11.2 leaves this cell undefined — W9.3 reconcile): when the hold
+deadline lapses while activation is still undelivered, the worker first
+takes the activate row's lease (a delivery in flight skips the order that
+tick), then voids the invoice at its persisted endpoint with reason
+`hold_expired`. A successful void (or an already-final prepare) runs the
+ordinary expiry effects in one transaction; `invoice_finalized` means
+paykit already activated (a lost 2xx), so the order goes `active`/`pending`
+and the ordinary pending-bitcoin expiry takes it next tick; an unreachable
+paykit is retried each tick until 30 minutes past the deadline, after which
+the marketplace voids locally, releases the hold, and defers the remote
+void to a `paykit.void` outbox row that retries for up to 24 hours (alert
+`paykit_unreachable_at_void`). Residual: a lost-response activation
+immediately followed by a paykit outage can leave paykit `observing` an
+invoice for an order the marketplace voided — bounded because paykit's
+`expires_at` equals the hold deadline, so the invoice expires there too.
+
 The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
 closed at startup** on a partial configuration (a URL without keys, or keys
 without a URL), rather than running with verification silently disabled or

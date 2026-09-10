@@ -808,11 +808,7 @@ pub async fn bind_payment_method(
                 "The Paykit server returned an inconsistent payment total.",
             );
         }
-        prepared = Some((
-            phase1.invoice_id,
-            phase1.stack_id.clone(),
-            endpoint.clone(),
-        ));
+        prepared = Some((phase1.invoice_id, phase1.stack_id.clone(), endpoint.clone()));
         // Persist the prepared invoice in the SAME transaction as the bind:
         // the stack identity and endpoint come from this call (never from
         // configuration read later), the total is the figure the buyer is

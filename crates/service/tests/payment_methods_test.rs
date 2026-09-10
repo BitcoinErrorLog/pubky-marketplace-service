@@ -654,10 +654,11 @@ async fn bitcoin_binding_creates_the_signed_paykit_request(pool: PgPool) {
     // the exact hold deadline, and the `{reference}:{bind_attempt}`
     // idempotency key.
     let listing_sats = 51_200u64;
-    let hold_deadline: chrono::DateTime<chrono::Utc> =
-        chrono::DateTime::parse_from_rfc3339(bound["hold_expires_at"].as_str().expect("hold armed"))
-            .expect("hold deadline parses")
-            .to_utc();
+    let hold_deadline: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(
+        bound["hold_expires_at"].as_str().expect("hold armed"),
+    )
+    .expect("hold deadline parses")
+    .to_utc();
     assert_eq!(
         paykit.requests(),
         vec![common::FakePaykitRequest {
@@ -677,7 +678,11 @@ async fn bitcoin_binding_creates_the_signed_paykit_request(pool: PgPool) {
     // Bind and activation intent committed atomically: exactly one
     // `paykit.activate` outbox row.
     assert_eq!(
-        count(&pool, "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate'").await,
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate'"
+        )
+        .await,
         1
     );
     let order_view = read_order(&app, &buyer.token, &order.order_id).await;

@@ -55,9 +55,7 @@ use crate::handlers::payment::confirm_order;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
 use crate::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
 use crate::model::{ListingRow, PaymentRow};
-use crate::payments::{
-    PaykitClient, PaykitCommandError, PaykitStatusOutcome, PaykitStatusSource,
-};
+use crate::payments::{PaykitClient, PaykitCommandError, PaykitStatusOutcome, PaykitStatusSource};
 use crate::queries::PAYMENT_COLUMNS;
 use crate::{expiry, AppState};
 
@@ -397,9 +395,12 @@ fn parse_activate_payload(row: &ClaimedOutboxRow) -> anyhow::Result<ActivatePayl
     let order_id = payload_str(&row.payload, "order_id", row.id)?
         .parse()
         .map_err(|_| anyhow::anyhow!("outbox row {} order_id is not a uuid", row.id))?;
-    let activation_attempt = row.payload["activation_attempt"]
-        .as_i64()
-        .ok_or_else(|| anyhow::anyhow!("outbox row {} payload is missing activation_attempt", row.id))?;
+    let activation_attempt = row.payload["activation_attempt"].as_i64().ok_or_else(|| {
+        anyhow::anyhow!(
+            "outbox row {} payload is missing activation_attempt",
+            row.id
+        )
+    })?;
     Ok(ActivatePayload {
         invoice_id,
         order_id,
@@ -409,7 +410,11 @@ fn parse_activate_payload(row: &ClaimedOutboxRow) -> anyhow::Result<ActivatePayl
 
 /// One transaction stamping the outbox row delivered and nothing else (the
 /// idempotent no-op for a row whose order already left `preparing`).
-async fn stamp_delivered_only(pool: &PgPool, row_id: i64, now: DateTime<Utc>) -> anyhow::Result<()> {
+async fn stamp_delivered_only(
+    pool: &PgPool,
+    row_id: i64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
     sqlx::query("UPDATE outbox SET delivered_at = $2 WHERE id = $1")
         .bind(row_id)
         .bind(now)
@@ -1457,7 +1462,10 @@ pub async fn verify_due_paykit_payments(
 /// cancels and restocks, and the payment record stays untouched exactly as
 /// buyer cancellation leaves it. Confirmed orders are `paid` and never
 /// match the sweep.
-pub async fn expire_due_payment_windows(state: &AppState, now: DateTime<Utc>) -> anyhow::Result<u64> {
+pub async fn expire_due_payment_windows(
+    state: &AppState,
+    now: DateTime<Utc>,
+) -> anyhow::Result<u64> {
     let pool = &state.pool;
     let mut tx = pool.begin().await?;
     // A `preparing` bitcoin order is excluded here: its expiry must first
@@ -1477,7 +1485,15 @@ pub async fn expire_due_payment_windows(state: &AppState, now: DateTime<Utc>) ->
 
     let mut expired = 0u64;
     for (order_id, payment_id, payment_state, buyer_pubky) in due {
-        expire_held_order(&mut tx, order_id, payment_id, &payment_state, &buyer_pubky, now).await?;
+        expire_held_order(
+            &mut tx,
+            order_id,
+            payment_id,
+            &payment_state,
+            &buyer_pubky,
+            now,
+        )
+        .await?;
         expired += 1;
     }
     tx.commit().await?;
@@ -1682,16 +1698,29 @@ async fn expire_preparing_order(
     let Some((outbox_row_id,)) = leased else {
         return Ok(false);
     };
-    let pin: Option<(Option<Uuid>, Option<String>, Option<String>, Option<DateTime<Utc>>, Uuid)> =
-        sqlx::query_as(
-            "SELECT o.paykit_invoice_id, o.paykit_stack_id, o.paykit_stack_endpoint, \
-             o.hold_expires_at, p.id \
+    #[derive(sqlx::FromRow)]
+    struct PreparingPin {
+        paykit_invoice_id: Option<Uuid>,
+        paykit_stack_id: Option<String>,
+        paykit_stack_endpoint: Option<String>,
+        hold_expires_at: Option<DateTime<Utc>>,
+        payment_id: Uuid,
+    }
+    let pin: Option<PreparingPin> = sqlx::query_as(
+        "SELECT o.paykit_invoice_id, o.paykit_stack_id, o.paykit_stack_endpoint, \
+             o.hold_expires_at, p.id AS payment_id \
              FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
-        )
-        .bind(order_id)
-        .fetch_optional(pool)
-        .await?;
-    let Some((Some(invoice_id), Some(stack_id), Some(endpoint), hold_expires_at, payment_id)) = pin
+    )
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(PreparingPin {
+        paykit_invoice_id: Some(invoice_id),
+        paykit_stack_id: Some(stack_id),
+        paykit_stack_endpoint: Some(endpoint),
+        hold_expires_at,
+        payment_id,
+    }) = pin
     else {
         anyhow::bail!("preparing order {order_id} is missing its persisted paykit pin");
     };
@@ -1822,8 +1851,15 @@ async fn void_and_expire_preparing_order(
         .bind(order_id)
         .fetch_one(&mut *tx)
         .await?;
-    expire_held_order(&mut tx, order_id, payment_id, "awaiting_entitlement", &buyer_pubky.0, now)
-        .await?;
+    expire_held_order(
+        &mut tx,
+        order_id,
+        payment_id,
+        "awaiting_entitlement",
+        &buyer_pubky.0,
+        now,
+    )
+    .await?;
     let (revision,): (i64,) = sqlx::query_as(
         "UPDATE orders SET revision = revision + 1, paykit_activation_state = 'voided', \
          paykit_request_state = NULL, updated_at = $2 \

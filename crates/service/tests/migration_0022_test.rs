@@ -117,10 +117,11 @@ async fn migration_0022_adds_the_two_phase_paykit_schema() {
             .unwrap_or_else(|e| panic!("paykit_request_state '{state}' must be admitted: {e}"));
     }
     // An unknown value is rejected.
-    let rejected = sqlx::query("UPDATE orders SET paykit_request_state = 'observing' WHERE id = $1")
-        .bind(order_id)
-        .execute(&pool)
-        .await;
+    let rejected =
+        sqlx::query("UPDATE orders SET paykit_request_state = 'observing' WHERE id = $1")
+            .bind(order_id)
+            .execute(&pool)
+            .await;
     assert!(
         rejected.is_err(),
         "an unknown paykit_request_state must be rejected"
@@ -135,10 +136,11 @@ async fn migration_0022_adds_the_two_phase_paykit_schema() {
             .await
             .unwrap_or_else(|e| panic!("paykit_activation_state '{state}' must be admitted: {e}"));
     }
-    let rejected = sqlx::query("UPDATE orders SET paykit_activation_state = 'primed' WHERE id = $1")
-        .bind(order_id)
-        .execute(&pool)
-        .await;
+    let rejected =
+        sqlx::query("UPDATE orders SET paykit_activation_state = 'primed' WHERE id = $1")
+            .bind(order_id)
+            .execute(&pool)
+            .await;
     assert!(
         rejected.is_err(),
         "an unknown paykit_activation_state must be rejected"

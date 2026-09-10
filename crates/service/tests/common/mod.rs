@@ -126,6 +126,47 @@ pub fn test_pickup_keys_with_previous() -> Arc<PickupKeys> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Tracing capture (alert-log assertions)
+// ---------------------------------------------------------------------------
+
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer lock")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn log_buffer() -> Arc<Mutex<Vec<u8>>> {
+    static BUFFER: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    BUFFER
+        .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+        .clone()
+}
+
+/// Installs the process-global tracing subscriber writing into a shared
+/// buffer (first call wins; later calls are no-ops). Tests assert on
+/// distinctive markers (order/invoice ids), never on global ordering.
+pub fn install_log_capture() {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(|| LogWriter(log_buffer()))
+        .with_ansi(false)
+        .try_init();
+}
+
+pub fn captured_logs() -> String {
+    String::from_utf8_lossy(&log_buffer().lock().expect("log buffer lock").clone()).into_owned()
+}
+
 /// A `Config::for_tests` variant with the sandbox deployment boundary off,
 /// so pickup commands and the buyer reveal are permitted.
 pub fn config_durable() -> Config {
@@ -1135,6 +1176,9 @@ pub enum FakePaykitReply {
     Contract,
     /// A named error envelope at the given status.
     Error(u16, String),
+    /// A 200 whose body violates the response shape (a failure the client
+    /// must treat as retryable: nothing may change).
+    MalformedOk,
     /// Hold the request open past the client's timeout, then 500.
     Hang,
 }
@@ -1164,6 +1208,10 @@ struct FakePaykitState {
     claimed: Vec<String>,
     /// Error code returned for payment-request creation, when forced.
     create_error: Option<String>,
+    create_error_status: u16,
+    /// Error (status, code) returned for EVERY activate/void call, when
+    /// forced (the "paykit is down" knob, ahead of any script).
+    command_failure: Option<(u16, String)>,
     create_shape: FakePaykitCreateShape,
     nonce_sats: u64,
     stack_id: String,
@@ -1234,6 +1282,25 @@ impl FakePaykit {
         self.state.lock().expect("fake paykit lock").create_error = None;
     }
 
+    /// Force payment-request creation to fail with an explicit status and
+    /// code (e.g. the 503 `bitcoin_creation_disabled` kill switch).
+    pub fn fail_creation_with_status(&self, status: u16, code: &str) {
+        let mut guard = self.state.lock().expect("fake paykit lock");
+        guard.create_error = Some(code.to_string());
+        guard.create_error_status = status;
+    }
+
+    /// Force every activate/void call to fail with (status, code), ahead
+    /// of any script, until cleared — the "paykit is unreachable" knob.
+    pub fn fail_commands_with(&self, status: u16, code: &str) {
+        self.state.lock().expect("fake paykit lock").command_failure =
+            Some((status, code.to_string()));
+    }
+
+    pub fn clear_command_failure(&self) {
+        self.state.lock().expect("fake paykit lock").command_failure = None;
+    }
+
     pub fn set_create_shape(&self, shape: FakePaykitCreateShape) {
         self.state.lock().expect("fake paykit lock").create_shape = shape;
     }
@@ -1243,7 +1310,11 @@ impl FakePaykit {
     }
 
     pub fn stack_id(&self) -> String {
-        self.state.lock().expect("fake paykit lock").stack_id.clone()
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .stack_id
+            .clone()
     }
 
     pub fn requests(&self) -> Vec<FakePaykitRequest> {
@@ -1362,7 +1433,13 @@ fn paykit_error(status: StatusCode, code: &str) -> axum::response::Response {
     (status, axum::Json(json!({ "error": { "code": code } }))).into_response()
 }
 
-fn paykit_record_call(state: &Arc<Mutex<FakePaykitState>>, method: &str, path: &str, host: &str, body: &Value) {
+fn paykit_record_call(
+    state: &Arc<Mutex<FakePaykitState>>,
+    method: &str,
+    path: &str,
+    host: &str,
+    body: &Value,
+) {
     state
         .lock()
         .expect("fake paykit lock")
@@ -1396,14 +1473,18 @@ async fn serve_paykit_payment_request(
     paykit_record_call(&state, "POST", "/v0/payment-requests", &host, &parsed);
     let mut guard = state.lock().expect("fake paykit lock");
     if let Some(code) = guard.create_error.clone() {
-        return paykit_error(StatusCode::CONFLICT, &code);
+        let status = StatusCode::from_u16(guard.create_error_status).expect("valid fake status");
+        return paykit_error(status, &code);
     }
     guard.requests.push(FakePaykitRequest {
         creator: parsed["creator"].as_str().unwrap_or_default().to_string(),
         reader: parsed["reader"].as_str().unwrap_or_default().to_string(),
         reference: parsed["reference"].as_str().unwrap_or_default().to_string(),
         amount_sats: parsed["amount_sats"].as_u64().unwrap_or_default(),
-        expires_at: parsed["expires_at"].as_str().unwrap_or_default().to_string(),
+        expires_at: parsed["expires_at"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         idempotency_key: parsed["idempotency_key"]
             .as_str()
             .unwrap_or_default()
@@ -1416,9 +1497,17 @@ async fn serve_paykit_payment_request(
             let invoice_id = uuid::Uuid::new_v4();
             let nonce_sats = guard.nonce_sats;
             let total_sats = amount_sats + nonce_sats;
-            let expires_at = parsed["expires_at"].as_str().unwrap_or_default().to_string();
-            let prepare_expires_at =
-                (chrono::Utc::now() + chrono::Duration::minutes(15)).to_rfc3339();
+            let expires_at = parsed["expires_at"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let prepare_expires_at = {
+                // Microsecond precision, matching timestamptz storage.
+                let now =
+                    chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+                        .expect("microsecond timestamp");
+                (now + chrono::Duration::minutes(15)).to_rfc3339()
+            };
             guard.invoices.insert(
                 invoice_id,
                 FakePaykitInvoice {
@@ -1442,7 +1531,9 @@ async fn serve_paykit_payment_request(
             });
             match guard.create_shape {
                 FakePaykitCreateShape::MissingField => {
-                    body.as_object_mut().expect("body is an object").remove("prepare_expires_at");
+                    body.as_object_mut()
+                        .expect("body is an object")
+                        .remove("prepare_expires_at");
                 }
                 FakePaykitCreateShape::TotalInconsistent => {
                     body["total_sats"] = json!(total_sats + 1);
@@ -1558,6 +1649,12 @@ async fn serve_paykit_command(
     paykit_record_call(&state, "POST", &path, &host, &parsed);
     let scripted = {
         let mut guard = state.lock().expect("fake paykit lock");
+        if let Some((status, code)) = guard.command_failure.clone() {
+            return paykit_error(
+                StatusCode::from_u16(status).expect("valid fake status"),
+                &code,
+            );
+        }
         let scripts = if command == "activate" {
             &mut guard.activate_scripts
         } else {
@@ -1568,8 +1665,13 @@ async fn serve_paykit_command(
             .and_then(std::collections::VecDeque::pop_front)
     };
     match scripted {
-        Some(FakePaykitReply::Error(status, code)) => {
-            paykit_error(StatusCode::from_u16(status).expect("valid fake status"), &code)
+        Some(FakePaykitReply::Error(status, code)) => paykit_error(
+            StatusCode::from_u16(status).expect("valid fake status"),
+            &code,
+        ),
+        Some(FakePaykitReply::MalformedOk) => {
+            use axum::response::IntoResponse;
+            (StatusCode::OK, axum::Json(json!({ "unexpected": true }))).into_response()
         }
         Some(FakePaykitReply::Hang) => {
             // Outlast the client's 10 s timeout, then fail.
@@ -1587,6 +1689,8 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
     let state = Arc::new(Mutex::new(FakePaykitState {
         claimed: Vec::new(),
         create_error: None,
+        create_error_status: 409,
+        command_failure: None,
         create_shape: FakePaykitCreateShape::Full,
         nonce_sats: 437,
         stack_id: format!("test-stack:{}", uuid::Uuid::new_v4()),
