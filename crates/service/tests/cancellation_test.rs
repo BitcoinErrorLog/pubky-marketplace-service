@@ -40,7 +40,7 @@ async fn listing_quantities(app: &TestApp, seller_pubky: &str) -> (i64, i64, i64
 }
 
 async fn notification_types(app: &TestApp, token: &str) -> Vec<String> {
-    drain_outbox(&app.pool, app.clock.now(), 30)
+    drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
         .expect("outbox drains");
     let (status, body) = get(app, "/v1/notifications", token).await;

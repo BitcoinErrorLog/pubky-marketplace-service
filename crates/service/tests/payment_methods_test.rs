@@ -646,22 +646,46 @@ async fn bitcoin_binding_creates_the_signed_paykit_request(pool: PgPool) {
     assert_eq!(bound["fiat_verification"], Value::Null);
     assert_eq!(bound["fiat_checkout_url"], Value::Null);
     assert_eq!(bound["paykit_request_reference"], json!(reference));
-    assert_eq!(bound["paykit_request_state"], json!("pending"));
+    assert_eq!(bound["paykit_request_state"], json!("preparing"));
+    assert_eq!(bound["paykit_activation_state"], json!("preparing"));
 
     // The fake paykit-server verified the request signature before
-    // recording it; the amount is the order's satoshi total.
-    let total_sats = bound["total"]["amount_minor"].as_u64().expect("sat total");
+    // recording it; phase 1 carries the listing price (never the nonce),
+    // the exact hold deadline, and the `{reference}:{bind_attempt}`
+    // idempotency key.
+    let listing_sats = 51_200u64;
+    let hold_deadline: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::parse_from_rfc3339(bound["hold_expires_at"].as_str().expect("hold armed"))
+            .expect("hold deadline parses")
+            .to_utc();
     assert_eq!(
         paykit.requests(),
         vec![common::FakePaykitRequest {
             creator: format!("pubky{}", seller.pubky),
             reader: format!("pubky{}", buyer.pubky),
             reference: reference.clone(),
-            amount_sats: total_sats,
+            amount_sats: listing_sats,
+            expires_at: hold_deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            idempotency_key: format!("{reference}:1"),
         }]
+    );
+    // The buyer-facing total is the paykit total (price + nonce).
+    assert_eq!(
+        bound["total"]["amount_minor"].as_u64().expect("sat total"),
+        listing_sats + 437
+    );
+    // Bind and activation intent committed atomically: exactly one
+    // `paykit.activate` outbox row.
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate'").await,
+        1
     );
     let order_view = read_order(&app, &buyer.token, &order.order_id).await;
     assert_eq!(order_view["payment"]["adapter"], json!("paykit"));
+    assert_eq!(
+        order_view["payment"]["amount"]["amount_minor"],
+        json!(listing_sats + 437)
+    );
 
     // Idempotent re-bind replays the request (same reference) harmlessly.
     let (status, _) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
@@ -1116,6 +1140,29 @@ async fn the_paykit_worker_confirms_a_settled_bitcoin_order(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "{body}");
     let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
 
+    // A bound order is `preparing` until the activation outbox row
+    // delivers; only then does the poll claim it.
+    let paykit_client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    marketplace_service::workers::drain_outbox(&app.pool, paykit_client, app.clock.now(), 30)
+        .await
+        .expect("activation delivery runs");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate' AND delivered_at IS NULL"
+        )
+        .await,
+        0,
+        "the activate row delivered"
+    );
+    let order_view = read_order(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(order_view["paykit_activation_state"], json!("active"));
+    assert_eq!(order_view["paykit_request_state"], json!("pending"));
+
     let source = FakePaykitStatus::default();
     let now = app.clock.now();
 
@@ -1180,6 +1227,15 @@ async fn a_confirmed_but_mismatched_amount_routes_to_manual_review(pool: PgPool)
     let order = create_pending_sat_order(&app, &seller, &buyer).await;
     bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
     let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    // Activate the prepared invoice so the order becomes pollable.
+    let paykit_client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    marketplace_service::workers::drain_outbox(&app.pool, paykit_client, app.clock.now(), 30)
+        .await
+        .expect("activation delivery runs");
 
     let source = FakePaykitStatus::default();
     source.set_outcome(

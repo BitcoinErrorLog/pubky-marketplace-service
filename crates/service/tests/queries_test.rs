@@ -339,7 +339,7 @@ async fn notifications_are_readable_only_by_their_recipient(pool: PgPool) {
     .await;
     execute(&app, &buyer.token, &checkout(&seller.pubky, 1)).await;
     execute(&app, &other_buyer.token, &checkout(&other_seller.pubky, 2)).await;
-    let delivered = drain_outbox(&app.pool, app.clock.now(), 30)
+    let delivered = drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
         .expect("outbox drains");
     assert_eq!(delivered, 2);

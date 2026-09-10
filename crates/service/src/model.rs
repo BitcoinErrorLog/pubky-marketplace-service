@@ -342,6 +342,34 @@ pub struct OrderRow {
     pub paykit_request_state: Option<String>,
     /// Poll stamp for the paykit verification worker; never serialized.
     pub paykit_last_checked_at: Option<DateTime<Utc>>,
+    /// Two-phase paykit protocol (§B.11): the invoice phase 1 prepared.
+    /// Internal correlation, never serialized.
+    pub paykit_invoice_id: Option<Uuid>,
+    /// The issuing stack's identity, from the phase-1 response body (never
+    /// configuration); every later message on this invoice is checked
+    /// against it. Never serialized.
+    pub paykit_stack_id: Option<String>,
+    /// The base URL the phase-1 call used, persisted in the bind
+    /// transaction so activate/void route back to the issuing stack after a
+    /// repoint. Never serialized.
+    pub paykit_stack_endpoint: Option<String>,
+    /// The figure the marketplace charges, displays and records:
+    /// `amount_sats + nonce_sats` from phase 1 (R3-3).
+    pub paykit_total_sats: Option<i64>,
+    pub paykit_expires_at: Option<DateTime<Utc>>,
+    pub paykit_prepare_expires_at: Option<DateTime<Utc>>,
+    /// §B.8.8 allocation mode, persisted for W1.15/W1.16. Never serialized.
+    pub paykit_allocation_mode: Option<String>,
+    /// First 8 bytes of SHA-256 over the derived address, hex — never the
+    /// address itself (§B.0). For the §D proofs; never serialized.
+    pub paykit_address_fingerprint: Option<String>,
+    /// Per-order phase-1 attempt counter (`{reference}:{attempt}` is the
+    /// idempotency key). Never serialized.
+    pub paykit_bind_attempt: i32,
+    /// Two-phase activation state: `preparing` until the activation outbox
+    /// row delivers, then `active`; `voided` when the prepare was voided or
+    /// reaped and the bind released.
+    pub paykit_activation_state: Option<String>,
     /// How this order reaches the buyer (§A2): exactly one of `shipping` |
     /// `pickup`. Required, not derivable: checkout splits one order per
     /// (seller, fulfillment), so reveal, shipping charge, and packing slip
@@ -412,7 +440,16 @@ impl OrderRow {
             "delivery_address": self.delivery_address.clone().unwrap_or(Value::Null),
             "subtotal": money_json(self.subtotal_minor, &self.currency, self.exponent),
             "shipping": money_json(self.shipping_minor, &self.currency, self.exponent),
-            "total": money_json(self.total_minor, &self.currency, self.exponent),
+            // The buyer-facing total of a bitcoin-bound order is the
+            // paykit total (price + nonce, §B.11.3): the figure the
+            // marketplace must charge, display and record. A `preparing` or
+            // `active` order always has it; an unbound order falls back to
+            // the listing total.
+            "total": money_json(
+                self.paykit_total_sats.unwrap_or(self.total_minor),
+                &self.currency,
+                self.exponent,
+            ),
             "guarantee_policy_version": self.guarantee_policy_version,
             "payment_id": self.payment_id,
             "receipt_id": self.receipt_id,
@@ -433,6 +470,8 @@ impl OrderRow {
             "fiat_transaction_ref": self.fiat_transaction_ref,
             "paykit_request_reference": self.paykit_request_reference,
             "paykit_request_state": self.paykit_request_state,
+            "paykit_activation_state": self.paykit_activation_state,
+            "paykit_total_sats": self.paykit_total_sats,
             "fulfillment": self.fulfillment,
             "first_revealed_at": self.first_revealed_at.map(format_timestamp),
             "created_at": format_timestamp(self.created_at),

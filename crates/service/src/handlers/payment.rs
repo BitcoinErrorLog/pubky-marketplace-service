@@ -321,9 +321,12 @@ pub(crate) async fn confirm_order(
     }
 
     // The receipt hash covers the canonical snake_case receipt payload in
-    // fixed field order, BLAKE3 like the prototype engine.
+    // fixed field order, BLAKE3 like the prototype engine. A bitcoin-bound
+    // order's recorded total is the paykit total (price + nonce, §B.11.3):
+    // the figure the marketplace charged, displayed and recorded.
+    let receipt_total = order.paykit_total_sats.unwrap_or(order.total_minor);
     let receipt_id = Uuid::new_v4();
-    let total = money_json(order.total_minor, &order.currency, order.exponent);
+    let total = money_json(receipt_total, &order.currency, order.exponent);
     let canonical = serde_json::to_vec(&json!({
         "order_id": order.id,
         "payment_id": payment.id,
@@ -344,7 +347,7 @@ pub(crate) async fn confirm_order(
     .bind(payment.id)
     .bind(&order.seller_pubky)
     .bind(&order.buyer_pubky)
-    .bind(order.total_minor)
+    .bind(receipt_total)
     .bind(&order.currency)
     .bind(order.exponent)
     .bind(&content_hash)

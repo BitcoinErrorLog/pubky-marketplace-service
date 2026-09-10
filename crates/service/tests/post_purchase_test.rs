@@ -111,7 +111,7 @@ async fn advances_sandbox_payment_through_detection_to_confirmation_and_issues_r
 
     // The seller is notified through the outbox, and the confirmed event is
     // unique per payment (events_one_payment_confirmed).
-    drain_outbox(&app.pool, app.clock.now(), 30)
+    drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
         .expect("outbox drains");
     let (status, body) = get(&app, "/v1/notifications", &seller.token).await;
@@ -331,7 +331,7 @@ async fn ships_confirms_delivery_and_allows_one_review_per_participant(pool: PgP
     assert_eq!(duplicate["error"]["code"], json!("INVALID_STATE"));
 
     // Fulfillment and review notifications went through the outbox.
-    drain_outbox(&app.pool, app.clock.now(), 30)
+    drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
         .expect("outbox drains");
     for (kind, expected) in [
@@ -464,7 +464,7 @@ async fn runs_return_approval_receipt_and_externally_verified_refund_without_cla
     );
     assert_eq!(refunded_order["return_request"]["state"], json!("refunded"));
 
-    drain_outbox(&app.pool, app.clock.now(), 30)
+    drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
         .expect("outbox drains");
     assert_eq!(

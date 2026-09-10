@@ -321,7 +321,7 @@ async fn offer_notifications_carry_the_offer_amount(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::OK, "accept failed: {body}");
 
-    drain_outbox(&app.pool, app.clock.now(), 50)
+    drain_outbox(&app.pool, None, app.clock.now(), 50)
         .await
         .expect("outbox drains");
     let delivered: Vec<(String, String, Option<serde_json::Value>)> =

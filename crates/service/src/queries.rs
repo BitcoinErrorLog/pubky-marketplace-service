@@ -57,7 +57,10 @@ pub const ORDER_COLUMNS: &str =
      cancellation_reason, stock_held, hold_expires_at, \
      shipment, delivery_assumed, return_request, external_refund, payment_method, fiat_checkout_url, \
      payment_reported_at, fiat_transaction_ref, fiat_verified_by, shipping_label, paykit_request_reference, paykit_request_state, \
-     paykit_last_checked_at, fulfillment, first_revealed_at, created_at, updated_at";
+     paykit_last_checked_at, paykit_invoice_id, paykit_stack_id, paykit_stack_endpoint, \
+     paykit_total_sats, paykit_expires_at, paykit_prepare_expires_at, paykit_allocation_mode, \
+     paykit_address_fingerprint, paykit_bind_attempt, paykit_activation_state, \
+     fulfillment, first_revealed_at, created_at, updated_at";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
      state, confirmations, amount_minor, currency, exponent, created_at, updated_at";

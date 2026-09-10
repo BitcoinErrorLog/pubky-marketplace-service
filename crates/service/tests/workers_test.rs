@@ -209,7 +209,7 @@ async fn crashed_outbox_claim_is_recovered_without_loss_or_duplication(pool: PgP
     assert_eq!(claimed.len(), 1);
 
     // While the claim lease is live, another drain must not steal the row.
-    let delivered = drain_outbox(&app.pool, app.clock.now(), 30)
+    let delivered = drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
         .expect("drain runs");
     assert_eq!(delivered, 0, "a live claim excludes other deliverers");
@@ -220,7 +220,7 @@ async fn crashed_outbox_claim_is_recovered_without_loss_or_duplication(pool: PgP
 
     // After the claim lapses, the row is recovered and delivered once.
     app.clock.advance_seconds(31);
-    let delivered = drain_outbox(&app.pool, app.clock.now(), 30)
+    let delivered = drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
         .expect("drain runs");
     assert_eq!(delivered, 1, "the crashed claim is recovered");
@@ -249,7 +249,7 @@ async fn outbox_redelivery_does_not_duplicate_notification_effects(pool: PgPool)
     execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
     execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
 
-    let delivered = drain_outbox(&app.pool, app.clock.now(), 30)
+    let delivered = drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
         .expect("drain runs");
     assert_eq!(delivered, 1);
@@ -264,7 +264,7 @@ async fn outbox_redelivery_does_not_duplicate_notification_effects(pool: PgPool)
         .execute(&app.pool)
         .await
         .expect("reset runs");
-    let redelivered = drain_outbox(&app.pool, app.clock.now(), 30)
+    let redelivered = drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
         .expect("drain runs");
     assert_eq!(redelivered, 1, "the intent is delivered again");

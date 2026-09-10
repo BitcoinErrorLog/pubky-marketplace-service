@@ -447,6 +447,16 @@ pub async fn close_locked_auction(
             paykit_request_reference: None,
             paykit_request_state: None,
             paykit_last_checked_at: None,
+            paykit_invoice_id: None,
+            paykit_stack_id: None,
+            paykit_stack_endpoint: None,
+            paykit_total_sats: None,
+            paykit_expires_at: None,
+            paykit_prepare_expires_at: None,
+            paykit_allocation_mode: None,
+            paykit_address_fingerprint: None,
+            paykit_bind_attempt: 0,
+            paykit_activation_state: None,
             // Auction listings are shipping-only (§A2 v1 scope, enforced at
             // registration): an auction order is always a shipped order.
             fulfillment: "shipping".to_string(),

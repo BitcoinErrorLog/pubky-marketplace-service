@@ -681,7 +681,9 @@ pub async fn bind_payment_method(
     let updated_order: OrderRow = match sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, payment_method = $2, \
          fiat_checkout_url = $3, paykit_request_reference = $4, \
-         paykit_request_state = CASE WHEN $4::text IS NULL THEN NULL ELSE 'pending' END, \
+         paykit_request_state = CASE WHEN $4::text IS NULL THEN NULL ELSE 'preparing' END, \
+         paykit_bind_attempt = CASE WHEN $4::text IS NULL \
+             THEN paykit_bind_attempt ELSE paykit_bind_attempt + 1 END, \
          updated_at = $5 WHERE id = $1 RETURNING {}",
         crate::queries::ORDER_COLUMNS
     ))
@@ -736,51 +738,211 @@ pub async fn bind_payment_method(
         return internal("payment method notification", &error);
     }
 
-    // Bitcoin: the Paykit payment request is created before commit so a
-    // refusal leaves the order unbound. The request itself is idempotent on
-    // (creator, reference), so a retried binding replays rather than
-    // double-requests.
+    // Bitcoin phase 1 (§B.11.2/§B.11.3): the Paykit prepare call happens
+    // before commit so a refusal leaves the order unbound (the fail-closed
+    // baseline). `expires_at` is the exact hold deadline armed above;
+    // `idempotency_key` is `{order_reference}:{bind_attempt}` with the
+    // attempt counter incremented by the bind UPDATE, so a transport retry
+    // replays the same prepared invoice while a re-bind after a void gets
+    // a fresh key. The bind AND the `paykit.activate` outbox row commit
+    // atomically or not at all.
+    let mut prepared: Option<(uuid::Uuid, String, String)> = None;
     if let Some(reference) = &paykit_reference {
         let paykit = payments.paykit.as_ref().expect("checked above");
         let amount_sats = bitcoin_amount_sats(&order).expect("checked above");
-        if let Err(error) = paykit
+        let endpoint = paykit.base_url().to_string();
+        let expires_at = updated_order.hold_expires_at.unwrap_or_else(|| {
+            now + chrono::Duration::seconds(state.config.fiat_payment_window_seconds)
+        });
+        let idempotency_key = format!("{reference}:{}", updated_order.paykit_bind_attempt);
+        let phase1 = paykit
             .create_payment_request(
                 &order.seller_pubky,
                 &order.buyer_pubky,
                 reference,
                 amount_sats,
+                expires_at,
+                &idempotency_key,
             )
-            .await
-        {
+            .await;
+        let phase1 = match phase1 {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = tx.rollback().await;
+                return match error {
+                    PaykitRequestError::SellerAccountUnavailable => method_error(
+                        ErrorCode::InvalidState,
+                        "seller_account_unclaimed",
+                        "The seller has no claimed Bitcoin receiving account.",
+                    ),
+                    PaykitRequestError::Rejected => method_error(
+                        ErrorCode::InvalidState,
+                        "paykit_rejected",
+                        "The Paykit payment request was refused (the buyer may have no Paykit-enabled wallet).",
+                    ),
+                    PaykitRequestError::TotalInconsistent => method_error(
+                        ErrorCode::InvalidState,
+                        "paykit_total_inconsistent",
+                        "The Paykit server returned an inconsistent payment total.",
+                    ),
+                    PaykitRequestError::Unavailable => method_error(
+                        ErrorCode::UpstreamUnavailable,
+                        "paykit_unavailable",
+                        "The Paykit server could not be reached; try again.",
+                    ),
+                };
+            }
+        };
+        if phase1.total_sats != amount_sats + phase1.nonce_sats {
+            tracing::error!(
+                order_id = %order.id,
+                amount_sats,
+                nonce_sats = phase1.nonce_sats,
+                total_sats = phase1.total_sats,
+                "ALERT paykit phase 1 total_sats != amount_sats + nonce_sats; refusing the bind"
+            );
             let _ = tx.rollback().await;
-            return match error {
-                PaykitRequestError::SellerAccountUnavailable => method_error(
-                    ErrorCode::InvalidState,
-                    "seller_account_unclaimed",
-                    "The seller has no claimed Bitcoin receiving account.",
-                ),
-                PaykitRequestError::Rejected => method_error(
-                    ErrorCode::InvalidState,
-                    "paykit_rejected",
-                    "The Paykit payment request was refused (the buyer may have no Paykit-enabled wallet).",
-                ),
-                PaykitRequestError::Unavailable => method_error(
-                    ErrorCode::UpstreamUnavailable,
-                    "paykit_unavailable",
-                    "The Paykit server could not be reached; try again.",
-                ),
-            };
+            return method_error(
+                ErrorCode::InvalidState,
+                "paykit_total_inconsistent",
+                "The Paykit server returned an inconsistent payment total.",
+            );
+        }
+        prepared = Some((
+            phase1.invoice_id,
+            phase1.stack_id.clone(),
+            endpoint.clone(),
+        ));
+        // Persist the prepared invoice in the SAME transaction as the bind:
+        // the stack identity and endpoint come from this call (never from
+        // configuration read later), the total is the figure the buyer is
+        // charged and shown, and the activation intent makes phase 2
+        // durable. Any failure below rolls the whole bind back; the
+        // courtesy void after the error return is best-effort (paykit's
+        // 15-minute reaper is the guarantee).
+        let persisted = async {
+            sqlx::query(
+                "UPDATE orders SET paykit_invoice_id = $2, paykit_stack_id = $3, \
+                 paykit_stack_endpoint = $4, paykit_total_sats = $5, paykit_expires_at = $6, \
+                 paykit_prepare_expires_at = $7, paykit_allocation_mode = $8, \
+                 paykit_address_fingerprint = $9, paykit_activation_state = 'preparing', \
+                 updated_at = $10 WHERE id = $1",
+            )
+            .bind(order.id)
+            .bind(phase1.invoice_id)
+            .bind(&phase1.stack_id)
+            .bind(&endpoint)
+            .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
+            .bind(phase1.expires_at)
+            .bind(phase1.prepare_expires_at)
+            .bind(&phase1.allocation_mode)
+            .bind(&phase1.derived_address_fingerprint)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            // The payment step's displayed amount is the paykit total
+            // (price + nonce), never the pre-nonce listing total.
+            sqlx::query("UPDATE payments SET amount_minor = $2, updated_at = $3 WHERE id = $1")
+                .bind(payment.id)
+                .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO outbox (event_id, kind, payload, created_at) \
+                 VALUES ($1, 'paykit.activate', $2, $3)",
+            )
+            .bind(event_id)
+            .bind(json!({
+                "invoice_id": phase1.invoice_id,
+                "order_id": order.id,
+                "stack_id": phase1.stack_id,
+                "total_sats": phase1.total_sats,
+                "stack_endpoint": endpoint,
+                "activation_attempt": 0,
+            }))
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            Ok::<(), sqlx::Error>(())
+        }
+        .await;
+        if let Err(error) = persisted {
+            let _ = tx.rollback().await;
+            spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+            return internal("paykit prepare persistence", &error);
         }
     }
 
+    // The response reflects the persisted phase-1 pin.
+    let updated_order: OrderRow = if prepared.is_some() {
+        match fetch_order_for_update(&mut tx, order_id).await {
+            Ok(Some(order)) => order,
+            Ok(None) => {
+                let _ = tx.rollback().await;
+                spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+                return internal("order re-read", &"order vanished mid-bind");
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+                return internal("order re-read", &error);
+            }
+        }
+    } else {
+        updated_order
+    };
     let response = match order_response(&mut tx, &updated_order, json!({})).await {
         Ok(response) => response,
-        Err(error) => return internal("order projection", &error),
+        Err(error) => {
+            let _ = tx.rollback().await;
+            spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+            return internal("order projection", &error);
+        }
     };
     match tx.commit().await {
         Ok(()) => response,
-        Err(error) => internal("payment method commit", &error),
+        Err(error) => {
+            // Phase 1 returned 200 but the local commit failed: one
+            // best-effort void (the reaper is the guarantee, this is
+            // courtesy), never blocking the error response on it.
+            spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+            internal("payment method commit", &error)
+        }
     }
+}
+
+/// Best-effort courtesy void after a phase-1 success whose local bind
+/// transaction did not commit (§B.11.4 row 6). Fire-and-forget: the void
+/// echoes the `stack_id` phase 1 returned and dials the endpoint the
+/// phase-1 call used; paykit's 15-minute prepare reaper is the guarantee.
+fn spawn_courtesy_void(
+    payments: &std::sync::Arc<PaymentsRuntime>,
+    prepared: &Option<(uuid::Uuid, String, String)>,
+    reason: &'static str,
+) {
+    let Some((invoice_id, stack_id, endpoint)) = prepared.clone() else {
+        return;
+    };
+    let payments = payments.clone();
+    tokio::spawn(async move {
+        let Some(paykit) = payments.paykit.as_ref() else {
+            return;
+        };
+        let outcome = paykit
+            .void_payment_request(&endpoint, invoice_id, &stack_id, reason)
+            .await;
+        match outcome {
+            Ok(voided) => {
+                tracing::info!(invoice_id = %invoice_id, state = %voided.state, "courtesy void delivered")
+            }
+            Err(error) => tracing::warn!(
+                invoice_id = %invoice_id,
+                error = ?error,
+                "courtesy void failed; paykit's prepare reaper is the backstop"
+            ),
+        }
+    });
 }
 
 /// Applies a verified/attested fiat payment: payment CAS

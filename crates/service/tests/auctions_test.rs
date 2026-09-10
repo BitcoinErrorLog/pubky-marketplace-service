@@ -20,7 +20,7 @@ use marketplace_service::workers::drain_outbox;
 /// Delivered notifications as (type, recipient, amount JSON) after draining
 /// the outbox, ordered for stable assertions.
 async fn delivered_notifications(app: &TestApp) -> Vec<(String, String, serde_json::Value)> {
-    drain_outbox(&app.pool, app.clock.now(), 50)
+    drain_outbox(&app.pool, None, app.clock.now(), 50)
         .await
         .expect("outbox drains");
     sqlx::query_as::<_, (String, String, Option<serde_json::Value>)>(

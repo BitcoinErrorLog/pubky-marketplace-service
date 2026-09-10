@@ -627,10 +627,89 @@ pub enum PaykitRequestError {
     /// session lapsed); the seller must (re-)claim through Paykit setup.
     SellerAccountUnavailable,
     /// The buyer has no Paykit receiver marker (no Bitkit wallet published
-    /// one) or the request was otherwise refused.
+    /// one), the request was refused, or the 200 body violated the
+    /// two-phase contract shape (missing field, a legacy 204).
     Rejected,
+    /// Phase 1 returned `total_sats != amount_sats + nonce_sats`: the two
+    /// services disagree about money. Refused, alerted, never retried.
+    TotalInconsistent,
     /// paykit-server is unreachable or timed out; retryable.
     Unavailable,
+}
+
+/// The phase-1 prepared invoice, parsed from the verbatim §B.11.3 200 body.
+/// Every field is required: a body missing any of them is a contract-shape
+/// violation and the bind is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitPrepared {
+    pub invoice_id: uuid::Uuid,
+    pub state: String,
+    pub stack_id: String,
+    pub allocation_mode: String,
+    pub nonce_sats: u64,
+    pub total_sats: u64,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub prepare_expires_at: chrono::DateTime<chrono::Utc>,
+    pub derived_address_fingerprint: String,
+}
+
+/// The phase-2 activation 200 body (`state` is `"observing"`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitActivated {
+    pub invoice_id: uuid::Uuid,
+    pub state: String,
+    pub activated_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub total_sats: u64,
+}
+
+/// The void 200 body.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitVoided {
+    pub invoice_id: uuid::Uuid,
+    pub state: String,
+    pub voided_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// How a signed `activate` or `void` call failed (§B.11.3 named errors).
+/// The terminal variants are per-contract final; `Unavailable` is the only
+/// retryable outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaykitCommandError {
+    /// 409: the prepare TTL reaped the invoice. Void the bind.
+    PrepareExpired,
+    /// 409: the invoice is in a finalized state. On `activate`: void the
+    /// bind; on `void` after a lost 2xx it means the invoice activated.
+    InvoiceFinalized,
+    /// 404: no such invoice on this stack — a stack mixup; alert.
+    UnknownInvoice,
+    /// 409: the echoed `total_sats` disagrees with paykit's stored total.
+    ActivationTotalMismatch,
+    /// 409: the echoed `stack_id` is not this stack's identity.
+    StackIdentityMismatch,
+    /// Any other refusal (unknown contract state): terminal, alert.
+    UnexpectedRejection(String),
+    /// 5xx, transport error, timeout, or a malformed success body:
+    /// retryable under the ordinary lease.
+    Unavailable,
+}
+
+impl PaykitCommandError {
+    fn from_status(status: reqwest::StatusCode, code: String) -> Self {
+        match (status.as_u16(), code.as_str()) {
+            (409, "prepare_expired") => PaykitCommandError::PrepareExpired,
+            (409, "invoice_finalized") => PaykitCommandError::InvoiceFinalized,
+            (404, "unknown_invoice") => PaykitCommandError::UnknownInvoice,
+            (409, "activation_total_mismatch") => PaykitCommandError::ActivationTotalMismatch,
+            (409, "stack_identity_mismatch") => PaykitCommandError::StackIdentityMismatch,
+            _ if status.is_server_error() => PaykitCommandError::Unavailable,
+            _ if status.is_client_error() => PaykitCommandError::UnexpectedRejection(code),
+            _ => PaykitCommandError::Unavailable,
+        }
+    }
 }
 
 /// The signed Paykit client: `x-paykit-signature` over the canonical JSON
@@ -771,21 +850,37 @@ impl PaykitClient {
         Ok((body, signature))
     }
 
-    /// Creates (or idempotently replays) the Paykit payment request for a
-    /// physical bitcoin order.
+    /// The base URL this client dials. The bind persists this value as the
+    /// order's `paykit_stack_endpoint` in the same transaction as phase 1,
+    /// so later activate/void calls route to the issuing stack even after
+    /// `PAYKIT_SERVER_URL` is repointed.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Phase 1 (§B.11.3): prepares (or idempotently replays) the Paykit
+    /// payment request for a physical bitcoin order. `expires_at` is the
+    /// exact hold deadline the bind armed; `idempotency_key` is
+    /// `{order_reference}:{bind_attempt}`. The 200 body is the verbatim
+    /// prepared shape; a legacy 204 or a body missing any field is a
+    /// hard refusal.
     pub async fn create_payment_request(
         &self,
         seller_pubky: &str,
         buyer_pubky: &str,
         reference: &str,
         amount_sats: u64,
-    ) -> Result<(), PaykitRequestError> {
+        expires_at: chrono::DateTime<chrono::Utc>,
+        idempotency_key: &str,
+    ) -> Result<PaykitPrepared, PaykitRequestError> {
         let (body, signature) = self
             .signed_body(&serde_json::json!({
                 "amount_sats": amount_sats,
                 "creator": pubky_app_key(seller_pubky),
                 "reader": pubky_app_key(buyer_pubky),
                 "reference": reference,
+                "expires_at": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "idempotency_key": idempotency_key,
             }))
             .map_err(|_| PaykitRequestError::Rejected)?;
         let response = self
@@ -798,7 +893,23 @@ impl PaykitClient {
             .map_err(|_| PaykitRequestError::Unavailable)?;
         let status = response.status();
         if status.is_success() {
-            return Ok(());
+            if status != reqwest::StatusCode::OK {
+                tracing::error!(
+                    status = %status,
+                    "paykit phase 1 answered a bodyless success; refusing the bind"
+                );
+                return Err(PaykitRequestError::Rejected);
+            }
+            return match response.json::<PaykitPrepared>().await {
+                Ok(prepared) => Ok(prepared),
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "paykit phase 1 returned a body violating the prepared shape"
+                    );
+                    Err(PaykitRequestError::Rejected)
+                }
+            };
         }
         let code = response
             .json::<serde_json::Value>()
@@ -809,8 +920,112 @@ impl PaykitClient {
         match code.as_str() {
             "creator_session_invalid" => Err(PaykitRequestError::SellerAccountUnavailable),
             "invalid_request" | "invoice_conflict" => Err(PaykitRequestError::Rejected),
+            // `bitcoin_creation_disabled` (503, §C.16) and everything else:
+            // refused cleanly as an availability failure, as today.
             _ => Err(PaykitRequestError::Unavailable),
         }
+    }
+
+    /// One signed POST to an explicit endpoint (the persisted per-order
+    /// stack endpoint, which may predate the configured base URL).
+    async fn post_signed_to(
+        &self,
+        endpoint: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<reqwest::Response, PaykitCommandError> {
+        let (body, signature) = self.signed_body(&body).map_err(|_| {
+            PaykitCommandError::UnexpectedRejection("body did not canonicalize".to_string())
+        })?;
+        self.http
+            .post(format!("{}{path}", endpoint.trim_end_matches('/')))
+            .header("x-paykit-signature", signature)
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| PaykitCommandError::Unavailable)
+    }
+
+    async fn error_code(response: reqwest::Response) -> (reqwest::StatusCode, String) {
+        let status = response.status();
+        let code = response
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|body| body["error"]["code"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        (status, code)
+    }
+
+    /// Phase 2 (§B.11.3): activates a prepared invoice, idempotently.
+    /// `invoice_id` is repeated in the signed body; `stack_id` and
+    /// `total_sats` are echoed as guards.
+    pub async fn activate_payment_request(
+        &self,
+        endpoint: &str,
+        invoice_id: uuid::Uuid,
+        stack_id: &str,
+        total_sats: u64,
+        activation_attempt: u64,
+    ) -> Result<PaykitActivated, PaykitCommandError> {
+        let response = self
+            .post_signed_to(
+                endpoint,
+                &format!("/v0/payment-requests/{invoice_id}/activate"),
+                serde_json::json!({
+                    "invoice_id": invoice_id,
+                    "stack_id": stack_id,
+                    "total_sats": total_sats,
+                    "activation_attempt": activation_attempt,
+                }),
+            )
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            return response.json::<PaykitActivated>().await.map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    "paykit activate returned a malformed success body; retrying"
+                );
+                PaykitCommandError::Unavailable
+            });
+        }
+        let (status, code) = Self::error_code(response).await;
+        Err(PaykitCommandError::from_status(status, code))
+    }
+
+    /// Voids a prepared invoice, idempotently (§B.11.3). `stack_id` is the
+    /// value phase 1 returned, never one re-derived from configuration.
+    pub async fn void_payment_request(
+        &self,
+        endpoint: &str,
+        invoice_id: uuid::Uuid,
+        stack_id: &str,
+        reason: &str,
+    ) -> Result<PaykitVoided, PaykitCommandError> {
+        let response = self
+            .post_signed_to(
+                endpoint,
+                &format!("/v0/payment-requests/{invoice_id}/void"),
+                serde_json::json!({
+                    "invoice_id": invoice_id,
+                    "stack_id": stack_id,
+                    "reason": reason,
+                }),
+            )
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            return response.json::<PaykitVoided>().await.map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    "paykit void returned a malformed success body; retrying"
+                );
+                PaykitCommandError::Unavailable
+            });
+        }
+        let (status, code) = Self::error_code(response).await;
+        Err(PaykitCommandError::from_status(status, code))
     }
 
     /// Polls the payment status for one order reference.

@@ -1111,15 +1111,69 @@ pub struct FakePaykitRequest {
     pub reader: String,
     pub reference: String,
     pub amount_sats: u64,
+    pub expires_at: String,
+    pub idempotency_key: String,
 }
 
-#[derive(Default)]
+/// The phase-1 response shape the double serves (§B.11.3 verbatim).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakePaykitCreateShape {
+    /// The contract 200 with every field.
+    Full,
+    /// The legacy pre-two-phase 204 (shape violation).
+    LegacyNoContent,
+    /// A 200 body missing `prepare_expires_at` (shape violation).
+    MissingField,
+    /// A 200 body whose `total_sats != amount_sats + nonce_sats`.
+    TotalInconsistent,
+}
+
+/// A scripted reply for one `activate`/`void` call on an invoice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FakePaykitReply {
+    /// Run the double's intrinsic contract semantics.
+    Contract,
+    /// A named error envelope at the given status.
+    Error(u16, String),
+    /// Hold the request open past the client's timeout, then 500.
+    Hang,
+}
+
+/// One invoice the double prepared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakePaykitInvoice {
+    pub invoice_id: uuid::Uuid,
+    pub state: String,
+    pub total_sats: u64,
+    pub expires_at: String,
+    pub prepare_expires_at: String,
+}
+
+/// One recorded call: method, path, the Host the client dialed, and the
+/// canonical body as received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakePaykitCall {
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub body: Value,
+}
+
 struct FakePaykitState {
     /// Sellers (bare z32) with claimed watch-only accounts.
     claimed: Vec<String>,
     /// Error code returned for payment-request creation, when forced.
     create_error: Option<String>,
+    create_shape: FakePaykitCreateShape,
+    nonce_sats: u64,
+    stack_id: String,
+    allocation_mode: String,
+    fingerprint: String,
     requests: Vec<FakePaykitRequest>,
+    invoices: HashMap<uuid::Uuid, FakePaykitInvoice>,
+    activate_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
+    void_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
+    calls: Vec<FakePaykitCall>,
     rail_health: Value,
     rail_health_requests: usize,
     rail_health_status: u16,
@@ -1127,10 +1181,13 @@ struct FakePaykitState {
 }
 
 /// A local paykit-server double serving the fork's marketplace surface
-/// (`GET /v0/accounts/{creator}`, signed `POST /v0/payment-requests`). The
-/// signature of every payment request is verified against the test signing
-/// key — exactly what the deployed server does — so the client's canonical
-/// JSON and header handling are covered end to end.
+/// (`GET /v0/accounts/{creator}`, signed `POST /v0/payment-requests`,
+/// `POST /v0/payment-requests/{id}/activate`, `…/void`) implementing the
+/// §B.11.3 contract verbatim — every named error included — so a contract
+/// drift on either side shows up as a test change. The signature of every
+/// signed request is verified against the test signing key — exactly what
+/// the deployed server does — so the client's canonical JSON and header
+/// handling are covered end to end.
 pub struct FakePaykit {
     state: Arc<Mutex<FakePaykitState>>,
     pub base_url: String,
@@ -1177,12 +1234,59 @@ impl FakePaykit {
         self.state.lock().expect("fake paykit lock").create_error = None;
     }
 
+    pub fn set_create_shape(&self, shape: FakePaykitCreateShape) {
+        self.state.lock().expect("fake paykit lock").create_shape = shape;
+    }
+
+    pub fn set_nonce_sats(&self, nonce_sats: u64) {
+        self.state.lock().expect("fake paykit lock").nonce_sats = nonce_sats;
+    }
+
+    pub fn stack_id(&self) -> String {
+        self.state.lock().expect("fake paykit lock").stack_id.clone()
+    }
+
     pub fn requests(&self) -> Vec<FakePaykitRequest> {
         self.state
             .lock()
             .expect("fake paykit lock")
             .requests
             .clone()
+    }
+
+    /// The invoice the double prepared for a phase-1 call, as stored.
+    pub fn invoice(&self, invoice_id: uuid::Uuid) -> Option<FakePaykitInvoice> {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .invoices
+            .get(&invoice_id)
+            .cloned()
+    }
+
+    /// Queue scripted replies for `activate` on one invoice, consumed in
+    /// order; the intrinsic contract runs once the queue empties.
+    pub fn script_activate(&self, invoice_id: uuid::Uuid, replies: Vec<FakePaykitReply>) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .activate_scripts
+            .insert(invoice_id, replies.into());
+    }
+
+    /// Queue scripted replies for `void` on one invoice.
+    pub fn script_void(&self, invoice_id: uuid::Uuid, replies: Vec<FakePaykitReply>) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .void_scripts
+            .insert(invoice_id, replies.into());
+    }
+
+    /// Every call the double received, with the body and the Host header
+    /// the client dialed (the repoint assertion).
+    pub fn calls(&self) -> Vec<FakePaykitCall> {
+        self.state.lock().expect("fake paykit lock").calls.clone()
     }
 }
 
@@ -1227,68 +1331,280 @@ async fn serve_paykit_health(
         .into_response()
 }
 
+/// Verifies the `x-paykit-signature` header over the raw canonical body,
+/// exactly as paykit-server does. Returns the parsed body on success.
+fn paykit_verify_signed(headers: &axum::http::HeaderMap, body: &[u8]) -> Option<Value> {
+    use ed25519_dalek::Verifier;
+    let signature = headers
+        .get("x-paykit-signature")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, value).ok()
+        })
+        .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())?;
+    paykit_test_verifying_key()
+        .verify(body, &ed25519_dalek::Signature::from_bytes(&signature))
+        .ok()?;
+    serde_json::from_slice::<Value>(body).ok()
+}
+
+fn paykit_unauthorized() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(json!({ "error": { "code": "invalid_signature" } })),
+    )
+        .into_response()
+}
+
+fn paykit_error(status: StatusCode, code: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (status, axum::Json(json!({ "error": { "code": code } }))).into_response()
+}
+
+fn paykit_record_call(state: &Arc<Mutex<FakePaykitState>>, method: &str, path: &str, host: &str, body: &Value) {
+    state
+        .lock()
+        .expect("fake paykit lock")
+        .calls
+        .push(FakePaykitCall {
+            method: method.to_string(),
+            path: path.to_string(),
+            host: host.to_string(),
+            body: body.clone(),
+        });
+}
+
+fn header_host(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
 async fn serve_paykit_payment_request(
     axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    use ed25519_dalek::Verifier;
-    let unauthorized = || {
-        (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({ "error": { "code": "invalid_signature" } })),
-        )
-            .into_response()
+    let host = header_host(&headers);
+    let Some(parsed) = paykit_verify_signed(&headers, &body) else {
+        return paykit_unauthorized();
     };
-    let Some(signature) = headers
-        .get("x-paykit-signature")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, value).ok()
-        })
-        .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
-    else {
-        return unauthorized();
-    };
-    if paykit_test_verifying_key()
-        .verify(&body, &ed25519_dalek::Signature::from_bytes(&signature))
-        .is_err()
-    {
-        return unauthorized();
-    }
-    let Ok(parsed) = serde_json::from_slice::<Value>(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({ "error": { "code": "invalid_request" } })),
-        )
-            .into_response();
-    };
+    paykit_record_call(&state, "POST", "/v0/payment-requests", &host, &parsed);
     let mut guard = state.lock().expect("fake paykit lock");
     if let Some(code) = guard.create_error.clone() {
-        return (
-            StatusCode::CONFLICT,
-            axum::Json(json!({ "error": { "code": code } })),
-        )
-            .into_response();
+        return paykit_error(StatusCode::CONFLICT, &code);
     }
     guard.requests.push(FakePaykitRequest {
         creator: parsed["creator"].as_str().unwrap_or_default().to_string(),
         reader: parsed["reader"].as_str().unwrap_or_default().to_string(),
         reference: parsed["reference"].as_str().unwrap_or_default().to_string(),
         amount_sats: parsed["amount_sats"].as_u64().unwrap_or_default(),
+        expires_at: parsed["expires_at"].as_str().unwrap_or_default().to_string(),
+        idempotency_key: parsed["idempotency_key"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
     });
-    StatusCode::NO_CONTENT.into_response()
+    match guard.create_shape {
+        FakePaykitCreateShape::LegacyNoContent => StatusCode::NO_CONTENT.into_response(),
+        _ => {
+            let amount_sats = parsed["amount_sats"].as_u64().unwrap_or_default();
+            let invoice_id = uuid::Uuid::new_v4();
+            let nonce_sats = guard.nonce_sats;
+            let total_sats = amount_sats + nonce_sats;
+            let expires_at = parsed["expires_at"].as_str().unwrap_or_default().to_string();
+            let prepare_expires_at =
+                (chrono::Utc::now() + chrono::Duration::minutes(15)).to_rfc3339();
+            guard.invoices.insert(
+                invoice_id,
+                FakePaykitInvoice {
+                    invoice_id,
+                    state: "prepared".to_string(),
+                    total_sats,
+                    expires_at: expires_at.clone(),
+                    prepare_expires_at: prepare_expires_at.clone(),
+                },
+            );
+            let mut body = json!({
+                "invoice_id": invoice_id,
+                "state": "prepared",
+                "stack_id": guard.stack_id,
+                "allocation_mode": guard.allocation_mode,
+                "nonce_sats": nonce_sats,
+                "total_sats": total_sats,
+                "expires_at": expires_at,
+                "prepare_expires_at": prepare_expires_at,
+                "derived_address_fingerprint": guard.fingerprint,
+            });
+            match guard.create_shape {
+                FakePaykitCreateShape::MissingField => {
+                    body.as_object_mut().expect("body is an object").remove("prepare_expires_at");
+                }
+                FakePaykitCreateShape::TotalInconsistent => {
+                    body["total_sats"] = json!(total_sats + 1);
+                }
+                _ => {}
+            }
+            (StatusCode::OK, axum::Json(body)).into_response()
+        }
+    }
+}
+
+/// The intrinsic contract for `activate`/`void` (§B.11.3, §B.11.6): stack
+/// identity, unknown invoices, state-machine edges. Scripted replies run
+/// first; this runs when no script is queued.
+fn paykit_command_contract(
+    guard: &mut FakePaykitState,
+    invoice_id: uuid::Uuid,
+    parsed: &Value,
+    command: &str,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // The echoed stack_id is checked on every command (r7).
+    if parsed["stack_id"].as_str().unwrap_or_default() != guard.stack_id {
+        return paykit_error(StatusCode::CONFLICT, "stack_identity_mismatch");
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let Some(invoice) = guard.invoices.get_mut(&invoice_id) else {
+        return paykit_error(StatusCode::NOT_FOUND, "unknown_invoice");
+    };
+    match command {
+        "activate" => {
+            // `total_sats` is a guard, not an instruction.
+            if parsed["total_sats"].as_u64().unwrap_or_default() != invoice.total_sats {
+                return paykit_error(StatusCode::CONFLICT, "activation_total_mismatch");
+            }
+            match invoice.state.as_str() {
+                "prepared" | "observing" => {
+                    invoice.state = "observing".to_string();
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "invoice_id": invoice_id,
+                            "state": "observing",
+                            "activated_at": now,
+                            "expires_at": invoice.expires_at,
+                            "total_sats": invoice.total_sats,
+                        })),
+                    )
+                        .into_response()
+                }
+                "void_prepare_expired" => paykit_error(StatusCode::CONFLICT, "prepare_expired"),
+                _ => paykit_error(StatusCode::CONFLICT, "invoice_finalized"),
+            }
+        }
+        "void" => match invoice.state.as_str() {
+            "prepared" | "void_cancelled" => {
+                invoice.state = "void_cancelled".to_string();
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "invoice_id": invoice_id,
+                        "state": "void_cancelled",
+                        "voided_at": now,
+                    })),
+                )
+                    .into_response()
+            }
+            "void_prepare_expired" => (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "invoice_id": invoice_id,
+                    "state": "void_prepare_expired",
+                    "voided_at": now,
+                })),
+            )
+                .into_response(),
+            _ => paykit_error(StatusCode::CONFLICT, "invoice_finalized"),
+        },
+        _ => unreachable!("activate or void"),
+    }
+}
+
+async fn serve_paykit_activate(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    axum::extract::Path(invoice_id): axum::extract::Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    serve_paykit_command(state, invoice_id, "activate", headers, body).await
+}
+
+async fn serve_paykit_void(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    axum::extract::Path(invoice_id): axum::extract::Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    serve_paykit_command(state, invoice_id, "void", headers, body).await
+}
+
+async fn serve_paykit_command(
+    state: Arc<Mutex<FakePaykitState>>,
+    invoice_id: uuid::Uuid,
+    command: &str,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let host = header_host(&headers);
+    let Some(parsed) = paykit_verify_signed(&headers, &body) else {
+        return paykit_unauthorized();
+    };
+    let path = format!("/v0/payment-requests/{invoice_id}/{command}");
+    paykit_record_call(&state, "POST", &path, &host, &parsed);
+    let scripted = {
+        let mut guard = state.lock().expect("fake paykit lock");
+        let scripts = if command == "activate" {
+            &mut guard.activate_scripts
+        } else {
+            &mut guard.void_scripts
+        };
+        scripts
+            .get_mut(&invoice_id)
+            .and_then(std::collections::VecDeque::pop_front)
+    };
+    match scripted {
+        Some(FakePaykitReply::Error(status, code)) => {
+            paykit_error(StatusCode::from_u16(status).expect("valid fake status"), &code)
+        }
+        Some(FakePaykitReply::Hang) => {
+            // Outlast the client's 10 s timeout, then fail.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            paykit_error(StatusCode::INTERNAL_SERVER_ERROR, "hung")
+        }
+        Some(FakePaykitReply::Contract) | None => {
+            let mut guard = state.lock().expect("fake paykit lock");
+            paykit_command_contract(&mut guard, invoice_id, &parsed, command)
+        }
+    }
 }
 
 pub async fn spawn_fake_paykit() -> FakePaykit {
-    let state: Arc<Mutex<FakePaykitState>> = Arc::default();
-    state.lock().expect("fake paykit lock").rail_health = json!({
-        "status": "ready",
-        "bitcoin_offer_available": true,
-    });
-    state.lock().expect("fake paykit lock").rail_health_status = 200;
-    state.lock().expect("fake paykit lock").account_status = 200;
+    let state = Arc::new(Mutex::new(FakePaykitState {
+        claimed: Vec::new(),
+        create_error: None,
+        create_shape: FakePaykitCreateShape::Full,
+        nonce_sats: 437,
+        stack_id: format!("test-stack:{}", uuid::Uuid::new_v4()),
+        allocation_mode: "shared_manual".to_string(),
+        fingerprint: "3f7a1c9e5b204d86".to_string(),
+        requests: Vec::new(),
+        invoices: HashMap::new(),
+        activate_scripts: HashMap::new(),
+        void_scripts: HashMap::new(),
+        calls: Vec::new(),
+        rail_health: json!({
+            "status": "ready",
+            "bitcoin_offer_available": true,
+        }),
+        rail_health_requests: 0,
+        rail_health_status: 200,
+        account_status: 200,
+    }));
     let router = Router::new()
         .route("/health/ready", axum::routing::get(serve_paykit_health))
         .route(
@@ -1298,6 +1614,14 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         .route(
             "/v0/payment-requests",
             axum::routing::post(serve_paykit_payment_request),
+        )
+        .route(
+            "/v0/payment-requests/{invoice_id}/activate",
+            axum::routing::post(serve_paykit_activate),
+        )
+        .route(
+            "/v0/payment-requests/{invoice_id}/void",
+            axum::routing::post(serve_paykit_void),
         )
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1403,6 +1727,36 @@ pub async fn test_app_with_payments_full(
         ipn,
         shippo,
     )
+}
+
+/// A test app on the given pool whose payments runtime points its paykit
+/// leg at an arbitrary base URL (the repoint test's "second deployment"),
+/// with fresh Stripe/IPN/Shippo doubles.
+pub async fn test_app_with_paykit_base(pool: PgPool, paykit_base_url: &str) -> TestApp {
+    let stripe = spawn_fake_stripe().await;
+    let ipn = spawn_fake_paypal_ipn().await;
+    let shippo = spawn_fake_shippo().await;
+    let runtime = Arc::new(PaymentsRuntime {
+        stripe_key_cipher: StripeKeyCipher::from_hex(TEST_STRIPE_ENCRYPTION_KEY)
+            .expect("test stripe key parses"),
+        stripe: StripeClient::new(&stripe.base_url).expect("fake stripe client builds"),
+        paykit: Some(
+            PaykitClient::new(paykit_base_url, TEST_PAYKIT_SIGNING_SEED)
+                .expect("fake paykit client builds"),
+        ),
+        paypal_ipn: PaypalIpnVerifier::new(&ipn.base_url).expect("fake ipn verifier builds"),
+        shippo: ShippoClient::new(&shippo.base_url).expect("fake shippo client builds"),
+    });
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
+        .with_payments(Some(runtime));
+    TestApp {
+        router: build_router(state.clone()),
+        pool,
+        clock,
+        state,
+    }
 }
 
 #[derive(Default)]
