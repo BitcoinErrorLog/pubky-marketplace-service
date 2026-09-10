@@ -167,8 +167,9 @@ redelivered row cannot apply twice. Terminal activation errors
 (`prepare_expired`, `invoice_finalized`, `unknown_invoice`, and the
 mismatch 409s) void the bind atomically — hold released, payment row
 restored to its pre-bind state, `payment.bitcoin_prepare_voided` emitted —
-and the mismatch and unknown-invoice cases alert; transient failures retry
-under the ordinary outbox lease.
+and the mismatch and unknown-invoice cases alert; transient failures — and
+a well-formed 200 whose `state` is not `observing`, which is a malformed
+success — retry under the ordinary outbox lease.
 
 **Hold expiry of a `preparing` order** (coordinator decision; design
 §B.11.2 leaves this cell undefined — W9.3 reconcile): when the hold

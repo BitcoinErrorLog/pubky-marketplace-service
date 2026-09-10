@@ -1183,6 +1183,9 @@ pub enum FakePaykitReply {
     /// A 200 whose body violates the response shape (a failure the client
     /// must treat as retryable: nothing may change).
     MalformedOk,
+    /// A well-formed 200 whose `state` is not `observing` (a §B.11.3
+    /// violation the client must treat as a retryable malformed success).
+    NonObservingOk(String),
     /// Hold the request open past the client's timeout, then 500.
     Hang,
 }
@@ -1689,6 +1692,22 @@ async fn serve_paykit_command(
         Some(FakePaykitReply::MalformedOk) => {
             use axum::response::IntoResponse;
             (StatusCode::OK, axum::Json(json!({ "unexpected": true }))).into_response()
+        }
+        Some(FakePaykitReply::NonObservingOk(wrong_state)) => {
+            use axum::response::IntoResponse;
+            let guard = state.lock().expect("fake paykit lock");
+            let invoice = guard.invoices.get(&invoice_id).expect("invoice prepared");
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "invoice_id": invoice_id,
+                    "state": wrong_state,
+                    "activated_at": chrono::Utc::now().to_rfc3339(),
+                    "expires_at": invoice.expires_at,
+                    "total_sats": invoice.total_sats,
+                })),
+            )
+                .into_response()
         }
         Some(FakePaykitReply::Hang) => {
             // Outlast the client's 10 s timeout, then fail.

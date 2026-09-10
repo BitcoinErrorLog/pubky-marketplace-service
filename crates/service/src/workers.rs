@@ -579,6 +579,19 @@ async fn deliver_paykit_activation(
         .await
     {
         Ok(activated) => {
+            // §B.11.3: a well-formed activation success has
+            // `state: "observing"`. Any other state in a 200 is a
+            // malformed success — retryable under the lease like an
+            // unparseable body, never terminal, never active.
+            if activated.state != "observing" {
+                tracing::warn!(
+                    order_id = %payload.order_id,
+                    invoice_id = %payload.invoice_id,
+                    state = %activated.state,
+                    "paykit activate returned a 200 with a non-observing state; retrying"
+                );
+                return Ok(false);
+            }
             if activated.total_sats != total_sats {
                 tracing::error!(
                     order_id = %payload.order_id,

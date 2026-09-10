@@ -641,6 +641,81 @@ async fn activation_flips_preparing_to_active_atomically(pool: PgPool) {
     assert_eq!(success.body["activation_attempt"], json!(2));
 }
 
+// 6b. A well-formed activation 200 whose `state` is not `observing` is a
+//     malformed success: nothing flips locally, the row retries under its
+//     lease, and a later well-formed 200 completes the activation.
+#[sqlx::test(migrations = "./migrations")]
+async fn activation_success_with_a_non_observing_state_retries(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let paykit_client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+
+    for bad_state in ["prepared", "collapsing"] {
+        // A fresh seller per case keeps the single-unit listings
+        // independent (a completed case holds its stock).
+        let seller = new_actor(&app).await;
+        let buyer = new_actor(&app).await;
+        enable_bitcoin(&app, &paykit, &seller).await;
+        let order = create_sat_order(&app, &seller, &buyer).await;
+        let (status, body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+        assert_eq!(status, StatusCode::OK, "{bad_state} bind failed: {body}");
+        let (invoice_id,): (Uuid,) =
+            sqlx::query_as("SELECT paykit_invoice_id FROM orders WHERE id = $1")
+                .bind(order_uuid(&order.order_id))
+                .fetch_one(&pool)
+                .await
+                .expect("order row exists");
+        paykit.script_activate(
+            invoice_id,
+            vec![
+                FakePaykitReply::NonObservingOk(bad_state.to_string()),
+                FakePaykitReply::Contract,
+            ],
+        );
+
+        drain_outbox(&app.pool, paykit_client, app.clock.now(), 30)
+            .await
+            .expect("drain runs");
+        let (request_state, activation_state, ..) = order_paykit_row(&pool, &order.order_id).await;
+        assert_eq!(
+            activation_state.as_deref(),
+            Some("preparing"),
+            "{bad_state}: nothing flips on a non-observing 200"
+        );
+        assert_eq!(request_state.as_deref(), Some("preparing"), "{bad_state}");
+        let undelivered: i64 = count(
+            &pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate' AND delivered_at IS NULL",
+        )
+        .await;
+        assert_eq!(undelivered, 1, "{bad_state}: the row retries");
+
+        // The retry (a well-formed 200) completes the activation.
+        sqlx::query(
+            "UPDATE outbox SET lease_until = NULL \
+             WHERE kind = 'paykit.activate' AND delivered_at IS NULL",
+        )
+        .execute(&pool)
+        .await
+        .expect("lease released");
+        drain_outbox(&app.pool, paykit_client, app.clock.now(), 30)
+            .await
+            .expect("drain runs");
+        let (request_state, activation_state, ..) = order_paykit_row(&pool, &order.order_id).await;
+        assert_eq!(activation_state.as_deref(), Some("active"), "{bad_state}");
+        assert_eq!(request_state.as_deref(), Some("pending"), "{bad_state}");
+        let activations = paykit
+            .calls()
+            .into_iter()
+            .filter(|call| call.path == format!("/v0/payment-requests/{invoice_id}/activate"))
+            .count();
+        assert_eq!(activations, 2, "{bad_state}: the bad 200 plus the retry");
+    }
+}
+
 // 7. A redelivered activate row cannot apply twice: no second HTTP call,
 //    no state change.
 #[sqlx::test(migrations = "./migrations")]
