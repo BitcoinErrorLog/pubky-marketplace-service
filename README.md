@@ -135,9 +135,13 @@ including `paykit_stack_endpoint`, the base URL the phase-1 call used, so
 later messages route back to the issuing stack even after
 `PAYKIT_SERVER_URL` is repointed — together with a durable
 `paykit.activate` outbox row. Bind and activation intent commit atomically
-or not at all; a phase-1 refusal rolls everything back (fail-closed), and
-a local commit failure after a phase-1 success triggers one best-effort
-courtesy void (paykit's 15-minute prepare reaper is the guarantee).
+or not at all; a phase-1 refusal rolls everything back (fail-closed). A
+commit call that reports an error after a phase-1 success has an ambiguous
+outcome — the write may be durable — so the bind is re-read before anything
+is voided: only a confirmed-absent bind triggers one best-effort courtesy
+void (paykit's 15-minute prepare reaper is the guarantee), a durable bind
+is carried forward by its activation row, and an unreadable state alerts
+and is left to the hold-expiry reconciliation below.
 `total_sats` (`price + nonce`) is the figure the marketplace charges,
 displays and records: the order projection, the payment step and the
 receipt all carry it. The phase-1 response is checked against the request

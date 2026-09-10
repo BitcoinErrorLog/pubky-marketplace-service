@@ -747,6 +747,9 @@ pub async fn bind_payment_method(
     // a fresh key. The bind AND the `paykit.activate` outbox row commit
     // atomically or not at all.
     let mut prepared: Option<(uuid::Uuid, String, String)> = None;
+    // The re-read key for an ambiguous COMMIT: `{reference}:{bind_attempt}`
+    // plus the invoice id, captured when phase 1 runs.
+    let mut bind_key: Option<(String, i32)> = None;
     if let Some(reference) = &paykit_reference {
         let paykit = payments.paykit.as_ref().expect("checked above");
         let amount_sats = bitcoin_amount_sats(&order).expect("checked above");
@@ -809,6 +812,7 @@ pub async fn bind_payment_method(
             );
         }
         prepared = Some((phase1.invoice_id, phase1.stack_id.clone(), endpoint.clone()));
+        bind_key = Some((reference.clone(), updated_order.paykit_bind_attempt));
         // The echoed `expires_at` must equal the hold deadline this call
         // sent (the wire format truncates to UTC seconds, so the comparison
         // is exact at second precision): a stack answering with a later
@@ -923,11 +927,78 @@ pub async fn bind_payment_method(
     match tx.commit().await {
         Ok(()) => response,
         Err(error) => {
-            // Phase 1 returned 200 but the local commit failed: one
-            // best-effort void (the reaper is the guarantee, this is
-            // courtesy), never blocking the error response on it.
-            spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+            // Phase 1 returned 200 but the commit call reported an error:
+            // the outcome is ambiguous (PostgreSQL may have durably
+            // committed before the connection dropped), so the courtesy
+            // void fires only after the bind is confirmed absent.
+            resolve_ambiguous_bind_commit(
+                &state, &payments, &prepared, order.id, &bind_key, &error,
+            )
+            .await;
             internal("payment method commit", &error)
+        }
+    }
+}
+
+/// Resolves an ambiguous bind COMMIT (§B.11.4): `commit()` reported
+/// `commit_error`, but PostgreSQL may still have durably committed (the
+/// connection can drop after COMMIT reached the server). The bind is
+/// re-read on a fresh connection; only a bind confirmed ABSENT gets the
+/// courtesy void — a durable bind is carried forward by its
+/// `paykit.activate` outbox row (voiding it would cancel a live bind), and
+/// a failed re-read enqueues nothing and alerts, leaving the hold-expiry
+/// path on `preparing` to settle the invoice against paykit's truth.
+pub async fn resolve_ambiguous_bind_commit(
+    state: &AppState,
+    payments: &std::sync::Arc<PaymentsRuntime>,
+    prepared: &Option<(uuid::Uuid, String, String)>,
+    order_id: Uuid,
+    bind_key: &Option<(String, i32)>,
+    commit_error: &sqlx::Error,
+) {
+    let (Some((invoice_id, _, _)), Some((reference, bind_attempt))) = (prepared, bind_key) else {
+        return;
+    };
+    let bind_present = sqlx::query_scalar::<_, i64>(
+        "SELECT 1::bigint FROM orders WHERE id = $1 AND paykit_request_reference = $2 \
+         AND paykit_bind_attempt = $3 AND paykit_invoice_id = $4",
+    )
+    .bind(order_id)
+    .bind(reference.as_str())
+    .bind(bind_attempt)
+    .bind(invoice_id)
+    .fetch_optional(&state.pool)
+    .await;
+    match bind_present {
+        Ok(Some(_)) => {
+            // The COMMIT reached the server: the bind and its activation
+            // intent are durable, and the outbox row carries phase 2
+            // forward.
+            tracing::warn!(
+                order_id = %order_id,
+                invoice_id = %invoice_id,
+                error = %commit_error,
+                "bind commit reported an error but the bind is durable; \
+                 the activation outbox carries it forward"
+            );
+        }
+        Ok(None) => {
+            // Confirmed absent: the transaction rolled back. One
+            // best-effort void (paykit's 15-minute reaper is the guarantee).
+            spawn_courtesy_void(payments, prepared, "marketplace_bind_rolled_back");
+        }
+        Err(read_error) => {
+            // Outcome unknown: enqueue nothing. If the bind is durable its
+            // outbox row drives activation; if it is not, the prepared
+            // invoice is unpublished and the reaper takes it.
+            tracing::error!(
+                order_id = %order_id,
+                invoice_id = %invoice_id,
+                commit_error = %commit_error,
+                read_error = %read_error,
+                "ALERT bind commit outcome is ambiguous and the re-read failed; \
+                 leaving reconciliation to the hold-expiry path"
+            );
         }
     }
 }

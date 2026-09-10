@@ -282,8 +282,9 @@ async fn activation_routes_to_the_persisted_endpoint_after_a_repoint(pool: PgPoo
     assert_eq!(stack_id2.as_deref(), Some(paykit_b.stack_id().as_str()));
 }
 
-// 3. A local commit failure after a phase-1 200 rolls the whole bind back
-//    (no bind, no outbox row) and sends one courtesy void.
+// 3. A genuine commit failure after a phase-1 200 rolls the whole bind
+//    back (no bind, no outbox row): the ambiguous-commit re-read confirms
+//    the bind ABSENT, so exactly one courtesy void fires.
 #[sqlx::test(migrations = "./migrations")]
 async fn a_failed_commit_after_phase_one_rolls_back_and_voids(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
@@ -357,6 +358,55 @@ async fn a_failed_commit_after_phase_one_rolls_back_and_voids(pool: PgPool) {
         json!("marketplace_bind_rolled_back")
     );
     assert_eq!(voids[0].body["stack_id"], json!(paykit.stack_id()));
+}
+
+// 3b. The other half of the ambiguous COMMIT: the commit call reports an
+//     error while the write is durable (the connection dropped after COMMIT
+//     reached the server). The re-read finds the bind, so ZERO voids may
+//     leave for paykit — the activation outbox row carries the bind
+//     forward. Driven through the store seam with the bind + outbox row
+//     committed.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_ambiguous_commit_with_a_durable_bind_never_voids(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _payment_id, invoice_id) =
+        bound_preparing_order(&app, &paykit, &seller, &buyer).await;
+
+    // The bind committed; now the commit path reports an error anyway.
+    let (reference, attempt): (String, i32) = sqlx::query_as(
+        "SELECT paykit_request_reference, paykit_bind_attempt FROM orders WHERE id = $1",
+    )
+    .bind(order_uuid(&order_id))
+    .fetch_one(&pool)
+    .await
+    .expect("order row exists");
+    let payments = app.state.payments.clone().expect("payments runtime");
+    let prepared = Some((invoice_id, paykit.stack_id(), paykit.base_url.clone()));
+    marketplace_service::payment_methods::resolve_ambiguous_bind_commit(
+        &app.state,
+        &payments,
+        &prepared,
+        order_uuid(&order_id),
+        &Some((reference, attempt)),
+        &sqlx::Error::Io(std::io::Error::other("injected ambiguous commit")),
+    )
+    .await;
+
+    // Nothing may leave for paykit; the bind and its outbox row stand.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        paykit
+            .calls()
+            .iter()
+            .all(|call| !call.path.ends_with("/void")),
+        "no void reached paykit: {:?}",
+        paykit.calls()
+    );
+    assert_eq!(activate_row_undelivered(&pool).await, 1);
+    let (_request_state, activation_state, ..) = order_paykit_row(&pool, &order_id).await;
+    assert_eq!(activation_state.as_deref(), Some("preparing"));
 }
 
 // 4. Phase-1 refusals keep their semantics and write nothing.
