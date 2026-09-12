@@ -143,6 +143,19 @@ pub fn order_json_with_reviews(order: &OrderRow, reviews: &[ReviewRow]) -> Value
     view
 }
 
+/// Seller-scoped variant used by the Paykit review commands. Keeping this
+/// separate prevents seller-only evidence from widening ordinary command
+/// result projections.
+pub fn seller_order_json_with_reviews(
+    order: &OrderRow,
+    reviews: &[ReviewRow],
+    authenticated_actor: &str,
+) -> Value {
+    let mut view = order.seller_projection_for_actor(authenticated_actor);
+    view["reviews"] = Value::Array(reviews.iter().map(ReviewRow::view).collect());
+    view
+}
+
 /// Persists the shared tail of an order action, mirroring the prototype's
 /// `persistOrderAction`: one immutable event on the order aggregate plus one
 /// outbox notification intent (`notification` is `(type, recipient)`),

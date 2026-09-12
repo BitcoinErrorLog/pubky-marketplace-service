@@ -9,6 +9,7 @@ pub mod auth;
 pub mod bitcoin_review;
 pub mod clock;
 pub mod config;
+pub mod contracts;
 pub mod executor;
 pub mod expiry;
 pub mod handlers;

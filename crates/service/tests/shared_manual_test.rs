@@ -9,6 +9,10 @@ mod common;
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
+use common::paykit_review::{
+    bound_shared_manual_order, confirm_call, create_sat_order, enable_bitcoin, poll_now,
+    status_confirmed, status_detected,
+};
 use common::*;
 use marketplace_service::bitcoin_review::{
     add_business_days, condition_seven_clear, route_due_seller_confirmation_windows,
@@ -16,9 +20,7 @@ use marketplace_service::bitcoin_review::{
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::payments::order_reference;
-use marketplace_service::workers::{
-    drain_outbox, expire_due_payment_windows, verify_due_paykit_payments,
-};
+use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
 use sqlx::{Acquire, PgPool};
 use uuid::Uuid;
@@ -42,112 +44,6 @@ const LIVE_SHARED_MANUAL_LATE_STATUS: &str = r#"{"allocation_mode":"shared_manua
 
 fn captured_late_status(payload: &str) -> Value {
     serde_json::from_str(payload).expect("captured live producer payload")
-}
-
-fn status_detected(mode: &str, confirmations: u32) -> Value {
-    bitcoin_status_v2(
-        "detected",
-        true,
-        mode,
-        Some(OBSERVED_TXID),
-        Some(TOTAL_SATS as u64),
-        Some(confirmations),
-    )
-}
-
-fn status_confirmed(mode: &str, amount_matched: bool, confirmations: u32) -> Value {
-    bitcoin_status_v2(
-        "confirmed",
-        amount_matched,
-        mode,
-        Some(OBSERVED_TXID),
-        Some(TOTAL_SATS as u64),
-        Some(confirmations),
-    )
-}
-
-/// One verification pass through the REAL signed status client against the
-/// local paykit double — the production transport/consumer seam, not a
-/// mock of it.
-async fn poll_now(app: &TestApp, now: DateTime<Utc>) -> u64 {
-    let client = app
-        .state
-        .payments
-        .as_ref()
-        .and_then(|payments| payments.paykit.as_ref())
-        .expect("paykit client configured");
-    verify_due_paykit_payments(&app.state, client, now)
-        .await
-        .expect("poll runs")
-}
-
-async fn enable_bitcoin(app: &TestApp, paykit: &FakePaykit, seller: &TestActor) {
-    let (status, body) = send(
-        app.router.clone(),
-        "PUT",
-        "/v0/sellers/me/payment-config",
-        Some(&seller.token),
-        &json!({ "bitcoin_enabled": true }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "config put failed: {body}");
-    paykit.set_claimed(&seller.pubky);
-}
-
-async fn create_sat_order(app: &TestApp, seller: &TestActor, buyer: &TestActor) -> PendingOrder {
-    let (status, body) =
-        execute(app, &seller.token, &register_sat_command(&seller.pubky, 16)).await;
-    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
-    let (status, body) = execute(
-        app,
-        &buyer.token,
-        &checkout_command_with_id(&seller.pubky, &Uuid::new_v4().to_string()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
-    PendingOrder {
-        order_id: body["result"]["orders"][0]["id"]
-            .as_str()
-            .expect("order id present")
-            .to_string(),
-        payment_id: body["result"]["payments"][0]["id"]
-            .as_str()
-            .expect("payment id present")
-            .to_string(),
-    }
-}
-
-/// Binds bitcoin on a `shared_manual` stack and activates, leaving the
-/// order `pending` and pollable. Returns (order_id, payment_id, reference).
-async fn bound_shared_manual_order(
-    app: &TestApp,
-    paykit: &FakePaykit,
-    seller: &TestActor,
-    buyer: &TestActor,
-) -> (String, String, String) {
-    paykit.set_allocation_mode("shared_manual");
-    enable_bitcoin(app, paykit, seller).await;
-    let order = create_sat_order(app, seller, buyer).await;
-    let (status, body) = send(
-        app.router.clone(),
-        "POST",
-        &format!("/v0/orders/{}/payment-method", order.order_id),
-        Some(&buyer.token),
-        &json!({ "method": "bitcoin" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
-    let paykit_client = app
-        .state
-        .payments
-        .as_ref()
-        .and_then(|payments| payments.paykit.as_ref());
-    let delivered = drain_outbox(&app.pool, paykit_client, app.clock.now(), 30)
-        .await
-        .expect("activation delivers");
-    assert!(delivered >= 1, "the activate row delivers");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
-    (order.order_id, order.payment_id, reference)
 }
 
 async fn bound_exclusive_order(
@@ -489,22 +385,6 @@ async fn order_facts(pool: &PgPool, order_id: &str) -> (String, String, bool, Op
         stock_held,
         hold.map(|h| h.to_rfc3339()),
     )
-}
-
-async fn confirm_call(
-    app: &TestApp,
-    token: &str,
-    order_id: &str,
-    body: &Value,
-) -> (StatusCode, Value) {
-    send(
-        app.router.clone(),
-        "POST",
-        &format!("/v0/orders/{order_id}/confirm-bitcoin-payment"),
-        Some(token),
-        body,
-    )
-    .await
 }
 
 #[sqlx::test(migrations = "./migrations")]

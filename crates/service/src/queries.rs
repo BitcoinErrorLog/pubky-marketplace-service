@@ -316,10 +316,12 @@ fn order_with_payment(
     order: &OrderRow,
     payment: Option<&PaymentRow>,
     reviews: &[&ReviewRow],
+    actor: &str,
 ) -> Value {
-    let mut view = order.projection();
+    let mut view = order
+        .projection_for_actor_with_payment(actor, payment.map(|payment| payment.state.as_str()));
     if let Some(payment) = payment {
-        view["payment"] = payment.projection();
+        view["payment"] = payment.projection_for_actor(actor);
     }
     view["reviews"] = Value::Array(reviews.iter().map(|review| review.view()).collect());
     view
@@ -376,7 +378,7 @@ pub async fn list_orders(
                 .iter()
                 .filter(|review| review.order_id == order.id)
                 .collect();
-            order_with_payment(order, payment, &order_reviews)
+            order_with_payment(order, payment, &order_reviews, &actor.0)
         })
         .collect();
     if let Err(error) = attach_pickup_terms_flags(&state.pool, &orders, &mut views).await {
@@ -446,7 +448,7 @@ pub async fn get_order(
     match reviews {
         Ok(reviews) => {
             let order_reviews: Vec<&ReviewRow> = reviews.iter().collect();
-            let mut view = order_with_payment(&order, payment.as_ref(), &order_reviews);
+            let mut view = order_with_payment(&order, payment.as_ref(), &order_reviews, &actor.0);
             let orders = [order];
             let mut views = [view];
             if let Err(error) = attach_pickup_terms_flags(&state.pool, &orders, &mut views).await {
@@ -798,7 +800,9 @@ pub async fn get_payment(
     .fetch_optional(&state.pool)
     .await;
     match payment {
-        Ok(Some(payment)) => (StatusCode::OK, Json(payment.projection())).into_response(),
+        Ok(Some(payment)) => {
+            (StatusCode::OK, Json(payment.projection_for_actor(&actor.0))).into_response()
+        }
         Ok(None) => query_error(ErrorCode::NotFound, "The payment was not found."),
         Err(error) => internal_error("payment", &error),
     }

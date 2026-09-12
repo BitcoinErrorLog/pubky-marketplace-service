@@ -406,6 +406,40 @@ impl OrderRow {
         view
     }
 
+    /// The participant projection with seller-only Paykit review evidence.
+    /// The stored observation is intentionally reduced to the facts needed
+    /// for the seller's attestation decision.
+    pub fn projection_for_actor(&self, actor: &str) -> Value {
+        self.projection_for_actor_with_payment(actor, None)
+    }
+
+    pub fn seller_projection_for_actor(&self, actor: &str) -> Value {
+        self.projection_for_actor_with_payment(actor, None)
+    }
+
+    pub fn projection_for_actor_with_payment(
+        &self,
+        actor: &str,
+        payment_state: Option<&str>,
+    ) -> Value {
+        let mut view = self.projection();
+        if payment_state == Some("manual_review") {
+            view["next_actor"] = json!("seller");
+        }
+        if actor == self.seller_pubky {
+            view["paykit_observation"] = seller_observation(self.paykit_observation.as_ref());
+            view["paykit_seller_confirmation_entered_at"] = self
+                .paykit_seller_confirmation_entered_at
+                .map(format_timestamp)
+                .into();
+            view["paykit_seller_confirmation_deadline"] = self
+                .paykit_seller_confirmation_deadline
+                .map(format_timestamp)
+                .into();
+        }
+        view
+    }
+
     /// How the bound fiat method is verified: `processor` (Stripe, via the
     /// seller's restricted key against the Stripe API), `gateway-notified`
     /// (PayPal, a postback-verified IPN from PayPal's servers paid the
@@ -437,6 +471,8 @@ impl OrderRow {
             self.payment_method.is_some(),
             self.payment_reported_at.is_some(),
             self.seller_has_rail,
+            self.paykit_request_state.as_deref(),
+            None,
         )
     }
 
@@ -496,8 +532,16 @@ fn next_actor_for_order(
     payment_method_bound: bool,
     payment_reported: bool,
     seller_has_rail: bool,
+    paykit_request_state: Option<&str>,
+    payment_state: Option<&str>,
 ) -> Option<&'static str> {
+    if payment_state == Some("manual_review") {
+        return Some("seller");
+    }
     match state {
+        "pending_payment" if paykit_request_state == Some("awaiting_seller_confirmation") => {
+            Some("seller")
+        }
         "pending_payment" if payment_reported => Some("seller"),
         "pending_payment" if !payment_method_bound && !seller_has_rail => Some("seller"),
         "pending_payment" | "shipped" => Some("buyer"),
@@ -511,72 +555,178 @@ fn next_actor_for_order(
     }
 }
 
+pub(crate) fn seller_observation(observation: Option<&Value>) -> Value {
+    let Some(observation) = observation else {
+        return Value::Null;
+    };
+    json!({
+        "txid": observation.get("txid").and_then(Value::as_str),
+        "observed_sats": observation.get("observed_sats").and_then(Value::as_i64),
+        "confirmations": observation.get("confirmations").and_then(Value::as_i64),
+        "amount_matched": observation.get("amount_matched").and_then(Value::as_bool),
+        "observed_at": observation.get("observed_at").and_then(Value::as_str),
+        "disappeared": observation.get("disappeared").and_then(Value::as_bool),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::next_actor_for_order;
+    use super::{next_actor_for_order, seller_observation};
+    use serde_json::json;
 
     #[test]
     fn next_actor_matches_order_state_and_payment_facts() {
         assert_eq!(
-            next_actor_for_order("pending_payment", false, false, false),
+            next_actor_for_order("pending_payment", false, false, false, None, None),
             Some("seller")
         );
         assert_eq!(
-            next_actor_for_order("pending_payment", false, false, true),
+            next_actor_for_order("pending_payment", false, false, true, None, None),
             Some("buyer")
         );
         assert_eq!(
-            next_actor_for_order("pending_payment", true, false, false),
+            next_actor_for_order("pending_payment", true, false, false, None, None),
             Some("buyer")
         );
         assert_eq!(
-            next_actor_for_order("pending_payment", true, true, true),
+            next_actor_for_order("pending_payment", true, true, true, None, None),
             Some("seller")
         );
         assert_eq!(
-            next_actor_for_order("pending_payment", false, true, true),
+            next_actor_for_order("pending_payment", false, true, true, None, None),
             Some("seller")
         );
         assert_eq!(
-            next_actor_for_order("shipped", true, false, true),
+            next_actor_for_order("shipped", true, false, true, None, None),
             Some("buyer")
         );
-        assert_eq!(next_actor_for_order("delivered", true, false, true), None);
         assert_eq!(
-            next_actor_for_order("paid", true, false, true),
-            Some("seller")
-        );
-        assert_eq!(
-            next_actor_for_order("processing", true, false, true),
-            Some("seller")
-        );
-        assert_eq!(
-            next_actor_for_order("return_requested", true, false, true),
-            Some("seller")
-        );
-        assert_eq!(
-            next_actor_for_order("cancel_requested", true, false, true),
-            Some("seller")
-        );
-        assert_eq!(
-            next_actor_for_order("return_approved", true, false, true),
-            Some("seller")
-        );
-        assert_eq!(
-            next_actor_for_order("return_received", true, false, true),
-            Some("seller")
-        );
-        assert_eq!(
-            next_actor_for_order("ready_for_pickup", true, false, true),
-            Some("buyer")
-        );
-        assert_eq!(next_actor_for_order("completed", true, false, true), None);
-        assert_eq!(next_actor_for_order("cancelled", true, false, true), None);
-        assert_eq!(
-            next_actor_for_order("refunded_external", true, false, true),
+            next_actor_for_order("delivered", true, false, true, None, None),
             None
         );
-        assert_eq!(next_actor_for_order("closed", true, false, true), None);
+        assert_eq!(
+            next_actor_for_order("paid", true, false, true, None, None),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("processing", true, false, true, None, None),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("return_requested", true, false, true, None, None),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("cancel_requested", true, false, true, None, None),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("return_approved", true, false, true, None, None),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("return_received", true, false, true, None, None),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("ready_for_pickup", true, false, true, None, None),
+            Some("buyer")
+        );
+        assert_eq!(
+            next_actor_for_order("completed", true, false, true, None, None),
+            None
+        );
+        assert_eq!(
+            next_actor_for_order("cancelled", true, false, true, None, None),
+            None
+        );
+        assert_eq!(
+            next_actor_for_order("refunded_external", true, false, true, None, None),
+            None
+        );
+        assert_eq!(
+            next_actor_for_order("closed", true, false, true, None, None),
+            None
+        );
+        assert_eq!(
+            next_actor_for_order(
+                "pending_payment",
+                true,
+                false,
+                true,
+                Some("awaiting_seller_confirmation"),
+                None,
+            ),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order(
+                "pending_payment",
+                true,
+                false,
+                true,
+                None,
+                Some("manual_review")
+            ),
+            Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order("cancelled", true, false, true, None, Some("manual_review")),
+            Some("seller")
+        );
+    }
+
+    #[test]
+    fn seller_observation_is_a_minimal_allowlist() {
+        let view = seller_observation(Some(&json!({
+            "state": "confirmed",
+            "txid": "tx",
+            "observed_sats": 10,
+            "confirmations": 2,
+            "amount_matched": true,
+            "observed_at": "2026-09-12T11:00:00Z",
+            "disappeared": false,
+            "endpoint": "https://secret.invalid",
+            "invoice_id": "secret",
+            "request_hash": "secret",
+            "provider_response": {"secret": true},
+            "address": "secret",
+            "token": "secret",
+        })));
+        assert_eq!(
+            view,
+            json!({
+                "txid": "tx",
+                "observed_sats": 10,
+                "confirmations": 2,
+                "amount_matched": true,
+                "observed_at": "2026-09-12T11:00:00Z",
+                "disappeared": false,
+            })
+        );
+    }
+
+    #[test]
+    fn seller_observation_rejects_nested_and_wrong_scalar_values() {
+        let view = seller_observation(Some(&json!({
+            "txid": {"nested": "secret"},
+            "observed_sats": "51637",
+            "confirmations": [2],
+            "amount_matched": "true",
+            "observed_at": {"timestamp": "secret"},
+            "disappeared": 0,
+        })));
+        assert_eq!(
+            view,
+            json!({
+                "txid": null,
+                "observed_sats": null,
+                "confirmations": null,
+                "amount_matched": null,
+                "observed_at": null,
+                "disappeared": null,
+            })
+        );
     }
 }
 
@@ -754,6 +904,16 @@ impl PaymentRow {
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
         })
+    }
+
+    /// Adds the manual-review window entry only for the listing seller.
+    pub fn projection_for_actor(&self, actor: &str) -> Value {
+        let mut view = self.projection();
+        if actor == self.seller_pubky {
+            view["manual_review_entered_at"] =
+                self.manual_review_entered_at.map(format_timestamp).into();
+        }
+        view
     }
 }
 

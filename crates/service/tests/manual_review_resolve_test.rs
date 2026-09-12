@@ -10,6 +10,11 @@ mod common;
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
+use common::paykit_review::{
+    bound_order, enable_bitcoin, into_manual_review_held, into_manual_review_late,
+    into_manual_review_mismatch, poll_now, resolve_call,
+    status_confirmed as shared_status_confirmed,
+};
 use common::*;
 use marketplace_service::bitcoin_review::{
     condition_seven_clear, route_due_seller_confirmation_windows, watch_manual_reviews,
@@ -27,201 +32,9 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 const TOTAL_SATS: i64 = 51_200 + 437;
-const OBSERVED_TXID: &str = "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c";
 
 fn status_confirmed(mode: &str, amount_matched: bool) -> Value {
-    bitcoin_status_v2(
-        "confirmed",
-        amount_matched,
-        mode,
-        Some(OBSERVED_TXID),
-        Some(TOTAL_SATS as u64),
-        Some(2),
-    )
-}
-
-async fn poll_now(app: &TestApp, now: DateTime<Utc>) -> u64 {
-    let client = app
-        .state
-        .payments
-        .as_ref()
-        .and_then(|payments| payments.paykit.as_ref())
-        .expect("paykit client configured");
-    verify_due_paykit_payments(&app.state, client, now)
-        .await
-        .expect("poll runs")
-}
-
-async fn enable_bitcoin(app: &TestApp, paykit: &FakePaykit, seller: &TestActor) {
-    let (status, body) = send(
-        app.router.clone(),
-        "PUT",
-        "/v0/sellers/me/payment-config",
-        Some(&seller.token),
-        &json!({ "bitcoin_enabled": true }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "config put failed: {body}");
-    paykit.set_claimed(&seller.pubky);
-}
-
-async fn create_sat_order(app: &TestApp, seller: &TestActor, buyer: &TestActor) -> PendingOrder {
-    let (status, body) =
-        execute(app, &seller.token, &register_sat_command(&seller.pubky, 16)).await;
-    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
-    // The checkout fixture pins the listing's CURRENT server revision so
-    // repeated orders against one listing never go stale.
-    let revision: i64 =
-        sqlx::query_scalar("SELECT server_revision FROM listings WHERE aggregate_id = $1")
-            .bind(format!("listing:{}_boots_01", seller.pubky))
-            .fetch_one(&app.pool)
-            .await
-            .expect("listing row");
-    let mut checkout = checkout_command_with_id(&seller.pubky, &Uuid::new_v4().to_string());
-    checkout["payload"]["lines"][0]["expected_revision"] = json!(revision);
-    let (status, body) = execute(app, &buyer.token, &checkout).await;
-    assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
-    PendingOrder {
-        order_id: body["result"]["orders"][0]["id"]
-            .as_str()
-            .expect("order id present")
-            .to_string(),
-        payment_id: body["result"]["payments"][0]["id"]
-            .as_str()
-            .expect("payment id present")
-            .to_string(),
-    }
-}
-
-/// Binds and activates a bitcoin order on the given allocation mode,
-/// returning (order_id, payment_id, reference).
-async fn bound_order(
-    app: &TestApp,
-    paykit: &FakePaykit,
-    seller: &TestActor,
-    buyer: &TestActor,
-    mode: &str,
-) -> (String, String, String) {
-    paykit.set_allocation_mode(mode);
-    enable_bitcoin(app, paykit, seller).await;
-    let order = create_sat_order(app, seller, buyer).await;
-    let (status, body) = send(
-        app.router.clone(),
-        "POST",
-        &format!("/v0/orders/{}/payment-method", order.order_id),
-        Some(&buyer.token),
-        &json!({ "method": "bitcoin" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
-    let client = app
-        .state
-        .payments
-        .as_ref()
-        .and_then(|payments| payments.paykit.as_ref());
-    drain_outbox(&app.pool, client, app.clock.now(), 30)
-        .await
-        .expect("activation delivers");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
-    (order.order_id, order.payment_id, reference)
-}
-
-/// The held entry class: shared_manual observation, entry, then the
-/// 24-hour reaper routes the payment to `manual_review` (hold preserved).
-async fn into_manual_review_held(
-    app: &TestApp,
-    paykit: &FakePaykit,
-    seller: &TestActor,
-    buyer: &TestActor,
-) -> (String, String) {
-    let (order_id, _payment_id, reference) =
-        bound_order(app, paykit, seller, buyer, "shared_manual").await;
-    paykit.set_status(&reference, status_confirmed("shared_manual", true));
-    let entered_at = app.clock.now();
-    poll_now(app, entered_at).await;
-    let routed = route_due_seller_confirmation_windows(
-        &app.state,
-        entered_at + chrono::Duration::seconds(SELLER_CONFIRMATION_WINDOW_SECONDS),
-    )
-    .await
-    .expect("reaper runs");
-    assert_eq!(routed, 1);
-    (order_id, reference)
-}
-
-/// The late-settlement entry class: the hold window lapses first (order
-/// cancelled, stock released), then a confirmed observation routes the
-/// expired payment to `manual_review`.
-async fn into_manual_review_late(
-    app: &TestApp,
-    paykit: &FakePaykit,
-    seller: &TestActor,
-    buyer: &TestActor,
-) -> (String, String) {
-    let (order_id, _payment_id, reference) =
-        bound_order(app, paykit, seller, buyer, "shared_manual").await;
-    let after_window = app.clock.now() + chrono::Duration::seconds(3700);
-    let expired = expire_due_payment_windows(&app.state, after_window)
-        .await
-        .expect("sweep runs");
-    assert_eq!(expired, 1);
-    paykit.set_status(&reference, status_confirmed("shared_manual", true));
-    let applied = poll_now(app, after_window + chrono::Duration::seconds(60)).await;
-    assert_eq!(applied, 1);
-    (order_id, reference)
-}
-
-/// The amount-mismatch entry class (exclusive rail): a confirmed
-/// observation with the wrong amount routes to `manual_review` with the
-/// hold still reserved.
-async fn into_manual_review_mismatch(
-    app: &TestApp,
-    paykit: &FakePaykit,
-    seller: &TestActor,
-    buyer: &TestActor,
-) -> (String, String) {
-    let (order_id, _payment_id, reference) =
-        bound_order(app, paykit, seller, buyer, "exclusive").await;
-    paykit.set_status(&reference, status_confirmed("exclusive", false));
-    let applied = poll_now(app, app.clock.now()).await;
-    assert_eq!(applied, 1);
-    (order_id, reference)
-}
-
-async fn resolve_call(
-    app: &TestApp,
-    token: &str,
-    order_id: &str,
-    key: Option<Uuid>,
-    body: &Value,
-) -> (StatusCode, Value) {
-    let mut request = axum::http::Request::builder()
-        .method("POST")
-        .uri(format!("/v0/orders/{order_id}/bitcoin/resolve"))
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"));
-    if let Some(key) = key {
-        request = request.header("Idempotency-Key", key.to_string());
-    }
-    let request = request
-        .body(axum::body::Body::from(
-            serde_json::to_vec(body).expect("body serializes"),
-        ))
-        .expect("request builds");
-    let response = tower::util::ServiceExt::oneshot(app.router.clone(), request)
-        .await
-        .expect("request executes");
-    let status = response.status();
-    let bytes = http_body_util::BodyExt::collect(response.into_body())
-        .await
-        .expect("body collects")
-        .to_bytes();
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, value)
+    shared_status_confirmed(mode, amount_matched, 2)
 }
 
 #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
@@ -1015,15 +828,8 @@ async fn resolve_refuses_a_missing_pin_and_a_non_review_payment(pool: PgPool) {
 
     // A payment that never entered manual_review: the named precondition,
     // distinct from already_resolved.
-    let (other_order_id, _reference) =
-        into_manual_review_held(&app, &paykit, &seller, &buyer).await;
-    sqlx::query(
-        "UPDATE payments SET state = 'awaiting_entitlement', manual_review_entered_at = NULL          WHERE order_id = $1",
-    )
-    .bind(Uuid::parse_str(&other_order_id).unwrap())
-    .execute(&pool)
-    .await
-    .expect("payment reset");
+    let (other_order_id, _payment_id, _reference) =
+        bound_order(&app, &paykit, &seller, &buyer, "shared_manual").await;
     let (status, body) = resolve_call(
         &app,
         &seller.token,
