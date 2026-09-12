@@ -71,6 +71,9 @@ pub const TASK_STAT_ATTESTATIONS: &str = "stat_attestations";
 pub const TASK_DELIVERY_AUTOCOMPLETE: &str = "delivery_autocomplete";
 pub const TASK_PICKUP_RESEAL: &str = "pickup_reseal";
 pub const TASK_PICKUP_RETENTION: &str = "pickup_retention";
+pub const TASK_SELLER_CONFIRMATION_WINDOW: &str = "seller_confirmation_window";
+pub const TASK_MANUAL_REVIEW_WATCH: &str = "manual_review_watch";
+pub const TASK_PAYKIT_RESOLVE_DELIVERY: &str = "paykit_resolve_delivery";
 
 /// The actor stamped on server-time post-purchase events and their
 /// notifications: the system, never a peer (ADR-0019).
@@ -915,7 +918,8 @@ async fn apply_manual_review(
 ) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
     let updated: Option<(i64, String)> = sqlx::query_as(
-        "UPDATE payments SET state = 'manual_review', revision = revision + 1, updated_at = $3 \
+        "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+         manual_review_entered_at = $3, updated_at = $3 \
          WHERE id = $1 AND state = $2 RETURNING revision, buyer_pubky",
     )
     .bind(row.payment_id)
@@ -1148,6 +1152,9 @@ struct ClaimedPaykitOrder {
     seller_pubky: String,
     paykit_request_reference: String,
     paykit_request_state: String,
+    paykit_allocation_mode: Option<String>,
+    paykit_stack_id: Option<String>,
+    paykit_stack_endpoint: Option<String>,
 }
 
 /// Claims a batch of bitcoin orders due for a paykit status poll by stamping
@@ -1161,21 +1168,29 @@ async fn claim_due_paykit_orders(
     // Expired payments keep polling only while money was already DETECTED
     // on-chain: a settlement confirmed after the hold window elapsed must
     // surface as manual_review, never vanish. An expired order that never
-    // saw a detection stops polling.
+    // saw a detection stops polling — except inside the §B.9 observation
+    // tail, where a LATE FIRST observation can still arrive and must route
+    // to manual_review, never to awaiting_seller_confirmation. Orders in
+    // `awaiting_seller_confirmation` are claimed on the status-only path:
+    // the poll refreshes facts and can never transition them to `paid`.
     sqlx::query_as(
         "UPDATE orders SET paykit_last_checked_at = $1, updated_at = updated_at \
          WHERE id IN (\
              SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
              WHERE p.adapter = 'paykit' \
              AND ((p.state = 'awaiting_entitlement' \
-                   AND o.paykit_request_state IN ('pending', 'detected')) \
-                  OR (p.state = 'expired' AND o.paykit_request_state = 'detected')) \
+                   AND o.paykit_request_state IN ('pending', 'detected', 'awaiting_seller_confirmation')) \
+                  OR (p.state = 'expired' AND o.paykit_request_state = 'detected') \
+                  OR (p.state = 'expired' AND o.paykit_request_state = 'pending' \
+                      AND o.paykit_expires_at IS NOT NULL \
+                      AND o.paykit_expires_at + INTERVAL '24 hours' > $1)) \
              AND o.paykit_request_reference IS NOT NULL \
              AND (o.paykit_last_checked_at IS NULL OR o.paykit_last_checked_at <= $2) \
              ORDER BY o.paykit_last_checked_at ASC NULLS FIRST LIMIT $3 \
              FOR UPDATE OF o SKIP LOCKED\
          ) RETURNING id, payment_id, buyer_pubky, seller_pubky, \
-         paykit_request_reference, paykit_request_state",
+         paykit_request_reference, paykit_request_state, paykit_allocation_mode, \
+         paykit_stack_id, paykit_stack_endpoint",
     )
     .bind(now)
     .bind(now - chrono::Duration::seconds(poll_seconds))
@@ -1187,14 +1202,23 @@ async fn claim_due_paykit_orders(
 /// Applies one confirmed paykit payment: `awaiting_entitlement → confirmed`
 /// exactly once via the shared confirmation effects; a confirmation the
 /// order can no longer accept (or an amount mismatch paykit observed) routes
-/// the payment to `manual_review`.
+/// the payment to `manual_review`. A LATE entry — the payment already
+/// expired, OR the producer's mandatory `late_settlement` flag marking a
+/// settlement outside the invoice's window — NEVER auto-pays: it enters
+/// the existing durable `manual_review` path and freezes the reported
+/// observation onto the order, so a later resolution's audit snapshot
+/// carries the facts the seller acted on.
 async fn apply_confirmed_paykit_payment(
     pool: &PgPool,
     row: &ClaimedPaykitOrder,
     amount_matched: bool,
+    observation: &crate::payments::PaykitObservation,
     pickup: Option<&crate::pickup::PickupKeys>,
     now: DateTime<Utc>,
+    late_settlement: bool,
 ) -> anyhow::Result<bool> {
+    let resolution_pins_present =
+        row.paykit_stack_id.is_some() && row.paykit_stack_endpoint.is_some();
     let mut tx = pool.begin().await?;
     let payment: Option<PaymentRow> = sqlx::query_as(&format!(
         "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1 FOR UPDATE"
@@ -1205,13 +1229,28 @@ async fn apply_confirmed_paykit_payment(
     let Some(payment) = payment else {
         anyhow::bail!("paykit order {} references a missing payment", row.id);
     };
-    if payment.state == "expired" {
-        // The settlement is real but the hold window already elapsed (the
-        // sweep released the stock and cancelled the order): retain the
-        // fact under manual review, exactly like a late Locks completion.
+    if payment.state == "expired" || (late_settlement && payment.state == "awaiting_entitlement") {
+        if !resolution_pins_present {
+            tx.rollback().await?;
+            tracing::error!(
+                order_id = %row.id,
+                code = "paykit_resolution_pins_missing",
+                "blocked late paykit manual-review entry for an unpinned legacy order"
+            );
+            return Ok(false);
+        }
+        // The settlement is real but cannot auto-pay: either the hold
+        // window already elapsed (the sweep released the stock and
+        // cancelled the order), or the producer flagged the settlement as
+        // LATE — outside the invoice's settlement window, so no automatic
+        // paid effect and no seller-confirmation entry is ever valid.
+        // Retain the fact under manual review, exactly like a late Locks
+        // completion. A replay finds the payment already advanced and
+        // changes nothing (the guard below); a terminal paid order never
+        // reaches this branch and never un-pays.
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-             updated_at = $2 WHERE id = $1 RETURNING revision",
+             manual_review_entered_at = $2, updated_at = $2 WHERE id = $1 RETURNING revision",
         )
         .bind(payment.id)
         .bind(now)
@@ -1228,16 +1267,28 @@ async fn apply_confirmed_paykit_payment(
         )
         .await?;
         sqlx::query(
-            "UPDATE orders SET paykit_request_state = 'confirmed', updated_at = $2 WHERE id = $1",
+            "UPDATE orders SET paykit_request_state = 'confirmed', \
+             paykit_seller_confirmation_entered_at = NULL, \
+             paykit_seller_confirmation_deadline = NULL, \
+             paykit_observation = $3, updated_at = $2 WHERE id = $1",
         )
         .bind(row.id)
         .bind(now)
+        .bind(crate::bitcoin_review::observation_json(
+            "confirmed",
+            amount_matched,
+            observation,
+            now,
+            false,
+        ))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         tracing::warn!(
             order_id = %row.id,
-            "paykit settlement confirmed after the hold window; routing to manual review"
+            late_settlement,
+            local_expired = payment.state == "expired",
+            "paykit settlement confirmed too late to auto-pay; routing to manual review"
         );
         return Ok(true);
     }
@@ -1249,7 +1300,7 @@ async fn apply_confirmed_paykit_payment(
         // Money arrived but not the required amount: never silently confirm.
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-             updated_at = $2 WHERE id = $1 RETURNING revision",
+             manual_review_entered_at = $2, updated_at = $2 WHERE id = $1 RETURNING revision",
         )
         .bind(payment.id)
         .bind(now)
@@ -1266,7 +1317,10 @@ async fn apply_confirmed_paykit_payment(
         )
         .await?;
         sqlx::query(
-            "UPDATE orders SET paykit_request_state = 'confirmed', updated_at = $2 WHERE id = $1",
+            "UPDATE orders SET paykit_request_state = 'confirmed', \
+             paykit_seller_confirmation_entered_at = NULL, \
+             paykit_seller_confirmation_deadline = NULL, \
+             updated_at = $2 WHERE id = $1",
         )
         .bind(row.id)
         .bind(now)
@@ -1324,7 +1378,9 @@ async fn apply_confirmed_paykit_payment(
             )
             .await?;
             sqlx::query(
-                "UPDATE orders SET paykit_request_state = 'confirmed', updated_at = $2 \
+                "UPDATE orders SET paykit_request_state = 'confirmed', \
+                 paykit_seller_confirmation_entered_at = NULL, \
+                 paykit_seller_confirmation_deadline = NULL, updated_at = $2 \
                  WHERE id = $1",
             )
             .bind(row.id)
@@ -1348,7 +1404,8 @@ async fn apply_confirmed_paykit_payment(
             let mut tx = pool.begin().await?;
             let updated: Option<(i64,)> = sqlx::query_as(
                 "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-                 updated_at = $2 WHERE id = $1 AND state = 'awaiting_entitlement' \
+                 manual_review_entered_at = $2, updated_at = $2 \
+                 WHERE id = $1 AND state = 'awaiting_entitlement' \
                  RETURNING revision",
             )
             .bind(payment.id)
@@ -1381,6 +1438,190 @@ async fn apply_confirmed_paykit_payment(
     }
 }
 
+/// The display-only `detected` flip: an on-chain detection advances the
+/// buyer-facing request state and nothing else — no payment authority.
+async fn mark_paykit_detected(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    if row.paykit_request_state != "detected" {
+        sqlx::query(
+            "UPDATE orders SET paykit_request_state = 'detected', updated_at = $2 \
+             WHERE id = $1 AND paykit_request_state = 'pending'",
+        )
+        .bind(row.id)
+        .bind(now)
+        .execute(pool)
+        .await?;
+    }
+    Ok(false)
+}
+
+/// Applies one matching observation for a `shared_manual` order (§B.8.8):
+/// entry to `awaiting_seller_confirmation` with the hold extended to the
+/// 24-hour seller-confirmation window, or a status-only fact refresh once
+/// inside. This path NEVER transitions the order to `paid` — the seller's
+/// attestation is the only exit — and a late observation (payment already
+/// expired) never enters the state; it takes the existing late path.
+async fn apply_shared_manual_observation(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    observed_state: &str,
+    amount_matched: bool,
+    observation: &crate::payments::PaykitObservation,
+    pickup: Option<&crate::pickup::PickupKeys>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    if row.paykit_stack_id.is_none() || row.paykit_stack_endpoint.is_none() {
+        tracing::error!(
+            order_id = %row.id,
+            code = "paykit_resolution_pins_missing",
+            "blocked shared_manual seller-confirmation entry for an unpinned legacy order"
+        );
+        return Ok(false);
+    }
+    let mut tx = pool.begin().await?;
+    // Canonical lock order: payment, then order.
+    let payment_state: Option<(String,)> =
+        sqlx::query_as("SELECT state FROM payments WHERE id = $1 FOR UPDATE")
+            .bind(row.payment_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((payment_state,)) = payment_state else {
+        anyhow::bail!("paykit order {} references a missing payment", row.id);
+    };
+    if payment_state != "awaiting_entitlement" {
+        // Late settlement (or an already-advanced payment): the
+        // `late_settlement` edge fires and the
+        // `awaiting_seller_confirmation` edge does not (Kimi P2). The
+        // existing late path routes a confirmed observation to
+        // manual_review; a detected one only advances the display state.
+        tx.rollback().await?;
+        if observed_state == "confirmed" {
+            return apply_confirmed_paykit_payment(
+                pool,
+                row,
+                amount_matched,
+                observation,
+                pickup,
+                now,
+                false,
+            )
+            .await;
+        }
+        if row.paykit_request_state != "detected" {
+            sqlx::query(
+                "UPDATE orders SET paykit_request_state = 'detected', updated_at = $2 \
+                 WHERE id = $1 AND paykit_request_state = 'pending'",
+            )
+            .bind(row.id)
+            .bind(now)
+            .execute(pool)
+            .await?;
+        }
+        return Ok(false);
+    }
+    let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
+        anyhow::bail!("paykit order {} is missing", row.id);
+    };
+    let observation_doc = crate::bitcoin_review::observation_json(
+        observed_state,
+        amount_matched,
+        observation,
+        now,
+        false,
+    );
+    let deadline =
+        now + chrono::Duration::seconds(crate::bitcoin_review::SELLER_CONFIRMATION_WINDOW_SECONDS);
+    // The entry edge: one conditional UPDATE from the non-late matching
+    // observation. The hold is EXTENDED to the 24-hour window, not expired
+    // (a buyer who demonstrably paid must not lose stock to a 3600 s
+    // timeout while waiting for a human).
+    let entered = sqlx::query(
+        "UPDATE orders SET paykit_request_state = 'awaiting_seller_confirmation', \
+         paykit_observation = $2, paykit_seller_confirmation_entered_at = $3, \
+         paykit_seller_confirmation_deadline = $4, \
+         hold_expires_at = CASE WHEN auction_aggregate_id IS NULL THEN $4 ELSE hold_expires_at END, \
+         updated_at = $3 \
+         WHERE id = $1 AND paykit_request_state IN ('pending', 'detected')",
+    )
+    .bind(row.id)
+    .bind(&observation_doc)
+    .bind(now)
+    .bind(deadline)
+    .execute(&mut *tx)
+    .await?;
+    if entered.rows_affected() == 1 {
+        // An auction order's hold is the winning reservation: extend it to
+        // the same window so the sweep cannot release it mid-confirmation.
+        if let Some(auction_aggregate_id) = &order.auction_aggregate_id {
+            sqlx::query(
+                "UPDATE reservations SET expires_at = $3, updated_at = $3 \
+                 WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active'",
+            )
+            .bind(auction_aggregate_id)
+            .bind(&order.buyer_pubky)
+            .bind(deadline)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        tracing::info!(
+            order_id = %row.id,
+            observed_state,
+            "shared_manual observation entered awaiting_seller_confirmation (hold extended 24h)"
+        );
+        return Ok(true);
+    }
+    // Already inside: the status-only path refreshes the live facts
+    // (confirmations progress, a refreshed observation after a
+    // disappearance) without ever advancing the order. The frozen audit
+    // snapshot is written only at confirmation, from this value.
+    let refreshed = sqlx::query(
+        "UPDATE orders SET paykit_observation = $2, updated_at = $3 \
+         WHERE id = $1 AND paykit_request_state = 'awaiting_seller_confirmation'",
+    )
+    .bind(row.id)
+    .bind(&observation_doc)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    if refreshed.rows_affected() == 1 {
+        if let Some(confirmations) = observation.confirmations {
+            sqlx::query("UPDATE payments SET confirmations = $2, updated_at = $3 WHERE id = $1")
+                .bind(row.payment_id)
+                .bind(i32::try_from(confirmations).unwrap_or(i32::MAX))
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(false)
+}
+
+/// A disappearance/reorg fact for an order awaiting seller confirmation:
+/// the observation is marked `disappeared` and shown to the seller; the
+/// order does not silently revert and does not advance (Q10).
+async fn mark_shared_manual_disappeared(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    sqlx::query(
+        "UPDATE orders SET paykit_observation = jsonb_set(paykit_observation, '{disappeared}', 'true'), \
+         updated_at = $2 \
+         WHERE id = $1 AND paykit_request_state = 'awaiting_seller_confirmation' \
+         AND paykit_observation IS NOT NULL",
+    )
+    .bind(row.id)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(false)
+}
+
 /// Applies the polled paykit status for ONE claimed order. Errors
 /// propagate to the caller's per-item handler — one bad row must never
 /// stall the rest of the claimed batch.
@@ -1394,35 +1635,109 @@ async fn apply_paykit_status_outcome(
         .status(&row.seller_pubky, &row.paykit_request_reference)
         .await
     {
-        PaykitStatusOutcome::Confirmed { amount_matched } => {
-            apply_confirmed_paykit_payment(
-                &state.pool,
-                row,
-                amount_matched,
-                state.pickup.as_deref(),
-                now,
-            )
-            .await
-        }
-        PaykitStatusOutcome::Detected => {
-            if row.paykit_request_state != "detected" {
-                sqlx::query(
-                    "UPDATE orders SET paykit_request_state = 'detected', updated_at = $2 \
-                     WHERE id = $1 AND paykit_request_state = 'pending'",
+        PaykitStatusOutcome::Confirmed {
+            amount_matched,
+            facts,
+        } => {
+            // The producer's mandatory late-settlement flag governs BEFORE
+            // any mode-based handling: a late confirmed settlement NEVER
+            // auto-pays (exclusive) and NEVER enters
+            // awaiting_seller_confirmation (shared_manual) — it takes the
+            // existing durable manual-review entry with the observation
+            // frozen.
+            if facts.late_settlement {
+                return apply_confirmed_paykit_payment(
+                    &state.pool,
+                    row,
+                    amount_matched,
+                    &facts.observation,
+                    state.pickup.as_deref(),
+                    now,
+                    true,
                 )
-                .bind(row.id)
-                .bind(now)
-                .execute(&state.pool)
-                .await?;
+                .await;
             }
-            Ok(false)
+            // The creator's CURRENT mode decides (§B.11.4 A3): a downgrade
+            // lands while an invoice is observing and the next matching
+            // observation enters awaiting_seller_confirmation. An unknown
+            // mode fails closed — no automatic paid handling, no entry.
+            match facts.allocation_mode.as_str() {
+                "shared_manual" => {
+                    apply_shared_manual_observation(
+                        &state.pool,
+                        row,
+                        "confirmed",
+                        amount_matched,
+                        &facts.observation,
+                        state.pickup.as_deref(),
+                        now,
+                    )
+                    .await
+                }
+                "exclusive" => {
+                    apply_confirmed_paykit_payment(
+                        &state.pool,
+                        row,
+                        amount_matched,
+                        &facts.observation,
+                        state.pickup.as_deref(),
+                        now,
+                        false,
+                    )
+                    .await
+                }
+                unknown => {
+                    tracing::warn!(
+                        order_id = %row.id,
+                        allocation_mode = %unknown,
+                        "paykit status reported an unknown allocation_mode; failing closed"
+                    );
+                    Ok(false)
+                }
+            }
         }
-        // Not yet visible, or the request never reached paykit-server
-        // (NotFound stays retryable: creation is idempotent and the
-        // binding transaction only commits after a successful create).
-        PaykitStatusOutcome::Undetected
-        | PaykitStatusOutcome::NotFound
-        | PaykitStatusOutcome::Unavailable => Ok(false),
+        PaykitStatusOutcome::Detected { facts } => {
+            // A LATE detection is fail-safe: display-only at most, never
+            // the seller-confirmation entry and never a payment authority
+            // transition.
+            if facts.late_settlement {
+                return mark_paykit_detected(&state.pool, row, now).await;
+            }
+            match facts.allocation_mode.as_str() {
+                "shared_manual" => {
+                    apply_shared_manual_observation(
+                        &state.pool,
+                        row,
+                        "detected",
+                        true,
+                        &facts.observation,
+                        state.pickup.as_deref(),
+                        now,
+                    )
+                    .await
+                }
+                "exclusive" => mark_paykit_detected(&state.pool, row, now).await,
+                unknown => {
+                    tracing::warn!(
+                        order_id = %row.id,
+                        allocation_mode = %unknown,
+                        "paykit status reported an unknown allocation_mode; failing closed"
+                    );
+                    Ok(false)
+                }
+            }
+        }
+        PaykitStatusOutcome::Undetected => {
+            if row.paykit_allocation_mode.as_deref() == Some("shared_manual") {
+                mark_shared_manual_disappeared(&state.pool, row, now).await
+            } else {
+                Ok(false)
+            }
+        }
+        // The request never reached paykit-server (NotFound stays
+        // retryable: creation is idempotent and the binding transaction
+        // only commits after a successful create).
+        PaykitStatusOutcome::NotFound | PaykitStatusOutcome::Unavailable => Ok(false),
     }
 }
 
@@ -1483,13 +1798,19 @@ pub async fn expire_due_payment_windows(
     let mut tx = pool.begin().await?;
     // A `preparing` bitcoin order is excluded here: its expiry must first
     // settle the prepared invoice with paykit (§B.11.2 hold-expiry rule,
-    // the coordinator-decided cell), handled per order below.
+    // the coordinator-decided cell), handled per order below. An order in
+    // `awaiting_seller_confirmation` is likewise excluded: its hold was
+    // extended to the 24-hour seller-confirmation window at entry, and the
+    // seller-window reaper (which routes the payment to `manual_review`
+    // with the hold PRESERVED) owns it — the buyer demonstrably paid on
+    // chain, so the ordinary sweep must never release that stock.
     let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
         "SELECT o.id, p.id, p.state, o.buyer_pubky \
          FROM orders o JOIN payments p ON p.order_id = o.id \
          WHERE o.state = 'pending_payment' AND o.stock_held AND o.hold_expires_at <= $1 \
          AND p.state IN ('awaiting_entitlement', 'detected', 'expired') \
          AND o.paykit_activation_state IS DISTINCT FROM 'preparing' \
+         AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation' \
          ORDER BY o.hold_expires_at FOR UPDATE OF o, p SKIP LOCKED",
     )
     .bind(now)
@@ -2266,6 +2587,10 @@ pub struct WorkerSummary {
     pub pickup_rows_resealed: u64,
     pub pickup_snapshots_purged: u64,
     pub pickup_versions_purged: u64,
+    pub seller_windows_routed: u64,
+    pub manual_review_sla_alerts: u64,
+    pub manual_reviews_abandoned: u64,
+    pub resolve_rows_delivered: u64,
 }
 
 /// One worker pass: for each task, take the lease, drain, release. Tasks
@@ -2390,6 +2715,64 @@ pub async fn run_once(
         let result = expire_due_payment_windows(state, now).await;
         release_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now).await?;
         summary.payment_windows_expired = result?;
+    }
+    // The shared_manual seller-confirmation window (§B.8.8): elapsed
+    // windows route to manual_review with the hold preserved.
+    if try_acquire_lease(
+        &state.pool,
+        TASK_SELLER_CONFIRMATION_WINDOW,
+        holder,
+        now,
+        lease_seconds,
+    )
+    .await?
+    {
+        let result = crate::bitcoin_review::route_due_seller_confirmation_windows(state, now).await;
+        release_lease(&state.pool, TASK_SELLER_CONFIRMATION_WINDOW, holder, now).await?;
+        summary.seller_windows_routed = result?;
+    }
+    // The manual-review watch: two-business-day SLA alerts, then the
+    // seven-day inactivity abandonment (same CAS as the seller's resolve).
+    if try_acquire_lease(
+        &state.pool,
+        TASK_MANUAL_REVIEW_WATCH,
+        holder,
+        now,
+        lease_seconds,
+    )
+    .await?
+    {
+        let result = crate::bitcoin_review::watch_manual_reviews(state, now).await;
+        release_lease(&state.pool, TASK_MANUAL_REVIEW_WATCH, holder, now).await?;
+        let (sla_alerts, abandoned) = result?;
+        summary.manual_review_sla_alerts = sla_alerts;
+        summary.manual_reviews_abandoned = abandoned;
+    }
+    // The pinned paykit.resolve delivery arm (§B.8.8 mapping + deadline).
+    if let Some(paykit) = state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
+    {
+        if try_acquire_lease(
+            &state.pool,
+            TASK_PAYKIT_RESOLVE_DELIVERY,
+            holder,
+            now,
+            lease_seconds,
+        )
+        .await?
+        {
+            let result = crate::resolve_delivery::deliver_due_resolve_rows(
+                state,
+                paykit,
+                now,
+                lease_seconds,
+            )
+            .await;
+            release_lease(&state.pool, TASK_PAYKIT_RESOLVE_DELIVERY, holder, now).await?;
+            summary.resolve_rows_delivered = result?;
+        }
     }
     // Post-purchase liveness is server time (no carrier tracking feed):
     // assume delivery after DELIVERY_ASSUME_DAYS, then auto-complete after
@@ -2711,6 +3094,10 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             pickup_rows_resealed = summary.pickup_rows_resealed,
                             pickup_snapshots_purged = summary.pickup_snapshots_purged,
                             pickup_versions_purged = summary.pickup_versions_purged,
+                            seller_windows_routed = summary.seller_windows_routed,
+                            manual_review_sla_alerts = summary.manual_review_sla_alerts,
+                            manual_reviews_abandoned = summary.manual_reviews_abandoned,
+                            resolve_rows_delivered = summary.resolve_rows_delivered,
                             "worker pass completed"
                         );
                     }

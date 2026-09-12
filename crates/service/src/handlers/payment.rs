@@ -125,6 +125,7 @@ pub async fn advance(
 
     let updated_payment: PaymentRow = sqlx::query_as(&format!(
         "UPDATE payments SET revision = revision + 1, state = $2, confirmations = $3, \
+         manual_review_entered_at = CASE WHEN $2 = 'manual_review' THEN $4 ELSE NULL END, \
          updated_at = $4 WHERE id = $1 RETURNING {PAYMENT_COLUMNS}"
     ))
     .bind(payment.id)

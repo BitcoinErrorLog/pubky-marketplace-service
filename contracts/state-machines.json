@@ -570,6 +570,16 @@
               "name": "refund.record_external"
             }
           ]
+        },
+        {
+          "from": "cancelled",
+          "to": "paid",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paykit_resolution"
+            }
+          ]
         }
       ],
       "commands": [
@@ -683,6 +693,26 @@
             {
               "trigger": "server",
               "name": "locks_late_completion"
+            }
+          ]
+        },
+        {
+          "from": "manual_review",
+          "to": "confirmed",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paykit_resolution"
+            }
+          ]
+        },
+        {
+          "from": "manual_review",
+          "to": "expired",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paykit_resolution"
             }
           ]
         }

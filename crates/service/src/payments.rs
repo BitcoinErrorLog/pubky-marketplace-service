@@ -606,15 +606,56 @@ impl PaypalIpnVerifier {
     }
 }
 
+/// The strict transaction-status contract paykit-server emits
+/// (`paykit.bitcoin_status/v2`, W1.14). The consumer fails CLOSED: a
+/// missing/wrong `contract_version`, a missing/unknown `allocation_mode`,
+/// an unknown status, or a missing/mistyped mandatory `late_settlement`
+/// boolean is never an automatic transition input.
+pub const PAYKIT_STATUS_CONTRACT: &str = "paykit.bitcoin_status/v2";
+
+/// The observation facts paykit-server reported for one status poll:
+/// the outpoint txid, the observed satoshi total, and the confirmation
+/// depth at that instant. Every field is optional on the wire (an older
+/// paykit-server reports none of them); what is present is frozen into the
+/// order's live observation and, at seller confirmation, into the audit
+/// record — never supplied by any peer (design §B.8.8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PaykitObservation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_sats: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmations: Option<u32>,
+}
+
+/// The validated per-poll facts: the creator's CURRENT allocation mode —
+/// which decides automatic versus seller-confirmed handling (§B.11.4 A3)
+/// — the producer's mandatory late-settlement flag, plus the reported
+/// observation. `late_settlement` is the producer's authoritative
+/// statement that the settlement landed outside the invoice's settlement
+/// window: a late observation NEVER auto-pays and NEVER enters
+/// `awaiting_seller_confirmation`; a confirmed one routes to durable
+/// `manual_review`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaykitStatusFacts {
+    pub allocation_mode: String,
+    pub late_settlement: bool,
+    pub observation: PaykitObservation,
+}
+
 /// Paykit payment-request status as this service consumes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaykitStatusOutcome {
     Undetected,
-    Detected,
+    Detected {
+        facts: PaykitStatusFacts,
+    },
     /// Confirmed on-chain; `amount_matched` is paykit-server's own
     /// observation of the required satoshi amount.
     Confirmed {
         amount_matched: bool,
+        facts: PaykitStatusFacts,
     },
     NotFound,
     Unavailable,
@@ -672,6 +713,36 @@ pub struct PaykitVoided {
     pub invoice_id: uuid::Uuid,
     pub state: String,
     pub voided_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The resolve success body (§B.9): the recorded resolution, echoing the
+/// invoice, the resolution, and the instant, with the finalized state
+/// (`resolved_paid_manually` / `resolved_closed`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitResolved {
+    pub invoice_id: uuid::Uuid,
+    pub resolution: String,
+    pub resolved_at: chrono::DateTime<chrono::Utc>,
+    pub state: String,
+}
+
+/// The verbatim outcome of one signed `resolve` call, for the delivery
+/// arm's response-class mapping (§B.8.8). Every HTTP status — success,
+/// named refusal, or unmapped — reaches the caller; only a transport
+/// failure (connect/TLS/timeout) is an `Err`.
+#[derive(Debug)]
+pub struct PaykitResolveResponse {
+    pub status: reqwest::StatusCode,
+    /// The application error code from an `{"error": {"code": ...}}`
+    /// envelope, when one was sent.
+    pub code: Option<String>,
+    /// The raw `Retry-After` header, when present (delay-seconds or
+    /// HTTP-date; parsed by the caller, malformed falls back to backoff).
+    pub retry_after: Option<String>,
+    /// The parsed success body on a 2xx (None when the body violates the
+    /// contract shape — the caller treats that as a malformed success).
+    pub resolved: Option<PaykitResolved>,
 }
 
 /// How a signed `activate` or `void` call failed (§B.11.3 named errors).
@@ -1028,7 +1099,99 @@ impl PaykitClient {
         Err(PaykitCommandError::from_status(status, code))
     }
 
-    /// Polls the payment status for one order reference.
+    /// §B.9 resolve: records the marketplace-authoritative money outcome on
+    /// the issuing stack, idempotent on `(invoice_id, resolution)`. The
+    /// canonical body is exactly `{invoice_id, resolution, resolved_at,
+    /// stack_id}` (the captured contract shape); `stack_id` is the value
+    /// phase 1 returned, and the call dials the ROW's pinned endpoint.
+    pub async fn resolve_payment_request(
+        &self,
+        endpoint: &str,
+        invoice_id: uuid::Uuid,
+        stack_id: &str,
+        resolution: &str,
+        resolved_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<PaykitResolveResponse, PaykitCommandError> {
+        let response = self
+            .post_signed_to(
+                endpoint,
+                &format!("/v0/payment-requests/{invoice_id}/resolve"),
+                serde_json::json!({
+                    "invoice_id": invoice_id,
+                    "resolution": resolution,
+                    "resolved_at": resolved_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "stack_id": stack_id,
+                }),
+            )
+            .await?;
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.text().await.unwrap_or_default();
+        if status.is_success() {
+            let resolved = serde_json::from_str::<PaykitResolved>(&body)
+                .map_err(|error| {
+                    tracing::warn!(
+                        error = %error,
+                        "paykit resolve returned a malformed success body"
+                    );
+                    error
+                })
+                .ok();
+            return Ok(PaykitResolveResponse {
+                status,
+                code: None,
+                retry_after,
+                resolved,
+            });
+        }
+        let code = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|body| body["error"]["code"].as_str().map(str::to_owned));
+        Ok(PaykitResolveResponse {
+            status,
+            code,
+            retry_after,
+            resolved: None,
+        })
+    }
+
+    /// Reads `stack_id` from an EXPLICIT endpoint's `/health/ready` (the
+    /// pinned-endpoint half of the resolve pin, §B.8.8): the delivery arm
+    /// compares the row's persisted identity against what that address
+    /// currently answers, per endpoint rather than per process. Transport
+    /// or shape failures are `Err`; a well-formed body without the field
+    /// answers `None`.
+    pub async fn stack_identity_at(
+        &self,
+        endpoint: &str,
+    ) -> Result<Option<String>, PaykitRequestError> {
+        let response = self
+            .http
+            .get(format!("{}/health/ready", endpoint.trim_end_matches('/')))
+            .timeout(AVAILABILITY_HTTP_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| PaykitRequestError::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(PaykitRequestError::Unavailable);
+        }
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|_| PaykitRequestError::Unavailable)?;
+        Ok(body["stack_id"].as_str().map(str::to_owned))
+    }
+
+    /// Polls the payment status for one order reference against the strict
+    /// `paykit.bitcoin_status/v2` contract (W1.14): a missing/wrong
+    /// `contract_version`, a missing/unknown `allocation_mode`, an unknown
+    /// status, a missing/mistyped mandatory `late_settlement` boolean, or
+    /// a malformed body all fail CLOSED as `Unavailable` — never an
+    /// automatic transition input.
     pub async fn payment_status(&self, seller_pubky: &str, reference: &str) -> PaykitStatusOutcome {
         let Ok((body, signature)) = self.signed_body(&serde_json::json!({
             "bundle_id": reference,
@@ -1059,19 +1222,63 @@ impl PaykitClient {
         }
         #[derive(Deserialize)]
         struct StatusBody {
-            status: String,
+            contract_version: Option<String>,
+            status: Option<String>,
+            allocation_mode: Option<String>,
+            // Mandatory strict boolean (no default): an absent, null, or
+            // wrong-typed `late_settlement` fails the whole body parse and
+            // the poll fails CLOSED as `Unavailable`.
+            late_settlement: bool,
+            #[serde(default)]
             amount_matched: bool,
+            #[serde(default)]
+            observed_sats: Option<u64>,
+            #[serde(default)]
+            confirmations: Option<u32>,
+            #[serde(default)]
+            txid: Option<String>,
         }
-        match response.json::<StatusBody>().await {
-            Ok(body) => match body.status.as_str() {
-                "undetected" => PaykitStatusOutcome::Undetected,
-                "detected" => PaykitStatusOutcome::Detected,
-                "confirmed" => PaykitStatusOutcome::Confirmed {
-                    amount_matched: body.amount_matched,
-                },
-                _ => PaykitStatusOutcome::Unavailable,
+        let body = match response.json::<StatusBody>().await {
+            Ok(body) => body,
+            Err(_) => {
+                tracing::warn!("paykit payment status returned a malformed body; failing closed");
+                return PaykitStatusOutcome::Unavailable;
+            }
+        };
+        // Contract validation, fail closed: the version must be the strict
+        // v2 marker and the mode exactly one of the two known values.
+        if body.contract_version.as_deref() != Some(PAYKIT_STATUS_CONTRACT) {
+            tracing::warn!(
+                "paykit payment status violated the status contract version; failing closed"
+            );
+            return PaykitStatusOutcome::Unavailable;
+        }
+        let Some(allocation_mode) = body
+            .allocation_mode
+            .filter(|mode| matches!(mode.as_str(), "exclusive" | "shared_manual"))
+        else {
+            tracing::warn!(
+                "paykit payment status carried a missing or unknown allocation_mode; failing closed"
+            );
+            return PaykitStatusOutcome::Unavailable;
+        };
+        let facts = PaykitStatusFacts {
+            allocation_mode,
+            late_settlement: body.late_settlement,
+            observation: PaykitObservation {
+                txid: body.txid,
+                observed_sats: body.observed_sats,
+                confirmations: body.confirmations,
             },
-            Err(_) => PaykitStatusOutcome::Unavailable,
+        };
+        match body.status.as_deref() {
+            Some("undetected") => PaykitStatusOutcome::Undetected,
+            Some("detected") => PaykitStatusOutcome::Detected { facts },
+            Some("confirmed") => PaykitStatusOutcome::Confirmed {
+                amount_matched: body.amount_matched,
+                facts,
+            },
+            _ => PaykitStatusOutcome::Unavailable,
         }
     }
 }

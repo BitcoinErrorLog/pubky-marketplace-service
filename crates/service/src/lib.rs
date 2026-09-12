@@ -6,6 +6,7 @@
 
 pub mod attestor;
 pub mod auth;
+pub mod bitcoin_review;
 pub mod clock;
 pub mod config;
 pub mod executor;
@@ -20,6 +21,7 @@ pub mod payment_methods;
 pub mod payments;
 pub mod pickup;
 pub mod queries;
+pub mod resolve_delivery;
 pub mod result;
 pub mod seal;
 pub mod shipping;
@@ -70,6 +72,9 @@ pub struct AppState {
     /// plaintext, and `pickup_available` reports false (all-or-none gating;
     /// see [`pickup::pickup_keys_from_env`]).
     pub pickup: Option<Arc<PickupKeys>>,
+    /// Per-endpoint cache of pinned-stack readiness identities for the
+    /// resolve delivery arm (§B.8.8: 15 s TTL, per endpoint).
+    pub resolve_pin_cache: resolve_delivery::ResolvePinCache,
 }
 
 impl AppState {
@@ -93,6 +98,7 @@ impl AppState {
             payments: None,
             payment_availability: PaymentAvailabilityCache::default(),
             pickup: None,
+            resolve_pin_cache: resolve_delivery::ResolvePinCache::default(),
         }
     }
 

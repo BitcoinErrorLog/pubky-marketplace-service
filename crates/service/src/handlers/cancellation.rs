@@ -234,7 +234,7 @@ pub async fn approve(
 /// releases below run (drop lock before listing locks). A no-op for orders
 /// without a drop stamp — including auction and offer orders, which never
 /// debited a drop.
-async fn credit_order_drop(
+pub(crate) async fn credit_order_drop(
     tx: &mut Transaction<'_, Postgres>,
     order: &OrderRow,
     now: DateTime<Utc>,
@@ -277,7 +277,7 @@ async fn credit_order_drop(
 /// already lapsed on server time (the expiry sweep returned the unit and
 /// marked the reservation `expired`), the cancel still succeeds without
 /// releasing the same unit twice.
-async fn release_reserved_hold(
+pub(crate) async fn release_reserved_hold(
     tx: &mut Transaction<'_, Postgres>,
     order: &OrderRow,
     now: DateTime<Utc>,

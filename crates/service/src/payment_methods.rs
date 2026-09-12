@@ -1124,7 +1124,8 @@ async fn apply_fiat_paid(
         // a late Locks completion).
         let updated: Option<(i64,)> = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-             updated_at = $2 WHERE id = $1 AND state = 'expired' RETURNING revision",
+             manual_review_entered_at = $2, updated_at = $2 \
+             WHERE id = $1 AND state = 'expired' RETURNING revision",
         )
         .bind(payment.id)
         .bind(now)
@@ -1262,7 +1263,8 @@ async fn apply_fiat_paid(
                 .map_err(|error| internal("manual review transaction", &error))?;
             let updated: Option<(i64,)> = sqlx::query_as(
                 "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-                 updated_at = $3 WHERE id = $1 AND state = $2 RETURNING revision",
+                 manual_review_entered_at = $3, updated_at = $3 \
+                 WHERE id = $1 AND state = $2 RETURNING revision",
             )
             .bind(payment.id)
             .bind("awaiting_entitlement")

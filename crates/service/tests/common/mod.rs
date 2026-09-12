@@ -1173,13 +1173,15 @@ pub enum FakePaykitCreateShape {
     ExpiryEarlier,
 }
 
-/// A scripted reply for one `activate`/`void` call on an invoice.
+/// A scripted reply for one `activate`/`void`/`resolve` call on an invoice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FakePaykitReply {
     /// Run the double's intrinsic contract semantics.
     Contract,
     /// A named error envelope at the given status.
     Error(u16, String),
+    /// A named error envelope with a `Retry-After` header (429/503 rows).
+    ErrorWithRetryAfter(u16, String, String),
     /// A 200 whose body violates the response shape (a failure the client
     /// must treat as retryable: nothing may change).
     MalformedOk,
@@ -1228,6 +1230,13 @@ struct FakePaykitState {
     invoices: HashMap<uuid::Uuid, FakePaykitInvoice>,
     activate_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
     void_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
+    resolve_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
+    /// Recorded resolutions: invoice -> (resolution, resolved_at), the
+    /// idempotency anchor for `(invoice_id, resolution)` (§B.9).
+    resolutions: HashMap<uuid::Uuid, (String, String)>,
+    /// Scripted transaction-status bodies by bundle id (the strict
+    /// `paykit.bitcoin_status/v2` shape the real client consumes).
+    status_bodies: HashMap<String, Value>,
     calls: Vec<FakePaykitCall>,
     rail_health: Value,
     rail_health_requests: usize,
@@ -1359,6 +1368,67 @@ impl FakePaykit {
             .expect("fake paykit lock")
             .void_scripts
             .insert(invoice_id, replies.into());
+    }
+
+    /// Queue scripted replies for `resolve` on one invoice (the delivery
+    /// arm's 408/425/429/5xx and refusal classes, served over real HTTP).
+    pub fn script_resolve(&self, invoice_id: uuid::Uuid, replies: Vec<FakePaykitReply>) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .resolve_scripts
+            .insert(invoice_id, replies.into());
+    }
+
+    /// The allocation mode phase 1 reports (`shared_manual` or
+    /// `exclusive`; the double defaults to `exclusive` so pre-W1.15
+    /// behaviour is unchanged unless a test opts in).
+    pub fn set_allocation_mode(&self, mode: &str) {
+        self.state.lock().expect("fake paykit lock").allocation_mode = mode.to_string();
+    }
+
+    /// Moves a prepared invoice to a named state (the resolve contract's
+    /// `prepared` / `observing` / void-state rows).
+    pub fn set_invoice_state(&self, invoice_id: uuid::Uuid, state: &str) {
+        let mut guard = self.state.lock().expect("fake paykit lock");
+        let invoice = guard
+            .invoices
+            .get_mut(&invoice_id)
+            .expect("invoice prepared");
+        invoice.state = state.to_string();
+    }
+
+    /// The resolution the double recorded for an invoice, if any.
+    pub fn resolution(&self, invoice_id: uuid::Uuid) -> Option<(String, String)> {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .resolutions
+            .get(&invoice_id)
+            .cloned()
+    }
+
+    /// Pre-records a resolution on the double (the idempotent-replay and
+    /// conflicting-resolution contract rows).
+    pub fn record_resolution(&self, invoice_id: uuid::Uuid, resolution: &str, resolved_at: &str) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .resolutions
+            .insert(
+                invoice_id,
+                (resolution.to_string(), resolved_at.to_string()),
+            );
+    }
+
+    /// Serves a transaction-status body for one bundle id (the order
+    /// reference), consumed by the REAL signed status client over HTTP.
+    pub fn set_status(&self, bundle_id: &str, body: Value) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .status_bodies
+            .insert(bundle_id.to_string(), body);
     }
 
     /// Every call the double received, with the body and the Host header
@@ -1689,6 +1759,15 @@ async fn serve_paykit_command(
             StatusCode::from_u16(status).expect("valid fake status"),
             &code,
         ),
+        Some(FakePaykitReply::ErrorWithRetryAfter(status, code, retry_after)) => {
+            use axum::response::IntoResponse;
+            (
+                StatusCode::from_u16(status).expect("valid fake status"),
+                [(axum::http::header::RETRY_AFTER, retry_after)],
+                axum::Json(json!({ "error": { "code": code } })),
+            )
+                .into_response()
+        }
         Some(FakePaykitReply::MalformedOk) => {
             use axum::response::IntoResponse;
             (StatusCode::OK, axum::Json(json!({ "unexpected": true }))).into_response()
@@ -1721,7 +1800,182 @@ async fn serve_paykit_command(
     }
 }
 
+/// The intrinsic contract for `resolve` (§B.9 r13): stack identity, unknown
+/// invoices, per-state accept/refuse, and idempotency on
+/// `(invoice_id, resolution)` — a same-resolution redelivery replays the
+/// recorded 200; a conflicting one is `invoice_already_resolved`.
+fn paykit_resolve_contract(
+    guard: &mut FakePaykitState,
+    invoice_id: uuid::Uuid,
+    parsed: &Value,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if parsed["stack_id"].as_str().unwrap_or_default() != guard.stack_id {
+        return paykit_error(StatusCode::CONFLICT, "stack_identity_mismatch");
+    }
+    let resolution = parsed["resolution"].as_str().unwrap_or_default();
+    let resolved_at = parsed["resolved_at"].as_str().unwrap_or_default();
+    if let Some((existing_resolution, existing_resolved_at)) = guard.resolutions.get(&invoice_id) {
+        if existing_resolution == resolution {
+            let state = if resolution == "paid_manually" {
+                "resolved_paid_manually"
+            } else {
+                "resolved_closed"
+            };
+            return (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "invoice_id": invoice_id,
+                    "resolution": existing_resolution,
+                    "resolved_at": existing_resolved_at,
+                    "state": state,
+                })),
+            )
+                .into_response();
+        }
+        return paykit_error(StatusCode::CONFLICT, "invoice_already_resolved");
+    }
+    let Some(invoice) = guard.invoices.get(&invoice_id) else {
+        return paykit_error(StatusCode::NOT_FOUND, "unknown_invoice");
+    };
+    match invoice.state.as_str() {
+        "prepared" => paykit_error(StatusCode::CONFLICT, "invoice_not_activated"),
+        "awaiting_baseline" => paykit_error(StatusCode::CONFLICT, "invoice_baseline_in_progress"),
+        "void_baseline_failed" | "void_prepare_expired" | "void_cancelled" => {
+            paykit_error(StatusCode::CONFLICT, "invoice_finalized")
+        }
+        "observing" | "expired_tail" | "expired_final" => {
+            let state = if resolution == "paid_manually" {
+                "resolved_paid_manually"
+            } else {
+                "resolved_closed"
+            };
+            guard.resolutions.insert(
+                invoice_id,
+                (resolution.to_string(), resolved_at.to_string()),
+            );
+            guard
+                .invoices
+                .get_mut(&invoice_id)
+                .expect("invoice present")
+                .state = state.to_string();
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "invoice_id": invoice_id,
+                    "resolution": resolution,
+                    "resolved_at": resolved_at,
+                    "state": state,
+                })),
+            )
+                .into_response()
+        }
+        _ => paykit_error(StatusCode::CONFLICT, "invoice_finalized"),
+    }
+}
+
+async fn serve_paykit_resolve(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    axum::extract::Path(invoice_id): axum::extract::Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let host = header_host(&headers);
+    let Some(parsed) = paykit_verify_signed(&headers, &body) else {
+        return paykit_unauthorized();
+    };
+    let path = format!("/v0/payment-requests/{invoice_id}/resolve");
+    paykit_record_call(&state, "POST", &path, &host, &parsed);
+    let scripted = {
+        let mut guard = state.lock().expect("fake paykit lock");
+        guard
+            .resolve_scripts
+            .get_mut(&invoice_id)
+            .and_then(std::collections::VecDeque::pop_front)
+    };
+    match scripted {
+        Some(FakePaykitReply::Error(status, code)) => paykit_error(
+            StatusCode::from_u16(status).expect("valid fake status"),
+            &code,
+        ),
+        Some(FakePaykitReply::ErrorWithRetryAfter(status, code, retry_after)) => {
+            use axum::response::IntoResponse;
+            (
+                StatusCode::from_u16(status).expect("valid fake status"),
+                [(axum::http::header::RETRY_AFTER, retry_after)],
+                axum::Json(json!({ "error": { "code": code } })),
+            )
+                .into_response()
+        }
+        Some(FakePaykitReply::MalformedOk) => {
+            use axum::response::IntoResponse;
+            (StatusCode::OK, axum::Json(json!({ "unexpected": true }))).into_response()
+        }
+        Some(FakePaykitReply::NonObservingOk(_)) | Some(FakePaykitReply::Hang) => {
+            paykit_error(StatusCode::INTERNAL_SERVER_ERROR, "hung")
+        }
+        Some(FakePaykitReply::Contract) | None => {
+            let mut guard = state.lock().expect("fake paykit lock");
+            paykit_resolve_contract(&mut guard, invoice_id, &parsed)
+        }
+    }
+}
+
+/// The strict transaction-status body shape (`paykit.bitcoin_status/v2`,
+/// W1.14): contract version, status, the creator's CURRENT allocation
+/// mode, the mandatory `late_settlement` boolean (an on-time settlement
+/// reports `false`), and the optional observation facts.
+pub fn bitcoin_status_v2(
+    status: &str,
+    amount_matched: bool,
+    allocation_mode: &str,
+    txid: Option<&str>,
+    observed_sats: Option<u64>,
+    confirmations: Option<u32>,
+) -> Value {
+    let mut body = json!({
+        "contract_version": "paykit.bitcoin_status/v2",
+        "status": status,
+        "amount_matched": amount_matched,
+        "allocation_mode": allocation_mode,
+        "late_settlement": false,
+    });
+    if let Some(txid) = txid {
+        body["txid"] = json!(txid);
+    }
+    if let Some(sats) = observed_sats {
+        body["observed_sats"] = json!(sats);
+    }
+    if let Some(confs) = confirmations {
+        body["confirmations"] = json!(confs);
+    }
+    body
+}
+
+async fn serve_paykit_status(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let host = header_host(&headers);
+    let Some(parsed) = paykit_verify_signed(&headers, &body) else {
+        return paykit_unauthorized();
+    };
+    paykit_record_call(&state, "POST", "/transactions/status", &host, &parsed);
+    let bundle_id = parsed["bundle_id"].as_str().unwrap_or_default();
+    let body = {
+        let guard = state.lock().expect("fake paykit lock");
+        guard.status_bodies.get(bundle_id).cloned()
+    };
+    match body {
+        Some(body) => (StatusCode::OK, axum::Json(body)).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 pub async fn spawn_fake_paykit() -> FakePaykit {
+    let stack_id = format!("test-stack:{}", uuid::Uuid::new_v4());
     let state = Arc::new(Mutex::new(FakePaykitState {
         claimed: Vec::new(),
         create_error: None,
@@ -1729,17 +1983,21 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         command_failure: None,
         create_shape: FakePaykitCreateShape::Full,
         nonce_sats: 437,
-        stack_id: format!("test-stack:{}", uuid::Uuid::new_v4()),
-        allocation_mode: "shared_manual".to_string(),
+        stack_id: stack_id.clone(),
+        allocation_mode: "exclusive".to_string(),
         fingerprint: "3f7a1c9e5b204d86".to_string(),
         requests: Vec::new(),
         invoices: HashMap::new(),
         activate_scripts: HashMap::new(),
         void_scripts: HashMap::new(),
+        resolve_scripts: HashMap::new(),
+        resolutions: HashMap::new(),
+        status_bodies: HashMap::new(),
         calls: Vec::new(),
         rail_health: json!({
             "status": "ready",
             "bitcoin_offer_available": true,
+            "stack_id": stack_id,
         }),
         rail_health_requests: 0,
         rail_health_status: 200,
@@ -1763,6 +2021,14 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
             "/v0/payment-requests/{invoice_id}/void",
             axum::routing::post(serve_paykit_void),
         )
+        .route(
+            "/v0/payment-requests/{invoice_id}/resolve",
+            axum::routing::post(serve_paykit_resolve),
+        )
+        .route(
+            "/transactions/status",
+            axum::routing::post(serve_paykit_status),
+        )
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1785,6 +2051,16 @@ pub struct FakePaykitStatus {
     outcomes: Mutex<HashMap<String, PaykitStatusOutcome>>,
 }
 
+/// The validated-facts bundle for a worker-test outcome on an
+/// `exclusive` creator (the pre-W1.15 automatic path).
+pub fn exclusive_facts() -> marketplace_service::payments::PaykitStatusFacts {
+    marketplace_service::payments::PaykitStatusFacts {
+        allocation_mode: "exclusive".to_string(),
+        late_settlement: false,
+        observation: Default::default(),
+    }
+}
+
 impl FakePaykitStatus {
     pub fn set_outcome(&self, reference: &str, outcome: PaykitStatusOutcome) {
         self.outcomes
@@ -1801,12 +2077,12 @@ impl PaykitStatusSource for FakePaykitStatus {
         reference: &'a str,
     ) -> Pin<Box<dyn Future<Output = PaykitStatusOutcome> + Send + 'a>> {
         Box::pin(async move {
-            *self
-                .outcomes
+            self.outcomes
                 .lock()
                 .expect("fake paykit status lock")
                 .get(reference)
-                .unwrap_or(&PaykitStatusOutcome::NotFound)
+                .cloned()
+                .unwrap_or(PaykitStatusOutcome::NotFound)
         })
     }
 }

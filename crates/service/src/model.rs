@@ -370,6 +370,17 @@ pub struct OrderRow {
     /// row delivers, then `active`; `voided` when the prepare was voided or
     /// reaped and the bind released.
     pub paykit_activation_state: Option<String>,
+    /// The latest Paykit observation as the status-only poll refreshed it
+    /// (`{state, observed_sats, confirmations, amount_matched, txid,
+    /// observed_at, disappeared}`). Facts for the seller's decision, never
+    /// a transition input. Internal, never serialized.
+    pub paykit_observation: Option<Value>,
+    /// Server-clock entry into `awaiting_seller_confirmation` and the armed
+    /// 24-hour seller-confirmation deadline (design §B.8.8). Cleared when
+    /// the order leaves the state (the schema CHECK is a biconditional).
+    /// Never serialized.
+    pub paykit_seller_confirmation_entered_at: Option<DateTime<Utc>>,
+    pub paykit_seller_confirmation_deadline: Option<DateTime<Utc>>,
     /// How this order reaches the buyer (§A2): exactly one of `shipping` |
     /// `pickup`. Required, not derivable: checkout splits one order per
     /// (seller, fulfillment), so reveal, shipping charge, and packing slip
@@ -696,6 +707,23 @@ pub struct PaymentRow {
     pub amount_minor: i64,
     pub currency: String,
     pub exponent: i32,
+    /// Stamped by EVERY transition into `manual_review` (schema CHECK);
+    /// cleared when the payment leaves the state. The two-business-day
+    /// seller-response SLA and the seven-day inactivity clock read it.
+    pub manual_review_entered_at: Option<DateTime<Utc>>,
+    /// The SLA breach alert fires once per manual-review entry.
+    pub manual_review_sla_alerted_at: Option<DateTime<Utc>>,
+    /// The resolution record (all NULL until resolved, schema CHECK):
+    /// the Idempotency-Key / reaper-minted key, the outcome, the basis,
+    /// who resolved, and the validated external refund reference.
+    pub resolution_id: Option<Uuid>,
+    pub resolution_outcome: Option<String>,
+    pub resolution_basis: Option<String>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolved_by_pubky: Option<String>,
+    /// The validated external refund reference. Never serialized on the
+    /// payment projection (the order's `external_refund` carries it).
+    pub refund_reference: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -705,7 +733,10 @@ impl PaymentRow {
     /// correlation, which ADR-0019 §8 forbids in exposed records (`access
     /// credentials or bundle_id`), no longer exists on the payment row at
     /// all: it lives encrypted in `payment_locks_correlations` and has no
-    /// serialization path.
+    /// serialization path. The resolution outcome/basis ARE rendered
+    /// (design §B.9 r12: projections distinguish a resolved payment from a
+    /// naturally confirmed/expired one); the refund reference is not — the
+    /// order's `external_refund` carries it to both participants.
     pub fn projection(&self) -> Value {
         json!({
             "id": self.id,
@@ -717,6 +748,9 @@ impl PaymentRow {
             "state": self.state,
             "confirmations": self.confirmations,
             "amount": money_json(self.amount_minor, &self.currency, self.exponent),
+            "resolution_outcome": self.resolution_outcome,
+            "resolution_basis": self.resolution_basis,
+            "resolved_at": self.resolved_at.map(format_timestamp),
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
         })

@@ -457,6 +457,9 @@ pub async fn close_locked_auction(
             paykit_address_fingerprint: None,
             paykit_bind_attempt: 0,
             paykit_activation_state: None,
+            paykit_observation: None,
+            paykit_seller_confirmation_entered_at: None,
+            paykit_seller_confirmation_deadline: None,
             // Auction listings are shipping-only (§A2 v1 scope, enforced at
             // registration): an auction order is always a shipped order.
             fulfillment: "shipping".to_string(),
@@ -502,6 +505,14 @@ pub async fn close_locked_auction(
             amount_minor: total_minor,
             currency: final_price.currency.clone(),
             exponent: final_price.exponent,
+            manual_review_entered_at: None,
+            manual_review_sla_alerted_at: None,
+            resolution_id: None,
+            resolution_outcome: None,
+            resolution_basis: None,
+            resolved_at: None,
+            resolved_by_pubky: None,
+            refund_reference: None,
             created_at: now,
             updated_at: now,
         };

@@ -60,10 +60,15 @@ pub const ORDER_COLUMNS: &str =
      paykit_last_checked_at, paykit_invoice_id, paykit_stack_id, paykit_stack_endpoint, \
      paykit_total_sats, paykit_expires_at, paykit_prepare_expires_at, paykit_allocation_mode, \
      paykit_address_fingerprint, paykit_bind_attempt, paykit_activation_state, \
+     paykit_observation, paykit_seller_confirmation_entered_at, \
+     paykit_seller_confirmation_deadline, \
      fulfillment, first_revealed_at, created_at, updated_at";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
-     state, confirmations, amount_minor, currency, exponent, created_at, updated_at";
+     state, confirmations, amount_minor, currency, exponent, \
+     manual_review_entered_at, manual_review_sla_alerted_at, \
+     resolution_id, resolution_outcome, resolution_basis, resolved_at, resolved_by_pubky, \
+     refund_reference, created_at, updated_at";
 
 pub async fn seller_has_rail(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

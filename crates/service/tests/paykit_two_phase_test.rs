@@ -152,6 +152,9 @@ fn host_of(base_url: &str) -> String {
 #[sqlx::test(migrations = "./migrations")]
 async fn phase_one_persists_the_prepared_body_and_one_activate_row(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    // The pin persists the phase-1 allocation mode verbatim; the double
+    // reports `shared_manual` here so the assertion covers it.
+    paykit.set_allocation_mode("shared_manual");
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, invoice_id) =
@@ -1157,7 +1160,12 @@ async fn a_preparing_order_is_not_polled(pool: PgPool) {
     let reference = order_reference(order_uuid(&order_id));
 
     let source = FakePaykitStatus::default();
-    source.set_outcome(&reference, PaykitStatusOutcome::Detected);
+    source.set_outcome(
+        &reference,
+        PaykitStatusOutcome::Detected {
+            facts: exclusive_facts(),
+        },
+    );
     let applied = marketplace_service::workers::verify_due_paykit_payments(
         &app.state,
         &source,
@@ -1234,6 +1242,7 @@ async fn the_buyer_total_is_the_paykit_total(pool: PgPool) {
         &reference,
         PaykitStatusOutcome::Confirmed {
             amount_matched: true,
+            facts: exclusive_facts(),
         },
     );
     app.clock.advance_seconds(60);

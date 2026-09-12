@@ -1182,7 +1182,12 @@ async fn the_paykit_worker_confirms_a_settled_bitcoin_order(pool: PgPool) {
     assert_eq!(order_view["paykit_request_state"], json!("pending"));
 
     // Detected: the projection reflects it; the payment still awaits.
-    source.set_outcome(&reference, PaykitStatusOutcome::Detected);
+    source.set_outcome(
+        &reference,
+        PaykitStatusOutcome::Detected {
+            facts: exclusive_facts(),
+        },
+    );
     let later = now + chrono::Duration::seconds(60);
     marketplace_service::workers::verify_due_paykit_payments(&app.state, &source, later)
         .await
@@ -1196,6 +1201,7 @@ async fn the_paykit_worker_confirms_a_settled_bitcoin_order(pool: PgPool) {
         &reference,
         PaykitStatusOutcome::Confirmed {
             amount_matched: true,
+            facts: exclusive_facts(),
         },
     );
     let even_later = later + chrono::Duration::seconds(60);
@@ -1247,6 +1253,7 @@ async fn a_confirmed_but_mismatched_amount_routes_to_manual_review(pool: PgPool)
         &reference,
         PaykitStatusOutcome::Confirmed {
             amount_matched: false,
+            facts: exclusive_facts(),
         },
     );
     let applied = marketplace_service::workers::verify_due_paykit_payments(

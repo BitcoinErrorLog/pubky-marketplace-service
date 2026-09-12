@@ -84,6 +84,14 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::payment_methods::confirm_fiat_received),
         )
         .route(
+            "/v0/orders/{id}/confirm-bitcoin-payment",
+            post(crate::bitcoin_review::confirm_bitcoin_payment),
+        )
+        .route(
+            "/v0/orders/{id}/bitcoin/resolve",
+            post(crate::bitcoin_review::resolve_bitcoin_payment),
+        )
+        .route(
             "/v0/sellers/me/shipping-config",
             put(crate::shipping::put_shipping_config).get(crate::shipping::get_shipping_config),
         )

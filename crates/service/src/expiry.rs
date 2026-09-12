@@ -25,10 +25,23 @@ struct DueReservation {
 /// 'active'`.
 pub async fn expire_due_reservations(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
     let mut tx = pool.begin().await?;
+    // The exclusion: an auction winner's reservation whose order is awaiting
+    // seller confirmation or sits in Paykit manual review is PRESERVED —
+    // the buyer demonstrably paid on chain, and the stock stays held until
+    // the seller resolves or the seven-day reaper abandons (§B.8.8: routing
+    // to manual_review never releases the hold). Scoped to the Paykit
+    // bitcoin rail; every other reservation sweeps exactly as before.
     let due: Vec<DueReservation> = sqlx::query_as(
         "SELECT id, listing_aggregate_id, buyer_pubky, quantity, drop_aggregate_id \
          FROM reservations \
          WHERE status = 'active' AND expires_at <= $1 \
+         AND NOT EXISTS (\
+             SELECT 1 FROM orders o JOIN payments p ON p.order_id = o.id \
+             WHERE o.auction_aggregate_id = reservations.listing_aggregate_id \
+             AND o.buyer_pubky = reservations.buyer_pubky \
+             AND o.payment_method = 'bitcoin' AND p.adapter = 'paykit' \
+             AND (o.paykit_request_state = 'awaiting_seller_confirmation' \
+                  OR p.state = 'manual_review')) \
          ORDER BY expires_at FOR UPDATE SKIP LOCKED",
     )
     .bind(now)

@@ -188,6 +188,79 @@ immediately followed by a paykit outage can leave paykit `observing` an
 invoice for an order the marketplace voided — bounded because paykit's
 `expires_at` equals the hold deadline, so the invoice expires there too.
 
+### `shared_manual` checkout and manual-review resolution (W1.15)
+
+A seller whose Paykit creator is `shared_manual` confirms Bitcoin payments
+manually: no chain observation moves the order to `paid`. The strict
+`paykit.bitcoin_status/v2` contract gates every poll — a missing/wrong
+`contract_version` or a missing/unknown `allocation_mode` fails closed
+(never an automatic transition input) — and the creator's CURRENT mode
+decides: `exclusive` confirms automatically as before, while a matching,
+non-late `shared_manual` observation enters
+`orders.paykit_request_state = 'awaiting_seller_confirmation'`, extends
+the inventory hold to a bounded 24-hour seller-confirmation window, and
+keeps polling on a status-only basis (facts refresh; nothing advances).
+A late observation (payment already expired) never enters the state — it
+takes the existing late path straight to `manual_review`. The stored
+observation is audit-only; there is no seller-facing Marketplace read path
+for it. Sellers confirm from their Paykit stack view, while the service uses
+the stored facts to preserve the audit trail and validate the resolution.
+
+Three exits, each one CAS with every effect in the same transaction:
+
+- **Seller confirm** (`POST /v0/orders/{id}/confirm-bitcoin-payment`,
+  body `{reason}`): the session pubky is resolved order → listing → seller
+  (403 `not_order_seller` for anyone else) BEFORE the idempotency lookup;
+  the audit row derives `confirmed_txid`/`confirmed_amount_sats` and the
+  frozen observation from the stored Paykit observation, never the body
+  (a disagreeing body-supplied value is rejected with
+  `confirmation_observation_mismatch`), with
+  `confirmation_basis = 'seller_attestation'`. Idempotent on the order id.
+- **The 24-hour seller-window reaper**: the order's request state becomes
+  `confirmed` and the payment `manual_review` with
+  `manual_review_entered_at` stamped (the hold is PRESERVED), starting the
+  two-business-day seller-response SLA (alert only) and the seven-day
+  inactivity clock.
+- **Seller resolve / the seven-day reaper**
+  (`POST /v0/orders/{id}/bitcoin/resolve`, Paykit-Bitcoin scope only):
+  one shared CAS (`state='manual_review' AND resolution_outcome IS NULL`)
+  applies `paid` (existing confirmation effects; late entries reacquire
+  inventory in lock order or fail `409 stock_unavailable`), `refunded`
+  (payment stays `confirmed` with `resolution_outcome='refunded'`,
+  validated external refund reference, order `refunded_external`), or
+  `abandoned` (payment `expired`, order cancelled, hold released). The
+  reaper is the same abandoned branch with
+  `resolution_basis='seller_unresponsive'`; a later seller resolve is 409.
+  `Idempotency-Key` (a UUID) replays same-key/same-body, conflicts
+  same-key/different-body, and refuses any different key with
+  `409 already_resolved`.
+
+Every terminal outcome writes exactly one audit row, one event, and one
+`paykit.resolve` outbox row pinned by stack identity AND bind-time
+endpoint. The delivery arm dials the ROW'S endpoint (never the current
+default), compares the readiness `stack_id` before sending (a mismatch
+sends nothing and terminates `stack_pin_mismatch` with an alert), and maps
+every response class to exactly one outcome: permanent refusals terminate
+visibly; 401/403 retry with an immediate first alert; 408/425/429, 5xx
+and transport failures retry under the hard one-hour
+`delivery_deadline`; `Retry-After` on 429/503 is honoured as
+`min(deadline, max(backoff_due_at, retry_after_due_at))` — a floor, never
+an undercut. Terminal rows block the §C.16 condition-6 drain until
+acknowledged; the infrastructure acknowledgement terminates DELIVERY only
+and never touches the order outcome. Condition 7 keeps the old stack
+retained until
+`NOT EXISTS (orders pinned to it awaiting seller confirmation or payments
+in manual_review)` — only seller resolution or the seven-day reaper
+clears it. No path in this flow can un-pay an order.
+
+The drain orchestration primitives are deliberately service/ops-only:
+`condition_seven_clear` checks for live order/payment pins,
+`condition_six_blocking_rows` counts undelivered or unacknowledged resolve
+rows, `terminate_resolve_delivery` terminates delivery for one outbox row,
+and `acknowledge_resolve_row` records an operator acknowledgement. They do
+not expose HTTP authority or change an order outcome; future cross-repo drain
+orchestration consumes them.
+
 The three `LOCKS_*` secrets/URL are all-or-nothing: the service **fails
 closed at startup** on a partial configuration (a URL without keys, or keys
 without a URL), rather than running with verification silently disabled or

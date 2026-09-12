@@ -212,6 +212,37 @@ async fn rejects_invalid_payment_transitions_and_non_buyer_advancement(pool: PgP
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
 }
 
+#[sqlx::test(migrations = "./migrations")]
+async fn sandbox_manual_review_stamps_the_receiver_clock(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    let (_, body) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id present")
+        .to_string();
+    let payment_uuid = uuid::Uuid::parse_str(&payment_id).expect("payment uuid");
+    let now = app.clock.now();
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &payment_command(&payment_id, 1, "manual_review", 0, 1_008),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "manual review failed: {body}");
+    assert_eq!(body["result"]["payment"]["state"], json!("manual_review"));
+    let entered_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT manual_review_entered_at FROM payments WHERE id = $1")
+            .bind(payment_uuid)
+            .fetch_one(&app.pool)
+            .await
+            .expect("manual review timestamp");
+    assert_eq!(entered_at, now);
+}
+
 // TS case: "ships, confirms delivery, and allows one review per participant".
 #[sqlx::test]
 async fn ships_confirms_delivery_and_allows_one_review_per_participant(pool: PgPool) {
