@@ -36,6 +36,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::{DateTime, Datelike, Utc, Weekday};
 use marketplace_domain::{ids, ErrorCode};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -43,10 +44,14 @@ use uuid::Uuid;
 
 use crate::auth::Actor;
 use crate::clock::format_timestamp;
+use crate::contracts::ReviewReason;
 use crate::executor::insert_event;
 use crate::handlers::holds::{release_lines, HeldQuantity};
-use crate::handlers::{fetch_listing, fetch_order_for_update, insert_notification_intent};
-use crate::model::{OrderRow, PaymentRow};
+use crate::handlers::{
+    fetch_listing, fetch_order_for_update, insert_notification_intent,
+    seller_order_json_with_reviews,
+};
+use crate::model::{seller_observation, OrderRow, PaymentRow};
 use crate::payments::PaykitObservation;
 use crate::queries::{ORDER_COLUMNS, PAYMENT_COLUMNS};
 use crate::workers::SYSTEM_ACTOR;
@@ -75,15 +80,19 @@ const RESOLUTION_OUTCOMES: [&str; 3] = ["paid", "refunded", "abandoned"];
 /// Machine-readable failure in the standard envelope, with a `reason`
 /// sub-code the client can branch on. Static copy only — nothing about the
 /// order, the observation, or any server value is interpolated.
-fn review_error(code: ErrorCode, reason: &str, message: &str) -> Response {
+fn review_error(code: ErrorCode, reason: ReviewReason, message: &str) -> Response {
     (
         StatusCode::from_u16(code.http_status()).expect("error codes map to valid statuses"),
         Json(json!({
             "ok": false,
-            "error": { "code": code, "message": message, "reason": reason },
+            "error": { "code": code, "message": message, "reason": reason.as_str() },
         })),
     )
         .into_response()
+}
+
+const fn review_reason(reason: ReviewReason) -> ReviewReason {
+    reason
 }
 
 fn internal(context: &str, error: &dyn std::fmt::Display) -> Response {
@@ -209,7 +218,7 @@ async fn listing_seller_for_order(
 fn not_order_seller() -> Response {
     review_error(
         ErrorCode::Unauthorized,
-        "not_order_seller",
+        review_reason(ReviewReason::NotOrderSeller),
         "Only the seller of this order's listing may perform this action.",
     )
 }
@@ -226,7 +235,7 @@ type StoredConfirmation = (
 fn order_not_found() -> Response {
     review_error(
         ErrorCode::NotFound,
-        "order_not_found",
+        review_reason(ReviewReason::OrderNotFound),
         "The order was not found.",
     )
 }
@@ -235,7 +244,7 @@ fn order_not_found() -> Response {
 // Seller confirmation (POST /v0/orders/{id}/confirm-bitcoin-payment)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConfirmBitcoinPaymentBody {
     /// Free-text seller note (bounded), recorded as `confirmed_reason`.
@@ -276,7 +285,7 @@ pub async fn confirm_bitcoin_payment(
     {
         return review_error(
             ErrorCode::InvalidCommand,
-            "invalid_reason",
+            review_reason(ReviewReason::InvalidReason),
             "The reason must be at most 500 characters.",
         );
     }
@@ -319,7 +328,7 @@ pub async fn confirm_bitcoin_payment(
                     "confirmed_reason": reason,
                     "confirmation_source": "seller",
                     "confirmation_basis": "seller_attestation",
-                    "paykit_observation": observation,
+                    "paykit_observation": seller_observation(Some(&observation)),
                 },
             })),
         )
@@ -342,7 +351,7 @@ pub async fn confirm_bitcoin_payment(
             );
             return review_error(
                 ErrorCode::InvalidCommand,
-                "confirmation_observation_mismatch",
+                review_reason(ReviewReason::ConfirmationObservationMismatch),
                 "The supplied transaction details do not match the observed payment.",
             );
         }
@@ -356,7 +365,7 @@ pub async fn confirm_bitcoin_payment(
             );
             return review_error(
                 ErrorCode::InvalidCommand,
-                "confirmation_observation_mismatch",
+                review_reason(ReviewReason::ConfirmationObservationMismatch),
                 "The supplied transaction details do not match the observed payment.",
             );
         }
@@ -405,7 +414,7 @@ pub async fn confirm_bitcoin_payment(
         let _ = tx.rollback().await;
         return review_error(
             ErrorCode::InvalidState,
-            "order_not_awaiting_confirmation",
+            review_reason(ReviewReason::OrderNotAwaitingConfirmation),
             "This order is not awaiting seller confirmation.",
         );
     }
@@ -446,7 +455,7 @@ pub async fn confirm_bitcoin_payment(
                 let _ = tx.rollback().await;
                 return review_error(
                     failure.code,
-                    "confirmation_effects_failed",
+                    review_reason(ReviewReason::ConfirmationEffectsFailed),
                     &failure.message,
                 );
             }
@@ -528,7 +537,7 @@ pub async fn confirm_bitcoin_payment(
             StatusCode::OK,
             Json(json!({
                 "ok": true,
-                "order": crate::handlers::order_json_with_reviews(&confirmed_order, &reviews),
+                "order": seller_order_json_with_reviews(&confirmed_order, &reviews, &actor.0),
                 "confirmation": {
                     "order_id": order_id,
                     "confirmed_by_pubky": actor.0,
@@ -538,7 +547,7 @@ pub async fn confirm_bitcoin_payment(
                     "confirmed_reason": body.reason,
                     "confirmation_source": "seller",
                     "confirmation_basis": "seller_attestation",
-                    "paykit_observation": observation,
+                    "paykit_observation": seller_observation(Some(&observation)),
                 },
             })),
         )
@@ -595,7 +604,7 @@ async fn enqueue_resolve_row(
 // Seller manual-review resolution (POST /v0/orders/{id}/bitcoin/resolve)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveBitcoinPaymentBody {
     outcome: String,
@@ -643,14 +652,14 @@ pub async fn resolve_bitcoin_payment(
     let Some(resolution_id) = resolution_id else {
         return review_error(
             ErrorCode::InvalidCommand,
-            "invalid_idempotency_key",
+            review_reason(ReviewReason::InvalidIdempotencyKey),
             "The Idempotency-Key header must be a UUID.",
         );
     };
     if !RESOLUTION_OUTCOMES.contains(&body.outcome.as_str()) {
         return review_error(
             ErrorCode::InvalidCommand,
-            "invalid_outcome",
+            review_reason(ReviewReason::InvalidOutcome),
             "The outcome must be paid, refunded, or abandoned.",
         );
     }
@@ -661,7 +670,7 @@ pub async fn resolve_bitcoin_payment(
     {
         return review_error(
             ErrorCode::InvalidCommand,
-            "invalid_reason",
+            review_reason(ReviewReason::InvalidReason),
             "The reason must be at most 500 characters.",
         );
     }
@@ -670,7 +679,7 @@ pub async fn resolve_bitcoin_payment(
         ("refunded", _) => {
             return review_error(
                 ErrorCode::InvalidCommand,
-                "invalid_refund_reference",
+                review_reason(ReviewReason::InvalidRefundReference),
                 "A refunded resolution requires a valid external refund reference.",
             );
         }
@@ -678,7 +687,7 @@ pub async fn resolve_bitcoin_payment(
         (_, Some(_)) => {
             return review_error(
                 ErrorCode::InvalidCommand,
-                "invalid_refund_reference",
+                review_reason(ReviewReason::InvalidRefundReference),
                 "Only a refunded resolution carries a refund reference.",
             );
         }
@@ -699,7 +708,7 @@ pub async fn resolve_bitcoin_payment(
     if order.payment_method.as_deref() != Some("bitcoin") {
         return review_error(
             ErrorCode::InvalidState,
-            "resolution_not_applicable",
+            review_reason(ReviewReason::ResolutionNotApplicable),
             "Bitcoin resolution applies only to bitcoin-bound orders.",
         );
     }
@@ -709,7 +718,7 @@ pub async fn resolve_bitcoin_payment(
     if !pins_present {
         return review_error(
             ErrorCode::InvalidState,
-            "missing_pin",
+            review_reason(ReviewReason::MissingPin),
             "This order has no pinned paykit stack to resolve against.",
         );
     }
@@ -735,7 +744,7 @@ pub async fn resolve_bitcoin_payment(
         }
         return review_error(
             ErrorCode::IdempotencyConflict,
-            "conflict",
+            review_reason(ReviewReason::Conflict),
             "The Idempotency-Key was already used with a different resolution.",
         );
     }
@@ -752,7 +761,7 @@ pub async fn resolve_bitcoin_payment(
     if any_resolution {
         return review_error(
             ErrorCode::InvalidState,
-            "already_resolved",
+            review_reason(ReviewReason::AlreadyResolved),
             "This order's payment was already resolved.",
         );
     }
@@ -774,17 +783,17 @@ pub async fn resolve_bitcoin_payment(
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(ResolutionFailure::AlreadyResolved) => review_error(
             ErrorCode::InvalidState,
-            "already_resolved",
+            review_reason(ReviewReason::AlreadyResolved),
             "This order's payment was already resolved.",
         ),
         Err(ResolutionFailure::NotInManualReview) => review_error(
             ErrorCode::InvalidState,
-            "not_in_manual_review",
+            review_reason(ReviewReason::NotInManualReview),
             "This order's payment is not awaiting manual resolution.",
         ),
         Err(ResolutionFailure::StockUnavailable) => review_error(
             ErrorCode::InsufficientInventory,
-            "stock_unavailable",
+            review_reason(ReviewReason::StockUnavailable),
             "The order's inventory can no longer be reacquired; choose refunded or abandoned.",
         ),
         Err(ResolutionFailure::Internal(context, error)) => internal(&context, &error),
@@ -953,7 +962,7 @@ pub(crate) async fn apply_manual_review_resolution(
 
     let response = json!({
         "ok": true,
-        "order": updated_order.projection(),
+        "order": updated_order.seller_projection_for_actor(input.event_actor),
         "resolution": {
             "order_id": order_id,
             "resolution_id": input.resolution_id,

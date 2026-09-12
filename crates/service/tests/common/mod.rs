@@ -3,6 +3,8 @@
 //! through the full HTTP stack, including Pubky AuthToken auth.
 #![allow(dead_code)]
 
+pub mod paykit_review;
+
 use std::sync::Arc;
 
 use axum::body::Body;
