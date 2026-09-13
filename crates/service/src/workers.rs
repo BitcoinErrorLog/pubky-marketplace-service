@@ -3268,6 +3268,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             manual_review_sla_alerts = summary.manual_review_sla_alerts,
                             manual_reviews_abandoned = summary.manual_reviews_abandoned,
                             resolve_rows_delivered = summary.resolve_rows_delivered,
+                            fx_samples_accepted = summary.fx_samples_accepted,
                             "worker pass completed"
                         );
                     }
