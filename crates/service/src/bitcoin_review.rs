@@ -437,6 +437,17 @@ pub async fn confirm_bitcoin_payment(
             &"payment left awaiting_entitlement mid-confirm",
         );
     };
+    if let Err(error) = sqlx::query(
+        "UPDATE orders SET paykit_observed_sats = COALESCE(\
+             paykit_observed_sats, (paykit_observation->>'observed_sats')::bigint) \
+         WHERE id = $1 AND paykit_observed_sats IS NULL",
+    )
+    .bind(order_id)
+    .execute(&mut *tx)
+    .await
+    {
+        return internal("freeze observed payment", &error);
+    }
     // The fulfilment effects: paid, receipt exactly once, hold consumed.
     let (confirmed_order, _receipt, receipt_event_id) =
         match crate::handlers::payment::confirm_order(
@@ -953,11 +964,11 @@ pub(crate) async fn apply_manual_review_resolution(
     // The immutable observed-payment snapshot: what the refund amount
     // derives from — server-stored facts, never the request body.
     let snapshot = json!({
-        "observation": order.paykit_observation,
+        "observation": updated_order.paykit_observation,
         "payment_amount_minor": payment.amount_minor,
         "currency": payment.currency,
         "exponent": payment.exponent,
-        "paykit_total_sats": order.paykit_total_sats,
+        "paykit_observed_sats": updated_order.paykit_observed_sats,
     });
 
     let response = json!({
@@ -1243,7 +1254,7 @@ fn inputless_command_id() -> Uuid {
 async fn apply_refunded_effects(
     tx: &mut Transaction<'_, Postgres>,
     order: &OrderRow,
-    payment: &PaymentRow,
+    _payment: &PaymentRow,
     input: &ResolutionInput<'_>,
     now: DateTime<Utc>,
 ) -> Result<OrderRow, ResolutionFailure> {
@@ -1264,7 +1275,12 @@ async fn apply_refunded_effects(
             format!("order in unexpected state {}", current.state),
         ));
     }
-    let amount_minor = order.paykit_total_sats.unwrap_or(payment.amount_minor);
+    let Some(amount_minor) = order.paykit_observed_sats else {
+        return Err(ResolutionFailure::Internal(
+            "refund requires manual confirmation".into(),
+            "the Paykit observed amount has not been frozen".into(),
+        ));
+    };
     let external_refund = json!({
         "amount_minor": amount_minor,
         "transaction_id": input.refund_reference,
@@ -1468,7 +1484,9 @@ async fn route_one_seller_confirmation_window(
     let won = sqlx::query(
         "UPDATE orders SET paykit_request_state = 'confirmed', \
          paykit_seller_confirmation_entered_at = NULL, \
-         paykit_seller_confirmation_deadline = NULL, hold_expires_at = NULL, updated_at = $2 \
+         paykit_seller_confirmation_deadline = NULL, hold_expires_at = NULL, \
+         paykit_observed_sats = COALESCE(paykit_observed_sats, \
+             (paykit_observation->>'observed_sats')::bigint), updated_at = $2 \
          WHERE id = $1 AND paykit_request_state = 'awaiting_seller_confirmation'",
     )
     .bind(order_id)

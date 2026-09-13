@@ -536,10 +536,10 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 }
 
 /// The migration catalog is strictly increasing, unique per number, and
-/// ends at 0023. Migrations 0001–0022 are never rewritten; this asserts
-/// 0023 is the only addition.
+/// ends at 0024. Migrations 0001–0023 are never rewritten; this asserts
+/// 0024 is the only addition.
 #[test]
-fn migration_catalog_ends_unique_at_0023() {
+fn migration_catalog_ends_unique_at_0024() {
     let mut numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -551,8 +551,8 @@ fn migration_catalog_ends_unique_at_0023() {
         .collect();
     numbers.sort_unstable();
     numbers.dedup();
-    let expected: Vec<u32> = (1..=23).collect();
-    assert_eq!(numbers, expected, "the catalog is 0001..=0023, gapless");
+    let expected: Vec<u32> = (1..=24).collect();
+    assert_eq!(numbers, expected, "the catalog is 0001..=0024, gapless");
 }
 
 /// Every writer of `payments.state = 'manual_review'` across Bitcoin,
@@ -606,7 +606,8 @@ fn every_manual_review_writer_stamps_the_entry_time() {
         }
     }
     // The enumerated set: Locks apply_manual_review (1), the paykit worker
-    // (3: late settlement, amount mismatch, confirm-failure), the fiat
+    // (4: late settlement, amount mismatch, observed-amount-vs-quote
+    // mismatch on FX-quoted orders, confirm-failure), the fiat
     // apply_fiat_paid (2: expired, confirm-failure), the sandbox transition
     // (1), and the shared_manual 24-hour seller-window reaper (1). Any NEW
     // writer fails here until it is reviewed, stamped, and enumerated.
@@ -620,7 +621,7 @@ fn every_manual_review_writer_stamps_the_entry_time() {
             ("bitcoin_review.rs".to_string(), 1),
             ("payment.rs".to_string(), 1),
             ("payment_methods.rs".to_string(), 2),
-            ("workers.rs".to_string(), 4),
+            ("workers.rs".to_string(), 5),
         ]),
         "the manual_review writer set drifted; stamp and enumerate the new writer"
     );

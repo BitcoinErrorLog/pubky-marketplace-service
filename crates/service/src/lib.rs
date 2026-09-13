@@ -12,6 +12,7 @@ pub mod config;
 pub mod contracts;
 pub mod executor;
 pub mod expiry;
+pub mod fx;
 pub mod handlers;
 pub mod homeserver;
 pub mod http;

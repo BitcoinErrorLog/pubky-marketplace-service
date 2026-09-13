@@ -61,6 +61,9 @@ pub const ORDER_COLUMNS: &str =
      payment_reported_at, fiat_transaction_ref, fiat_verified_by, shipping_label, paykit_request_reference, paykit_request_state, \
      paykit_last_checked_at, paykit_invoice_id, paykit_stack_id, paykit_stack_endpoint, \
      paykit_total_sats, paykit_expires_at, paykit_prepare_expires_at, paykit_allocation_mode, \
+     bitcoin_quote_rate, bitcoin_quote_source, bitcoin_quote_fetched_at, bitcoin_quoted_sats, \
+     bitcoin_quote_expires_at, bitcoin_quote_currency, bitcoin_quote_exponent, \
+     bitcoin_quote_spread_bps, paykit_observed_sats, \
      paykit_address_fingerprint, paykit_bind_attempt, paykit_activation_state, \
      paykit_observation, paykit_seller_confirmation_entered_at, \
      paykit_seller_confirmation_deadline, \

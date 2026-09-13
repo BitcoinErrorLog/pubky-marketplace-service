@@ -356,6 +356,15 @@ pub struct OrderRow {
     /// The figure the marketplace charges, displays and records:
     /// `amount_sats + nonce_sats` from phase 1 (R3-3).
     pub paykit_total_sats: Option<i64>,
+    pub bitcoin_quote_rate: Option<sqlx::types::BigDecimal>,
+    pub bitcoin_quote_source: Option<String>,
+    pub bitcoin_quote_fetched_at: Option<DateTime<Utc>>,
+    pub bitcoin_quoted_sats: Option<i64>,
+    pub bitcoin_quote_expires_at: Option<DateTime<Utc>>,
+    pub bitcoin_quote_currency: Option<String>,
+    pub bitcoin_quote_exponent: Option<i16>,
+    pub bitcoin_quote_spread_bps: Option<i32>,
+    pub paykit_observed_sats: Option<i64>,
     pub paykit_expires_at: Option<DateTime<Utc>>,
     pub paykit_prepare_expires_at: Option<DateTime<Utc>>,
     /// §B.8.8 allocation mode, persisted for W1.15/W1.16. Never serialized.
@@ -428,6 +437,7 @@ impl OrderRow {
         }
         if actor == self.seller_pubky {
             view["paykit_observation"] = seller_observation(self.paykit_observation.as_ref());
+            view["paykit_observed_sats"] = self.paykit_observed_sats.into();
             view["paykit_seller_confirmation_entered_at"] = self
                 .paykit_seller_confirmation_entered_at
                 .map(format_timestamp)
@@ -477,6 +487,13 @@ impl OrderRow {
     }
 
     pub fn view(&self) -> Value {
+        let displayed_total = if matches!(self.currency.as_str(), "SAT" | "BTC")
+            && self.paykit_total_sats.is_some()
+        {
+            self.paykit_total_sats.unwrap_or(self.total_minor)
+        } else {
+            self.total_minor
+        };
         json!({
             "id": self.id,
             "buyer_pubky": self.buyer_pubky,
@@ -487,16 +504,7 @@ impl OrderRow {
             "delivery_address": self.delivery_address.clone().unwrap_or(Value::Null),
             "subtotal": money_json(self.subtotal_minor, &self.currency, self.exponent),
             "shipping": money_json(self.shipping_minor, &self.currency, self.exponent),
-            // The buyer-facing total of a bitcoin-bound order is the
-            // paykit total (price + nonce, §B.11.3): the figure the
-            // marketplace must charge, display and record. A `preparing` or
-            // `active` order always has it; an unbound order falls back to
-            // the listing total.
-            "total": money_json(
-                self.paykit_total_sats.unwrap_or(self.total_minor),
-                &self.currency,
-                self.exponent,
-            ),
+            "total": money_json(displayed_total, &self.currency, self.exponent),
             "guarantee_policy_version": self.guarantee_policy_version,
             "payment_id": self.payment_id,
             "receipt_id": self.receipt_id,
@@ -519,6 +527,16 @@ impl OrderRow {
             "paykit_request_state": self.paykit_request_state,
             "paykit_activation_state": self.paykit_activation_state,
             "paykit_total_sats": self.paykit_total_sats,
+            "bitcoin_quote": {
+                "rate": self.bitcoin_quote_rate.as_ref().map(ToString::to_string),
+                "source": self.bitcoin_quote_source,
+                "fetched_at": self.bitcoin_quote_fetched_at.map(format_timestamp),
+                "quoted_sats": self.bitcoin_quoted_sats,
+                "expires_at": self.bitcoin_quote_expires_at.map(format_timestamp),
+                "currency": self.bitcoin_quote_currency,
+                "exponent": self.bitcoin_quote_exponent,
+                "spread_bps": self.bitcoin_quote_spread_bps,
+            },
             "fulfillment": self.fulfillment,
             "first_revealed_at": self.first_revealed_at.map(format_timestamp),
             "created_at": format_timestamp(self.created_at),
