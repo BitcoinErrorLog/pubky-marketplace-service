@@ -129,11 +129,11 @@ pub fn parse_feed(body: &[u8], observed_at: DateTime<Utc>) -> Result<RateSample,
     let ticker = ticker[0];
     let updated_at =
         DateTime::from_timestamp_millis(ticker.last_updated_at).ok_or(FxError::Malformed)?;
-    let age = observed_at.signed_duration_since(updated_at).num_seconds();
-    if age > MAX_RATE_AGE_SECS {
+    let age = observed_at.signed_duration_since(updated_at);
+    if age > Duration::seconds(MAX_RATE_AGE_SECS) {
         return Err(FxError::Stale);
     }
-    if age < -MAX_FUTURE_SKEW_SECS {
+    if age < -Duration::seconds(MAX_FUTURE_SKEW_SECS) {
         return Err(FxError::Future);
     }
     let rate = Decimal::parse(&ticker.last_price).ok_or(FxError::Malformed)?;
@@ -205,7 +205,6 @@ pub async fn quote_usd(
     exponent: i32,
     now: DateTime<Utc>,
 ) -> Result<(Decimal, RateSample, u64), FxError> {
-    let current = fetch_current(now).await?;
     let rates: Vec<(String,)> = sqlx::query_as(
         "SELECT rate::text FROM fx_rate_samples \
          WHERE currency = 'USD' AND accepted_at >= $1 ORDER BY accepted_at",
@@ -221,6 +220,7 @@ pub async fn quote_usd(
             .collect(),
     )
     .ok_or(FxError::MissingReference)?;
+    let current = fetch_current(now).await?;
     if !within_deviation(&current.rate, &median_rate) {
         return Err(FxError::DeviationExceeded);
     }

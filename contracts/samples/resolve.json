@@ -17,6 +17,16 @@
       "body": {
         "ok": true,
         "order": {
+          "bitcoin_quote": {
+            "currency": null,
+            "expires_at": null,
+            "exponent": null,
+            "fetched_at": null,
+            "quoted_sats": null,
+            "rate": null,
+            "source": null,
+            "spread_bps": null
+          },
           "buyer_pubky": "<pubky:buyer>",
           "cancellation_reason": "closed after manual review",
           "created_at": "<timestamp:1>",
@@ -62,6 +72,7 @@
             "observed_sats": 51637,
             "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
           },
+          "paykit_observed_sats": 51637,
           "paykit_request_reference": "<paykit-reference:1>",
           "paykit_request_state": "confirmed",
           "paykit_seller_confirmation_deadline": null,
@@ -349,6 +360,16 @@
       "body": {
         "ok": true,
         "order": {
+          "bitcoin_quote": {
+            "currency": null,
+            "expires_at": null,
+            "exponent": null,
+            "fetched_at": null,
+            "quoted_sats": null,
+            "rate": null,
+            "source": null,
+            "spread_bps": null
+          },
           "buyer_pubky": "<pubky:buyer>",
           "cancellation_reason": null,
           "created_at": "<timestamp:1>",
@@ -394,6 +415,7 @@
             "observed_sats": 51637,
             "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
           },
+          "paykit_observed_sats": 51637,
           "paykit_request_reference": "<paykit-reference:2>",
           "paykit_request_state": "confirmed",
           "paykit_seller_confirmation_deadline": null,
@@ -456,6 +478,16 @@
       "body": {
         "ok": true,
         "order": {
+          "bitcoin_quote": {
+            "currency": null,
+            "expires_at": null,
+            "exponent": null,
+            "fetched_at": null,
+            "quoted_sats": null,
+            "rate": null,
+            "source": null,
+            "spread_bps": null
+          },
           "buyer_pubky": "<pubky:buyer>",
           "cancellation_reason": "refunded by the seller after manual review",
           "created_at": "<timestamp:1>",
@@ -505,6 +537,7 @@
             "observed_sats": 51637,
             "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
           },
+          "paykit_observed_sats": 51637,
           "paykit_request_reference": "<paykit-reference:3>",
           "paykit_request_state": "confirmed",
           "paykit_seller_confirmation_deadline": null,
@@ -567,6 +600,16 @@
       "body": {
         "ok": true,
         "order": {
+          "bitcoin_quote": {
+            "currency": null,
+            "expires_at": null,
+            "exponent": null,
+            "fetched_at": null,
+            "quoted_sats": null,
+            "rate": null,
+            "source": null,
+            "spread_bps": null
+          },
           "buyer_pubky": "<pubky:buyer>",
           "cancellation_reason": null,
           "created_at": "<timestamp:1>",
@@ -612,6 +655,7 @@
             "observed_sats": 51637,
             "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
           },
+          "paykit_observed_sats": 51637,
           "paykit_request_reference": "<paykit-reference:2>",
           "paykit_request_state": "confirmed",
           "paykit_seller_confirmation_deadline": null,

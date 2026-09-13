@@ -606,7 +606,8 @@ fn every_manual_review_writer_stamps_the_entry_time() {
         }
     }
     // The enumerated set: Locks apply_manual_review (1), the paykit worker
-    // (3: late settlement, amount mismatch, confirm-failure), the fiat
+    // (4: late settlement, amount mismatch, observed-amount-vs-quote
+    // mismatch on FX-quoted orders, confirm-failure), the fiat
     // apply_fiat_paid (2: expired, confirm-failure), the sandbox transition
     // (1), and the shared_manual 24-hour seller-window reaper (1). Any NEW
     // writer fails here until it is reviewed, stamped, and enumerated.
@@ -620,7 +621,7 @@ fn every_manual_review_writer_stamps_the_entry_time() {
             ("bitcoin_review.rs".to_string(), 1),
             ("payment.rs".to_string(), 1),
             ("payment_methods.rs".to_string(), 2),
-            ("workers.rs".to_string(), 4),
+            ("workers.rs".to_string(), 5),
         ]),
         "the manual_review writer set drifted; stamp and enumerate the new writer"
     );

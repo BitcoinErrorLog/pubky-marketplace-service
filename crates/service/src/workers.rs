@@ -1360,6 +1360,59 @@ async fn apply_confirmed_paykit_payment(
     let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
         anyhow::bail!("paykit order {} is missing", row.id);
     };
+    // Exact-settlement enforcement applies only where the marketplace itself
+    // froze the satoshi figure at bind (an FX-quoted order): the buyer was
+    // invoiced `paykit_total_sats` (quote + nonce), so anything else the
+    // observer reports is an under/over-payment a human must review. For
+    // legacy SAT/BTC orders the invoice amount is the order total and
+    // paykit-server's own `amount_matched` (handled above) remains the sole
+    // amount arbiter — a later observation never un-pays through this path.
+    let observed_amount_mismatch = order.bitcoin_quoted_sats.is_some()
+        && observation.observed_sats.is_some_and(|observed| {
+            i64::try_from(observed).ok() != order.paykit_total_sats
+        });
+    if observed_amount_mismatch {
+        let (revision,): (i64,) = sqlx::query_as(
+            "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+             manual_review_entered_at = $2, updated_at = $2 WHERE id = $1 RETURNING revision",
+        )
+        .bind(payment.id)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        crate::executor::insert_event(
+            &mut tx,
+            row.id,
+            &ids::payment_aggregate_id(payment.id),
+            revision,
+            &row.buyer_pubky,
+            "payment.manual_review",
+            now,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE orders SET paykit_request_state = 'confirmed', paykit_observation = $3, updated_at = $2 \
+             WHERE id = $1",
+        )
+        .bind(row.id)
+        .bind(now)
+        .bind(crate::bitcoin_review::observation_json(
+            "confirmed",
+            amount_matched,
+            observation,
+            now,
+            false,
+        ))
+        .execute(&mut *tx)
+        .await?;
+        freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
+        tx.commit().await?;
+        tracing::warn!(
+            order_id = %row.id,
+            "confirmed paykit payment observed amount differs from the bind quote; routing to manual review"
+        );
+        return Ok(true);
+    }
     match confirm_order(
         &mut tx,
         &row.buyer_pubky,
@@ -1404,11 +1457,18 @@ async fn apply_confirmed_paykit_payment(
             sqlx::query(
                 "UPDATE orders SET paykit_request_state = 'confirmed', \
                  paykit_seller_confirmation_entered_at = NULL, \
-                 paykit_seller_confirmation_deadline = NULL, updated_at = $2 \
+                 paykit_seller_confirmation_deadline = NULL, paykit_observation = $3, updated_at = $2 \
                  WHERE id = $1",
             )
             .bind(row.id)
             .bind(now)
+            .bind(crate::bitcoin_review::observation_json(
+                "confirmed",
+                amount_matched,
+                observation,
+                now,
+                false,
+            ))
             .execute(&mut *tx)
             .await?;
             freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
@@ -1450,11 +1510,18 @@ async fn apply_confirmed_paykit_payment(
                 .await?;
             }
             sqlx::query(
-                "UPDATE orders SET paykit_request_state = 'confirmed', updated_at = $2 \
+                "UPDATE orders SET paykit_request_state = 'confirmed', paykit_observation = $3, updated_at = $2 \
                  WHERE id = $1",
             )
             .bind(row.id)
             .bind(now)
+            .bind(crate::bitcoin_review::observation_json(
+                "confirmed",
+                amount_matched,
+                observation,
+                now,
+                false,
+            ))
             .execute(&mut *tx)
             .await?;
             freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
@@ -2634,6 +2701,27 @@ pub async fn sample_fx_rate(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result
     let bucket_seconds = now.timestamp() - now.timestamp().rem_euclid(FX_SAMPLE_INTERVAL_SECONDS);
     let bucket = DateTime::from_timestamp(bucket_seconds, 0)
         .ok_or_else(|| anyhow::anyhow!("invalid FX sample bucket"))?;
+    let reference: Vec<(String,)> = sqlx::query_as(
+        "SELECT rate::text FROM fx_rate_samples \
+         WHERE currency = 'USD' AND accepted_at >= $1",
+    )
+    .bind(fx::reference_cutoff(now))
+    .fetch_all(pool)
+    .await?;
+    if let Some(median) = fx::median(
+        reference
+            .into_iter()
+            .filter_map(|(rate,)| fx::Decimal::parse(&rate))
+            .collect(),
+    ) {
+        if !fx::within_deviation(&sample.rate, &median) {
+            tracing::warn!(
+                reason = "deviation_exceeded",
+                "FX reference sample rejected"
+            );
+            return Ok(0);
+        }
+    }
     let inserted = sqlx::query(
         "INSERT INTO fx_rate_samples \
          (currency, rate, fetched_at, accepted_at, sample_bucket, source) \
