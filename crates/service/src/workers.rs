@@ -48,6 +48,7 @@ use chrono::{DateTime, Utc};
 use marketplace_domain::ids;
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::handlers::auction::{close_locked_auction, parse_auction};
@@ -57,7 +58,7 @@ use crate::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
 use crate::model::{ListingRow, PaymentRow};
 use crate::payments::{PaykitClient, PaykitCommandError, PaykitStatusOutcome, PaykitStatusSource};
 use crate::queries::PAYMENT_COLUMNS;
-use crate::{expiry, AppState};
+use crate::{expiry, fx, AppState};
 
 pub const TASK_RESERVATION_EXPIRY: &str = "reservation_expiry";
 pub const TASK_DROP_TRANSITIONS: &str = "drop_transitions";
@@ -74,6 +75,7 @@ pub const TASK_PICKUP_RETENTION: &str = "pickup_retention";
 pub const TASK_SELLER_CONFIRMATION_WINDOW: &str = "seller_confirmation_window";
 pub const TASK_MANUAL_REVIEW_WATCH: &str = "manual_review_watch";
 pub const TASK_PAYKIT_RESOLVE_DELIVERY: &str = "paykit_resolve_delivery";
+pub const TASK_FX_SAMPLER: &str = "fx_sampler";
 
 /// The actor stamped on server-time post-purchase events and their
 /// notifications: the system, never a peer (ADR-0019).
@@ -86,6 +88,7 @@ pub const DELIVERY_SWEEP_MAX_BATCHES: u32 = 10;
 const OUTBOX_BATCH_SIZE: i64 = 100;
 const LOCKS_VERIFY_BATCH_SIZE: i64 = 25;
 const PAYKIT_VERIFY_BATCH_SIZE: i64 = 25;
+const FX_SAMPLE_INTERVAL_SECONDS: i64 = 60;
 
 /// Stat attestation cadence (ratified D3: weekly) and window (trailing 90
 /// days, matching the design's period example).
@@ -1208,6 +1211,25 @@ async fn claim_due_paykit_orders(
 /// the existing durable `manual_review` path and freezes the reported
 /// observation onto the order, so a later resolution's audit snapshot
 /// carries the facts the seller acted on.
+async fn freeze_paykit_observation(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+    observed_sats: Option<u64>,
+) -> anyhow::Result<()> {
+    let Some(observed_sats) = observed_sats else {
+        return Ok(());
+    };
+    sqlx::query(
+        "UPDATE orders SET paykit_observed_sats = $2 \
+         WHERE id = $1 AND paykit_observed_sats IS NULL",
+    )
+    .bind(order_id)
+    .bind(i64::try_from(observed_sats)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn apply_confirmed_paykit_payment(
     pool: &PgPool,
     row: &ClaimedPaykitOrder,
@@ -1283,6 +1305,7 @@ async fn apply_confirmed_paykit_payment(
         ))
         .execute(&mut *tx)
         .await?;
+        freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
         tx.commit().await?;
         tracing::warn!(
             order_id = %row.id,
@@ -1326,6 +1349,7 @@ async fn apply_confirmed_paykit_payment(
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
         tx.commit().await?;
         tracing::warn!(
             order_id = %row.id,
@@ -1387,6 +1411,7 @@ async fn apply_confirmed_paykit_payment(
             .bind(now)
             .execute(&mut *tx)
             .await?;
+            freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
             tx.commit().await?;
             tracing::info!(
                 order_id = %row.id,
@@ -1432,6 +1457,7 @@ async fn apply_confirmed_paykit_payment(
             .bind(now)
             .execute(&mut *tx)
             .await?;
+            freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
             tx.commit().await?;
             Ok(updated.is_some())
         }
@@ -2591,6 +2617,47 @@ pub struct WorkerSummary {
     pub manual_review_sla_alerts: u64,
     pub manual_reviews_abandoned: u64,
     pub resolve_rows_delivered: u64,
+    pub fx_samples_accepted: u64,
+}
+
+/// Samples the bounded sole source once per server-time bucket. The unique
+/// bucket constraint is the concurrency cap; invalid samples never reach the
+/// table. The endpoint and ticker contract are pinned in `fx.rs`.
+pub async fn sample_fx_rate(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
+    let sample = match fx::fetch_current(now).await {
+        Ok(sample) => sample,
+        Err(error) => {
+            tracing::warn!(reason = ?error, "FX reference sample rejected");
+            return Ok(0);
+        }
+    };
+    let bucket_seconds = now.timestamp() - now.timestamp().rem_euclid(FX_SAMPLE_INTERVAL_SECONDS);
+    let bucket = DateTime::from_timestamp(bucket_seconds, 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid FX sample bucket"))?;
+    let inserted = sqlx::query(
+        "INSERT INTO fx_rate_samples \
+         (currency, rate, fetched_at, accepted_at, sample_bucket, source) \
+         VALUES ('USD', $1, $2, $3, $4, 'blocktank') \
+         ON CONFLICT (currency, sample_bucket) DO NOTHING",
+    )
+    .bind(
+        sqlx::types::BigDecimal::from_str(&sample.rate.to_string_value())
+            .expect("validated FX rate is a decimal"),
+    )
+    .bind(sample.fetched_at)
+    .bind(now)
+    .bind(bucket)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "DELETE FROM fx_rate_samples \
+         WHERE accepted_at < $1 - interval '3660 seconds'",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(inserted)
 }
 
 /// One worker pass: for each task, take the lease, drain, release. Tasks
@@ -2715,6 +2782,11 @@ pub async fn run_once(
         let result = expire_due_payment_windows(state, now).await;
         release_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now).await?;
         summary.payment_windows_expired = result?;
+    }
+    if try_acquire_lease(&state.pool, TASK_FX_SAMPLER, holder, now, lease_seconds).await? {
+        let result = sample_fx_rate(&state.pool, now).await;
+        release_lease(&state.pool, TASK_FX_SAMPLER, holder, now).await?;
+        summary.fx_samples_accepted = result?;
     }
     // The shared_manual seller-confirmation window (§B.8.8): elapsed
     // windows route to manual_review with the hold preserved.

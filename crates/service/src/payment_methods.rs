@@ -31,6 +31,7 @@ use marketplace_domain::{ids, ErrorCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::auth::Actor;
@@ -466,7 +467,39 @@ fn bitcoin_amount_sats(order: &OrderRow) -> Option<u64> {
     }
     u64::try_from(order.total_minor)
         .ok()
-        .filter(|sats| *sats > 0)
+        .filter(|sats| *sats >= crate::fx::MIN_QUOTE_SATS as u64)
+}
+
+fn fx_error_response(error: crate::fx::FxError) -> Response {
+    let (reason, message) = match error {
+        crate::fx::FxError::MissingReference => (
+            "fx_reference_unavailable",
+            "A verified FX reference is not available yet.",
+        ),
+        crate::fx::FxError::Stale => ("fx_rate_stale", "The FX reference is stale."),
+        crate::fx::FxError::Future => ("fx_rate_stale", "The FX reference timestamp is invalid."),
+        crate::fx::FxError::OutOfBounds => (
+            "fx_rate_out_of_bounds",
+            "The FX reference is outside the permitted range.",
+        ),
+        crate::fx::FxError::DeviationExceeded => (
+            "fx_deviation_exceeded",
+            "The FX reference deviates too far from the persisted reference.",
+        ),
+        crate::fx::FxError::BelowMinimum => (
+            "below_minimum_sats",
+            "The Bitcoin amount is below the 1,000-satoshi minimum.",
+        ),
+        crate::fx::FxError::CapExceeded => (
+            "fx_rate_out_of_bounds",
+            "The Bitcoin amount exceeds the permitted maximum.",
+        ),
+        crate::fx::FxError::Overflow | crate::fx::FxError::Malformed => (
+            "fx_reference_unavailable",
+            "The FX reference could not be used.",
+        ),
+    };
+    method_error(ErrorCode::InvalidState, reason, message)
 }
 
 /// `POST /v0/orders/{id}/payment-method` (buyer session): binds exactly one
@@ -565,6 +598,58 @@ pub async fn bind_payment_method(
         Err(error) => return internal("payment config read", &error),
     };
 
+    let bitcoin_quote = if method == "bitcoin" {
+        if !config.as_ref().is_some_and(|config| config.bitcoin_enabled) {
+            return method_error(
+                ErrorCode::InvalidState,
+                "method_unavailable",
+                "The seller does not accept Bitcoin.",
+            );
+        }
+        if payments.paykit.is_none() {
+            return method_error(
+                ErrorCode::UpstreamUnavailable,
+                "bitcoin_unavailable",
+                "Bitcoin payments are not enabled on this deployment.",
+            );
+        }
+        if matches!(
+            (order.currency.as_str(), order.exponent),
+            ("SAT", 0) | ("BTC", 8)
+        ) {
+            Some((
+                None,
+                match bitcoin_amount_sats(&order) {
+                    Some(sats) => sats,
+                    None => {
+                        return method_error(
+                            ErrorCode::InvalidState,
+                            "below_minimum_sats",
+                            "The Bitcoin amount is below the 1,000-satoshi minimum.",
+                        )
+                    }
+                },
+            ))
+        } else if order.currency == "USD" && order.exponent == 2 {
+            let (rate, sample, sats) =
+                match crate::fx::quote_usd(&state.pool, order.total_minor, order.exponent, now)
+                    .await
+                {
+                    Ok(quote) => quote,
+                    Err(error) => return fx_error_response(error),
+                };
+            Some((Some((rate, sample)), sats))
+        } else {
+            return method_error(
+                ErrorCode::InvalidState,
+                "currency_unsupported",
+                "Bitcoin binding supports only USD/2, BTC/8, and SAT/0 orders.",
+            );
+        }
+    } else {
+        None
+    };
+
     // The bind lock point: choosing a real rail is the payment start, so it
     // acquires the order's inventory hold and arms the fiat payment window
     // (all three rails; the paykit worker and both fiat verification legs
@@ -591,31 +676,7 @@ pub async fn bind_payment_method(
 
     let (fiat_checkout_url, paykit_reference, adapter): (Option<String>, Option<String>, &str) =
         match method {
-            "bitcoin" => {
-                let enabled = config.as_ref().is_some_and(|config| config.bitcoin_enabled);
-                if !enabled {
-                    return method_error(
-                        ErrorCode::InvalidState,
-                        "method_unavailable",
-                        "The seller does not accept Bitcoin.",
-                    );
-                }
-                if payments.paykit.is_none() {
-                    return method_error(
-                        ErrorCode::UpstreamUnavailable,
-                        "bitcoin_unavailable",
-                        "Bitcoin payments are not enabled on this deployment.",
-                    );
-                }
-                if bitcoin_amount_sats(&order).is_none() {
-                    return method_error(
-                        ErrorCode::InvalidState,
-                        "currency_unsupported",
-                        "Bitcoin payment requires a SAT- or BTC-denominated order.",
-                    );
-                }
-                (None, Some(order_reference(order.id)), "paykit")
-            }
+            "bitcoin" => (None, Some(order_reference(order.id)), "paykit"),
             "stripe" => {
                 let Some(link) = config
                     .as_ref()
@@ -752,7 +813,10 @@ pub async fn bind_payment_method(
     let mut bind_key: Option<(String, i32)> = None;
     if let Some(reference) = &paykit_reference {
         let paykit = payments.paykit.as_ref().expect("checked above");
-        let amount_sats = bitcoin_amount_sats(&order).expect("checked above");
+        let amount_sats = bitcoin_quote
+            .as_ref()
+            .map(|(_, sats)| *sats)
+            .expect("checked above");
         let endpoint = paykit.base_url().to_string();
         let expires_at = updated_order.hold_expires_at.unwrap_or_else(|| {
             now + chrono::Duration::seconds(state.config.fiat_payment_window_seconds)
@@ -850,7 +914,11 @@ pub async fn bind_payment_method(
                  paykit_stack_endpoint = $4, paykit_total_sats = $5, paykit_expires_at = $6, \
                  paykit_prepare_expires_at = $7, paykit_allocation_mode = $8, \
                  paykit_address_fingerprint = $9, paykit_activation_state = 'preparing', \
-                 updated_at = $10 WHERE id = $1",
+                 updated_at = $10, bitcoin_quote_rate = $11, bitcoin_quote_source = $12, \
+                 bitcoin_quote_fetched_at = $13, bitcoin_quoted_sats = $14, \
+                 bitcoin_quote_expires_at = $18, bitcoin_quote_currency = $15, \
+                 bitcoin_quote_exponent = $16, bitcoin_quote_spread_bps = $17 \
+                 WHERE id = $1",
             )
             .bind(order.id)
             .bind(phase1.invoice_id)
@@ -862,6 +930,57 @@ pub async fn bind_payment_method(
             .bind(&phase1.allocation_mode)
             .bind(&phase1.derived_address_fingerprint)
             .bind(now)
+            .bind(
+                bitcoin_quote
+                    .as_ref()
+                    .and_then(|(quote, _)| quote.as_ref())
+                    .map(|(rate, _)| {
+                        sqlx::types::BigDecimal::from_str(&rate.to_string_value())
+                            .expect("FX rate is a valid decimal")
+                    }),
+            )
+            .bind(
+                bitcoin_quote
+                    .as_ref()
+                    .and_then(|(quote, _)| quote.as_ref().map(|_| crate::fx::FX_SOURCE)),
+            )
+            .bind(
+                bitcoin_quote
+                    .as_ref()
+                    .and_then(|(quote, _)| quote.as_ref().map(|(_, sample)| sample.fetched_at)),
+            )
+            .bind(
+                bitcoin_quote
+                    .as_ref()
+                    .and_then(|(quote, sats)| quote.as_ref().map(|_| *sats))
+                    .map(i64::try_from)
+                    .transpose()
+                    .expect("quote sats fit i64"),
+            )
+            .bind(
+                bitcoin_quote
+                    .as_ref()
+                    .and_then(|(quote, _)| quote.as_ref())
+                    .map(|_| order.currency.as_str()),
+            )
+            .bind(
+                bitcoin_quote
+                    .as_ref()
+                    .and_then(|(quote, _)| quote.as_ref())
+                    .map(|_| i16::try_from(order.exponent).expect("exponent fits i16")),
+            )
+            .bind(
+                bitcoin_quote
+                    .as_ref()
+                    .and_then(|(quote, _)| quote.as_ref())
+                    .map(|_| 0_i32),
+            )
+            .bind(
+                bitcoin_quote
+                    .as_ref()
+                    .and_then(|(quote, _)| quote.as_ref())
+                    .map(|_| expires_at),
+            )
             .execute(&mut *tx)
             .await?;
             // The payment step's displayed amount is the paykit total

@@ -570,9 +570,27 @@ async fn binding_rejections_cover_role_availability_and_currency(pool: PgPool) {
         );
     }
 
-    // Bitcoin on a USD order: currency unsupported even when enabled.
+    // A JPY/0 order is outside the initial USD/2 FX contract even when
+    // Bitcoin is enabled; the rejection must happen before feed/Paykit work.
     put_config(&app, &seller.token, &json!({ "bitcoin_enabled": true })).await;
     paykit.set_claimed(&seller.pubky);
+    sqlx::query("UPDATE orders SET currency = 'JPY', exponent = 0 WHERE id = $1")
+        .bind(Uuid::parse_str(&order.order_id).expect("order id is a UUID"))
+        .execute(&app.pool)
+        .await
+        .expect("test order currency update");
+    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"]["reason"],
+        json!("currency_unsupported"),
+        "{body}"
+    );
+    sqlx::query("UPDATE orders SET currency = 'USD', exponent = 3 WHERE id = $1")
+        .bind(Uuid::parse_str(&order.order_id).expect("order id is a UUID"))
+        .execute(&app.pool)
+        .await
+        .expect("test order exponent update");
     let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(

@@ -422,7 +422,7 @@ async fn mismatch_entry_resolves_paid_with_the_held_stock(pool: PgPool) {
     .await
     .expect("audit row");
     assert_eq!(snapshot["payment_amount_minor"], json!(TOTAL_SATS));
-    assert_eq!(snapshot["paykit_total_sats"], json!(TOTAL_SATS));
+    assert_eq!(snapshot["paykit_observed_sats"], json!(TOTAL_SATS));
 }
 
 // ---------------------------------------------------------------------------
