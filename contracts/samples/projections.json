@@ -69,7 +69,7 @@
             "exponent": 2
           },
           "minimum_next_bid": {
-            "amount_minor": 7500,
+            "amount_minor": 7001,
             "currency": "USD",
             "exponent": 2
           }
