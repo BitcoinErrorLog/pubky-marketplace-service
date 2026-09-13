@@ -29,17 +29,21 @@ const AUCTION_HOLD_SECONDS: i64 = 30 * 60;
 
 /// Returns the lowest proxy maximum accepted for the next bid by a bidder.
 ///
-/// Both the visible price and the bidder's prior maximum must be exceeded by
-/// one minimum increment. This is shared with the authenticated listing
+/// The visible price advances by the auction increment, while a bidder
+/// raising their own proxy ceiling only needs to exceed their previous
+/// maximum by one minor unit. This is shared with the authenticated listing
 /// projection so the UI cannot show a stale threshold.
 pub fn personal_minimum_next_bid(
     current_price_minor: i64,
     minimum_increment_minor: i64,
     bidder_previous_maximum: i64,
 ) -> i64 {
-    current_price_minor
-        .max(bidder_previous_maximum)
-        .saturating_add(minimum_increment_minor)
+    let visible_price_minimum = current_price_minor.saturating_add(minimum_increment_minor);
+    if bidder_previous_maximum == 0 {
+        visible_price_minimum
+    } else {
+        visible_price_minimum.max(bidder_previous_maximum.saturating_add(1))
+    }
 }
 
 pub async fn place_bid(
@@ -112,7 +116,7 @@ pub async fn place_bid(
     if payload.maximum_amount.amount_minor < minimum_next_bid {
         return Ok(Err(CommandFailure::with_revision(
             ErrorCode::BidTooLow,
-            "Bid maximum must meet the current visible price and prior maximum increment.",
+            "Bid maximum must meet the current visible price increment and exceed the prior maximum.",
             listing.server_revision,
         )));
     }

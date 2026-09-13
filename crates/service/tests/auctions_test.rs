@@ -223,7 +223,7 @@ async fn rejects_seller_low_stale_and_post_close_bids(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
     assert_eq!(
         body["error"]["message"],
-        json!("Bid maximum must meet the current visible price and prior maximum increment.")
+        json!("Bid maximum must meet the current visible price increment and exceed the prior maximum.")
     );
 
     let (status, _) = execute(
@@ -260,7 +260,7 @@ async fn rejects_seller_low_stale_and_post_close_bids(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
     assert_eq!(
         body["error"]["message"],
-        json!("Bid maximum must meet the current visible price and prior maximum increment.")
+        json!("Bid maximum must meet the current visible price increment and exceed the prior maximum.")
     );
 
     app.clock.advance_seconds(11 * 60);
@@ -304,42 +304,77 @@ async fn personal_minimum_is_the_exact_bid_acceptance_boundary(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::OK, "at first minimum: {body}");
 
-    // A different first-time bidder has the same boundary and may bid at it.
+    // A leader raising a private maximum only needs to exceed their old
+    // maximum by one minor unit when that is higher than the visible
+    // boundary.
     let (status, body) = execute(
         &app,
         &other_buyer.token,
-        &place_bid_command(&seller.pubky, 12, 4_999, 2),
+        &place_bid_command(&seller.pubky, 12, 7_000, 2),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "below second minimum: {body}");
-    let (status, body) = execute(
-        &app,
-        &other_buyer.token,
-        &place_bid_command(&seller.pubky, 13, 5_000, 2),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "at second minimum: {body}");
+    assert_eq!(status, StatusCode::OK, "second bidder minimum: {body}");
 
-    // The original bidder's own maximum now raises the boundary to 5,500.
     let (status, body) = execute(
         &app,
-        &buyer.token,
-        &place_bid_command(&seller.pubky, 14, 5_499, 3),
+        &other_buyer.token,
+        &place_bid_command(&seller.pubky, 13, 7_000, 3),
     )
     .await;
     assert_eq!(
         status,
         StatusCode::CONFLICT,
-        "below returning minimum: {body}"
+        "leader's previous maximum is refused: {body}"
+    );
+    assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
+    let (status, body) = execute(
+        &app,
+        &other_buyer.token,
+        &place_bid_command(&seller.pubky, 14, 7_001, 3),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "leader's previous maximum plus one is accepted: {body}"
+    );
+
+    // A returning non-leader must still clear the visible price increment.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 15, 5_499, 4),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "non-leader below visible minimum: {body}"
     );
     assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &place_bid_command(&seller.pubky, 15, 5_500, 3),
+        &place_bid_command(&seller.pubky, 16, 5_999, 4),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "at returning minimum: {body}");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "non-leader below visible minimum: {body}"
+    );
+    assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 17, 6_000, 4),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "non-leader at visible minimum: {body}"
+    );
 }
 
 // The prototype rejects bids on non-auction listings as INVALID_STATE.

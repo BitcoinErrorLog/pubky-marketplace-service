@@ -156,6 +156,8 @@ async fn auction_projection_exposes_the_leader_but_no_other_bidder_data(pool: Pg
         first_bidder_listing["viewer_bid"]["minimum_next_bid"]["amount_minor"],
         json!(8_000)
     );
+    // The non-leader's projection is the same boundary enforced by
+    // place_bid: visible price 7,500 plus the 500 increment.
     assert!(!first_bidder_listing.to_string().contains("9000"));
 
     let (status, second_bidder_listing) = get(
@@ -175,8 +177,10 @@ async fn auction_projection_exposes_the_leader_but_no_other_bidder_data(pool: Pg
     );
     assert_eq!(
         second_bidder_listing["viewer_bid"]["minimum_next_bid"]["amount_minor"],
-        json!(9_500)
+        json!(9_001)
     );
+    // The leader's projection is the same boundary enforced by place_bid:
+    // its previous maximum 9,000 plus one minor unit.
     assert!(!second_bidder_listing.to_string().contains("7000"));
 
     // A non-bidder gets no viewer-specific field, and maximum (proxy) bids
