@@ -201,6 +201,7 @@ pub fn reference_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
 
 pub async fn quote_usd(
     pool: &sqlx::PgPool,
+    feed_url: &str,
     total_minor: i64,
     exponent: i32,
     now: DateTime<Utc>,
@@ -220,7 +221,7 @@ pub async fn quote_usd(
             .collect(),
     )
     .ok_or(FxError::MissingReference)?;
-    let current = fetch_current(now).await?;
+    let current = fetch_current(feed_url, now).await?;
     if !within_deviation(&current.rate, &median_rate) {
         return Err(FxError::DeviationExceeded);
     }
@@ -228,14 +229,16 @@ pub async fn quote_usd(
     Ok((current.rate.clone(), current, sats))
 }
 
-pub async fn fetch_current(now: DateTime<Utc>) -> Result<RateSample, FxError> {
+pub async fn fetch_current(feed_url: &str, now: DateTime<Utc>) -> Result<RateSample, FxError> {
     let response = reqwest::Client::builder()
         .timeout(StdDuration::from_secs(3))
         .build()
         .map_err(|_| FxError::Malformed)?
-        .get(FX_URL)
+        .get(feed_url)
         .send()
         .await
+        .map_err(|_| FxError::Malformed)?
+        .error_for_status()
         .map_err(|_| FxError::Malformed)?;
     let body = response.bytes().await.map_err(|_| FxError::Malformed)?;
     parse_feed(&body, now)

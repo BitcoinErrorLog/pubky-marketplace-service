@@ -100,6 +100,10 @@ pub struct Config {
     /// before the ordinary terminal-order purge takes it
     /// (`PICKUP_DISPUTE_RETENTION_DAYS`, default 30, minimum 1; §A3).
     pub pickup_dispute_retention_days: i64,
+    /// The bounded sole FX source URL (`FX_FEED_URL`, default the pinned
+    /// Blocktank BTCUSD ticker endpoint). Deployment-overridable so a
+    /// repoint is a configuration act, never a code change.
+    pub fx_feed_url: String,
 }
 
 impl Config {
@@ -159,6 +163,8 @@ impl Config {
         )?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         let pickup_dispute_retention_days = env_days("PICKUP_DISPUTE_RETENTION_DAYS", 30)?;
+        let fx_feed_url =
+            std::env::var("FX_FEED_URL").unwrap_or_else(|_| crate::fx::FX_URL.to_string());
         let public_app_origin = env_origin("PUBLIC_APP_ORIGIN")?;
         let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
         Ok(Self {
@@ -183,6 +189,7 @@ impl Config {
             public_service_origin,
             sandbox_payments_enabled,
             pickup_dispute_retention_days,
+            fx_feed_url,
         })
     }
 
@@ -210,6 +217,7 @@ impl Config {
             public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
             pickup_dispute_retention_days: 30,
+            fx_feed_url: crate::fx::FX_URL.to_string(),
         }
     }
 }

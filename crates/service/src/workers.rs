@@ -1368,9 +1368,9 @@ async fn apply_confirmed_paykit_payment(
     // paykit-server's own `amount_matched` (handled above) remains the sole
     // amount arbiter — a later observation never un-pays through this path.
     let observed_amount_mismatch = order.bitcoin_quoted_sats.is_some()
-        && observation.observed_sats.is_some_and(|observed| {
-            i64::try_from(observed).ok() != order.paykit_total_sats
-        });
+        && observation
+            .observed_sats
+            .is_some_and(|observed| i64::try_from(observed).ok() != order.paykit_total_sats);
     if observed_amount_mismatch {
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
@@ -2690,8 +2690,12 @@ pub struct WorkerSummary {
 /// Samples the bounded sole source once per server-time bucket. The unique
 /// bucket constraint is the concurrency cap; invalid samples never reach the
 /// table. The endpoint and ticker contract are pinned in `fx.rs`.
-pub async fn sample_fx_rate(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
-    let sample = match fx::fetch_current(now).await {
+pub async fn sample_fx_rate(
+    pool: &PgPool,
+    feed_url: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<u64> {
+    let sample = match fx::fetch_current(feed_url, now).await {
         Ok(sample) => sample,
         Err(error) => {
             tracing::warn!(reason = ?error, "FX reference sample rejected");
@@ -2872,7 +2876,7 @@ pub async fn run_once(
         summary.payment_windows_expired = result?;
     }
     if try_acquire_lease(&state.pool, TASK_FX_SAMPLER, holder, now, lease_seconds).await? {
-        let result = sample_fx_rate(&state.pool, now).await;
+        let result = sample_fx_rate(&state.pool, &state.config.fx_feed_url, now).await;
         release_lease(&state.pool, TASK_FX_SAMPLER, holder, now).await?;
         summary.fx_samples_accepted = result?;
     }

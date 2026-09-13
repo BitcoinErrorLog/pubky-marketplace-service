@@ -3,6 +3,7 @@
 //! through the full HTTP stack, including Pubky AuthToken auth.
 #![allow(dead_code)]
 
+pub mod fx_feed;
 pub mod paykit_review;
 
 use std::sync::Arc;
@@ -2144,6 +2145,45 @@ pub async fn test_app_with_payments_full(
         paykit,
         ipn,
         shippo,
+    )
+}
+
+/// [`test_app_with_payments`] plus the FX feed double: the app's configured
+/// `FX_FEED_URL` points at a local scripted Blocktank double whose fetch
+/// counter the idempotency tests assert against.
+pub async fn test_app_with_payments_and_fx(
+    pool: PgPool,
+) -> (TestApp, FakePaykit, fx_feed::FakeFxFeed) {
+    let stripe = spawn_fake_stripe().await;
+    let paykit = spawn_fake_paykit().await;
+    let ipn = spawn_fake_paypal_ipn().await;
+    let shippo = spawn_fake_shippo().await;
+    let fx = fx_feed::spawn_fake_fx().await;
+    let runtime = Arc::new(PaymentsRuntime {
+        stripe_key_cipher: StripeKeyCipher::from_hex(TEST_STRIPE_ENCRYPTION_KEY)
+            .expect("test stripe key parses"),
+        stripe: StripeClient::new(&stripe.base_url).expect("fake stripe client builds"),
+        paykit: Some(
+            PaykitClient::new(&paykit.base_url, TEST_PAYKIT_SIGNING_SEED)
+                .expect("fake paykit client builds"),
+        ),
+        paypal_ipn: PaypalIpnVerifier::new(&ipn.base_url).expect("fake ipn verifier builds"),
+        shippo: ShippoClient::new(&shippo.base_url).expect("fake shippo client builds"),
+    });
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let mut config = Config::for_tests();
+    config.fx_feed_url = fx.base_url.clone();
+    let state = AppState::new(pool.clone(), clock.clone(), config).with_payments(Some(runtime));
+    (
+        TestApp {
+            router: build_router(state.clone()),
+            pool,
+            clock,
+            state,
+        },
+        paykit,
+        fx,
     )
 }
 

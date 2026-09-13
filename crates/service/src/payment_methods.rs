@@ -631,13 +631,18 @@ pub async fn bind_payment_method(
                 },
             ))
         } else if order.currency == "USD" && order.exponent == 2 {
-            let (rate, sample, sats) =
-                match crate::fx::quote_usd(&state.pool, order.total_minor, order.exponent, now)
-                    .await
-                {
-                    Ok(quote) => quote,
-                    Err(error) => return fx_error_response(error),
-                };
+            let (rate, sample, sats) = match crate::fx::quote_usd(
+                &state.pool,
+                &state.config.fx_feed_url,
+                order.total_minor,
+                order.exponent,
+                now,
+            )
+            .await
+            {
+                Ok(quote) => quote,
+                Err(error) => return fx_error_response(error),
+            };
             Some((Some((rate, sample)), sats))
         } else {
             return method_error(
