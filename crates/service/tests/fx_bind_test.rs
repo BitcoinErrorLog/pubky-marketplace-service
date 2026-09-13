@@ -828,7 +828,8 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
     );
 
     // A later observation refreshes the JSON facts only; the frozen column
-    // is single-assignment (the shared-manual status-only refresh path).
+    // is assigned at ENTRY (A1) and is single-assignment (the shared-manual
+    // status-only refresh path).
     fixture.paykit.set_allocation_mode("shared_manual");
     let order = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
     fixture.app.clock.set(now);
@@ -857,6 +858,11 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
         facts.paykit_request_state.as_deref(),
         Some("awaiting_seller_confirmation")
     );
+    assert_eq!(
+        facts.paykit_observed_sats,
+        Some(total_sats),
+        "A1: the first authority-establishing observation is frozen at entry"
+    );
     // The second observation carries different facts (more confirmations).
     fixture.paykit.set_status(
         &reference,
@@ -871,13 +877,19 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
     );
     let _ = poll_now(&fixture.app, now + Duration::seconds(30)).await;
     let facts = order_facts(&pool, &order.order_id).await;
+    assert_eq!(
+        facts.paykit_observed_sats,
+        Some(total_sats),
+        "the refresh touches the JSON only, never the frozen column"
+    );
     let observation = facts.paykit_observation.expect("observation facts");
     assert_eq!(
         observation["confirmations"],
         json!(9),
         "the later observation refreshed the JSON facts"
     );
-    // Route the 24h window: the freeze CAS reads the refreshed JSON once.
+    // Route the 24h window: the reaper's COALESCE freeze is a fallback for
+    // pre-existing rows and must not win against the entry freeze.
     let routed = route_due_seller_confirmation_windows(
         &fixture.app.state,
         now + Duration::seconds(SELLER_CONFIRMATION_WINDOW_SECONDS),
@@ -889,12 +901,137 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
     assert_eq!(
         facts.paykit_observed_sats,
         Some(total_sats),
-        "the frozen column is assigned exactly once, from the latest facts"
+        "frozen at entry (A1); the reaper's fallback freeze never wins"
     );
     let observation_after = facts
         .paykit_observation
         .expect("observation facts retained");
     assert_eq!(observation_after["confirmations"], json!(9));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn shared_manual_freeze_pins_the_first_observation_for_refunds(pool: PgPool) {
+    install_log_capture();
+    let fixture = fx_fixture(pool.clone()).await;
+    let now = fixture.app.clock.now();
+    seed_fx_samples(&pool, RATE, now, 3).await;
+    fixture.paykit.set_allocation_mode("shared_manual");
+
+    // N sats: the FIRST matching shared-manual observation establishes
+    // authority, enters awaiting_seller_confirmation, and is frozen onto
+    // the order in the same transaction (A1).
+    let order = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
+    let (status, body) = bind_bitcoin(&fixture.app, &fixture.buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    activate_bound(&fixture).await;
+    let n_sats = order_facts(&pool, &order.order_id)
+        .await
+        .paykit_total_sats
+        .expect("invoice total");
+    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    fixture.paykit.set_status(
+        &reference,
+        bitcoin_status_v2(
+            "confirmed",
+            true,
+            "shared_manual",
+            Some("fx-freeze-txid"),
+            Some(n_sats as u64),
+            Some(1),
+        ),
+    );
+    assert!(poll_now(&fixture.app, now).await >= 1);
+    let facts = order_facts(&pool, &order.order_id).await;
+    assert_eq!(
+        facts.paykit_request_state.as_deref(),
+        Some("awaiting_seller_confirmation")
+    );
+    assert_eq!(
+        facts.paykit_observed_sats,
+        Some(n_sats),
+        "A1: frozen at entry, in the same transaction as the state change"
+    );
+    assert_eq!(
+        facts
+            .paykit_observation
+            .as_ref()
+            .expect("observation facts")["observed_sats"],
+        json!(n_sats)
+    );
+
+    // A later status refresh reports M != N sats: the JSON observation
+    // moves to M, the frozen column stays N.
+    let m_sats = n_sats + 1_000;
+    fixture.paykit.set_status(
+        &reference,
+        bitcoin_status_v2(
+            "confirmed",
+            false,
+            "shared_manual",
+            Some("fx-freeze-txid"),
+            Some(m_sats as u64),
+            Some(3),
+        ),
+    );
+    let _ = poll_now(&fixture.app, now + Duration::seconds(30)).await;
+    let facts = order_facts(&pool, &order.order_id).await;
+    assert_eq!(
+        facts.paykit_observed_sats,
+        Some(n_sats),
+        "the freeze pins the first observation"
+    );
+    assert_eq!(
+        facts
+            .paykit_observation
+            .as_ref()
+            .expect("observation facts")["observed_sats"],
+        json!(m_sats),
+        "the JSON carries the refreshed facts"
+    );
+
+    // Route the 24h window: the reaper's fallback freeze never wins.
+    let routed = route_due_seller_confirmation_windows(
+        &fixture.app.state,
+        now + Duration::seconds(SELLER_CONFIRMATION_WINDOW_SECONDS),
+    )
+    .await
+    .expect("seller-window reaper runs");
+    assert!(routed >= 1);
+    assert_eq!(payment_state(&pool, &order.order_id).await, "manual_review");
+    assert_eq!(
+        order_facts(&pool, &order.order_id)
+            .await
+            .paykit_observed_sats,
+        Some(n_sats),
+        "still the first observation after the reaper"
+    );
+
+    // The refund derives from the frozen first observation N, never M.
+    let (status, body) = resolve_call(
+        &fixture.app,
+        &fixture.seller.token,
+        &order.order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "refunded", "external_refund_reference": "tx-refund-freeze" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "refund resolve failed: {body}\n{}",
+        captured_logs()
+    );
+    let external_refund: Value =
+        sqlx::query_scalar("SELECT external_refund FROM orders WHERE id = $1")
+            .bind(Uuid::parse_str(&order.order_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("external refund row");
+    assert_eq!(
+        external_refund["amount_minor"],
+        json!(n_sats),
+        "the refund derives from the frozen first observation"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]

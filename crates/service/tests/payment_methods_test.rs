@@ -721,6 +721,48 @@ async fn bitcoin_binding_creates_the_signed_paykit_request(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn bitcoin_binding_binds_small_unquoted_sat_orders(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    put_config(&app, &seller.token, &json!({ "bitcoin_enabled": true })).await;
+    paykit.set_claimed(&seller.pubky);
+
+    // A 500-sat SAT/0 order: below the 1,000-sat minimum that applies to
+    // FIAT-CONVERTED quotes only. Unquoted bitcoin-denominated totals keep
+    // the legacy any-positive semantics and bind exactly as before.
+    let mut register = register_sat_command(&seller.pubky, 1);
+    register["payload"]["unit_price"] =
+        json!({ "amount_minor": 500, "currency": "SAT", "exponent": 0 });
+    register["payload"]["shipping_minor"] = json!(0);
+    let (status, body) = execute(&app, &seller.token, &register).await;
+    assert_eq!(status, StatusCode::OK, "register failed: {body}");
+    let (status, body) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id")
+        .to_string();
+
+    let (status, body) = bind_method(&app, &buyer.token, &order_id, "bitcoin").await;
+    assert_eq!(status, StatusCode::OK, "500-sat SAT/0 bind failed: {body}");
+    assert_eq!(
+        paykit.requests().len(),
+        1,
+        "the paykit request left the process"
+    );
+    assert_eq!(paykit.requests()[0].amount_sats, 500);
+    // No FX quote is involved: the SAT total passes through unquoted.
+    let quoted: Option<i64> =
+        sqlx::query_scalar("SELECT bitcoin_quoted_sats FROM orders WHERE id = $1")
+            .bind(Uuid::parse_str(&order_id).expect("order id is a uuid"))
+            .fetch_one(&pool)
+            .await
+            .expect("order row");
+    assert_eq!(quoted, None, "an unquoted SAT order stores no FX quote");
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn a_refused_paykit_request_leaves_the_order_unbound(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;

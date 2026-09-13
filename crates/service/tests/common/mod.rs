@@ -2149,8 +2149,9 @@ pub async fn test_app_with_payments_full(
 }
 
 /// [`test_app_with_payments`] plus the FX feed double: the app's configured
-/// `FX_FEED_URL` points at a local scripted Blocktank double whose fetch
-/// counter the idempotency tests assert against.
+/// `fx_feed_url` is overridden IN-PROCESS (a release binary cannot be
+/// repointed by environment) to point at a local scripted Blocktank double
+/// whose fetch counter the idempotency tests assert against.
 pub async fn test_app_with_payments_and_fx(
     pool: PgPool,
 ) -> (TestApp, FakePaykit, fx_feed::FakeFxFeed) {

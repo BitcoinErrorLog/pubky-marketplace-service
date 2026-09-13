@@ -34,7 +34,10 @@ pub struct Decimal {
 impl Decimal {
     pub fn parse(value: &str) -> Option<Self> {
         let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
-        if fraction.len() > 38 || whole.len() > 38 {
+        // The fraction is capped at 8 digits (one satoshi of BTC precision)
+        // so the checked scaling in the comparison paths can never be asked
+        // to widen a mantissa by more than 10^8.
+        if fraction.len() > 8 || whole.len() > 38 {
             return None;
         }
         if whole.is_empty()
@@ -51,11 +54,19 @@ impl Decimal {
         })
     }
 
-    fn cmp(&self, other: &Self) -> Ordering {
+    /// The mantissa widened to `scale` fractional digits, checked: an
+    /// over-wide value returns `None` so callers fail closed instead of
+    /// wrapping.
+    fn widened(&self, scale: u32) -> Option<u128> {
+        let factor = 10u128.checked_pow(scale.checked_sub(self.scale)?)?;
+        self.mantissa.checked_mul(factor)
+    }
+
+    fn cmp(&self, other: &Self) -> Option<Ordering> {
         let scale = self.scale.max(other.scale);
-        let left = self.mantissa * 10u128.pow(scale - self.scale);
-        let right = other.mantissa * 10u128.pow(scale - other.scale);
-        left.cmp(&right)
+        let left = self.widened(scale)?;
+        let right = other.widened(scale)?;
+        Some(left.cmp(&right))
     }
 
     fn in_bounds(&self) -> bool {
@@ -67,7 +78,11 @@ impl Decimal {
             mantissa: RATE_MAX_USD,
             scale: 0,
         };
-        self.cmp(&min) != Ordering::Less && self.cmp(&max) != Ordering::Greater
+        // Fail closed: an unwidenable value is treated as out of bounds.
+        match (self.cmp(&min), self.cmp(&max)) {
+            (Some(low), Some(high)) => low != Ordering::Less && high != Ordering::Greater,
+            _ => false,
+        }
     }
 
     pub fn to_string_value(&self) -> String {
@@ -150,16 +165,31 @@ pub fn median(mut rates: Vec<Decimal>) -> Option<Decimal> {
     if rates.len() < REFERENCE_MIN_SAMPLES {
         return None;
     }
-    rates.sort_by(Decimal::cmp);
+    // Fail closed: every value must widen to the common scale without
+    // overflow, or there is no trustworthy reference to sort.
+    let scale = rates.iter().map(|rate| rate.scale).max()?;
+    for rate in &rates {
+        rate.widened(scale)?;
+    }
+    rates.sort_by(|left, right| left.cmp(right).unwrap_or(Ordering::Equal));
     Some(rates[rates.len() / 2].clone())
 }
 
 pub fn within_deviation(rate: &Decimal, reference: &Decimal) -> bool {
     let scale = rate.scale.max(reference.scale);
-    let rate_value = rate.mantissa * 10u128.pow(scale - rate.scale);
-    let reference_value = reference.mantissa * 10u128.pow(scale - reference.scale);
+    // Fail closed: an unwidenable value is treated as out of bounds.
+    let (Some(rate_value), Some(reference_value)) = (rate.widened(scale), reference.widened(scale))
+    else {
+        return false;
+    };
     let difference = rate_value.abs_diff(reference_value);
-    difference * 10_000 <= reference_value * MAX_DEVIATION_BPS
+    let (Some(scaled_difference), Some(scaled_bound)) = (
+        difference.checked_mul(10_000),
+        reference_value.checked_mul(MAX_DEVIATION_BPS),
+    ) else {
+        return false;
+    };
+    scaled_difference <= scaled_bound
 }
 
 /// Converts fiat minor units into satoshis with checked integer arithmetic:
@@ -257,6 +287,46 @@ mod tests {
         )
         .expect("captured production response parses");
         assert_eq!(sample.rate.to_string_value(), "77197");
+    }
+
+    #[test]
+    fn parse_caps_the_fraction_at_eight_digits() {
+        assert_eq!(
+            Decimal::parse("77197.12345678")
+                .expect("eight fraction digits parse")
+                .to_string_value(),
+            "77197.12345678"
+        );
+        // Nine digits is already too wide; a 40-digit fraction is rejected
+        // outright so the checked widening paths can never be stretched.
+        assert_eq!(Decimal::parse("77197.123456789"), None);
+        let forty_digit_fraction = format!("77197.{}", "1".repeat(40));
+        assert_eq!(Decimal::parse(&forty_digit_fraction), None);
+    }
+
+    #[test]
+    fn comparison_paths_fail_closed_on_unwidenable_values() {
+        // A mantissa near u128::MAX cannot be widened to a fractional
+        // scale: comparisons fail closed instead of wrapping.
+        let huge = Decimal {
+            mantissa: u128::MAX,
+            scale: 0,
+        };
+        assert!(!huge.in_bounds(), "far outside the permitted range");
+        let fractional = Decimal::parse("77197.5").unwrap();
+        assert!(
+            !within_deviation(&huge, &fractional),
+            "an unwidenable value is treated as a deviation breach"
+        );
+        assert_eq!(
+            median(vec![
+                huge,
+                Decimal::parse("77197").unwrap(),
+                Decimal::parse("77200.5").unwrap(),
+            ]),
+            None,
+            "an unwidenable sample voids the reference"
+        );
     }
 
     #[test]

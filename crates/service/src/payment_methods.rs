@@ -457,6 +457,8 @@ fn is_fiat_currency(order: &OrderRow) -> bool {
 
 /// The satoshi amount of a bitcoin-denominated order: `SAT` (exponent 0)
 /// and `BTC` (exponent 8) totals are both already in satoshi minor units.
+/// Any POSITIVE total binds (legacy semantics); the 1,000-sat minimum is
+/// enforced only inside [`crate::fx::quote_sats`] for fiat-converted quotes.
 fn bitcoin_amount_sats(order: &OrderRow) -> Option<u64> {
     let supported = matches!(
         (order.currency.as_str(), order.exponent),
@@ -467,7 +469,7 @@ fn bitcoin_amount_sats(order: &OrderRow) -> Option<u64> {
     }
     u64::try_from(order.total_minor)
         .ok()
-        .filter(|sats| *sats >= crate::fx::MIN_QUOTE_SATS as u64)
+        .filter(|sats| *sats > 0)
 }
 
 fn fx_error_response(error: crate::fx::FxError) -> Response {
@@ -624,8 +626,8 @@ pub async fn bind_payment_method(
                     None => {
                         return method_error(
                             ErrorCode::InvalidState,
-                            "below_minimum_sats",
-                            "The Bitcoin amount is below the 1,000-satoshi minimum.",
+                            "invalid_sats",
+                            "The Bitcoin amount must be a positive satoshi amount.",
                         )
                     }
                 },

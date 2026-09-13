@@ -1646,6 +1646,12 @@ async fn apply_shared_manual_observation(
     .execute(&mut *tx)
     .await?;
     if entered.rows_affected() == 1 {
+        // A1: the FIRST authority-establishing observation is frozen onto
+        // the order in the same transaction as the state change. Later
+        // status refreshes update the JSON facts only; the seller-window
+        // reaper's COALESCE freeze remains a fallback for rows that entered
+        // before this freeze existed and can never win against this value.
+        freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
         // An auction order's hold is the winning reservation: extend it to
         // the same window so the sweep cannot release it mid-confirmation.
         if let Some(auction_aggregate_id) = &order.auction_aggregate_id {
@@ -1669,8 +1675,8 @@ async fn apply_shared_manual_observation(
     }
     // Already inside: the status-only path refreshes the live facts
     // (confirmations progress, a refreshed observation after a
-    // disappearance) without ever advancing the order. The frozen audit
-    // snapshot is written only at confirmation, from this value.
+    // disappearance) without ever advancing the order and without touching
+    // the observation frozen at entry (A1).
     let refreshed = sqlx::query(
         "UPDATE orders SET paykit_observation = $2, updated_at = $3 \
          WHERE id = $1 AND paykit_request_state = 'awaiting_seller_confirmation'",

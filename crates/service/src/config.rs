@@ -100,9 +100,13 @@ pub struct Config {
     /// before the ordinary terminal-order purge takes it
     /// (`PICKUP_DISPUTE_RETENTION_DAYS`, default 30, minimum 1; §A3).
     pub pickup_dispute_retention_days: i64,
-    /// The bounded sole FX source URL (`FX_FEED_URL`, default the pinned
-    /// Blocktank BTCUSD ticker endpoint). Deployment-overridable so a
-    /// repoint is a configuration act, never a code change.
+    /// The bounded sole FX source URL. Permanently the pinned Blocktank
+    /// BTCUSD ticker endpoint ([`crate::fx::FX_URL`]): a release binary
+    /// CANNOT be repointed by environment — `from_env` never consults
+    /// `FX_FEED_URL`. Integration tests override the field in-process (the
+    /// test harness constructs `Config` directly and points it at a local
+    /// scripted double before building `AppState`); that seam is not
+    /// reachable from any environment variable.
     pub fx_feed_url: String,
 }
 
@@ -163,8 +167,10 @@ impl Config {
         )?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         let pickup_dispute_retention_days = env_days("PICKUP_DISPUTE_RETENTION_DAYS", 30)?;
-        let fx_feed_url =
-            std::env::var("FX_FEED_URL").unwrap_or_else(|_| crate::fx::FX_URL.to_string());
+        // The FX feed is the pinned Blocktank endpoint, always: the source
+        // is a permanent bounded single source, so no environment variable
+        // is consulted here (a release binary cannot be repointed).
+        let fx_feed_url = crate::fx::FX_URL.to_string();
         let public_app_origin = env_origin("PUBLIC_APP_ORIGIN")?;
         let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
         Ok(Self {
@@ -283,7 +289,34 @@ fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_days, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS};
+    use super::{parse_days, Config, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS};
+
+    /// Serializes the environment-mutating test (env is process-global).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn from_env_never_consults_fx_feed_url() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_database_url = std::env::var("DATABASE_URL").ok();
+        let previous_fx_feed_url = std::env::var("FX_FEED_URL").ok();
+        std::env::set_var("DATABASE_URL", "postgres://example.invalid/test");
+        std::env::set_var("FX_FEED_URL", "https://attacker.example/fx");
+        let result = Config::from_env();
+        match previous_database_url {
+            Some(value) => std::env::set_var("DATABASE_URL", value),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match previous_fx_feed_url {
+            Some(value) => std::env::set_var("FX_FEED_URL", value),
+            None => std::env::remove_var("FX_FEED_URL"),
+        }
+        let config = result.expect("from_env succeeds with DATABASE_URL set");
+        assert_eq!(
+            config.fx_feed_url,
+            crate::fx::FX_URL,
+            "a release binary cannot be repointed by FX_FEED_URL"
+        );
+    }
 
     #[test]
     fn delivery_day_counts_parse_with_defaults_and_bounds() {
