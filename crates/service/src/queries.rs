@@ -33,11 +33,13 @@ use uuid::Uuid;
 
 use crate::auth::Actor;
 use crate::clock::format_timestamp;
+use crate::handlers::auction::personal_minimum_next_bid;
 use crate::handlers::{
     drops::DROP_COLUMNS, offers::OFFER_COLUMNS, LISTING_COLUMNS, REVIEW_COLUMNS,
 };
 use crate::model::{
-    DropRow, ListingRow, NotificationRow, OfferRow, OrderRow, PaymentRow, ReceiptRow, ReviewRow,
+    AuctionState, DropRow, ListingRow, NotificationRow, OfferRow, OrderRow, PaymentRow, ReceiptRow,
+    ReviewRow,
 };
 use crate::AppState;
 
@@ -202,9 +204,12 @@ pub async fn get_band_consent(
 /// `GET /v1/listings/{aggregate_id}`: the listing/inventory projection,
 /// readable by any authenticated user (public catalog data). Exposes no
 /// buyer identity beyond the auction's current leader, which the auction
-/// state already makes visible to every bidder.
+/// state already makes visible to every bidder. An auction bidder additionally
+/// receives only their own proxy maximum and the minimum next maximum accepted
+/// for that bidder; this field is absent for other viewers.
 pub async fn get_listing(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(aggregate_id): Path<String>,
 ) -> Response {
     let listing: Result<Option<ListingRow>, sqlx::Error> = sqlx::query_as(&format!(
@@ -214,7 +219,46 @@ pub async fn get_listing(
     .fetch_optional(&state.pool)
     .await;
     match listing {
-        Ok(Some(listing)) => (StatusCode::OK, Json(listing.view())).into_response(),
+        Ok(Some(listing)) => {
+            let own_bid: Result<Option<(i64, String, i32)>, sqlx::Error> = sqlx::query_as(
+                "SELECT maximum_amount_minor, currency, exponent FROM bids \
+                 WHERE listing_aggregate_id = $1 AND bidder_pubky = $2 \
+                 ORDER BY maximum_amount_minor DESC LIMIT 1",
+            )
+            .bind(&aggregate_id)
+            .bind(&actor.0)
+            .fetch_optional(&state.pool)
+            .await;
+            let own_bid = match own_bid {
+                Ok(own_bid) => own_bid,
+                Err(error) => return internal_error("listing viewer bid", &error),
+            };
+            let mut view = listing.view();
+            if let (Some((maximum_minor, currency, exponent)), Some(auction_value)) =
+                (own_bid, listing.auction.as_ref())
+            {
+                if let Ok(auction) = AuctionState::from_value(auction_value) {
+                    let minimum_minor = personal_minimum_next_bid(
+                        auction.current_price.amount_minor,
+                        auction.minimum_increment.amount_minor,
+                        maximum_minor,
+                    );
+                    view["viewer_bid"] = json!({
+                        "maximum_amount": crate::model::money_json(
+                            maximum_minor,
+                            &currency,
+                            exponent,
+                        ),
+                        "minimum_next_bid": crate::model::money_json(
+                            minimum_minor,
+                            &currency,
+                            exponent,
+                        ),
+                    });
+                }
+            }
+            (StatusCode::OK, Json(view)).into_response()
+        }
         Ok(None) => query_error(ErrorCode::NotFound, "The listing was not found."),
         Err(error) => internal_error("listing", &error),
     }

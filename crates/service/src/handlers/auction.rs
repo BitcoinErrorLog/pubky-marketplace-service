@@ -27,6 +27,21 @@ use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 /// The auction winner's inventory hold, as in the prototype engine.
 const AUCTION_HOLD_SECONDS: i64 = 30 * 60;
 
+/// Returns the lowest proxy maximum accepted for the next bid by a bidder.
+///
+/// Both the visible price and the bidder's prior maximum must be exceeded by
+/// one minimum increment. This is shared with the authenticated listing
+/// projection so the UI cannot show a stale threshold.
+pub fn personal_minimum_next_bid(
+    current_price_minor: i64,
+    minimum_increment_minor: i64,
+    bidder_previous_maximum: i64,
+) -> i64 {
+    current_price_minor
+        .max(bidder_previous_maximum)
+        .saturating_add(minimum_increment_minor)
+}
+
 pub async fn place_bid(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
@@ -82,14 +97,6 @@ pub async fn place_bid(
             "Bid maximum must use the auction asset and exponent.",
         )));
     }
-    if payload.maximum_amount.amount_minor <= auction.current_price.amount_minor {
-        return Ok(Err(CommandFailure::with_revision(
-            ErrorCode::BidTooLow,
-            "Bid maximum must exceed the current visible price.",
-            listing.server_revision,
-        )));
-    }
-
     let previous_bids = fetch_bids(tx, &listing.aggregate_id).await?;
     let bidder_previous_maximum = previous_bids
         .iter()
@@ -97,10 +104,15 @@ pub async fn place_bid(
         .map(|bid| bid.maximum_amount_minor)
         .max()
         .unwrap_or(0);
-    if payload.maximum_amount.amount_minor <= bidder_previous_maximum {
+    let minimum_next_bid = personal_minimum_next_bid(
+        auction.current_price.amount_minor,
+        auction.minimum_increment.amount_minor,
+        bidder_previous_maximum,
+    );
+    if payload.maximum_amount.amount_minor < minimum_next_bid {
         return Ok(Err(CommandFailure::with_revision(
             ErrorCode::BidTooLow,
-            "A new proxy maximum must exceed the bidder previous maximum.",
+            "Bid maximum must meet the current visible price and prior maximum increment.",
             listing.server_revision,
         )));
     }

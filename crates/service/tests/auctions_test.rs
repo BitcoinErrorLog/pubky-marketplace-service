@@ -223,7 +223,7 @@ async fn rejects_seller_low_stale_and_post_close_bids(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
     assert_eq!(
         body["error"]["message"],
-        json!("Bid maximum must exceed the current visible price.")
+        json!("Bid maximum must meet the current visible price and prior maximum increment.")
     );
 
     let (status, _) = execute(
@@ -260,7 +260,7 @@ async fn rejects_seller_low_stale_and_post_close_bids(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
     assert_eq!(
         body["error"]["message"],
-        json!("A new proxy maximum must exceed the bidder previous maximum.")
+        json!("Bid maximum must meet the current visible price and prior maximum increment.")
     );
 
     app.clock.advance_seconds(11 * 60);
@@ -272,6 +272,74 @@ async fn rejects_seller_low_stale_and_post_close_bids(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], json!("AUCTION_CLOSED"));
+}
+
+#[sqlx::test]
+async fn personal_minimum_is_the_exact_bid_acceptance_boundary(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let other_buyer = new_actor(&app).await;
+    execute(
+        &app,
+        &seller.token,
+        &register_auction_command(&seller.pubky),
+    )
+    .await;
+
+    // First-time bidders must meet visible price plus the increment.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 10, 4_999, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "below first minimum: {body}");
+    assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 11, 5_000, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "at first minimum: {body}");
+
+    // A different first-time bidder has the same boundary and may bid at it.
+    let (status, body) = execute(
+        &app,
+        &other_buyer.token,
+        &place_bid_command(&seller.pubky, 12, 4_999, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "below second minimum: {body}");
+    let (status, body) = execute(
+        &app,
+        &other_buyer.token,
+        &place_bid_command(&seller.pubky, 13, 5_000, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "at second minimum: {body}");
+
+    // The original bidder's own maximum now raises the boundary to 5,500.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 14, 5_499, 3),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "below returning minimum: {body}"
+    );
+    assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 15, 5_500, 3),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "at returning minimum: {body}");
 }
 
 // The prototype rejects bids on non-auction listings as INVALID_STATE.

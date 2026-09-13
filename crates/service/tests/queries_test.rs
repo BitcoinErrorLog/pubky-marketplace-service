@@ -137,8 +137,52 @@ async fn auction_projection_exposes_the_leader_but_no_other_bidder_data(pool: Pg
     );
     assert_eq!(listing["auction"]["bid_count"], json!(2));
 
-    // Outbid bidders and maximum (proxy) bids stay private.
+    let (status, first_bidder_listing) = get(
+        &app,
+        &format!("/v1/listings/{aggregate}"),
+        Some(&first_bidder.token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "first bidder read failed: {first_bidder_listing}"
+    );
+    assert_eq!(
+        first_bidder_listing["viewer_bid"]["maximum_amount"]["amount_minor"],
+        json!(7_000)
+    );
+    assert_eq!(
+        first_bidder_listing["viewer_bid"]["minimum_next_bid"]["amount_minor"],
+        json!(8_000)
+    );
+    assert!(!first_bidder_listing.to_string().contains("9000"));
+
+    let (status, second_bidder_listing) = get(
+        &app,
+        &format!("/v1/listings/{aggregate}"),
+        Some(&second_bidder.token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "second bidder read failed: {second_bidder_listing}"
+    );
+    assert_eq!(
+        second_bidder_listing["viewer_bid"]["maximum_amount"]["amount_minor"],
+        json!(9_000)
+    );
+    assert_eq!(
+        second_bidder_listing["viewer_bid"]["minimum_next_bid"]["amount_minor"],
+        json!(9_500)
+    );
+    assert!(!second_bidder_listing.to_string().contains("7000"));
+
+    // A non-bidder gets no viewer-specific field, and maximum (proxy) bids
+    // stay private.
     let serialized = listing.to_string();
+    assert!(listing.get("viewer_bid").is_none());
     assert!(
         !serialized.contains(&first_bidder.pubky),
         "auction projection must not expose outbid bidder identities"

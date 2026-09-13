@@ -5,7 +5,10 @@ use common::paykit_review::{
     bound_order, confirm_call, into_awaiting_confirmation, into_manual_review_held,
     into_manual_review_late, resolve_call, OBSERVED_TXID, TOTAL_SATS,
 };
-use common::{create_pending_order, new_actor, send, test_app_with_payments, TestActor, TestApp};
+use common::{
+    create_pending_order, execute, listing_aggregate, new_actor, place_bid_command,
+    register_auction_command, send, test_app_with_payments, TestActor, TestApp,
+};
 use marketplace_service::contracts::{
     assert_no_sensitive_values, endpoint_contracts, normalized_snapshot, ReviewReason,
 };
@@ -887,6 +890,30 @@ fn insert_projection(
     );
 }
 
+fn insert_listing_projection(
+    map: &mut ContractMap,
+    key: &str,
+    aggregate_id: &str,
+    status: StatusCode,
+    response: Value,
+) {
+    assert!(
+        map.insert(
+            key.to_string(),
+            request_record(
+                "GET",
+                format!("/v1/listings/{aggregate_id}"),
+                &["authorization"],
+                Value::Null,
+                status,
+                response,
+            ),
+        )
+        .is_none(),
+        "duplicate listing projection case {key}"
+    );
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
@@ -982,6 +1009,52 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
         response,
     );
 
+    let seller = new_actor(&app).await;
+    let bidder = new_actor(&app).await;
+    execute(
+        &app,
+        &seller.token,
+        &register_auction_command(&seller.pubky),
+    )
+    .await;
+    execute(
+        &app,
+        &bidder.token,
+        &place_bid_command(&seller.pubky, 1, 7_000, 1),
+    )
+    .await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    let (status, response) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/listings/{aggregate_id}"),
+        Some(&seller.token),
+        &Value::Null,
+    )
+    .await;
+    insert_listing_projection(
+        &mut map,
+        "auction_seller_no_viewer_bid",
+        &aggregate_id,
+        status,
+        response,
+    );
+    let (status, response) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/listings/{aggregate_id}"),
+        Some(&bidder.token),
+        &Value::Null,
+    )
+    .await;
+    insert_listing_projection(
+        &mut map,
+        "auction_bidder_viewer_bid",
+        &aggregate_id,
+        status,
+        response,
+    );
+
     assert_exact_keys(
         &map,
         &[
@@ -991,6 +1064,8 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
             "buyer_manual_review_held",
             "seller_manual_review_late",
             "buyer_manual_review_late",
+            "auction_seller_no_viewer_bid",
+            "auction_bidder_viewer_bid",
         ],
     );
     assert_snapshot("projections", &json!(map));

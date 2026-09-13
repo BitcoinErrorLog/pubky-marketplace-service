@@ -206,8 +206,10 @@ async fn hundred_concurrent_proxy_bids_produce_one_deterministic_leader_and_one_
     for (index, bidder) in bidders.into_iter().enumerate() {
         let router = app.router.clone();
         let seller_pubky = seller.pubky.clone();
-        // Bidder i's proxy maximum: 5_100 .. 15_000 in 100-minor steps.
-        let maximum_minor = 5_000 + 100 * (index as i64 + 1);
+        // Bidder i's proxy maximum: 6_000 .. 105_000 in 1_000-minor steps.
+        // The spacing keeps each first-time maximum above the current
+        // visible-price increment as concurrent bids serialize.
+        let maximum_minor = 5_000 + 1_000 * (index as i64 + 1);
         handles.push(tokio::spawn(async move {
             let mut expected_revision = 1i64;
             for attempt in 0..300u64 {
@@ -273,7 +275,7 @@ async fn hundred_concurrent_proxy_bids_produce_one_deterministic_leader_and_one_
         .as_i64()
         .expect("visible price");
     assert!(
-        (14_900..=15_000).contains(&visible),
+        (104_500..=105_000).contains(&visible),
         "visible price is runner-up bound: {visible}"
     );
     assert_eq!(auction["reserve_met"], json!(true));

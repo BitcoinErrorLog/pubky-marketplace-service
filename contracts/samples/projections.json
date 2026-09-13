@@ -1,4 +1,150 @@
 {
+  "auction_bidder_viewer_bid": {
+    "request": {
+      "body": null,
+      "headers_present": [
+        "authorization"
+      ],
+      "method": "GET",
+      "path": "/v1/listings/listing:<pubky:seller>_boots_01"
+    },
+    "response": {
+      "body": {
+        "aggregate_id": "listing:<pubky:seller>_boots_01",
+        "auction": {
+          "anti_sniping_extension_seconds": 120,
+          "anti_sniping_window_seconds": 60,
+          "bid_count": 1,
+          "current_price": {
+            "amount_minor": 4500,
+            "currency": "USD",
+            "exponent": 2
+          },
+          "ends_at": "<timestamp:1>",
+          "leader_pubky": "<pubky:2>",
+          "minimum_increment": {
+            "amount_minor": 500,
+            "currency": "USD",
+            "exponent": 2
+          },
+          "reserve_met": false,
+          "reserve_price": {
+            "amount_minor": 6000,
+            "currency": "USD",
+            "exponent": 2
+          },
+          "starts_at": "<timestamp:2>",
+          "status": "active"
+        },
+        "available_quantity": 1,
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "fulfillment_methods": [
+          "shipping"
+        ],
+        "listing_id": "boots_01",
+        "listing_revision": 1,
+        "reserved_quantity": 0,
+        "sale_format": "auction",
+        "seller_pubky": "<pubky:seller>",
+        "server_revision": 2,
+        "shipping": {
+          "amount_minor": 1200,
+          "currency": "USD",
+          "exponent": 2
+        },
+        "sold_quantity": 0,
+        "state": "available",
+        "title": "Marketplace item",
+        "total_quantity": 1,
+        "unit_price": {
+          "amount_minor": 4500,
+          "currency": "USD",
+          "exponent": 2
+        },
+        "updated_at": "<timestamp:2>",
+        "viewer_bid": {
+          "maximum_amount": {
+            "amount_minor": 7000,
+            "currency": "USD",
+            "exponent": 2
+          },
+          "minimum_next_bid": {
+            "amount_minor": 7500,
+            "currency": "USD",
+            "exponent": 2
+          }
+        }
+      },
+      "status": 200
+    }
+  },
+  "auction_seller_no_viewer_bid": {
+    "request": {
+      "body": null,
+      "headers_present": [
+        "authorization"
+      ],
+      "method": "GET",
+      "path": "/v1/listings/listing:<pubky:seller>_boots_01"
+    },
+    "response": {
+      "body": {
+        "aggregate_id": "listing:<pubky:seller>_boots_01",
+        "auction": {
+          "anti_sniping_extension_seconds": 120,
+          "anti_sniping_window_seconds": 60,
+          "bid_count": 1,
+          "current_price": {
+            "amount_minor": 4500,
+            "currency": "USD",
+            "exponent": 2
+          },
+          "ends_at": "<timestamp:1>",
+          "leader_pubky": "<pubky:2>",
+          "minimum_increment": {
+            "amount_minor": 500,
+            "currency": "USD",
+            "exponent": 2
+          },
+          "reserve_met": false,
+          "reserve_price": {
+            "amount_minor": 6000,
+            "currency": "USD",
+            "exponent": 2
+          },
+          "starts_at": "<timestamp:2>",
+          "status": "active"
+        },
+        "available_quantity": 1,
+        "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "fulfillment_methods": [
+          "shipping"
+        ],
+        "listing_id": "boots_01",
+        "listing_revision": 1,
+        "reserved_quantity": 0,
+        "sale_format": "auction",
+        "seller_pubky": "<pubky:seller>",
+        "server_revision": 2,
+        "shipping": {
+          "amount_minor": 1200,
+          "currency": "USD",
+          "exponent": 2
+        },
+        "sold_quantity": 0,
+        "state": "available",
+        "title": "Marketplace item",
+        "total_quantity": 1,
+        "unit_price": {
+          "amount_minor": 4500,
+          "currency": "USD",
+          "exponent": 2
+        },
+        "updated_at": "<timestamp:2>"
+      },
+      "status": 200
+    }
+  },
   "buyer_awaiting_confirmation": {
     "request": {
       "body": null,
@@ -12,7 +158,7 @@
       "body": {
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": null,
-        "created_at": "<timestamp:1>",
+        "created_at": "<timestamp:2>",
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -23,7 +169,7 @@
         "first_revealed_at": null,
         "fulfillment": "shipping",
         "guarantee_policy_version": 1,
-        "hold_expires_at": "<timestamp:2>",
+        "hold_expires_at": "<timestamp:3>",
         "id": "<uuid:1>",
         "lines": [
           {
@@ -59,7 +205,7 @@
           },
           "buyer_pubky": "<pubky:buyer>",
           "confirmations": 0,
-          "created_at": "<timestamp:1>",
+          "created_at": "<timestamp:2>",
           "id": "<uuid:2>",
           "order_id": "<uuid:1>",
           "resolution_basis": null,
@@ -68,7 +214,7 @@
           "revision": 2,
           "seller_pubky": "<pubky:seller>",
           "state": "awaiting_entitlement",
-          "updated_at": "<timestamp:1>"
+          "updated_at": "<timestamp:2>"
         },
         "payment_id": "<uuid:2>",
         "payment_method": "bitcoin",
@@ -97,7 +243,7 @@
           "currency": "SAT",
           "exponent": 0
         },
-        "updated_at": "<timestamp:1>"
+        "updated_at": "<timestamp:2>"
       },
       "status": 200
     }
@@ -115,7 +261,7 @@
       "body": {
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": null,
-        "created_at": "<timestamp:1>",
+        "created_at": "<timestamp:2>",
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -162,7 +308,7 @@
           },
           "buyer_pubky": "<pubky:buyer>",
           "confirmations": 0,
-          "created_at": "<timestamp:1>",
+          "created_at": "<timestamp:2>",
           "id": "<uuid:4>",
           "order_id": "<uuid:3>",
           "resolution_basis": null,
@@ -171,7 +317,7 @@
           "revision": 3,
           "seller_pubky": "<pubky:seller>",
           "state": "manual_review",
-          "updated_at": "<timestamp:2>"
+          "updated_at": "<timestamp:3>"
         },
         "payment_id": "<uuid:4>",
         "payment_method": "bitcoin",
@@ -200,7 +346,7 @@
           "currency": "SAT",
           "exponent": 0
         },
-        "updated_at": "<timestamp:2>"
+        "updated_at": "<timestamp:3>"
       },
       "status": 200
     }
@@ -218,7 +364,7 @@
       "body": {
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": "payment window elapsed",
-        "created_at": "<timestamp:1>",
+        "created_at": "<timestamp:2>",
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -265,7 +411,7 @@
           },
           "buyer_pubky": "<pubky:buyer>",
           "confirmations": 0,
-          "created_at": "<timestamp:1>",
+          "created_at": "<timestamp:2>",
           "id": "<uuid:6>",
           "order_id": "<uuid:5>",
           "resolution_basis": null,
@@ -274,7 +420,7 @@
           "revision": 4,
           "seller_pubky": "<pubky:seller>",
           "state": "manual_review",
-          "updated_at": "<timestamp:3>"
+          "updated_at": "<timestamp:4>"
         },
         "payment_id": "<uuid:6>",
         "payment_method": "bitcoin",
@@ -303,7 +449,7 @@
           "currency": "SAT",
           "exponent": 0
         },
-        "updated_at": "<timestamp:3>"
+        "updated_at": "<timestamp:4>"
       },
       "status": 200
     }
@@ -321,7 +467,7 @@
       "body": {
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": null,
-        "created_at": "<timestamp:1>",
+        "created_at": "<timestamp:2>",
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -332,7 +478,7 @@
         "first_revealed_at": null,
         "fulfillment": "shipping",
         "guarantee_policy_version": 1,
-        "hold_expires_at": "<timestamp:2>",
+        "hold_expires_at": "<timestamp:3>",
         "id": "<uuid:1>",
         "lines": [
           {
@@ -360,14 +506,14 @@
           "amount_matched": true,
           "confirmations": 2,
           "disappeared": false,
-          "observed_at": "<timestamp:1>",
+          "observed_at": "<timestamp:2>",
           "observed_sats": 51637,
           "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
         },
         "paykit_request_reference": "<paykit-reference:1>",
         "paykit_request_state": "awaiting_seller_confirmation",
-        "paykit_seller_confirmation_deadline": "<timestamp:2>",
-        "paykit_seller_confirmation_entered_at": "<timestamp:1>",
+        "paykit_seller_confirmation_deadline": "<timestamp:3>",
+        "paykit_seller_confirmation_entered_at": "<timestamp:2>",
         "paykit_total_sats": 51637,
         "payment": {
           "adapter": "paykit",
@@ -378,7 +524,7 @@
           },
           "buyer_pubky": "<pubky:buyer>",
           "confirmations": 0,
-          "created_at": "<timestamp:1>",
+          "created_at": "<timestamp:2>",
           "id": "<uuid:2>",
           "manual_review_entered_at": null,
           "order_id": "<uuid:1>",
@@ -388,7 +534,7 @@
           "revision": 2,
           "seller_pubky": "<pubky:seller>",
           "state": "awaiting_entitlement",
-          "updated_at": "<timestamp:1>"
+          "updated_at": "<timestamp:2>"
         },
         "payment_id": "<uuid:2>",
         "payment_method": "bitcoin",
@@ -417,7 +563,7 @@
           "currency": "SAT",
           "exponent": 0
         },
-        "updated_at": "<timestamp:1>"
+        "updated_at": "<timestamp:2>"
       },
       "status": 200
     }
@@ -435,7 +581,7 @@
       "body": {
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": null,
-        "created_at": "<timestamp:1>",
+        "created_at": "<timestamp:2>",
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -474,7 +620,7 @@
           "amount_matched": true,
           "confirmations": 2,
           "disappeared": false,
-          "observed_at": "<timestamp:1>",
+          "observed_at": "<timestamp:2>",
           "observed_sats": 51637,
           "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
         },
@@ -492,9 +638,9 @@
           },
           "buyer_pubky": "<pubky:buyer>",
           "confirmations": 0,
-          "created_at": "<timestamp:1>",
+          "created_at": "<timestamp:2>",
           "id": "<uuid:4>",
-          "manual_review_entered_at": "<timestamp:2>",
+          "manual_review_entered_at": "<timestamp:3>",
           "order_id": "<uuid:3>",
           "resolution_basis": null,
           "resolution_outcome": null,
@@ -502,7 +648,7 @@
           "revision": 3,
           "seller_pubky": "<pubky:seller>",
           "state": "manual_review",
-          "updated_at": "<timestamp:2>"
+          "updated_at": "<timestamp:3>"
         },
         "payment_id": "<uuid:4>",
         "payment_method": "bitcoin",
@@ -531,7 +677,7 @@
           "currency": "SAT",
           "exponent": 0
         },
-        "updated_at": "<timestamp:2>"
+        "updated_at": "<timestamp:3>"
       },
       "status": 200
     }
@@ -549,7 +695,7 @@
       "body": {
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": "payment window elapsed",
-        "created_at": "<timestamp:1>",
+        "created_at": "<timestamp:2>",
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -588,7 +734,7 @@
           "amount_matched": true,
           "confirmations": 2,
           "disappeared": false,
-          "observed_at": "<timestamp:3>",
+          "observed_at": "<timestamp:4>",
           "observed_sats": 51637,
           "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
         },
@@ -606,9 +752,9 @@
           },
           "buyer_pubky": "<pubky:buyer>",
           "confirmations": 0,
-          "created_at": "<timestamp:1>",
+          "created_at": "<timestamp:2>",
           "id": "<uuid:6>",
-          "manual_review_entered_at": "<timestamp:3>",
+          "manual_review_entered_at": "<timestamp:4>",
           "order_id": "<uuid:5>",
           "resolution_basis": null,
           "resolution_outcome": null,
@@ -616,7 +762,7 @@
           "revision": 4,
           "seller_pubky": "<pubky:seller>",
           "state": "manual_review",
-          "updated_at": "<timestamp:3>"
+          "updated_at": "<timestamp:4>"
         },
         "payment_id": "<uuid:6>",
         "payment_method": "bitcoin",
@@ -645,7 +791,7 @@
           "currency": "SAT",
           "exponent": 0
         },
-        "updated_at": "<timestamp:3>"
+        "updated_at": "<timestamp:4>"
       },
       "status": 200
     }
