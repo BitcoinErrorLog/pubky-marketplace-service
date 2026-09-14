@@ -492,6 +492,50 @@ mod tests {
             )
         };
         let issued = issue();
+        if std::env::var_os("UPDATE_RECEIPT_SAMPLES").is_some() {
+            let write_sample = |name: &str, issued: IssuedReceiptAttestation| {
+                let sample = json!({
+                    "receipt_attestation": {
+                        "jws": issued.jws,
+                        "claims": issued.claims,
+                    },
+                    "attestor_pubky": attestor.pubky(),
+                });
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/samples")
+                    .join(format!("receipt-attestation-{name}.json"));
+                std::fs::write(
+                    path,
+                    serde_json::to_vec_pretty(&sample).expect("sample serializes"),
+                )
+                .expect("sample writes");
+            };
+            write_sample("v1", issued.clone());
+            write_sample(
+                "v2-bitcoin",
+                attestor.issue_receipt_attestation_v2(
+                    Uuid::parse_str("97c2ff18-cf54-4727-bbc4-4463df5c5084").unwrap(),
+                    Uuid::parse_str("de7fa583-bbc3-415d-96c6-d6a54a185221").unwrap(),
+                    "hnhabjbjbjjxzbcif7stmqi9p76qubombhsujfrgezkmfgqydm8o",
+                    "obh36yni5ctgxac4wwicubxj9hdksx5aqrmsqb8undokqqekhpfy",
+                    json!({"amount_minor": 51_637, "currency": "SAT", "exponent": 0}),
+                    json!({"amount_minor": 13_700, "currency": "USD", "exponent": 2}),
+                    paid_at,
+                ),
+            );
+            write_sample(
+                "v2-same-currency",
+                attestor.issue_receipt_attestation_v2(
+                    Uuid::parse_str("7bdd4ba2-ac6f-4370-a6ef-8edd469b28d2").unwrap(),
+                    Uuid::parse_str("e5752e58-9b32-40e8-86c3-2a80c908a955").unwrap(),
+                    "6m3819xgydzdrc1hihdj9r9k45zze5qjbzcs5mh98sp5abi9x87y",
+                    "ddkhtthrpa7m94apwy6437ddz47a61jpyq9n5zo8kdozqbu4phuy",
+                    json!({"amount_minor": 13_700, "currency": "USD", "exponent": 2}),
+                    json!({"amount_minor": 13_700, "currency": "USD", "exponent": 2}),
+                    paid_at,
+                ),
+            );
+        }
         // Deterministic: no `now` input, so re-issuance is byte-identical.
         assert_eq!(issued.jws, issue().jws);
 

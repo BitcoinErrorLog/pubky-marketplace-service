@@ -77,6 +77,59 @@ fn verify_jws(jws: &str) -> Value {
     claims
 }
 
+#[test]
+fn checked_in_receipt_attestation_samples_verify_against_the_attestor() {
+    for (path, expected_typ, expected_version) in [
+        (
+            "../../contracts/samples/receipt-attestation-v1.json",
+            "pubky-order-receipt+v1",
+            1,
+        ),
+        (
+            "../../contracts/samples/receipt-attestation-v2-bitcoin.json",
+            "pubky-order-receipt+v2",
+            2,
+        ),
+        (
+            "../../contracts/samples/receipt-attestation-v2-same-currency.json",
+            "pubky-order-receipt+v2",
+            2,
+        ),
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        let sample: Value = serde_json::from_str(
+            std::fs::read_to_string(&path)
+                .expect("sample exists")
+                .as_str(),
+        )
+        .expect("sample JSON");
+        let attestation = &sample["receipt_attestation"];
+        assert_eq!(
+            attestation["jws"]
+                .as_str()
+                .expect("sample jws")
+                .split('.')
+                .count(),
+            3
+        );
+        let claims = &attestation["claims"];
+        assert_eq!(claims["v"], json!(expected_version));
+        assert_eq!(claims["iss"], sample["attestor_pubky"]);
+        let header = URL_SAFE_NO_PAD
+            .decode(
+                attestation["jws"]
+                    .as_str()
+                    .expect("sample jws")
+                    .split('.')
+                    .next()
+                    .expect("sample header"),
+            )
+            .expect("header b64");
+        let header: Value = serde_json::from_slice(&header).expect("header JSON");
+        assert_eq!(header["typ"], json!(expected_typ));
+    }
+}
+
 /// Drives a paid order to `delivered` and returns the order id.
 async fn delivered_order(app: &TestApp, seller: &TestActor, buyer: &TestActor) -> String {
     let order = create_paid_order(app, seller, buyer).await;
@@ -642,6 +695,70 @@ async fn new_ordinary_receipt_attestation_uses_v2_and_binds_both_totals(pool: Pg
     // The receipt was issued at the fixed test instant.
     assert_eq!(claims["paid_at"], json!("2026-08-19T22:00:00.000Z"));
     assert_eq!(claims["iat"], json!(app.clock.now().timestamp()));
+}
+
+#[sqlx::test]
+async fn bitcoin_settled_receipt_attestation_is_v2_with_distinct_money_fields(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    let (status, body) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id")
+        .to_string();
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    sqlx::query("UPDATE orders SET paykit_total_sats = 51_637 WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&order_id).expect("order uuid"))
+        .execute(&app.pool)
+        .await
+        .expect("bitcoin settlement total");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &payment_command(&payment_id, 1, "confirmed", 1, 1_051),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment failed: {body}");
+    let receipt_id = body["result"]["receipt"]["id"]
+        .as_str()
+        .expect("receipt id")
+        .to_string();
+
+    let (status, body) = get(
+        &app,
+        &format!("/v1/receipts/{receipt_id}/attestation"),
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "attestation failed: {body}");
+    let jws = body["receipt_attestation"]["jws"]
+        .as_str()
+        .expect("attestation jws");
+    let header = String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(jws.split('.').next().expect("header"))
+            .expect("header b64"),
+    )
+    .expect("header utf8");
+    assert_eq!(header, r#"{"alg":"EdDSA","typ":"pubky-order-receipt+v2"}"#);
+    let claims = verify_jws(jws);
+    assert_eq!(claims, body["receipt_attestation"]["claims"]);
+    assert_eq!(
+        claims["settlement_total"],
+        json!({"amount_minor": 51_637, "currency": "SAT", "exponent": 0})
+    );
+    assert_eq!(
+        claims["merchandise_total"],
+        json!({"amount_minor": 13_700, "currency": "USD", "exponent": 2})
+    );
+    assert_eq!(claims["v"], json!(2));
+    assert_eq!(claims["iss"], json!(test_attestor().pubky()));
 }
 
 #[sqlx::test]

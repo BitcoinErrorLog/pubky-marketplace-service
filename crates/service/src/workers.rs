@@ -49,6 +49,7 @@ use marketplace_domain::ids;
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 use crate::handlers::auction::{close_locked_auction, parse_auction};
@@ -76,6 +77,16 @@ pub const TASK_SELLER_CONFIRMATION_WINDOW: &str = "seller_confirmation_window";
 pub const TASK_MANUAL_REVIEW_WATCH: &str = "manual_review_watch";
 pub const TASK_PAYKIT_RESOLVE_DELIVERY: &str = "paykit_resolve_delivery";
 pub const TASK_FX_SAMPLER: &str = "fx_sampler";
+
+static AWARD_EXPIRY_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the process-wide count of award-expiry deadlock retries.
+///
+/// This is an observation seam for integration tests; it does not alter retry
+/// timing or outcome.
+pub fn award_expiry_retry_count() -> usize {
+    AWARD_EXPIRY_RETRY_COUNT.load(Ordering::SeqCst)
+}
 
 /// The actor stamped on server-time post-purchase events and their
 /// notifications: the system, never a peer (ADR-0019).
@@ -203,6 +214,7 @@ pub async fn expire_due_offers(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Res
                 }
                 Ok(false) => break,
                 Err(error) if is_deadlock(&error) && attempt < 2 => {
+                    AWARD_EXPIRY_RETRY_COUNT.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(std::time::Duration::from_millis(5 * (attempt + 1))).await;
                 }
                 Err(error) => {

@@ -1007,6 +1007,110 @@ async fn award_expiry_retries_after_a_real_postgres_deadlock(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn award_expiry_worker_retries_when_it_is_the_deadlock_victim(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (offer_id, _award_id, listing_aggregate_id, _revision, _hash, _quantity) =
+        accepted_offer_fixture(&app, &seller, &buyer).await;
+    app.clock.advance_seconds(1_801);
+    let now = app.clock.now();
+    let offer_uuid = uuid::Uuid::parse_str(&offer_id).expect("offer id");
+    let retries_before = marketplace_service::workers::award_expiry_retry_count();
+
+    let options = app.pool.connect_options().clone();
+    let mut reverse_holder = PgConnection::connect_with(&options)
+        .await
+        .expect("reverse-order connection");
+    sqlx::query("BEGIN")
+        .execute(&mut reverse_holder)
+        .await
+        .expect("reverse-order transaction");
+    sqlx::query("SELECT aggregate_id FROM listings WHERE aggregate_id = $1 FOR UPDATE")
+        .bind(&listing_aggregate_id)
+        .execute(&mut reverse_holder)
+        .await
+        .expect("hold listing lock");
+
+    let worker = tokio::spawn({
+        let pool = app.pool.clone();
+        async move { marketplace_service::workers::expire_due_offers(&pool, now).await }
+    });
+    let wait_started = tokio::time::Instant::now();
+    loop {
+        let worker_waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' \
+                   AND query LIKE '%UPDATE listings SET server_revision%' \
+             )",
+        )
+        .fetch_one(&app.pool)
+        .await
+        .expect("lock-wait probe");
+        if worker_waiting {
+            break;
+        }
+        assert!(
+            wait_started.elapsed() < std::time::Duration::from_secs(10),
+            "award-expiry worker never reached the listing lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let _reverse_offer_lock = sqlx::query("SELECT id FROM offers WHERE id = $1 FOR UPDATE")
+        .bind(offer_uuid)
+        .execute(&mut reverse_holder)
+        .await;
+    let _ = sqlx::query("ROLLBACK").execute(&mut reverse_holder).await;
+
+    let expired = worker
+        .await
+        .expect("worker task joins")
+        .expect("worker expiry completes after retry");
+    assert_eq!(expired, 1);
+    assert!(
+        marketplace_service::workers::award_expiry_retry_count() > retries_before,
+        "worker must observe at least one 40P01 retry"
+    );
+
+    let (offer_state, reservation_status, available, reserved, sold, total): (
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT o.state, r.status, l.available_quantity, l.reserved_quantity, \
+         l.sold_quantity, l.total_quantity \
+         FROM offers o \
+         JOIN reservations r ON r.id = o.reservation_id \
+         JOIN listings l ON l.aggregate_id = o.listing_aggregate_id \
+         WHERE o.id = $1",
+    )
+    .bind(offer_uuid)
+    .fetch_one(&app.pool)
+    .await
+    .expect("expired award state");
+    assert_eq!(offer_state, "expired");
+    assert_eq!(reservation_status, "expired");
+    assert_eq!(reserved, 0);
+    assert_eq!(available + reserved + sold, total);
+    let expiry_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND kind = 'offer.expired'",
+    )
+    .bind(format!("offer:{offer_id}"))
+    .fetch_one(&app.pool)
+    .await
+    .expect("expiry event count");
+    assert_eq!(
+        expiry_events, 1,
+        "reservation release is emitted exactly once"
+    );
+}
+
+#[sqlx::test]
 async fn changed_listing_snapshot_between_fetch_and_offer_lock_is_refused(pool: PgPool) {
     let source = Arc::new(MutatingListingSnapshotSource::new(
         pool.clone(),
