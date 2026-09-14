@@ -17,6 +17,7 @@ pub mod handlers;
 pub mod homeserver;
 pub mod http;
 pub mod locks;
+pub(crate) mod logging;
 pub mod model;
 pub mod payment_availability;
 pub mod payment_methods;

@@ -12,8 +12,10 @@ use marketplace_domain::commands::{parse_command, validate_actor, Command, Comma
 use marketplace_domain::ErrorCode;
 use serde_json::Value;
 use sqlx::{Postgres, Transaction};
+use std::time::Instant;
 use uuid::Uuid;
 
+use crate::logging::{log_command, log_invalid_command};
 use crate::result::{success_body, CommandFailure, HandlerResult};
 use crate::AppState;
 
@@ -22,12 +24,15 @@ pub async fn execute(
     actor: &str,
     raw: &Value,
 ) -> Result<(StatusCode, Value), sqlx::Error> {
+    let started = Instant::now();
     if let Err(issues) = validate_actor(actor) {
+        log_invalid_command(None, started.elapsed().as_millis() as u64);
         return Ok(failure_response(&CommandFailure::invalid_command(issues)));
     }
     let command = match parse_command(raw) {
         Ok(command) => command,
         Err(issues) => {
+            log_invalid_command(Some(actor), started.elapsed().as_millis() as u64);
             return Ok(failure_response(&CommandFailure::invalid_command(issues)));
         }
     };
@@ -53,17 +58,35 @@ pub async fn execute(
     if let Some((stored_hash, stored_result)) = stored {
         tx.commit().await?;
         if stored_hash == request_hash {
-            tracing::info!(
-                command_id = %command.command_id,
-                kind = command.kind(),
-                "returning stored idempotent result"
+            log_command(
+                actor,
+                command.kind(),
+                &command.command_id.to_string(),
+                &command.aggregate_id,
+                "idempotent_replay",
+                None,
+                None,
+                stored_result["revision"].as_i64().unwrap_or_default(),
+                started.elapsed().as_millis() as u64,
             );
             return Ok((StatusCode::OK, stored_result));
         }
-        return Ok(failure_response(&CommandFailure::new(
+        let failure = CommandFailure::new(
             ErrorCode::IdempotencyConflict,
             "The command id was already used with different input.",
-        )));
+        );
+        log_command(
+            actor,
+            command.kind(),
+            &command.command_id.to_string(),
+            &command.aggregate_id,
+            "conflict",
+            Some(failure.code),
+            Some(&failure.message),
+            command.expected_revision,
+            started.elapsed().as_millis() as u64,
+        );
+        return Ok(failure_response(&failure));
     }
 
     let now = state.clock.now();
@@ -83,38 +106,55 @@ pub async fn execute(
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
-            tracing::info!(
-                command_id = %command.command_id,
-                aggregate_id = %command.aggregate_id,
-                kind = command.kind(),
-                revision = success.revision,
-                "command accepted"
+            log_command(
+                actor,
+                command.kind(),
+                &command.command_id.to_string(),
+                &command.aggregate_id,
+                "accepted",
+                None,
+                None,
+                success.revision,
+                started.elapsed().as_millis() as u64,
             );
             Ok((StatusCode::OK, body))
         }
         Ok(Err(failure)) => {
             tx.rollback().await?;
-            tracing::info!(
-                command_id = %command.command_id,
-                aggregate_id = %command.aggregate_id,
-                kind = command.kind(),
-                code = ?failure.code,
-                "command rejected"
+            log_command(
+                actor,
+                command.kind(),
+                &command.command_id.to_string(),
+                &command.aggregate_id,
+                "refused",
+                Some(failure.code),
+                Some(&failure.message),
+                failure
+                    .current_revision
+                    .unwrap_or(command.expected_revision),
+                started.elapsed().as_millis() as u64,
             );
             Ok(failure_response(&failure))
         }
         Err(error) => {
             tx.rollback().await?;
             if is_unique_violation(&error) {
-                tracing::warn!(
-                    command_id = %command.command_id,
-                    kind = command.kind(),
-                    "command rejected by database uniqueness constraint"
-                );
-                return Ok(failure_response(&CommandFailure::new(
+                let failure = CommandFailure::new(
                     ErrorCode::InvariantViolation,
                     "A uniqueness constraint rejected the command.",
-                )));
+                );
+                log_command(
+                    actor,
+                    command.kind(),
+                    &command.command_id.to_string(),
+                    &command.aggregate_id,
+                    "conflict",
+                    Some(failure.code),
+                    Some(&failure.message),
+                    command.expected_revision,
+                    started.elapsed().as_millis() as u64,
+                );
+                return Ok(failure_response(&failure));
             }
             Err(error)
         }

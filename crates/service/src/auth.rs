@@ -33,6 +33,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::clock::format_timestamp;
+use crate::logging;
 use crate::AppState;
 
 /// Minimum length of a serialized v0 AuthToken: 64-byte signature, 10-byte
@@ -209,7 +210,10 @@ pub async fn create_session(State(state): State<AppState>, body: Bytes) -> Respo
         );
     }
 
-    tracing::info!(pubky = %verified.pubky, "issued auth session");
+    tracing::info!(
+        actor_prefix = logging::actor_prefix(&verified.pubky),
+        "issued auth session"
+    );
     (
         StatusCode::CREATED,
         Json(json!({
@@ -235,6 +239,12 @@ pub async fn require_session(
         .and_then(|value| value.strip_prefix("Bearer "))
         .and_then(|token| URL_SAFE_NO_PAD.decode(token).ok());
     let Some(token) = token else {
+        tracing::warn!(
+            route = logging::route_template(&request),
+            status = StatusCode::UNAUTHORIZED.as_u16(),
+            reason = "MISSING_OR_MALFORMED_BEARER",
+            "auth.rejected"
+        );
         return auth_error(
             StatusCode::UNAUTHORIZED,
             "A session bearer token is required.",
@@ -257,6 +267,12 @@ pub async fn require_session(
         }
     };
     let Some((pubky, _)) = session else {
+        tracing::warn!(
+            route = logging::route_template(&request),
+            status = StatusCode::UNAUTHORIZED.as_u16(),
+            reason = "INVALID_OR_EXPIRED_SESSION",
+            "auth.rejected"
+        );
         return auth_error(
             StatusCode::UNAUTHORIZED,
             "The session is invalid or expired.",
@@ -264,7 +280,15 @@ pub async fn require_session(
     };
 
     request.extensions_mut().insert(Actor(pubky));
-    next.run(request).await
+    let Some(actor) = request.extensions().get::<Actor>().cloned() else {
+        return auth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Session authentication failed.",
+        );
+    };
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(actor);
+    response
 }
 
 #[cfg(test)]

@@ -5,11 +5,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
+use std::time::Instant;
 use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
 
 use crate::auth::{self, Actor};
-use crate::{executor, queries, AppState};
+use crate::{executor, logging, queries, AppState};
 
 pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
@@ -129,8 +129,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v0/paypal/ipn", post(crate::payment_methods::paypal_ipn))
         .merge(protected)
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(log_request))
         .with_state(state)
+}
+
+async fn log_request(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let started = Instant::now();
+    let method = request.method().to_string();
+    let route = logging::route_template(&request).to_string();
+    let response = next.run(request).await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    logging::log_http_request(&method, &route, &response, latency_ms);
+    response
 }
 
 /// Public health/capability surface. `pickup_available` tells clients
