@@ -175,7 +175,20 @@ async fn drop_sync_registers_updates_while_announced_and_locks_terms_at_launch(p
     assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"));
     assert_eq!(
         body["error"]["message"],
-        json!("The drop references unregistered listings: ghost_a, ghost_b.")
+        json!("The drop references unregistered listings.")
+    );
+    assert_eq!(
+        body["error"]["issues"],
+        json!([
+            {
+                "path": "payload.listing_ids",
+                "message": "Unregistered listing: ghost_a"
+            },
+            {
+                "path": "payload.listing_ids",
+                "message": "Unregistered listing: ghost_b"
+            }
+        ])
     );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM drops").await, 0);
 

@@ -49,6 +49,14 @@ async fn command_events_are_structured_and_privacy_safe(pool: PgPool) {
     assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"]["code"], "UNAUTHORIZED");
 
+    let (status, body) = execute(&app, &seller.token, &serde_json::json!({})).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "{body}"
+    );
+    assert_eq!(body["error"]["code"], "INVALID_COMMAND");
+
     let accepted = checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000009902");
     let (status, body) = execute(&app, &buyer.token, &accepted).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
@@ -59,6 +67,13 @@ async fn command_events_are_structured_and_privacy_safe(pool: PgPool) {
     assert!(logs.contains("\"outcome\":\"refused\""), "{logs}");
     assert!(logs.contains("\"error_code\":\"UNAUTHORIZED\""), "{logs}");
     assert!(logs.contains("\"outcome\":\"accepted\""), "{logs}");
+    assert!(logs.contains("\"message\":\"command.invalid\""), "{logs}");
+    assert!(logs.contains("\"outcome\":\"invalid\""), "{logs}");
+    assert!(
+        logs.contains("\"error_code\":\"INVALID_COMMAND\""),
+        "{logs}"
+    );
+    assert!(logs.contains("\"latency_ms\""), "{logs}");
     for field in [
         "\"kind\"",
         "\"command_id\"",
@@ -73,7 +88,11 @@ async fn command_events_are_structured_and_privacy_safe(pool: PgPool) {
         assert!(logs.contains(field), "missing {field}: {logs}");
     }
     assert!(!logs.contains("\"payload\""), "{logs}");
+    assert!(!logs.contains("Invalid envelope"), "{logs}");
     assert!(!logs.contains("\"amount_minor\""), "{logs}");
+    assert!(!logs.contains("12500"), "{logs}");
+    assert!(!logs.contains("13700"), "{logs}");
+    assert!(!logs.contains("1200"), "{logs}");
     assert!(!logs.contains("Bearer"), "{logs}");
     assert!(!logs.contains(&"y".repeat(52)), "{logs}");
     assert!(

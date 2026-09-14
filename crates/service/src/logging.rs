@@ -12,19 +12,61 @@ fn redact_pubkys(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut index = 0;
     while index < chars.len() {
-        if index + 52 <= chars.len() {
-            let candidate: String = chars[index..index + 52].iter().collect();
-            if marketplace_domain::pubky::is_valid_pubky(&candidate) {
-                output.push_str(&actor_prefix(&candidate));
-                output.push('…');
-                index += 52;
-                continue;
+        if is_zbase32(chars[index]) {
+            let run_start = index;
+            while index < chars.len() && is_zbase32(chars[index]) {
+                index += 1;
             }
+            let run = &chars[run_start..index];
+            if run.len() >= 52 {
+                output.push_str(&actor_prefix(&run.iter().collect::<String>()));
+                output.push('…');
+            } else {
+                output.extend(run);
+            }
+            continue;
         }
         output.push(chars[index]);
         index += 1;
     }
     output
+}
+
+fn is_zbase32(value: char) -> bool {
+    matches!(
+        value.to_ascii_lowercase(),
+        'y' | 'b'
+            | 'n'
+            | 'd'
+            | 'r'
+            | 'f'
+            | 'g'
+            | '8'
+            | 'e'
+            | 'j'
+            | 'k'
+            | 'm'
+            | 'c'
+            | 'p'
+            | 'q'
+            | 'x'
+            | 'o'
+            | 't'
+            | '1'
+            | 'u'
+            | 'w'
+            | 'i'
+            | 's'
+            | 'z'
+            | 'a'
+            | '3'
+            | '4'
+            | '5'
+            | 'h'
+            | '7'
+            | '6'
+            | '9'
+    )
 }
 
 pub(crate) fn error_code_name(code: Option<ErrorCode>) -> &'static str {
@@ -117,5 +159,42 @@ pub(crate) fn log_command(
             latency_ms,
             "command.executed"
         );
+    }
+}
+
+pub(crate) fn log_invalid_command(actor: Option<&str>, latency_ms: u64) {
+    let actor_prefix = actor.map(actor_prefix);
+    tracing::warn!(
+        actor_prefix,
+        outcome = "invalid",
+        error_code = "INVALID_COMMAND",
+        latency_ms,
+        "command.invalid"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_pubkys;
+
+    #[test]
+    fn redacts_pubky_runs_without_leaving_partial_values() {
+        let pubky = "y".repeat(52);
+        assert_eq!(redact_pubkys(&pubky), "yyyyyyyy…");
+        assert_eq!(redact_pubkys(&format!("x{pubky}")), "xxxxxxxx…");
+        assert_eq!(redact_pubkys(&format!("xxxxxxx{pubky}")), "xxxxxxxx…");
+        assert_eq!(redact_pubkys(&pubky.to_uppercase()), "YYYYYYYY…");
+        assert_eq!(redact_pubkys(&format!("{pubky}{pubky}")), "yyyyyyyy…");
+    }
+
+    #[test]
+    fn preserves_short_runs_and_redacts_id_shapes() {
+        let pubky = "y".repeat(52);
+        assert_eq!(redact_pubkys(&"y".repeat(51)), "y".repeat(51));
+        assert_eq!(
+            redact_pubkys(&format!("listing:{pubky}_id")),
+            "listing:yyyyyyyy…_id"
+        );
+        assert_eq!(redact_pubkys(&format!("order:{pubky}")), "order:yyyyyyyy…");
     }
 }

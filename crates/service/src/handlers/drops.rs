@@ -169,13 +169,25 @@ pub async fn sync(
         }
     }
     if !missing.is_empty() {
-        return Ok(Err(CommandFailure::new(
-            ErrorCode::InvalidCommand,
-            &format!(
-                "The drop references unregistered listings: {}.",
-                missing.join(", ")
+        tracing::warn!(
+            missing_count = missing.len(),
+            "drop.sync refused: unregistered listings"
+        );
+        return Ok(Err(CommandFailure {
+            issues: Some(
+                missing
+                    .iter()
+                    .map(|listing_id| marketplace_domain::ValidationIssue {
+                        path: "payload.listing_ids".to_string(),
+                        message: format!("Unregistered listing: {listing_id}"),
+                    })
+                    .collect(),
             ),
-        )));
+            ..CommandFailure::new(
+                ErrorCode::InvalidCommand,
+                "The drop references unregistered listings.",
+            )
+        }));
     }
 
     let current = fetch_drop_for_update(tx, &command.aggregate_id).await?;

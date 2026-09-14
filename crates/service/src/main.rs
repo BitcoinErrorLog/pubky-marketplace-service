@@ -7,14 +7,25 @@ use marketplace_service::clock::SystemClock;
 use marketplace_service::config::Config;
 use marketplace_service::{http, workers, AppState};
 
+fn env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,marketplace_service=info"))
+        .add_directive("sqlx=warn".parse().expect("valid sqlx log directive"))
+        .add_directive("hyper=warn".parse().expect("valid hyper log directive"))
+        .add_directive(
+            "tower_http=warn"
+                .parse()
+                .expect("valid tower_http log directive"),
+        )
+        .add_directive("h2=warn".parse().expect("valid h2 log directive"))
+        .add_directive("rustls=warn".parse().expect("valid rustls log directive"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,marketplace_service=info")),
-        )
+        .with_env_filter(env_filter())
         .init();
 
     let config = Config::from_env()?;
@@ -101,4 +112,26 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %bind_addr, "marketplace transaction service listening");
     axum::serve(listener, http::build_router(state)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_filter;
+
+    #[test]
+    fn dependency_directives_remain_at_warn() {
+        let filter = env_filter().to_string();
+        for directive in [
+            "sqlx=warn",
+            "hyper=warn",
+            "tower_http=warn",
+            "h2=warn",
+            "rustls=warn",
+        ] {
+            assert!(
+                filter.contains(directive),
+                "{directive} missing from {filter}"
+            );
+        }
+    }
 }

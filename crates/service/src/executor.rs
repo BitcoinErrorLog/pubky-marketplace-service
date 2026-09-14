@@ -15,7 +15,7 @@ use sqlx::{Postgres, Transaction};
 use std::time::Instant;
 use uuid::Uuid;
 
-use crate::logging::log_command;
+use crate::logging::{log_command, log_invalid_command};
 use crate::result::{success_body, CommandFailure, HandlerResult};
 use crate::AppState;
 
@@ -26,11 +26,13 @@ pub async fn execute(
 ) -> Result<(StatusCode, Value), sqlx::Error> {
     let started = Instant::now();
     if let Err(issues) = validate_actor(actor) {
+        log_invalid_command(None, started.elapsed().as_millis() as u64);
         return Ok(failure_response(&CommandFailure::invalid_command(issues)));
     }
     let command = match parse_command(raw) {
         Ok(command) => command,
         Err(issues) => {
+            log_invalid_command(Some(actor), started.elapsed().as_millis() as u64);
             return Ok(failure_response(&CommandFailure::invalid_command(issues)));
         }
     };

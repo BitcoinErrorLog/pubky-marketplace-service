@@ -280,11 +280,12 @@ pub async fn require_session(
     };
 
     request.extensions_mut().insert(Actor(pubky));
-    let actor = request
-        .extensions()
-        .get::<Actor>()
-        .cloned()
-        .expect("actor inserted above");
+    let Some(actor) = request.extensions().get::<Actor>().cloned() else {
+        return auth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Session authentication failed.",
+        );
+    };
     let mut response = next.run(request).await;
     response.extensions_mut().insert(actor);
     response
