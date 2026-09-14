@@ -117,15 +117,17 @@ pub async fn create(
                 Ok(snapshot) => Some(snapshot),
                 Err(_) => {
                     return Ok(Err(CommandFailure::new(
-                        ErrorCode::InvalidCommand,
-                        "The seller listing record cannot be used for this offer.",
+                        ErrorCode::AwardListingChanged,
+                        "The listing snapshot does not match the offer terms.",
                     )));
                 }
             },
             HomeserverRawFetchOutcome::TooLarge => {
+                // Design §7 designates an oversized seller record as a
+                // changed canonical body, never malformed command input.
                 return Ok(Err(CommandFailure::new(
-                    ErrorCode::InvalidCommand,
-                    "The seller listing record cannot be used for this offer.",
+                    ErrorCode::AwardListingChanged,
+                    "The listing snapshot does not match the offer terms.",
                 )));
             }
             HomeserverRawFetchOutcome::NotFound | HomeserverRawFetchOutcome::Unavailable => None,
@@ -219,7 +221,7 @@ pub async fn create(
     Ok(Ok(HandlerSuccess {
         revision: 1,
         event_ids: vec![event_id],
-        result: json!({ "kind": "offer", "offer": offer.view() }),
+        result: json!({ "kind": "offer", "offer": offer.view(now) }),
     }))
 }
 
@@ -228,9 +230,59 @@ pub async fn counter(
     actor: &str,
     command: &Command,
     payload: &CounterOfferPayload,
-    _homeserver: Option<&dyn HomeserverListingClient>,
+    homeserver: Option<&dyn HomeserverListingClient>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
+    let locator: Option<OfferRow> = sqlx::query_as(&format!(
+        "SELECT {OFFER_COLUMNS} FROM offers \
+         WHERE id = $1 AND (buyer_pubky = $2 OR seller_pubky = $2)"
+    ))
+    .bind(payload.offer_id)
+    .bind(actor)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let refreshed_terms = if let (Some(homeserver), Some(locator)) = (homeserver, locator.as_ref())
+    {
+        let listing_id: Option<String> =
+            sqlx::query_scalar("SELECT listing_id FROM listings WHERE aggregate_id = $1")
+                .bind(&locator.listing_aggregate_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let Some(listing_id) = listing_id else {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::NotFound,
+                "The offer listing is unavailable.",
+            )));
+        };
+        match homeserver
+            .fetch_listing_raw(&locator.seller_pubky, &listing_id)
+            .await
+        {
+            HomeserverRawFetchOutcome::Found(raw) => match award_terms_from_bytes(&raw) {
+                Ok(snapshot) => Some(snapshot),
+                Err(_) => {
+                    return Ok(Err(CommandFailure::new(
+                        ErrorCode::AwardListingChanged,
+                        "The listing snapshot does not match the offer terms.",
+                    )));
+                }
+            },
+            HomeserverRawFetchOutcome::TooLarge => {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::AwardListingChanged,
+                    "The listing snapshot does not match the offer terms.",
+                )));
+            }
+            HomeserverRawFetchOutcome::NotFound | HomeserverRawFetchOutcome::Unavailable => {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::InvalidState,
+                    "The seller listing record is unavailable.",
+                )));
+            }
+        }
+    } else {
+        None
+    };
     let offer =
         match actionable_offer(tx, actor, payload.offer_id, &command.aggregate_id, now).await? {
             Ok(offer) => offer,
@@ -255,6 +307,40 @@ pub async fn counter(
             "Counteroffer amount must use the original asset and exponent.",
         )));
     }
+    let refreshed_variant = if let Some(snapshot) = refreshed_terms.as_ref() {
+        if snapshot.currency != payload.amount.currency
+            || snapshot.exponent != payload.amount.exponent
+        {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::AwardListingChanged,
+                "The listing snapshot does not match the offer terms.",
+            )));
+        }
+        let variant = offer
+            .variant_id
+            .as_deref()
+            .and_then(|id| snapshot.variants.iter().find(|variant| variant.id == id))
+            .or_else(|| {
+                (offer.variant_id.is_none() && snapshot.variants.len() == 1)
+                    .then(|| &snapshot.variants[0])
+            });
+        let Some(variant) = variant else {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::AwardVariantMismatch,
+                "The checkout variant does not match the accepted offer.",
+            )));
+        };
+        if variant.quantity < payload.quantity {
+            return Ok(Err(CommandFailure::with_revision(
+                ErrorCode::InsufficientInventory,
+                "The counteroffer quantity is unavailable.",
+                offer.revision,
+            )));
+        }
+        Some(variant.id.clone())
+    } else {
+        None
+    };
     let Some(listing) = fetch_listing(tx, &offer.listing_aggregate_id).await? else {
         return Ok(Err(CommandFailure::new(
             ErrorCode::NotFound,
@@ -288,7 +374,11 @@ pub async fn counter(
     let updated: OfferRow = sqlx::query_as(&format!(
         "UPDATE offers SET revision = $2, state = 'countered', offered_by = $3, \
          amount_minor = $4, quantity = $5, message = $6, expires_at = $7, updated_at = $8, \
-         history = history || $9::jsonb \
+         history = history || $9::jsonb, \
+         variant_id = COALESCE($10, variant_id), \
+         terms_listing_revision = COALESCE($11, terms_listing_revision), \
+         terms_listing_record_sha256 = COALESCE($12, terms_listing_record_sha256), \
+         terms_snapshot = COALESCE($13, terms_snapshot) \
          WHERE id = $1 RETURNING {OFFER_COLUMNS}"
     ))
     .bind(offer.id)
@@ -300,6 +390,23 @@ pub async fn counter(
     .bind(expires_at)
     .bind(now)
     .bind(json!([entry]))
+    .bind(refreshed_variant.as_deref())
+    .bind(refreshed_terms.as_ref().map(|snapshot| snapshot.revision))
+    .bind(
+        refreshed_terms
+            .as_ref()
+            .map(|snapshot| snapshot.raw_sha256.as_str()),
+    )
+    .bind(refreshed_terms.as_ref().map(|snapshot| {
+        json!({
+            "revision": snapshot.revision,
+            "title": snapshot.title,
+            "currency": snapshot.currency,
+            "exponent": snapshot.exponent,
+            "shipping_minor": snapshot.shipping_minor,
+            "variant": refreshed_variant.as_ref().or(offer.variant_id.as_ref()),
+        })
+    }))
     .fetch_one(&mut **tx)
     .await?;
 
@@ -328,7 +435,7 @@ pub async fn counter(
     Ok(Ok(HandlerSuccess {
         revision: new_revision,
         event_ids: vec![event_id],
-        result: json!({ "kind": "offer", "offer": updated.view() }),
+        result: json!({ "kind": "offer", "offer": updated.view(now) }),
     }))
 }
 
@@ -369,6 +476,8 @@ pub async fn accept(
         {
             HomeserverRawFetchOutcome::Found(raw) => raw,
             HomeserverRawFetchOutcome::TooLarge => {
+                // Design §7 designates an oversized seller record as a
+                // changed canonical body, never malformed command input.
                 return Ok(Err(CommandFailure::new(
                     ErrorCode::AwardListingChanged,
                     "The listing snapshot does not match the offer terms.",
@@ -385,8 +494,8 @@ pub async fn accept(
             Ok(snapshot) => snapshot,
             Err(_) => {
                 return Ok(Err(CommandFailure::new(
-                    ErrorCode::InvalidCommand,
-                    "The seller listing record cannot be used for this offer.",
+                    ErrorCode::AwardListingChanged,
+                    "The listing snapshot does not match the offer terms.",
                 )));
             }
         };
@@ -652,7 +761,7 @@ pub async fn accept(
         event_ids: vec![offer_event_id, inventory_event_id],
         result: json!({
             "kind": "accepted_offer",
-            "offer": accepted.view(),
+            "offer": accepted.view(now),
             "listing": updated_listing.view(),
             "reservation": reservation.view(),
         }),
@@ -711,7 +820,7 @@ pub async fn reject(
     Ok(Ok(HandlerSuccess {
         revision: updated.revision,
         event_ids: vec![event_id],
-        result: json!({ "kind": "offer", "offer": updated.view() }),
+        result: json!({ "kind": "offer", "offer": updated.view(now) }),
     }))
 }
 
@@ -757,7 +866,7 @@ pub async fn withdraw(
     Ok(Ok(HandlerSuccess {
         revision: updated.revision,
         event_ids: vec![event_id],
-        result: json!({ "kind": "offer", "offer": updated.view() }),
+        result: json!({ "kind": "offer", "offer": updated.view(now) }),
     }))
 }
 

@@ -15,10 +15,11 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use common::{
-    checkout_command, count, create_paid_order, drop_record_json, execute, indexed_command_id,
-    new_actor, order_command, payment_command, register_command, send, sync_drop_command, test_app,
-    test_app_with_attestor, test_app_with_homeserver, test_app_with_homeserver_and_attestor,
-    test_attestor, ts_after, FakeHomeserver, PaidOrder, TestActor, TestApp,
+    checkout_command, count, create_offer_command, create_paid_order, drop_record_json, execute,
+    indexed_command_id, listing_aggregate, new_actor, offer_action, order_command, payment_command,
+    register_command, send, sync_drop_command, test_app, test_app_with_attestor,
+    test_app_with_homeserver, test_app_with_homeserver_and_attestor, test_attestor, ts_after,
+    FakeHomeserver, PaidOrder, TestActor, TestApp, OFFER_COMMAND_ID,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::workers::generate_due_stat_attestations;
@@ -574,7 +575,7 @@ async fn refund_outcomes_annotate_the_order_ref(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn receipt_attestation_is_verifiable_and_binds_the_paid_order_facts(pool: PgPool) {
+async fn new_ordinary_receipt_attestation_uses_v2_and_binds_both_totals(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -592,12 +593,12 @@ async fn receipt_attestation_is_verifiable_and_binds_the_paid_order_facts(pool: 
         .expect("receipt attestation jws present");
 
     // Compact JWS: exactly three base64url segments, and the protected
-    // header is byte-exact (the specs-fork verifier contract).
+    // header is byte-exact.
     let parts: Vec<&str> = jws.split('.').collect();
     assert_eq!(parts.len(), 3, "compact JWS has three segments");
     assert_eq!(
         String::from_utf8(URL_SAFE_NO_PAD.decode(parts[0]).expect("header b64")).expect("utf8"),
-        r#"{"alg":"EdDSA","typ":"pubky-order-receipt+v1"}"#
+        r#"{"alg":"EdDSA","typ":"pubky-order-receipt+v2"}"#
     );
 
     // Third-party recipe: the signature verifies against the iss pubky
@@ -622,24 +623,248 @@ async fn receipt_attestation_is_verifiable_and_binds_the_paid_order_facts(pool: 
             "seller",
             "order",
             "receipt",
-            "total_minor",
-            "currency",
-            "exponent",
+            "settlement_total",
+            "merchandise_total",
             "paid_at",
             "iat"
         ]
     );
-    assert_eq!(claims["v"], json!(1));
+    assert_eq!(claims["v"], json!(2));
     assert_eq!(claims["buyer"], json!(buyer.pubky));
     assert_eq!(claims["seller"], json!(seller.pubky));
     assert_eq!(claims["order"], json!(paid.order_id));
     assert_eq!(claims["receipt"], json!(paid.receipt_id));
-    assert_eq!(claims["total_minor"], json!(paid.total_minor));
-    assert_eq!(claims["currency"], json!("USD"));
-    assert_eq!(claims["exponent"], json!(2));
+    assert_eq!(
+        claims["settlement_total"],
+        json!({"amount_minor": paid.total_minor, "currency": "USD", "exponent": 2})
+    );
+    assert_eq!(claims["merchandise_total"], claims["settlement_total"]);
     // The receipt was issued at the fixed test instant.
     assert_eq!(claims["paid_at"], json!("2026-08-19T22:00:00.000Z"));
     assert_eq!(claims["iat"], json!(app.clock.now().timestamp()));
+}
+
+#[sqlx::test]
+async fn legacy_receipt_reissue_is_byte_identical_to_the_v1_prechange_output(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "register failed: {body}");
+    let (status, body) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
+    let order_id: uuid::Uuid = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id")
+        .parse()
+        .expect("order uuid");
+    let payment_id: uuid::Uuid = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .parse()
+        .expect("payment uuid");
+    let receipt_id =
+        uuid::Uuid::parse_str("00000000-0000-4000-8000-00000000a101").expect("receipt uuid");
+    let issued_at = app.clock.now();
+    sqlx::query(
+        "UPDATE payments SET merchandise_amount_minor = NULL, merchandise_currency = NULL, \
+         merchandise_exponent = NULL WHERE id = $1",
+    )
+    .bind(payment_id)
+    .execute(&app.pool)
+    .await
+    .expect("legacy payment shape");
+    sqlx::query("UPDATE orders SET paykit_total_sats = 50001 WHERE id = $1")
+        .bind(order_id)
+        .execute(&app.pool)
+        .await
+        .expect("legacy Bitcoin payable stored");
+    sqlx::query(
+        "INSERT INTO receipts (id, order_id, payment_id, issuer_pubky, recipient_pubky, \
+         total_minor, currency, exponent, content_hash, issued_at) \
+         VALUES ($1, $2, $3, $4, $5, 50001, 'USD', 2, $6, $7)",
+    )
+    .bind(receipt_id)
+    .bind(order_id)
+    .bind(payment_id)
+    .bind(&seller.pubky)
+    .bind(&buyer.pubky)
+    .bind("legacy-content-hash")
+    .bind(issued_at)
+    .execute(&app.pool)
+    .await
+    .expect("legacy receipt inserted");
+
+    let expected = test_attestor().issue_receipt_attestation(
+        order_id,
+        receipt_id,
+        &buyer.pubky,
+        &seller.pubky,
+        13_700,
+        "USD",
+        2,
+        issued_at,
+    );
+    let (status, body) = get(
+        &app,
+        &format!("/v1/receipts/{receipt_id}/attestation"),
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "attestation failed: {body}");
+    assert_eq!(body["receipt_attestation"]["jws"], json!(expected.jws));
+    assert_eq!(body["receipt_attestation"]["claims"], expected.claims);
+    let (status, order) = get(&app, &format!("/v1/orders/{order_id}"), &buyer.token).await;
+    assert_eq!(status, StatusCode::OK, "order failed: {order}");
+    assert_eq!(order["payment"]["merchandise_amount"], Value::Null);
+    let (status, receipt) = get(&app, &format!("/v1/receipts/{receipt_id}"), &buyer.token).await;
+    assert_eq!(status, StatusCode::OK, "receipt failed: {receipt}");
+    assert_eq!(receipt["merchandise_total"], Value::Null);
+}
+
+#[sqlx::test]
+async fn legacy_non_bitcoin_views_synthesize_merchandise_from_the_legacy_total(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    let (status, body) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
+    let order_id: uuid::Uuid = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id")
+        .parse()
+        .expect("order uuid");
+    let payment_id: uuid::Uuid = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .parse()
+        .expect("payment uuid");
+    sqlx::query(
+        "UPDATE payments SET merchandise_amount_minor = NULL, merchandise_currency = NULL, \
+         merchandise_exponent = NULL WHERE id = $1",
+    )
+    .bind(payment_id)
+    .execute(&app.pool)
+    .await
+    .expect("legacy payment");
+    let receipt_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO receipts (id, order_id, payment_id, issuer_pubky, recipient_pubky, \
+         total_minor, currency, exponent, content_hash, issued_at) \
+         VALUES ($1, $2, $3, $4, $5, 13700, 'USD', 2, 'legacy', $6)",
+    )
+    .bind(receipt_id)
+    .bind(order_id)
+    .bind(payment_id)
+    .bind(&seller.pubky)
+    .bind(&buyer.pubky)
+    .bind(app.clock.now())
+    .execute(&app.pool)
+    .await
+    .expect("legacy receipt");
+
+    let expected = json!({"amount_minor": 13_700, "currency": "USD", "exponent": 2});
+    let (status, order) = get(&app, &format!("/v1/orders/{order_id}"), &buyer.token).await;
+    assert_eq!(status, StatusCode::OK, "order failed: {order}");
+    assert_eq!(order["payment"]["merchandise_amount"], expected);
+    let (status, receipt) = get(&app, &format!("/v1/receipts/{receipt_id}"), &buyer.token).await;
+    assert_eq!(status, StatusCode::OK, "receipt failed: {receipt}");
+    assert_eq!(receipt["merchandise_total"], expected);
+}
+
+#[sqlx::test]
+async fn new_offer_receipt_attestation_uses_v2(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 2)).await;
+    let (status, body) = execute(&app, &buyer.token, &create_offer_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "offer create failed: {body}");
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &offer_action("offer.accept", 1, "00000000-0000-4000-8000-00000000a102"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "offer accept failed: {body}");
+    sqlx::query(
+        "UPDATE offers SET accepted_listing_record_sha256 = $2, accepted_variant_id = $3 \
+         WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(OFFER_COMMAND_ID).expect("offer uuid"))
+    .bind("a".repeat(64))
+    .bind("boots_01")
+    .execute(&app.pool)
+    .await
+    .expect("accepted snapshot normalized");
+    let (award_id, listing_revision): (uuid::Uuid, i64) =
+        sqlx::query_as("SELECT award_id, accepted_listing_revision FROM offers WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(OFFER_COMMAND_ID).expect("offer uuid"))
+            .fetch_one(&app.pool)
+            .await
+            .expect("accepted award");
+    let listing = listing_aggregate(&seller.pubky);
+    let checkout = json!({
+        "version": 1,
+        "command_id": "00000000-0000-4000-8000-00000000a103",
+        "aggregate_id": format!("offer:{OFFER_COMMAND_ID}"),
+        "expected_revision": 2,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "offer.checkout",
+        "payload": {
+            "offer_id": OFFER_COMMAND_ID,
+            "award_id": award_id,
+            "listing_aggregate_id": listing,
+            "listing_revision": listing_revision,
+            "listing_record_sha256": "a".repeat(64),
+            "variant_id": "boots_01",
+            "quantity": 1,
+            "delivery_address": {
+                "name": "Alice Buyer",
+                "line1": "1 Market Street",
+                "line2": "",
+                "city": "New York",
+                "region": "NY",
+                "postal_code": "10001",
+                "country_code": "US"
+            },
+            "guarantee_policy_version": 1
+        }
+    });
+    let (status, body) = execute(&app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "offer checkout failed: {body}");
+    let payment_id = body["result"]["order"]["payment_id"]
+        .as_str()
+        .expect("payment id");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &payment_command(payment_id, 1, "confirmed", 1, 0xa104),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment failed: {body}");
+    let receipt_id = body["result"]["receipt"]["id"]
+        .as_str()
+        .expect("receipt id");
+    let (status, body) = get(
+        &app,
+        &format!("/v1/receipts/{receipt_id}/attestation"),
+        &buyer.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "attestation failed: {body}");
+    let jws = body["receipt_attestation"]["jws"]
+        .as_str()
+        .expect("attestation jws");
+    let header = String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(jws.split('.').next().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(header, r#"{"alg":"EdDSA","typ":"pubky-order-receipt+v2"}"#);
+    assert_eq!(body["receipt_attestation"]["claims"]["v"], json!(2));
 }
 
 #[sqlx::test]

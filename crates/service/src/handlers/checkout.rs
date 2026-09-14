@@ -392,8 +392,9 @@ pub async fn handle(
         };
         sqlx::query(
             "INSERT INTO payments (id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
-             state, confirmations, amount_minor, currency, exponent, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)",
+             state, confirmations, amount_minor, currency, exponent, merchandise_amount_minor, \
+             merchandise_currency, merchandise_exponent, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $9, $10, $11, $12, $12)",
         )
         .bind(payment.id)
         .bind(payment.order_id)

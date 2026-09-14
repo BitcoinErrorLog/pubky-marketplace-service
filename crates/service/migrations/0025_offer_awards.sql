@@ -47,14 +47,20 @@ ALTER TABLE offers
         state NOT IN ('accepted', 'converted') OR (
             award_id IS NOT NULL AND accepted_at IS NOT NULL
             AND award_expires_at IS NOT NULL AND reservation_id IS NOT NULL
-            AND accepted_unit_price_minor > 0 AND accepted_currency IS NOT NULL
-            AND accepted_exponent BETWEEN 0 AND 18 AND accepted_quantity > 0
+            AND accepted_unit_price_minor IS NOT NULL AND accepted_unit_price_minor > 0
+            AND accepted_currency IS NOT NULL
+            AND accepted_exponent IS NOT NULL AND accepted_exponent BETWEEN 0 AND 18
+            AND accepted_quantity IS NOT NULL AND accepted_quantity > 0
             AND accepted_listing_aggregate_id IS NOT NULL
-            AND accepted_listing_revision > 0
+            AND accepted_listing_title IS NOT NULL
+            AND accepted_listing_revision IS NOT NULL AND accepted_listing_revision > 0
             AND accepted_listing_record_sha256 IS NOT NULL
             AND accepted_variant_id IS NOT NULL
-            AND accepted_shipping_minor >= 0 AND accepted_subtotal_minor > 0
-            AND accepted_total_minor > 0 AND accepted_fulfillment = 'shipping'
+            AND accepted_variant_options IS NOT NULL
+            AND accepted_shipping_minor IS NOT NULL AND accepted_shipping_minor >= 0
+            AND accepted_subtotal_minor IS NOT NULL AND accepted_subtotal_minor > 0
+            AND accepted_total_minor IS NOT NULL AND accepted_total_minor > 0
+            AND accepted_fulfillment IS NOT NULL AND accepted_fulfillment = 'shipping'
         )
     ),
     ADD CONSTRAINT offers_converted_snapshot_check CHECK (
@@ -99,11 +105,11 @@ ALTER TABLE receipts
     ADD CONSTRAINT receipts_merchandise_money_check CHECK (
         (merchandise_total_minor IS NULL AND merchandise_currency IS NULL
             AND merchandise_exponent IS NULL)
-        OR (merchandise_total_minor >= 0 AND merchandise_currency IS NOT NULL
-            AND merchandise_exponent BETWEEN 0 AND 18)
+        OR (merchandise_total_minor IS NOT NULL AND merchandise_total_minor >= 0
+            AND merchandise_currency IS NOT NULL
+            AND merchandise_exponent IS NOT NULL AND merchandise_exponent BETWEEN 0 AND 18)
     );
 
 CREATE INDEX offers_award_expiry_idx
     ON offers (award_expires_at)
     WHERE state = 'accepted';
-

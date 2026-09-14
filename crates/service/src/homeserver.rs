@@ -21,7 +21,7 @@ use marketplace_domain::commands::{AuctionTerms, RegisterListingPayload, SaleFor
 use marketplace_domain::money::Money;
 use marketplace_domain::ValidationIssue;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 /// Environment variable naming the homeserver base URL used to fetch
@@ -133,36 +133,78 @@ pub fn award_terms_from_bytes(bytes: &[u8]) -> Result<AwardListingSnapshot, &'st
         .and_then(Value::as_array)
         .ok_or("missing variants")?
         .iter()
-        .filter_map(|variant| {
-            let object = variant.as_object()?;
+        .map(|variant| {
+            let object = variant.as_object().ok_or("invalid variant")?;
             if object.get("enabled").and_then(Value::as_bool) != Some(true) {
-                return None;
+                return Err("invalid enabled variant");
             }
-            let id = object.get("id").and_then(Value::as_str)?.to_string();
-            let quantity = object.get("quantity").and_then(Value::as_i64)?;
-            if quantity <= 0 {
-                return None;
-            }
-            let options = object
-                .get("options")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(vec![]));
-            let sku = object
-                .get("sku")
+            let id = object
+                .get("id")
                 .and_then(Value::as_str)
-                .map(str::to_string);
-            let price = object
-                .get("priceOverride")
-                .and_then(|value| money(value).ok());
-            Some(AwardVariantSnapshot {
+                .filter(|id| !id.is_empty())
+                .ok_or("invalid variant id")?
+                .to_string();
+            let quantity = object
+                .get("quantity")
+                .and_then(Value::as_i64)
+                .filter(|quantity| *quantity > 0)
+                .ok_or("invalid variant quantity")?;
+            let mut options = object
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .map(|option| {
+                            let object = option.as_object().ok_or("invalid variant option")?;
+                            let name = object
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .filter(|value| !value.is_empty())
+                                .ok_or("invalid variant option name")?;
+                            let value = object
+                                .get("value")
+                                .and_then(Value::as_str)
+                                .filter(|value| !value.is_empty())
+                                .ok_or("invalid variant option value")?;
+                            Ok(json!({"name": name, "value": value}))
+                        })
+                        .collect::<Result<Vec<_>, &'static str>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            options.sort_by(|left, right| {
+                left["name"]
+                    .as_str()
+                    .cmp(&right["name"].as_str())
+                    .then_with(|| left["value"].as_str().cmp(&right["value"].as_str()))
+            });
+            if options.len() > 100 {
+                return Err("too many variant options");
+            }
+            let sku = match object.get("sku") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .filter(|sku| !sku.is_empty())
+                        .ok_or("invalid variant sku")?
+                        .to_string(),
+                ),
+            };
+            let price = match object.get("priceOverride") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(money(value)?),
+            };
+            Ok(AwardVariantSnapshot {
                 id,
                 sku,
-                options,
+                options: Value::Array(options),
                 quantity,
                 price,
             })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, &'static str>>()?;
     if variants.is_empty()
         || variants
             .iter()
@@ -173,28 +215,44 @@ pub fn award_terms_from_bytes(bytes: &[u8]) -> Result<AwardListingSnapshot, &'st
     {
         return Err("invalid enabled variants");
     }
-    let shipping_minor = object
-        .get("shippingOptions")
-        .and_then(Value::as_array)
-        .map(|options| {
+    if variants.iter().any(|variant| {
+        variant
+            .price
+            .as_ref()
+            .is_some_and(|price| price.currency != unit.currency || price.exponent != unit.exponent)
+    }) {
+        return Err("variant money mismatch");
+    }
+    let shipping_minor = match object.get("shippingOptions") {
+        None => 0,
+        Some(value) => {
+            let options = value.as_array().ok_or("invalid shipping options")?;
+            if options.is_empty() {
+                return Err("unpriceable shipping");
+            }
             options
                 .iter()
-                .filter_map(|option| {
-                    let object = option.as_object()?;
-                    match object.get("pricing").and_then(Value::as_str)? {
-                        "free" => Some(0),
-                        "flat" => {
-                            let price = money(object.get("price")?).ok()?;
-                            (price.currency == unit.currency && price.exponent == unit.exponent)
-                                .then_some(price.amount_minor)
+                .map(|option| {
+                    let object = option.as_object().ok_or("invalid shipping option")?;
+                    match object.get("pricing").and_then(Value::as_str) {
+                        Some("free") => Ok(0),
+                        Some("flat") => {
+                            let price =
+                                money(object.get("price").ok_or("missing shipping price")?)?;
+                            if price.currency != unit.currency || price.exponent != unit.exponent {
+                                return Err("shipping money mismatch");
+                            }
+                            Ok(price.amount_minor)
                         }
-                        _ => None,
+                        _ => Err("unpriceable shipping"),
                     }
                 })
+                .collect::<Result<Vec<_>, &'static str>>()?
+                .into_iter()
                 .min()
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
+                .ok_or("unpriceable shipping")?
+        }
+    };
     let raw_sha256 = hex::encode(Sha256::digest(bytes));
     Ok(AwardListingSnapshot {
         raw_sha256,

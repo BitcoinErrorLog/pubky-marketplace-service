@@ -351,7 +351,8 @@ pub async fn list_offers(
     .await;
     match offers {
         Ok(offers) => {
-            let views: Vec<Value> = offers.iter().map(OfferRow::view).collect();
+            let now = state.clock.now();
+            let views: Vec<Value> = offers.iter().map(|offer| offer.view(now)).collect();
             (StatusCode::OK, Json(json!({ "offers": views }))).into_response()
         }
         Err(error) => internal_error("offers", &error),
@@ -370,7 +371,10 @@ fn order_with_payment(
     let mut view = order
         .projection_for_actor_with_payment(actor, payment.map(|payment| payment.state.as_str()));
     if let Some(payment) = payment {
-        view["payment"] = payment.projection_for_actor(actor);
+        let synthesize_legacy =
+            order.paykit_total_sats.is_none() || matches!(payment.currency.as_str(), "SAT" | "BTC");
+        view["payment"] =
+            payment.projection_for_actor_with_legacy_merchandise(actor, synthesize_legacy);
     }
     view["reviews"] = Value::Array(reviews.iter().map(|review| review.view()).collect());
     view
@@ -527,7 +531,25 @@ pub async fn get_receipt(
     .fetch_optional(&state.pool)
     .await;
     match receipt {
-        Ok(Some(receipt)) => (StatusCode::OK, Json(receipt.view())).into_response(),
+        Ok(Some(receipt)) => {
+            let paykit_total_sats: Result<Option<i64>, sqlx::Error> =
+                sqlx::query_scalar("SELECT paykit_total_sats FROM orders WHERE id = $1")
+                    .bind(receipt.order_id)
+                    .fetch_one(&state.pool)
+                    .await;
+            match paykit_total_sats {
+                Ok(paykit_total_sats) => {
+                    let synthesize_legacy = paykit_total_sats.is_none()
+                        || matches!(receipt.currency.as_str(), "SAT" | "BTC");
+                    (
+                        StatusCode::OK,
+                        Json(receipt.view_with_legacy_merchandise(synthesize_legacy)),
+                    )
+                        .into_response()
+                }
+                Err(error) => internal_error("receipt order", &error),
+            }
+        }
         Ok(None) => query_error(ErrorCode::NotFound, "The receipt was not found."),
         Err(error) => internal_error("receipt", &error),
     }
@@ -548,7 +570,9 @@ type ReceiptAttestationRow = (
     Option<i64>,
     Option<String>,
     Option<i32>,
+    i64,
     String,
+    i32,
 );
 
 /// `GET /v1/receipts/{id}/attestation`: a compact JWS signed by the
@@ -573,7 +597,8 @@ pub async fn get_receipt_attestation(
     let row: Result<Option<ReceiptAttestationRow>, sqlx::Error> = sqlx::query_as(
         "SELECT r.id, r.order_id, r.issued_at, o.buyer_pubky, o.seller_pubky, \
          r.total_minor, r.currency, r.exponent, r.merchandise_total_minor, \
-         r.merchandise_currency, r.merchandise_exponent, o.priced_from \
+         r.merchandise_currency, r.merchandise_exponent, \
+         o.total_minor, o.currency, o.exponent \
          FROM receipts r JOIN orders o ON o.id = r.order_id \
          WHERE r.id = $1 AND (o.buyer_pubky = $2 OR o.seller_pubky = $2)",
     )
@@ -593,7 +618,9 @@ pub async fn get_receipt_attestation(
         merchandise_total_minor,
         merchandise_currency,
         merchandise_exponent,
-        priced_from,
+        order_total_minor,
+        order_currency,
+        order_exponent,
     ) = match row {
         Ok(Some(row)) => row,
         Ok(None) => return query_error(ErrorCode::NotFound, "The receipt was not found."),
@@ -605,26 +632,26 @@ pub async fn get_receipt_attestation(
             "The receipt attestation was not found.",
         );
     };
-    let issued = if priced_from == "offer" {
+    let issued = if let (
+        Some(merchandise_total_minor),
+        Some(merchandise_currency),
+        Some(merchandise_exponent),
+    ) = (
+        merchandise_total_minor,
+        merchandise_currency.as_deref(),
+        merchandise_exponent,
+    ) {
         attestor.issue_receipt_attestation_v2(
             order_id,
             receipt_id,
             &buyer,
             &seller,
             crate::model::money_json(total_minor, &currency, exponent),
-            match (
+            crate::model::money_json(
                 merchandise_total_minor,
-                merchandise_currency.as_deref(),
+                merchandise_currency,
                 merchandise_exponent,
-            ) {
-                (Some(amount), Some(currency), Some(exponent)) => {
-                    crate::model::money_json(amount, currency, exponent)
-                }
-                _ if matches!(currency.as_str(), "SAT" | "BTC") => {
-                    crate::model::money_json(total_minor, &currency, exponent)
-                }
-                _ => Value::Null,
-            },
+            ),
             issued_at,
         )
     } else {
@@ -633,9 +660,9 @@ pub async fn get_receipt_attestation(
             receipt_id,
             &buyer,
             &seller,
-            total_minor,
-            &currency,
-            i64::from(exponent),
+            order_total_minor,
+            &order_currency,
+            i64::from(order_exponent),
             issued_at,
         )
     };

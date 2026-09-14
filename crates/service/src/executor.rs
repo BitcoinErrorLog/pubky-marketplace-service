@@ -248,7 +248,20 @@ async fn dispatch(
             .await
         }
         CommandPayload::OfferCheckout(payload) => {
-            crate::handlers::offer_checkout::handle(tx, actor, command, payload, now).await
+            let hold_window_seconds = state
+                .config
+                .locks_payment_window_seconds
+                .max(state.config.fiat_payment_window_seconds)
+                .max(state.config.sandbox_payment_window_seconds);
+            crate::handlers::offer_checkout::handle(
+                tx,
+                actor,
+                command,
+                payload,
+                state.clock.as_ref(),
+                hold_window_seconds,
+            )
+            .await
         }
         CommandPayload::RejectOffer(payload) => {
             crate::handlers::offers::reject(tx, actor, command, payload, now).await

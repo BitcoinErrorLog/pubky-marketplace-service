@@ -1092,3 +1092,98 @@ async fn usd_bind_end_to_end_amount_and_role_scoped_projection(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "strangers see no quote");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn usd_offer_checkout_bitcoin_bind_keeps_settlement_and_merchandise_typed(pool: PgPool) {
+    let fixture = fx_fixture(pool.clone()).await;
+    seed_fx_samples(&pool, RATE, fixture.app.clock.now(), 3).await;
+    let (status, body) = execute(
+        &fixture.app,
+        &fixture.buyer.token,
+        &create_offer_command(&fixture.seller.pubky, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "offer create failed: {body}");
+    let (status, body) = execute(
+        &fixture.app,
+        &fixture.seller.token,
+        &offer_action("offer.accept", 1, "00000000-0000-4000-8000-00000000f101"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "offer accept failed: {body}");
+    sqlx::query(
+        "UPDATE offers SET accepted_listing_record_sha256 = $2, accepted_variant_id = $3 \
+         WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(OFFER_COMMAND_ID).expect("offer uuid"))
+    .bind("a".repeat(64))
+    .bind("boots_01")
+    .execute(&fixture.app.pool)
+    .await
+    .expect("accepted snapshot normalized");
+    let (award_id, listing_revision): (Uuid, i64) =
+        sqlx::query_as("SELECT award_id, accepted_listing_revision FROM offers WHERE id = $1")
+            .bind(Uuid::parse_str(OFFER_COMMAND_ID).expect("offer uuid"))
+            .fetch_one(&fixture.app.pool)
+            .await
+            .expect("accepted award");
+    let checkout = json!({
+        "version": 1,
+        "command_id": "00000000-0000-4000-8000-00000000f102",
+        "aggregate_id": format!("offer:{OFFER_COMMAND_ID}"),
+        "expected_revision": 2,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "offer.checkout",
+        "payload": {
+            "offer_id": OFFER_COMMAND_ID,
+            "award_id": award_id,
+            "listing_aggregate_id": listing_aggregate(&fixture.seller.pubky),
+            "listing_revision": listing_revision,
+            "listing_record_sha256": "a".repeat(64),
+            "variant_id": "boots_01",
+            "quantity": 1,
+            "delivery_address": {
+                "name": "Alice Buyer",
+                "line1": "1 Market Street",
+                "line2": "",
+                "city": "New York",
+                "region": "NY",
+                "postal_code": "10001",
+                "country_code": "US"
+            },
+            "guarantee_policy_version": 1
+        }
+    });
+    let (status, body) = execute(&fixture.app, &fixture.buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "offer checkout failed: {body}");
+    let order_id = body["result"]["order"]["id"].as_str().expect("order id");
+    let (status, body) = bind_bitcoin(&fixture.app, &fixture.buyer.token, order_id).await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+
+    let (status, projection) = send(
+        fixture.app.router.clone(),
+        "GET",
+        &format!("/v1/orders/{order_id}"),
+        Some(&fixture.buyer.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "projection failed: {projection}");
+    assert_eq!(
+        projection["payment"]["amount"],
+        json!({
+            "amount_minor": projection["bitcoin_payable"]["amount_minor"],
+            "currency": "SAT",
+            "exponent": 0
+        })
+    );
+    assert_eq!(
+        projection["payment"]["merchandise_amount"],
+        json!({"amount_minor": 10_000, "currency": "USD", "exponent": 2})
+    );
+    assert_eq!(
+        projection["merchandise_total"],
+        json!({"amount_minor": 10_000, "currency": "USD", "exponent": 2})
+    );
+    assert_eq!(projection["priced_from"], json!("offer"));
+}

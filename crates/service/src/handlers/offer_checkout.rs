@@ -5,6 +5,7 @@ use serde_json::json;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::clock::Clock;
 use crate::executor::insert_event;
 use crate::handlers::offers::OFFER_COLUMNS;
 use crate::handlers::{fetch_listing_for_update, insert_notification_intent};
@@ -26,7 +27,8 @@ pub async fn handle(
     actor: &str,
     command: &Command,
     payload: &OfferCheckoutPayload,
-    _now: DateTime<Utc>,
+    clock: &dyn Clock,
+    hold_window_seconds: i64,
 ) -> Result<HandlerResult, sqlx::Error> {
     let offer: Option<OfferRow> = sqlx::query_as(&format!(
         "SELECT {OFFER_COLUMNS} FROM offers WHERE id = $1 FOR UPDATE"
@@ -59,6 +61,18 @@ pub async fn handle(
             offer.revision,
         )));
     }
+    let lock_now = clock.now();
+    if offer.expiry_reason.as_deref() == Some("award_window")
+        || (offer.state == "accepted"
+            && offer
+                .award_expires_at
+                .is_none_or(|deadline| lock_now >= deadline))
+    {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::AwardExpired,
+            "This accepted offer's checkout window has expired. Nothing was ordered.",
+        )));
+    }
     if offer.state == "converted" {
         return Ok(Err(CommandFailure::new(
             ErrorCode::AwardAlreadyConverted,
@@ -69,18 +83,6 @@ pub async fn handle(
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "Only an accepted offer can enter offer checkout.",
-        )));
-    }
-    let lock_now: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
-        .fetch_one(&mut **tx)
-        .await?;
-    if offer
-        .award_expires_at
-        .is_none_or(|deadline| lock_now >= deadline)
-    {
-        return Ok(Err(CommandFailure::new(
-            ErrorCode::AwardExpired,
-            "This accepted offer's checkout window has expired. Nothing was ordered.",
         )));
     }
     if offer.accepted_variant_id.as_deref() != Some(&payload.variant_id) {
@@ -175,7 +177,7 @@ pub async fn handle(
         "variant_id": payload.variant_id,
         "fulfillment": "shipping"
     }]);
-    let hold_expires_at = lock_now + chrono::Duration::seconds(3600);
+    let hold_expires_at = lock_now + chrono::Duration::seconds(hold_window_seconds);
     let converted_reservation: Option<Uuid> = sqlx::query_scalar(
         "UPDATE reservations SET status = 'converted', updated_at = $2 \
          WHERE id = $1 AND status = 'active' RETURNING id",
@@ -253,9 +255,19 @@ pub async fn handle(
         lock_now,
     )
     .await?;
+    let order_event_id = insert_event(
+        tx,
+        command.command_id,
+        &ids::order_aggregate_id(order_id),
+        1,
+        actor,
+        "order.created",
+        lock_now,
+    )
+    .await?;
     insert_notification_intent(
         tx,
-        event_id,
+        order_event_id,
         "order_created",
         &offer.seller_pubky,
         actor,
@@ -266,7 +278,7 @@ pub async fn handle(
     .await?;
     Ok(Ok(HandlerSuccess {
         revision: offer.revision + 1,
-        event_ids: vec![event_id],
+        event_ids: vec![event_id, order_event_id],
         result: json!({
             "kind": "order",
             "order": {

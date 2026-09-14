@@ -18,9 +18,10 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use common::{
-    count, counter_offer_command, create_offer_command, execute, listing_aggregate, new_actor,
-    offer_action, register_command, register_listing_command, reserve_command, send, test_app,
-    test_app_with_homeserver, test_app_with_homeserver_client, OFFER_COMMAND_ID,
+    config_durable, count, counter_offer_command, create_offer_command, execute, listing_aggregate,
+    new_actor, offer_action, register_command, register_listing_command, reserve_command, send,
+    test_app, test_app_with_config, test_app_with_homeserver, test_app_with_homeserver_client,
+    OFFER_COMMAND_ID,
 };
 
 struct MutatingListingSnapshotSource {
@@ -124,6 +125,18 @@ async fn supports_private_offer_counteroffer_and_atomic_acceptance_history(pool:
     assert_eq!(accepted["result"]["kind"], json!("accepted_offer"));
     assert_eq!(accepted["result"]["offer"]["state"], json!("accepted"));
     assert_eq!(accepted["result"]["offer"]["revision"], json!(3));
+    assert_eq!(
+        accepted["result"]["offer"]["award"]["listing"]["seller_pubky"],
+        json!(seller.pubky)
+    );
+    assert_eq!(
+        accepted["result"]["offer"]["award"]["listing"]["listing_id"],
+        json!("boots_01")
+    );
+    assert_eq!(
+        accepted["result"]["offer"]["award"]["listing"]["title"],
+        json!("Marketplace item")
+    );
     let listing = &accepted["result"]["listing"];
     assert_eq!(listing["available_quantity"], json!(1));
     assert_eq!(listing["reserved_quantity"], json!(1));
@@ -145,6 +158,18 @@ async fn supports_private_offer_counteroffer_and_atomic_acceptance_history(pool:
         .map(|entry| entry["action"].as_str().expect("action string"))
         .collect();
     assert_eq!(actions, vec!["created", "countered", "accepted"]);
+    app.clock.advance_seconds(1_800);
+    let (status, offers) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/offers",
+        Some(&buyer.token),
+        &serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "offer list failed: {offers}");
+    assert_eq!(offers["offers"][0]["state"], json!("expired"));
+    assert_eq!(offers["offers"][0]["award"]["state"], json!("expired"));
 }
 
 // TS case: "enforces participant roles for counter, reject, and withdraw"
@@ -303,6 +328,27 @@ async fn offer_checkout_transfers_the_accepted_hold_and_preserves_merchandise_te
     );
     let (status, body) = execute(&app, &buyer.token, &command).await;
     assert_eq!(status, StatusCode::OK, "offer checkout failed: {body}");
+    assert_eq!(body["event_ids"].as_array().map(Vec::len), Some(2));
+    let event_kinds: Vec<String> =
+        sqlx::query_scalar("SELECT kind FROM events WHERE command_id = $1 ORDER BY kind")
+            .bind(
+                uuid::Uuid::parse_str("00000000-0000-4000-8000-000000001102").expect("command id"),
+            )
+            .fetch_all(&app.pool)
+            .await
+            .expect("conversion events");
+    assert_eq!(
+        event_kinds,
+        vec!["offer.converted".to_string(), "order.created".to_string()]
+    );
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.order_created'"
+        )
+        .await,
+        1
+    );
     assert_eq!(body["result"]["order"]["priced_from"], json!("offer"));
     assert_eq!(
         body["result"]["order"]["total"]["amount_minor"],
@@ -334,6 +380,63 @@ async fn offer_checkout_transfers_the_accepted_hold_and_preserves_merchandise_te
         state,
         ("converted".to_string(), "converted".to_string(), 1, 1)
     );
+}
+
+#[sqlx::test]
+async fn offer_checkout_uses_injected_clock_and_longest_configured_hold_window(pool: PgPool) {
+    let mut config = config_durable();
+    config.locks_payment_window_seconds = 4_200;
+    config.fiat_payment_window_seconds = 5_100;
+    config.sandbox_payment_window_seconds = 6_000;
+    let app = test_app_with_config(pool, config).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (offer_id, award_id, listing, revision, hash, quantity) =
+        accepted_offer_fixture(&app, &seller, &buyer).await;
+    let lock_now = app.clock.now();
+    let command = offer_checkout_command(
+        &offer_id,
+        &award_id,
+        &listing,
+        revision,
+        &hash,
+        "boots_01",
+        quantity,
+        "00000000-0000-4000-8000-000000001119",
+    );
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "offer checkout failed: {body}");
+    let hold_expires_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT hold_expires_at FROM orders WHERE offer_award_id = $1")
+            .bind(uuid::Uuid::parse_str(&award_id).expect("award id"))
+            .fetch_one(&app.pool)
+            .await
+            .expect("hold deadline");
+    assert_eq!(hold_expires_at, lock_now + chrono::Duration::seconds(6_000));
+}
+
+#[sqlx::test]
+async fn offer_checkout_refuses_at_the_injected_award_deadline(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (offer_id, award_id, listing, revision, hash, quantity) =
+        accepted_offer_fixture(&app, &seller, &buyer).await;
+    app.clock.advance_seconds(1_800);
+    let command = offer_checkout_command(
+        &offer_id,
+        &award_id,
+        &listing,
+        revision,
+        &hash,
+        "boots_01",
+        quantity,
+        "00000000-0000-4000-8000-000000001120",
+    );
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], json!("AWARD_EXPIRED"));
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 0);
 }
 
 #[sqlx::test]
@@ -502,7 +605,7 @@ async fn expired_award_releases_inventory(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let (offer_id, _award_id, _listing, _revision, _hash, _quantity) =
+    let (offer_id, award_id, listing, revision, hash, quantity) =
         accepted_offer_fixture(&app, &seller, &buyer).await;
     app.clock.advance_seconds(1_801);
     let expired = marketplace_service::workers::expire_due_offers(&app.pool, app.clock.now())
@@ -519,6 +622,97 @@ async fn expired_award_releases_inventory(pool: PgPool) {
     .await
     .expect("expired award state");
     assert_eq!(row, ("expired".to_string(), "expired".to_string(), 2, 0));
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND kind = 'offer.expired'",
+    )
+    .bind(format!("offer:{offer_id}"))
+    .fetch_one(&app.pool)
+    .await
+    .expect("expiry event count");
+    assert_eq!(event_count, 1);
+    let mut command = offer_checkout_command(
+        &offer_id,
+        &award_id,
+        &listing,
+        revision,
+        &hash,
+        "boots_01",
+        quantity,
+        "00000000-0000-4000-8000-000000001118",
+    );
+    command["expected_revision"] = json!(3);
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], json!("AWARD_EXPIRED"));
+}
+
+#[sqlx::test]
+async fn poisoned_award_does_not_roll_back_other_award_expiries(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let first_buyer = new_actor(&app).await;
+    let second_buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 2)).await;
+    execute(
+        &app,
+        &first_buyer.token,
+        &create_offer_command(&seller.pubky, 1),
+    )
+    .await;
+    execute(
+        &app,
+        &seller.token,
+        &offer_action("offer.accept", 1, "00000000-0000-4000-8000-000000001124"),
+    )
+    .await;
+    let second_offer_id = "00000000-0000-4000-8000-000000000600";
+    let mut second_offer = create_offer_command(&seller.pubky, 1);
+    second_offer["command_id"] = json!(second_offer_id);
+    second_offer["expected_revision"] = json!(2);
+    let (status, body) = execute(&app, &second_buyer.token, &second_offer).await;
+    assert_eq!(status, StatusCode::OK, "second offer failed: {body}");
+    let second_accept = json!({
+        "version": 1,
+        "command_id": "00000000-0000-4000-8000-000000001125",
+        "aggregate_id": format!("offer:{second_offer_id}"),
+        "expected_revision": 1,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "offer.accept",
+        "payload": {"offer_id": second_offer_id}
+    });
+    let (status, body) = execute(&app, &seller.token, &second_accept).await;
+    assert_eq!(status, StatusCode::OK, "second accept failed: {body}");
+    sqlx::query(
+        "UPDATE reservations SET quantity = 2 \
+         WHERE offer_award_id = (SELECT award_id FROM offers WHERE id = $1)",
+    )
+    .bind(uuid::Uuid::parse_str(OFFER_COMMAND_ID).expect("first offer id"))
+    .execute(&app.pool)
+    .await
+    .expect("poison first award");
+    app.clock.advance_seconds(1_801);
+    let expired = marketplace_service::workers::expire_due_offers(&app.pool, app.clock.now())
+        .await
+        .expect("award sweep");
+    assert_eq!(expired, 1);
+    let states: Vec<(uuid::Uuid, String)> =
+        sqlx::query_as("SELECT id, state FROM offers ORDER BY id")
+            .fetch_all(&app.pool)
+            .await
+            .expect("offer states");
+    assert_eq!(
+        states,
+        vec![
+            (
+                uuid::Uuid::parse_str(OFFER_COMMAND_ID).expect("first offer id"),
+                "accepted".to_string(),
+            ),
+            (
+                uuid::Uuid::parse_str(second_offer_id).expect("second offer id"),
+                "expired".to_string(),
+            ),
+        ]
+    );
 }
 
 #[sqlx::test]
@@ -862,8 +1056,8 @@ async fn raw_listing_snapshot_bounds_and_money_shape_are_refused(pool: PgPool) {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"));
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], json!("AWARD_LISTING_CHANGED"));
     assert_eq!(
         count(
             &app.pool,
@@ -872,6 +1066,131 @@ async fn raw_listing_snapshot_bounds_and_money_shape_are_refused(pool: PgPool) {
         .await,
         0
     );
+
+    let strict_failures = [
+        (
+            "00000000-0000-4000-8000-000000001121",
+            json!({
+                "revision": 3,
+                "sale": {
+                    "format": "fixed_price",
+                    "unitPrice": {"amountMinor": 1000, "currency": "USD", "exponent": 2}
+                },
+                "variants": [{"id": "boots_01", "enabled": false, "quantity": 1}],
+                "shippingOptions": [{"pricing": "free"}]
+            }),
+        ),
+        (
+            "00000000-0000-4000-8000-000000001122",
+            json!({
+                "revision": 4,
+                "sale": {
+                    "format": "fixed_price",
+                    "unitPrice": {"amountMinor": 1000, "currency": "USD", "exponent": 2}
+                },
+                "variants": [{
+                    "id": "boots_01",
+                    "enabled": true,
+                    "quantity": 1,
+                    "priceOverride": {"amountMinor": "1000", "currency": "USD", "exponent": 2}
+                }],
+                "shippingOptions": [{"pricing": "free"}]
+            }),
+        ),
+        (
+            "00000000-0000-4000-8000-000000001123",
+            json!({
+                "revision": 5,
+                "sale": {
+                    "format": "fixed_price",
+                    "unitPrice": {"amountMinor": 1000, "currency": "USD", "exponent": 2}
+                },
+                "variants": [{"id": "boots_01", "enabled": true, "quantity": 1}],
+                "shippingOptions": [{"pricing": "flat"}]
+            }),
+        ),
+        (
+            "00000000-0000-4000-8000-000000001126",
+            json!({
+                "revision": 6,
+                "sale": {
+                    "format": "fixed_price",
+                    "unitPrice": {"amountMinor": 1000, "currency": "USD", "exponent": 2}
+                },
+                "variants": [{
+                    "id": "boots_01",
+                    "enabled": true,
+                    "quantity": 1,
+                    "options": [{"name": "size", "value": 42}]
+                }],
+                "shippingOptions": [{"pricing": "free"}]
+            }),
+        ),
+    ];
+    for (command_id, record) in strict_failures {
+        homeserver.put_record(&seller.pubky, "boots_01", record);
+        let mut command = create_offer_command(&seller.pubky, 1);
+        command["command_id"] = json!(command_id);
+        let (status, body) = execute(&app, &buyer.token, &command).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{command_id}: {body}");
+        assert_eq!(
+            body["error"]["code"],
+            json!("AWARD_LISTING_CHANGED"),
+            "{command_id}: {body}"
+        );
+    }
+}
+
+#[sqlx::test]
+async fn counter_offer_refreshes_negotiated_terms_from_the_homeserver(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 2)).await;
+    let initial = json!({
+        "revision": 1,
+        "title": "Boots",
+        "sale": {
+            "format": "fixed_price",
+            "unitPrice": {"amountMinor": 12500, "currency": "USD", "exponent": 2}
+        },
+        "variants": [{"id": "boots_01", "enabled": true, "quantity": 2}],
+        "shippingOptions": [{"pricing": "free"}]
+    });
+    homeserver.put_record(&seller.pubky, "boots_01", initial);
+    let (status, body) = execute(&app, &buyer.token, &create_offer_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "offer create failed: {body}");
+    let original_hash: String =
+        sqlx::query_scalar("SELECT terms_listing_record_sha256 FROM offers WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(OFFER_COMMAND_ID).expect("offer id"))
+            .fetch_one(&app.pool)
+            .await
+            .expect("initial hash");
+    homeserver.put_record(
+        &seller.pubky,
+        "boots_01",
+        json!({
+            "revision": 2,
+            "title": "Boots refreshed",
+            "sale": {
+                "format": "fixed_price",
+                "unitPrice": {"amountMinor": 12500, "currency": "USD", "exponent": 2}
+            },
+            "variants": [{"id": "boots_01", "enabled": true, "quantity": 2}],
+            "shippingOptions": [{"pricing": "free"}]
+        }),
+    );
+    let (status, body) = execute(&app, &seller.token, &counter_offer_command(1)).await;
+    assert_eq!(status, StatusCode::OK, "counter failed: {body}");
+    let (revision, refreshed_hash): (i64, String) = sqlx::query_as(
+        "SELECT terms_listing_revision, terms_listing_record_sha256 FROM offers WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(OFFER_COMMAND_ID).expect("offer id"))
+    .fetch_one(&app.pool)
+    .await
+    .expect("refreshed terms");
+    assert_eq!(revision, 2);
+    assert_ne!(refreshed_hash, original_hash);
 }
 
 // TS case: "supports rejection by the recipient and withdrawal by the current author"
