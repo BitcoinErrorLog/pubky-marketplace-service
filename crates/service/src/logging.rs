@@ -83,6 +83,12 @@ pub(crate) fn error_code_name(code: Option<ErrorCode>) -> &'static str {
         Some(ErrorCode::AuctionClosed) => "AUCTION_CLOSED",
         Some(ErrorCode::BidTooLow) => "BID_TOO_LOW",
         Some(ErrorCode::UpstreamUnavailable) => "UPSTREAM_UNAVAILABLE",
+        Some(ErrorCode::AwardExpired) => "AWARD_EXPIRED",
+        Some(ErrorCode::AwardAlreadyConverted) => "AWARD_ALREADY_CONVERTED",
+        Some(ErrorCode::AwardQuantityMismatch) => "AWARD_QUANTITY_MISMATCH",
+        Some(ErrorCode::AwardVariantMismatch) => "AWARD_VARIANT_MISMATCH",
+        Some(ErrorCode::AwardListingChanged) => "AWARD_LISTING_CHANGED",
+        Some(ErrorCode::AwardHoldMissing) => "AWARD_HOLD_MISSING",
         None => "",
     }
 }

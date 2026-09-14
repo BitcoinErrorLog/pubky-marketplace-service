@@ -67,10 +67,11 @@ pub const ORDER_COLUMNS: &str =
      paykit_address_fingerprint, paykit_bind_attempt, paykit_activation_state, \
      paykit_observation, paykit_seller_confirmation_entered_at, \
      paykit_seller_confirmation_deadline, \
-     fulfillment, first_revealed_at, created_at, updated_at";
+     fulfillment, first_revealed_at, created_at, updated_at, offer_award_id, priced_from";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
      state, confirmations, amount_minor, currency, exponent, \
+     merchandise_amount_minor, merchandise_currency, merchandise_exponent, \
      manual_review_entered_at, manual_review_sla_alerted_at, \
      resolution_id, resolution_outcome, resolution_basis, resolved_at, resolved_by_pubky, \
      refund_reference, created_at, updated_at";
@@ -95,7 +96,8 @@ pub const NOTIFICATION_COLUMNS: &str =
     "id, recipient_pubky, actor_pubky, type, aggregate_id, amount, created_at, read_at";
 
 pub const RECEIPT_COLUMNS: &str = "id, order_id, payment_id, issuer_pubky, recipient_pubky, \
-     total_minor, currency, exponent, content_hash, issued_at";
+     total_minor, currency, exponent, merchandise_total_minor, merchandise_currency, \
+     merchandise_exponent, content_hash, issued_at";
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
@@ -534,7 +536,20 @@ pub async fn get_receipt(
 /// One row loaded for receipt attestation issuance: the receipt's identity
 /// and stored creation instant plus its order's participants and totals —
 /// every input the claims derive from.
-type ReceiptAttestationRow = (Uuid, Uuid, DateTime<Utc>, String, String, i64, String, i32);
+type ReceiptAttestationRow = (
+    Uuid,
+    Uuid,
+    DateTime<Utc>,
+    String,
+    String,
+    i64,
+    String,
+    i32,
+    Option<i64>,
+    Option<String>,
+    Option<i32>,
+    String,
+);
 
 /// `GET /v1/receipts/{id}/attestation`: a compact JWS signed by the
 /// attestor, attesting the receipt's facts (participants, order and receipt
@@ -557,7 +572,8 @@ pub async fn get_receipt_attestation(
 ) -> Response {
     let row: Result<Option<ReceiptAttestationRow>, sqlx::Error> = sqlx::query_as(
         "SELECT r.id, r.order_id, r.issued_at, o.buyer_pubky, o.seller_pubky, \
-         o.total_minor, o.currency, o.exponent \
+         r.total_minor, r.currency, r.exponent, r.merchandise_total_minor, \
+         r.merchandise_currency, r.merchandise_exponent, o.priced_from \
          FROM receipts r JOIN orders o ON o.id = r.order_id \
          WHERE r.id = $1 AND (o.buyer_pubky = $2 OR o.seller_pubky = $2)",
     )
@@ -565,28 +581,64 @@ pub async fn get_receipt_attestation(
     .bind(&actor.0)
     .fetch_optional(&state.pool)
     .await;
-    let (receipt_id, order_id, issued_at, buyer, seller, total_minor, currency, exponent) =
-        match row {
-            Ok(Some(row)) => row,
-            Ok(None) => return query_error(ErrorCode::NotFound, "The receipt was not found."),
-            Err(error) => return internal_error("receipt attestation", &error),
-        };
+    let (
+        receipt_id,
+        order_id,
+        issued_at,
+        buyer,
+        seller,
+        total_minor,
+        currency,
+        exponent,
+        merchandise_total_minor,
+        merchandise_currency,
+        merchandise_exponent,
+        priced_from,
+    ) = match row {
+        Ok(Some(row)) => row,
+        Ok(None) => return query_error(ErrorCode::NotFound, "The receipt was not found."),
+        Err(error) => return internal_error("receipt attestation", &error),
+    };
     let Some(attestor) = state.attestor.as_ref() else {
         return query_error(
             ErrorCode::NotFound,
             "The receipt attestation was not found.",
         );
     };
-    let issued = attestor.issue_receipt_attestation(
-        order_id,
-        receipt_id,
-        &buyer,
-        &seller,
-        total_minor,
-        &currency,
-        i64::from(exponent),
-        issued_at,
-    );
+    let issued = if priced_from == "offer" {
+        attestor.issue_receipt_attestation_v2(
+            order_id,
+            receipt_id,
+            &buyer,
+            &seller,
+            crate::model::money_json(total_minor, &currency, exponent),
+            match (
+                merchandise_total_minor,
+                merchandise_currency.as_deref(),
+                merchandise_exponent,
+            ) {
+                (Some(amount), Some(currency), Some(exponent)) => {
+                    crate::model::money_json(amount, currency, exponent)
+                }
+                _ if matches!(currency.as_str(), "SAT" | "BTC") => {
+                    crate::model::money_json(total_minor, &currency, exponent)
+                }
+                _ => Value::Null,
+            },
+            issued_at,
+        )
+    } else {
+        attestor.issue_receipt_attestation(
+            order_id,
+            receipt_id,
+            &buyer,
+            &seller,
+            total_minor,
+            &currency,
+            i64::from(exponent),
+            issued_at,
+        )
+    };
     (
         StatusCode::OK,
         Json(json!({

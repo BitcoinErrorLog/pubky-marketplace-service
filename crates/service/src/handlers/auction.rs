@@ -491,6 +491,8 @@ pub async fn close_locked_auction(
             first_revealed_at: None,
             created_at: now,
             updated_at: now,
+            offer_award_id: None,
+            priced_from: "listing".to_string(),
         };
         sqlx::query(
             "INSERT INTO orders (id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
@@ -530,6 +532,9 @@ pub async fn close_locked_auction(
             amount_minor: total_minor,
             currency: final_price.currency.clone(),
             exponent: final_price.exponent,
+            merchandise_amount_minor: Some(total_minor),
+            merchandise_currency: Some(final_price.currency.clone()),
+            merchandise_exponent: Some(final_price.exponent),
             manual_review_entered_at: None,
             manual_review_sla_alerted_at: None,
             resolution_id: None,

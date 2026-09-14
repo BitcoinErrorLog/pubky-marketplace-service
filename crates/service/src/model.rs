@@ -215,6 +215,32 @@ pub struct OfferRow {
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub variant_id: Option<String>,
+    pub terms_listing_revision: Option<i64>,
+    pub terms_listing_record_sha256: Option<String>,
+    pub terms_snapshot: Option<Value>,
+    pub award_id: Option<Uuid>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub award_expires_at: Option<DateTime<Utc>>,
+    pub reservation_id: Option<Uuid>,
+    pub accepted_unit_price_minor: Option<i64>,
+    pub accepted_currency: Option<String>,
+    pub accepted_exponent: Option<i32>,
+    pub accepted_quantity: Option<i64>,
+    pub accepted_listing_aggregate_id: Option<String>,
+    pub accepted_listing_title: Option<String>,
+    pub accepted_listing_revision: Option<i64>,
+    pub accepted_listing_record_sha256: Option<String>,
+    pub accepted_variant_id: Option<String>,
+    pub accepted_variant_sku: Option<String>,
+    pub accepted_variant_options: Option<Value>,
+    pub accepted_shipping_minor: Option<i64>,
+    pub accepted_subtotal_minor: Option<i64>,
+    pub accepted_total_minor: Option<i64>,
+    pub accepted_fulfillment: Option<String>,
+    pub converted_order_id: Option<Uuid>,
+    pub converted_at: Option<DateTime<Utc>>,
+    pub expiry_reason: Option<String>,
 }
 
 impl OfferRow {
@@ -239,6 +265,29 @@ impl OfferRow {
             "expires_at": format_timestamp(self.expires_at),
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
+            "award": self.award_id.map(|id| json!({
+                "id": id,
+                "state": if self.state == "accepted" { "active" } else { &self.state },
+                "listing": {
+                    "aggregate_id": self.accepted_listing_aggregate_id,
+                    "listing_revision": self.accepted_listing_revision,
+                    "listing_record_sha256": self.accepted_listing_record_sha256,
+                },
+                "variant": {
+                    "id": self.accepted_variant_id,
+                    "sku": self.accepted_variant_sku,
+                    "options": self.accepted_variant_options,
+                },
+                "unit_price": self.accepted_unit_price_minor.map(|amount| money_json(
+                    amount,
+                    self.accepted_currency.as_deref().unwrap_or(&self.currency),
+                    self.accepted_exponent.unwrap_or(self.exponent),
+                )),
+                "quantity": self.accepted_quantity,
+                "accepted_at": self.accepted_at.map(format_timestamp),
+                "convert_by": self.award_expires_at.map(format_timestamp),
+                "converted_order_id": self.converted_order_id,
+            })).unwrap_or(Value::Null),
         })
     }
 }
@@ -400,6 +449,8 @@ pub struct OrderRow {
     pub first_revealed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub offer_award_id: Option<Uuid>,
+    pub priced_from: String,
 }
 
 impl OrderRow {
@@ -815,6 +866,9 @@ pub struct ReceiptRow {
     pub total_minor: i64,
     pub currency: String,
     pub exponent: i32,
+    pub merchandise_total_minor: Option<i64>,
+    pub merchandise_currency: Option<String>,
+    pub merchandise_exponent: Option<i32>,
     pub content_hash: String,
     pub issued_at: DateTime<Utc>,
 }
@@ -828,6 +882,11 @@ impl ReceiptRow {
             "issuer_pubky": self.issuer_pubky,
             "recipient_pubky": self.recipient_pubky,
             "total": money_json(self.total_minor, &self.currency, self.exponent),
+            "merchandise_total": self.merchandise_total_minor.map(|amount| money_json(
+                amount,
+                self.merchandise_currency.as_deref().unwrap_or(&self.currency),
+                self.merchandise_exponent.unwrap_or(self.exponent),
+            )),
             "content_hash": self.content_hash,
             "issued_at": format_timestamp(self.issued_at),
         })
@@ -875,6 +934,9 @@ pub struct PaymentRow {
     pub amount_minor: i64,
     pub currency: String,
     pub exponent: i32,
+    pub merchandise_amount_minor: Option<i64>,
+    pub merchandise_currency: Option<String>,
+    pub merchandise_exponent: Option<i32>,
     /// Stamped by EVERY transition into `manual_review` (schema CHECK);
     /// cleared when the payment leaves the state. The two-business-day
     /// seller-response SLA and the seven-day inactivity clock read it.
@@ -916,6 +978,11 @@ impl PaymentRow {
             "state": self.state,
             "confirmations": self.confirmations,
             "amount": money_json(self.amount_minor, &self.currency, self.exponent),
+            "merchandise_amount": self.merchandise_amount_minor.map(|amount| money_json(
+                amount,
+                self.merchandise_currency.as_deref().unwrap_or(&self.currency),
+                self.merchandise_exponent.unwrap_or(self.exponent),
+            )),
             "resolution_outcome": self.resolution_outcome,
             "resolution_basis": self.resolution_basis,
             "resolved_at": self.resolved_at.map(format_timestamp),

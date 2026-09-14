@@ -154,6 +154,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         .await;
     Json(json!({
         "status": "ok",
+        "offer_checkout": true,
         "pickup_available": state.pickup_available(),
         "paykit_rail": {
             "bitcoin_offer_available": bitcoin_offer_available,

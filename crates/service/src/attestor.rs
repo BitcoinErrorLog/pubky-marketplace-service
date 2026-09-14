@@ -53,6 +53,7 @@ pub const SELLER_STATS_TYP: &str = "pubky-seller-stats+v1";
 /// record published on their own homeserver, verifiable against the
 /// attestor pubky alone after this operator disappears.
 pub const RECEIPT_ATTESTATION_TYP: &str = "pubky-order-receipt+v1";
+pub const RECEIPT_ATTESTATION_V2_TYP: &str = "pubky-order-receipt+v2";
 /// JOSE `typ` of a v1 drop edition attestation (ADR-0026 layer 2): the
 /// compact JWS attesting which numbered edition of a drop a paid order
 /// received, verifiable against the attestor pubky alone.
@@ -101,6 +102,20 @@ struct ReceiptAttestationClaims {
     iat: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ReceiptAttestationClaimsV2 {
+    v: i64,
+    iss: String,
+    buyer: String,
+    seller: String,
+    order: String,
+    receipt: String,
+    settlement_total: Value,
+    merchandise_total: Value,
+    paid_at: String,
+    iat: i64,
+}
+
 /// A freshly issued drop edition attestation: the compact JWS plus its
 /// claims. Like the receipt attestation, never stored — every claim derives
 /// from stored rows, so re-issuance is deterministic.
@@ -128,6 +143,33 @@ struct DropEditionAttestationClaims {
 }
 
 impl Attestor {
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_receipt_attestation_v2(
+        &self,
+        order_id: Uuid,
+        receipt_id: Uuid,
+        buyer_pubky: &str,
+        seller_pubky: &str,
+        settlement_total: Value,
+        merchandise_total: Value,
+        paid_at: DateTime<Utc>,
+    ) -> IssuedReceiptAttestation {
+        let claims = ReceiptAttestationClaimsV2 {
+            v: 2,
+            iss: self.pubky.clone(),
+            buyer: buyer_pubky.to_string(),
+            seller: seller_pubky.to_string(),
+            order: order_id.to_string(),
+            receipt: receipt_id.to_string(),
+            settlement_total,
+            merchandise_total,
+            paid_at: format_timestamp(paid_at),
+            iat: paid_at.timestamp(),
+        };
+        let claims = serde_json::to_value(claims).expect("claims serialize infallibly");
+        let jws = self.sign_compact(RECEIPT_ATTESTATION_V2_TYP, &claims);
+        IssuedReceiptAttestation { jws, claims }
+    }
     /// Builds the attestor from `ATTESTOR_SECRET_KEY` and
     /// `ATTESTOR_ORDER_SALT` (both 64 hex chars). Fail closed on partial
     /// configuration: either both are set or attestation support is off.

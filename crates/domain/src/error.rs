@@ -19,6 +19,12 @@ pub enum ErrorCode {
     /// reached or answered unusably. Retriable: the command may succeed
     /// once the upstream recovers, so it maps to 503 rather than a 4xx.
     UpstreamUnavailable,
+    AwardExpired,
+    AwardAlreadyConverted,
+    AwardQuantityMismatch,
+    AwardVariantMismatch,
+    AwardListingChanged,
+    AwardHoldMissing,
 }
 
 impl ErrorCode {
@@ -37,6 +43,12 @@ impl ErrorCode {
             | ErrorCode::InvalidState
             | ErrorCode::AuctionClosed
             | ErrorCode::BidTooLow => 409,
+            ErrorCode::AwardExpired
+            | ErrorCode::AwardAlreadyConverted
+            | ErrorCode::AwardQuantityMismatch
+            | ErrorCode::AwardVariantMismatch
+            | ErrorCode::AwardListingChanged
+            | ErrorCode::AwardHoldMissing => 409,
             ErrorCode::UpstreamUnavailable => 503,
         }
     }

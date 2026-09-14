@@ -141,9 +141,23 @@ pub async fn release_lease(
 /// an `offer.expired` event traceable through the offer id.
 pub async fn expire_due_offers(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
     let mut tx = pool.begin().await?;
-    let due: Vec<(Uuid, String, i64, String)> = sqlx::query_as(
-        "SELECT id, aggregate_id, revision, offered_by FROM offers \
-         WHERE state IN ('pending', 'countered') AND expires_at <= $1 \
+    #[derive(sqlx::FromRow)]
+    struct DueOffer {
+        id: Uuid,
+        aggregate_id: String,
+        revision: i64,
+        offered_by: String,
+        state: String,
+        reservation_id: Option<Uuid>,
+        award_id: Option<Uuid>,
+        listing_aggregate_id: String,
+        quantity: i64,
+    }
+    let due: Vec<DueOffer> = sqlx::query_as(
+        "SELECT id, aggregate_id, revision, offered_by, state, reservation_id, award_id, \
+         listing_aggregate_id, quantity FROM offers \
+         WHERE ((state IN ('pending', 'countered') AND expires_at <= $1) \
+            OR (state = 'accepted' AND award_expires_at <= $1)) \
          ORDER BY expires_at FOR UPDATE SKIP LOCKED",
     )
     .bind(now)
@@ -151,12 +165,65 @@ pub async fn expire_due_offers(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Res
     .await?;
 
     let mut expired = 0u64;
-    for (offer_id, aggregate_id, revision, offered_by) in due {
+    for offer in due {
+        if offer.state == "accepted" {
+            let Some(reservation_id) = offer.reservation_id else {
+                continue;
+            };
+            let Some(award_id) = offer.award_id else {
+                continue;
+            };
+            let reservation: Option<(String, i64)> = sqlx::query_as(
+                "UPDATE reservations SET status = 'expired', updated_at = $2 \
+                 WHERE id = $1 AND status = 'active' AND offer_award_id = $3 \
+                 RETURNING listing_aggregate_id, quantity",
+            )
+            .bind(reservation_id)
+            .bind(now)
+            .bind(award_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((reservation_listing, reservation_quantity)) = reservation else {
+                continue;
+            };
+            if reservation_listing != offer.listing_aggregate_id
+                || reservation_quantity != offer.quantity
+            {
+                anyhow::bail!("award reservation does not match its locked offer");
+            }
+            let listing_locked = sqlx::query(
+                "UPDATE listings SET server_revision = server_revision + 1, \
+                 state = CASE WHEN available_quantity = 0 THEN 'available' ELSE state END, \
+                 available_quantity = available_quantity + $2, reserved_quantity = reserved_quantity - $2, \
+                 updated_at = $3 WHERE aggregate_id = $1 AND reserved_quantity >= $2",
+            )
+            .bind(&offer.listing_aggregate_id)
+            .bind(offer.quantity)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            if listing_locked.rows_affected() != 1 {
+                anyhow::bail!("award reservation inventory is not held by its listing");
+            }
+            let offer_flipped = sqlx::query(
+                "UPDATE offers SET state = 'expired', expiry_reason = 'award_window', \
+                 revision = revision + 1, updated_at = $2 WHERE id = $1 AND state = 'accepted'",
+            )
+            .bind(offer.id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            if offer_flipped.rows_affected() != 1 {
+                anyhow::bail!("locked accepted offer could not be expired");
+            }
+            expired += 1;
+            continue;
+        }
         let flipped = sqlx::query(
             "UPDATE offers SET state = 'expired', revision = revision + 1, updated_at = $2 \
              WHERE id = $1 AND state IN ('pending', 'countered')",
         )
-        .bind(offer_id)
+        .bind(offer.id)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -168,14 +235,14 @@ pub async fn expire_due_offers(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Res
              occurred_at) VALUES ($1, $2, $3, $4, $5, 'offer.expired', $6)",
         )
         .bind(Uuid::new_v4())
-        .bind(offer_id)
-        .bind(&aggregate_id)
-        .bind(revision + 1)
-        .bind(&offered_by)
+        .bind(offer.id)
+        .bind(&offer.aggregate_id)
+        .bind(offer.revision + 1)
+        .bind(&offer.offered_by)
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        tracing::info!(offer_id = %offer_id, aggregate_id = %aggregate_id, "expired offer");
+        tracing::info!(offer_id = %offer.id, aggregate_id = %offer.aggregate_id, "expired offer");
         expired += 1;
     }
     tx.commit().await?;

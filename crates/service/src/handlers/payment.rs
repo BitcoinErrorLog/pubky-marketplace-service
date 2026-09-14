@@ -326,22 +326,36 @@ pub(crate) async fn confirm_order(
     // order's recorded total is the paykit total (price + nonce, §B.11.3):
     // the figure the marketplace charged, displayed and recorded.
     let receipt_total = order.paykit_total_sats.unwrap_or(order.total_minor);
+    let receipt_currency = if order.paykit_total_sats.is_some() {
+        "SAT"
+    } else {
+        &order.currency
+    };
+    let receipt_exponent = if order.paykit_total_sats.is_some() {
+        0
+    } else {
+        order.exponent
+    };
     let receipt_id = Uuid::new_v4();
-    let total = money_json(receipt_total, &order.currency, order.exponent);
+    let total = money_json(receipt_total, receipt_currency, receipt_exponent);
+    let merchandise_total = money_json(order.total_minor, &order.currency, order.exponent);
     let canonical = serde_json::to_vec(&json!({
         "order_id": order.id,
         "payment_id": payment.id,
         "total": total,
+        "merchandise_total": merchandise_total,
         "issued_at": format_timestamp(now),
     }))
     .expect("receipt payload serializes infallibly");
     let content_hash = blake3::hash(&canonical).to_hex().to_string();
     let receipt: ReceiptRow = sqlx::query_as(
         "INSERT INTO receipts (id, order_id, payment_id, issuer_pubky, recipient_pubky, \
-         total_minor, currency, exponent, content_hash, issued_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+         total_minor, currency, exponent, merchandise_total_minor, merchandise_currency, \
+         merchandise_exponent, content_hash, issued_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
          RETURNING id, order_id, payment_id, issuer_pubky, recipient_pubky, total_minor, \
-         currency, exponent, content_hash, issued_at",
+         currency, exponent, merchandise_total_minor, merchandise_currency, \
+         merchandise_exponent, content_hash, issued_at",
     )
     .bind(receipt_id)
     .bind(order.id)
@@ -349,6 +363,9 @@ pub(crate) async fn confirm_order(
     .bind(&order.seller_pubky)
     .bind(&order.buyer_pubky)
     .bind(receipt_total)
+    .bind(receipt_currency)
+    .bind(receipt_exponent)
+    .bind(order.total_minor)
     .bind(&order.currency)
     .bind(order.exponent)
     .bind(&content_hash)

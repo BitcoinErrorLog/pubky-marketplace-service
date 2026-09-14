@@ -17,12 +17,23 @@ use crate::executor::insert_event;
 use crate::handlers::{
     fetch_listing, fetch_listing_for_update, insert_notification_intent, LISTING_COLUMNS,
 };
+use crate::homeserver::{
+    award_terms_from_bytes, AwardListingSnapshot, AwardVariantSnapshot, HomeserverListingClient,
+    HomeserverRawFetchOutcome,
+};
 use crate::model::{ListingRow, OfferRow, ReservationRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 pub const OFFER_COLUMNS: &str = "id, aggregate_id, listing_aggregate_id, buyer_pubky, \
      seller_pubky, revision, state, offered_by, amount_minor, currency, exponent, quantity, \
-     message, history, expires_at, created_at, updated_at";
+     message, history, expires_at, created_at, updated_at, variant_id, \
+     terms_listing_revision, terms_listing_record_sha256, terms_snapshot, award_id, \
+     accepted_at, award_expires_at, reservation_id, accepted_unit_price_minor, \
+     accepted_currency, accepted_exponent, accepted_quantity, accepted_listing_aggregate_id, \
+     accepted_listing_title, accepted_listing_revision, accepted_listing_record_sha256, \
+     accepted_variant_id, accepted_variant_sku, accepted_variant_options, accepted_shipping_minor, \
+     accepted_subtotal_minor, accepted_total_minor, accepted_fulfillment, converted_order_id, \
+     converted_at, expiry_reason";
 
 /// Acceptance holds the inventory for 30 minutes, as in the prototype engine.
 const ACCEPTED_OFFER_HOLD_SECONDS: i64 = 30 * 60;
@@ -52,6 +63,7 @@ pub async fn create(
     actor: &str,
     command: &Command,
     payload: &OfferTermsPayload,
+    homeserver: Option<&dyn HomeserverListingClient>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(listing) = fetch_listing(tx, &command.aggregate_id).await? else {
@@ -96,6 +108,45 @@ pub async fn create(
         )));
     }
 
+    let terms = if let Some(homeserver) = homeserver {
+        match homeserver
+            .fetch_listing_raw(&listing.seller_pubky, &listing.listing_id)
+            .await
+        {
+            HomeserverRawFetchOutcome::Found(raw) => match award_terms_from_bytes(&raw) {
+                Ok(snapshot) => Some(snapshot),
+                Err(_) => {
+                    return Ok(Err(CommandFailure::new(
+                        ErrorCode::InvalidCommand,
+                        "The seller listing record cannot be used for this offer.",
+                    )));
+                }
+            },
+            HomeserverRawFetchOutcome::TooLarge => {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::InvalidCommand,
+                    "The seller listing record cannot be used for this offer.",
+                )));
+            }
+            HomeserverRawFetchOutcome::NotFound | HomeserverRawFetchOutcome::Unavailable => None,
+        }
+    } else {
+        None
+    };
+    let selected_variant = terms.as_ref().and_then(|snapshot| {
+        (snapshot.variants.len() == 1).then(|| snapshot.variants[0].id.clone())
+    });
+    let terms_snapshot = terms.as_ref().map(|snapshot| {
+        json!({
+            "revision": snapshot.revision,
+            "title": snapshot.title,
+            "currency": snapshot.currency,
+            "exponent": snapshot.exponent,
+            "shipping_minor": snapshot.shipping_minor,
+            "variant": selected_variant.clone(),
+        })
+    });
+
     let aggregate_id = ids::offer_aggregate_id(command.command_id);
     let expires_at = now + chrono::Duration::seconds(payload.expires_in_seconds);
     let amount_json = json!({
@@ -115,8 +166,10 @@ pub async fn create(
     let offer: OfferRow = sqlx::query_as(&format!(
         "INSERT INTO offers (id, aggregate_id, listing_aggregate_id, buyer_pubky, seller_pubky, \
          revision, state, offered_by, amount_minor, currency, exponent, quantity, message, \
-         history, expires_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, 1, 'pending', $4, $6, $7, $8, $9, $10, $11, $12, $13, $13) \
+         history, expires_at, created_at, updated_at, variant_id, terms_listing_revision, \
+         terms_listing_record_sha256, terms_snapshot) \
+         VALUES ($1, $2, $3, $4, $5, 1, 'pending', $4, $6, $7, $8, $9, $10, $11, $12, $13, $13, \
+                 $14, $15, $16, $17) \
          RETURNING {OFFER_COLUMNS}"
     ))
     .bind(command.command_id)
@@ -132,6 +185,10 @@ pub async fn create(
     .bind(&history)
     .bind(expires_at)
     .bind(now)
+    .bind(&selected_variant)
+    .bind(terms.as_ref().map(|snapshot| snapshot.revision))
+    .bind(terms.as_ref().map(|snapshot| snapshot.raw_sha256.clone()))
+    .bind(&terms_snapshot)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -171,6 +228,7 @@ pub async fn counter(
     actor: &str,
     command: &Command,
     payload: &CounterOfferPayload,
+    _homeserver: Option<&dyn HomeserverListingClient>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let offer =
@@ -279,13 +337,114 @@ pub async fn accept(
     actor: &str,
     command: &Command,
     payload: &OfferActionPayload,
+    homeserver: Option<&dyn HomeserverListingClient>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
+    let locator: Option<OfferRow> =
+        sqlx::query_as(&format!("SELECT {OFFER_COLUMNS} FROM offers WHERE id = $1"))
+            .bind(payload.offer_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(locator) = locator else {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::NotFound,
+            "The offer was not found.",
+        )));
+    };
+    let (snapshot, fetched_identity) = if let Some(homeserver) = homeserver {
+        let listing_id: Option<(String,)> =
+            sqlx::query_as("SELECT listing_id FROM listings WHERE aggregate_id = $1")
+                .bind(&locator.listing_aggregate_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let Some((listing_id,)) = listing_id else {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::NotFound,
+                "The offer listing is unavailable.",
+            )));
+        };
+        let raw = match homeserver
+            .fetch_listing_raw(&locator.seller_pubky, &listing_id)
+            .await
+        {
+            HomeserverRawFetchOutcome::Found(raw) => raw,
+            HomeserverRawFetchOutcome::TooLarge => {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::AwardListingChanged,
+                    "The listing snapshot does not match the offer terms.",
+                )));
+            }
+            HomeserverRawFetchOutcome::NotFound | HomeserverRawFetchOutcome::Unavailable => {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::InvalidState,
+                    "The seller listing record is unavailable.",
+                )));
+            }
+        };
+        let snapshot = match award_terms_from_bytes(&raw) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::InvalidCommand,
+                    "The seller listing record cannot be used for this offer.",
+                )));
+            }
+        };
+        (
+            snapshot,
+            Some((
+                locator.seller_pubky.clone(),
+                locator.listing_aggregate_id.clone(),
+                listing_id,
+            )),
+        )
+    } else {
+        (
+            AwardListingSnapshot {
+                raw_sha256: locator
+                    .terms_listing_record_sha256
+                    .clone()
+                    .unwrap_or_else(|| locator.listing_aggregate_id.clone()),
+                revision: locator.terms_listing_revision.unwrap_or(1),
+                title: "Marketplace item".to_string(),
+                currency: locator.currency.clone(),
+                exponent: locator.exponent,
+                shipping_minor: 0,
+                variants: vec![AwardVariantSnapshot {
+                    id: locator
+                        .variant_id
+                        .clone()
+                        .unwrap_or_else(|| locator.listing_aggregate_id.clone()),
+                    sku: None,
+                    options: Value::Array(vec![]),
+                    quantity: locator.quantity,
+                    price: None,
+                }],
+            },
+            None,
+        )
+    };
     let offer =
         match actionable_offer(tx, actor, payload.offer_id, &command.aggregate_id, now).await? {
             Ok(offer) => offer,
             Err(failure) => return Ok(Err(failure)),
         };
+    if let Some((fetched_seller, fetched_aggregate, fetched_listing_id)) = fetched_identity {
+        let current_listing = fetch_listing(tx, &offer.listing_aggregate_id).await?;
+        if offer.seller_pubky != fetched_seller
+            || offer.listing_aggregate_id != fetched_aggregate
+            || current_listing.as_ref().is_none_or(|listing| {
+                listing.seller_pubky != fetched_seller
+                    || listing.listing_id != fetched_listing_id
+                    || listing.aggregate_id != fetched_aggregate
+            })
+        {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::AwardListingChanged,
+                "The listing snapshot does not match the offer terms.",
+            )));
+        }
+    }
     if command.expected_revision != offer.revision {
         return Ok(Err(CommandFailure::with_revision(
             ErrorCode::RevisionConflict,
@@ -297,6 +456,44 @@ pub async fn accept(
         return Ok(Err(CommandFailure::new(
             ErrorCode::Unauthorized,
             "The current offer author cannot accept their own terms.",
+        )));
+    }
+    if offer
+        .terms_listing_record_sha256
+        .as_deref()
+        .is_some_and(|hash| hash != snapshot.raw_sha256)
+        || offer
+            .terms_listing_revision
+            .is_some_and(|revision| revision != snapshot.revision)
+    {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::AwardListingChanged,
+            "The listing snapshot does not match the offer terms.",
+        )));
+    }
+    let variant = if let Some(variant_id) = offer.variant_id.as_deref() {
+        snapshot
+            .variants
+            .iter()
+            .find(|variant| variant.id == variant_id)
+    } else if snapshot.variants.len() == 1 {
+        snapshot.variants.first()
+    } else {
+        None
+    };
+    let Some(variant) = variant else {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::AwardVariantMismatch,
+            "The checkout variant does not match the accepted offer.",
+        )));
+    };
+    if variant.quantity < offer.quantity
+        || snapshot.currency != offer.currency
+        || snapshot.exponent != offer.exponent
+    {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidCommand,
+            "Offer amount must use the listing asset and exponent.",
         )));
     }
     let Some(listing) = fetch_listing_for_update(tx, &offer.listing_aggregate_id).await? else {
@@ -312,8 +509,6 @@ pub async fn accept(
             offer.revision,
         )));
     }
-
-    let accepted = finish_offer(tx, &offer, actor, "accepted", now).await?;
 
     let new_listing_state = if listing.available_quantity == offer.quantity {
         "reserved"
@@ -343,9 +538,11 @@ pub async fn accept(
     .await?;
 
     let expires_at = now + chrono::Duration::seconds(ACCEPTED_OFFER_HOLD_SECONDS);
+    let award_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO reservations (id, listing_aggregate_id, buyer_pubky, quantity, status, \
-         expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, 'active', $5, $6, $6)",
+         expires_at, created_at, updated_at, offer_award_id) \
+         VALUES ($1, $2, $3, $4, 'active', $5, $6, $6, $7)",
     )
     .bind(command.command_id)
     .bind(&listing.aggregate_id)
@@ -353,6 +550,7 @@ pub async fn accept(
     .bind(offer.quantity)
     .bind(expires_at)
     .bind(now)
+    .bind(award_id)
     .execute(&mut **tx)
     .await?;
     let reservation = ReservationRow {
@@ -364,6 +562,58 @@ pub async fn accept(
         expires_at,
         created_at: now,
     };
+
+    let accepted: OfferRow = sqlx::query_as(&format!(
+        "UPDATE offers SET revision = $2, state = 'accepted', updated_at = $3,
+         award_id = $4, accepted_at = $3, award_expires_at = $5, reservation_id = $6,
+         accepted_unit_price_minor = amount_minor, accepted_currency = currency,
+         accepted_exponent = exponent, accepted_quantity = quantity,
+         accepted_listing_aggregate_id = listing_aggregate_id,
+         accepted_listing_title = $7, accepted_listing_revision = $8,
+         accepted_listing_record_sha256 = $9, accepted_variant_id = $10,
+         accepted_variant_sku = $11, accepted_variant_options = $12, accepted_shipping_minor = $13,
+         accepted_subtotal_minor = $14, accepted_total_minor = $15,
+         accepted_fulfillment = 'shipping',
+         history = history || $16::jsonb
+         WHERE id = $1 RETURNING {OFFER_COLUMNS}"
+    ))
+    .bind(offer.id)
+    .bind(offer.revision + 1)
+    .bind(now)
+    .bind(award_id)
+    .bind(expires_at)
+    .bind(command.command_id)
+    .bind(&snapshot.title)
+    .bind(snapshot.revision)
+    .bind(&snapshot.raw_sha256)
+    .bind(&variant.id)
+    .bind(variant.sku.as_deref())
+    .bind(&variant.options)
+    .bind(snapshot.shipping_minor)
+    .bind(
+        offer
+            .amount_minor
+            .checked_mul(offer.quantity)
+            .ok_or_else(|| sqlx::Error::Protocol("offer amount overflow".to_string()))?,
+    )
+    .bind(
+        offer
+            .amount_minor
+            .checked_mul(offer.quantity)
+            .and_then(|subtotal| subtotal.checked_add(snapshot.shipping_minor))
+            .ok_or_else(|| sqlx::Error::Protocol("offer total overflow".to_string()))?,
+    )
+    .bind(json!([history_entry(
+        offer.revision + 1,
+        actor,
+        "accepted",
+        &offer.amount_json(),
+        offer.quantity,
+        "",
+        now,
+    )]))
+    .fetch_one(&mut **tx)
+    .await?;
 
     let offer_event_id = insert_event(
         tx,

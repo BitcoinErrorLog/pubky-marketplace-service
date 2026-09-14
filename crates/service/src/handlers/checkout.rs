@@ -329,6 +329,8 @@ pub async fn handle(
             first_revealed_at: None,
             created_at: now,
             updated_at: now,
+            offer_award_id: None,
+            priced_from: "listing".to_string(),
         };
         sqlx::query(
             "INSERT INTO orders (id, checkout_command_id, drop_aggregate_id, buyer_pubky, \
@@ -374,6 +376,9 @@ pub async fn handle(
             amount_minor: total_minor,
             currency: currency.clone(),
             exponent,
+            merchandise_amount_minor: Some(total_minor),
+            merchandise_currency: Some(currency.clone()),
+            merchandise_exponent: Some(exponent),
             manual_review_entered_at: None,
             manual_review_sla_alerted_at: None,
             resolution_id: None,

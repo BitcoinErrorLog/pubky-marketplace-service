@@ -63,6 +63,7 @@ pub enum CommandPayload {
     CreateOffer(OfferTermsPayload),
     CounterOffer(CounterOfferPayload),
     AcceptOffer(OfferActionPayload),
+    OfferCheckout(OfferCheckoutPayload),
     RejectOffer(OfferActionPayload),
     WithdrawOffer(OfferActionPayload),
     PlaceBid(PlaceBidPayload),
@@ -99,6 +100,7 @@ impl Command {
             CommandPayload::CreateOffer(_) => "offer.create",
             CommandPayload::CounterOffer(_) => "offer.counter",
             CommandPayload::AcceptOffer(_) => "offer.accept",
+            CommandPayload::OfferCheckout(_) => "offer.checkout",
             CommandPayload::RejectOffer(_) => "offer.reject",
             CommandPayload::WithdrawOffer(_) => "offer.withdraw",
             CommandPayload::PlaceBid(_) => "auction.place_bid",
@@ -140,6 +142,7 @@ impl Command {
             CommandPayload::AcceptOffer(p)
             | CommandPayload::RejectOffer(p)
             | CommandPayload::WithdrawOffer(p) => serde_json::to_value(p),
+            CommandPayload::OfferCheckout(p) => serde_json::to_value(p),
             CommandPayload::PlaceBid(p) => serde_json::to_value(p),
             CommandPayload::CloseAuction(p) => serde_json::to_value(p),
             CommandPayload::AdvanceSandboxPayment(p) => serde_json::to_value(p),
@@ -412,6 +415,21 @@ pub struct CounterOfferPayload {
 #[serde(deny_unknown_fields)]
 pub struct OfferActionPayload {
     pub offer_id: Uuid,
+}
+
+/// Buyer-only conversion of an accepted offer award into one order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfferCheckoutPayload {
+    pub offer_id: Uuid,
+    pub award_id: Uuid,
+    pub listing_aggregate_id: String,
+    pub listing_revision: i64,
+    pub listing_record_sha256: String,
+    pub variant_id: String,
+    pub quantity: i64,
+    pub delivery_address: DeliveryAddress,
+    pub guarantee_policy_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -795,6 +813,7 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         "offer.create" => parse_payload(&envelope.payload).and_then(validate_create_offer)?,
         "offer.counter" => parse_payload(&envelope.payload).and_then(validate_counter_offer)?,
         "offer.accept" => parse_payload(&envelope.payload).map(CommandPayload::AcceptOffer)?,
+        "offer.checkout" => parse_payload(&envelope.payload).and_then(validate_offer_checkout)?,
         "offer.reject" => parse_payload(&envelope.payload).map(CommandPayload::RejectOffer)?,
         "offer.withdraw" => parse_payload(&envelope.payload).map(CommandPayload::WithdrawOffer)?,
         "auction.place_bid" => parse_payload(&envelope.payload).and_then(validate_place_bid)?,
@@ -1172,6 +1191,58 @@ fn validate_counter_offer(
     );
     if issues.is_empty() {
         Ok(CommandPayload::CounterOffer(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_offer_checkout(
+    mut payload: OfferCheckoutPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if !aggregate_id_regex().is_match(&payload.listing_aggregate_id) {
+        issues.push(issue(
+            "payload.listing_aggregate_id",
+            "Expected type:identifier aggregate format",
+        ));
+    }
+    if !(1..=MAX_SAFE_INTEGER).contains(&payload.listing_revision) {
+        issues.push(issue(
+            "payload.listing_revision",
+            "Expected a positive listing revision",
+        ));
+    }
+    if !content_hash_regex().is_match(&payload.listing_record_sha256) {
+        issues.push(issue(
+            "payload.listing_record_sha256",
+            "Expected a 64-character lowercase hex hash",
+        ));
+    }
+    if !entity_id_regex().is_match(&payload.variant_id) {
+        issues.push(issue(
+            "payload.variant_id",
+            "Expected a path-safe commerce identifier",
+        ));
+    }
+    if !(1..=1_000_000).contains(&payload.quantity) {
+        issues.push(issue(
+            "payload.quantity",
+            "Expected a quantity between 1 and 1000000",
+        ));
+    }
+    validate_delivery_address(
+        "payload.delivery_address",
+        &mut payload.delivery_address,
+        &mut issues,
+    );
+    if payload.guarantee_policy_version != 1 {
+        issues.push(issue(
+            "payload.guarantee_policy_version",
+            "Expected guarantee policy version 1",
+        ));
+    }
+    if issues.is_empty() {
+        Ok(CommandPayload::OfferCheckout(payload))
     } else {
         Err(issues)
     }
