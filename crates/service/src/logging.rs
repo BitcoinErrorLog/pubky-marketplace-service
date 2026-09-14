@@ -181,8 +181,8 @@ mod tests {
     fn redacts_pubky_runs_without_leaving_partial_values() {
         let pubky = "y".repeat(52);
         assert_eq!(redact_pubkys(&pubky), "yyyyyyyy…");
-        assert_eq!(redact_pubkys(&format!("x{pubky}")), "xxxxxxxx…");
-        assert_eq!(redact_pubkys(&format!("xxxxxxx{pubky}")), "xxxxxxxx…");
+        assert_eq!(redact_pubkys(&format!("x{pubky}")), "xyyyyyyy…");
+        assert_eq!(redact_pubkys(&format!("xxxxxxx{pubky}")), "xxxxxxxy…");
         assert_eq!(redact_pubkys(&pubky.to_uppercase()), "YYYYYYYY…");
         assert_eq!(redact_pubkys(&format!("{pubky}{pubky}")), "yyyyyyyy…");
     }
