@@ -75,6 +75,16 @@ pub struct AwardListingSnapshot {
 /// seller record bytes. Unknown display fields remain forward-compatible;
 /// malformed money, variants, or shipping are rejected.
 pub fn award_terms_from_bytes(bytes: &[u8]) -> Result<AwardListingSnapshot, &'static str> {
+    award_terms_from_bytes_for_variant(bytes, None)
+}
+
+/// Extracts award terms while validating only the variant consumed by the
+/// offer. When no variant has been selected yet, all enabled variants are
+/// retained so the caller can resolve a sole enabled variant.
+pub fn award_terms_from_bytes_for_variant(
+    bytes: &[u8],
+    selected_variant_id: Option<&str>,
+) -> Result<AwardListingSnapshot, &'static str> {
     if bytes.len() > MAX_AWARD_LISTING_BYTES {
         return Err("record exceeds size limit");
     }
@@ -128,15 +138,30 @@ pub fn award_terms_from_bytes(bytes: &[u8]) -> Result<AwardListingSnapshot, &'st
         })
     };
     let unit = money(sale.get("unitPrice").ok_or("missing unit price")?)?;
-    let variants = object
+    let raw_variants = object
         .get("variants")
         .and_then(Value::as_array)
-        .ok_or("missing variants")?
+        .ok_or("missing variants")?;
+    if let Some(selected_variant_id) = selected_variant_id {
+        let selected = raw_variants
+            .iter()
+            .find(|variant| variant.get("id").and_then(Value::as_str) == Some(selected_variant_id))
+            .ok_or("selected variant missing")?;
+        if selected.get("enabled").and_then(Value::as_bool) != Some(true) {
+            return Err("selected variant disabled");
+        }
+    }
+    let variants = raw_variants
         .iter()
+        .filter(|variant| {
+            variant.get("enabled").and_then(Value::as_bool) == Some(true)
+                && (selected_variant_id.is_none()
+                    || variant.get("id").and_then(Value::as_str) == selected_variant_id)
+        })
         .map(|variant| {
             let object = variant.as_object().ok_or("invalid variant")?;
             if object.get("enabled").and_then(Value::as_bool) != Some(true) {
-                return Err("invalid enabled variant");
+                return Err("selected variant disabled");
             }
             let id = object
                 .get("id")

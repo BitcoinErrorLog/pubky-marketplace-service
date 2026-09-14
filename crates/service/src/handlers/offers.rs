@@ -18,8 +18,8 @@ use crate::handlers::{
     fetch_listing, fetch_listing_for_update, insert_notification_intent, LISTING_COLUMNS,
 };
 use crate::homeserver::{
-    award_terms_from_bytes, AwardListingSnapshot, AwardVariantSnapshot, HomeserverListingClient,
-    HomeserverRawFetchOutcome,
+    award_terms_from_bytes, award_terms_from_bytes_for_variant, AwardListingSnapshot,
+    AwardVariantSnapshot, HomeserverListingClient, HomeserverRawFetchOutcome,
 };
 use crate::model::{ListingRow, OfferRow, ReservationRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
@@ -258,15 +258,17 @@ pub async fn counter(
             .fetch_listing_raw(&locator.seller_pubky, &listing_id)
             .await
         {
-            HomeserverRawFetchOutcome::Found(raw) => match award_terms_from_bytes(&raw) {
-                Ok(snapshot) => Some(snapshot),
-                Err(_) => {
-                    return Ok(Err(CommandFailure::new(
-                        ErrorCode::AwardListingChanged,
-                        "The listing snapshot does not match the offer terms.",
-                    )));
+            HomeserverRawFetchOutcome::Found(raw) => {
+                match award_terms_from_bytes_for_variant(&raw, locator.variant_id.as_deref()) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(_) => {
+                        return Ok(Err(CommandFailure::new(
+                            ErrorCode::AwardListingChanged,
+                            "The listing snapshot does not match the offer terms.",
+                        )));
+                    }
                 }
-            },
+            }
             HomeserverRawFetchOutcome::TooLarge => {
                 return Ok(Err(CommandFailure::new(
                     ErrorCode::AwardListingChanged,
@@ -490,7 +492,8 @@ pub async fn accept(
                 )));
             }
         };
-        let snapshot = match award_terms_from_bytes(&raw) {
+        let snapshot = match award_terms_from_bytes_for_variant(&raw, locator.variant_id.as_deref())
+        {
             Ok(snapshot) => snapshot,
             Err(_) => {
                 return Ok(Err(CommandFailure::new(

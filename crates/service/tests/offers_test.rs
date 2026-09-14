@@ -15,7 +15,7 @@ use marketplace_service::homeserver::{
     HomeserverFetchOutcome, HomeserverListingClient, HomeserverRawFetchOutcome,
 };
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 
 use common::{
     config_durable, count, counter_offer_command, create_offer_command, execute, listing_aggregate,
@@ -928,6 +928,85 @@ async fn concurrent_checkout_and_expiry_paths_complete_without_deadlock(pool: Pg
 }
 
 #[sqlx::test]
+async fn award_expiry_retries_after_a_real_postgres_deadlock(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (offer_id, _award_id, _listing, _revision, _hash, _quantity) =
+        accepted_offer_fixture(&app, &seller, &buyer).await;
+    app.clock.advance_seconds(1_801);
+    let now = app.clock.now();
+    let offer_uuid = uuid::Uuid::parse_str(&offer_id).expect("offer id");
+    let reservation_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT reservation_id FROM offers WHERE id = $1")
+            .bind(offer_uuid)
+            .fetch_one(&app.pool)
+            .await
+            .expect("reservation id");
+
+    let options = app.pool.connect_options().clone();
+    let mut offer_holder = PgConnection::connect_with(&options)
+        .await
+        .expect("offer connection");
+    let mut reservation_holder = PgConnection::connect_with(&options)
+        .await
+        .expect("reservation connection");
+    sqlx::query("BEGIN")
+        .execute(&mut offer_holder)
+        .await
+        .expect("offer transaction");
+    sqlx::query("BEGIN")
+        .execute(&mut reservation_holder)
+        .await
+        .expect("reservation transaction");
+    sqlx::query("SELECT id FROM offers WHERE id = $1 FOR UPDATE")
+        .bind(offer_uuid)
+        .execute(&mut offer_holder)
+        .await
+        .expect("hold offer lock");
+    sqlx::query("SELECT id FROM reservations WHERE id = $1 FOR UPDATE")
+        .bind(reservation_id)
+        .execute(&mut reservation_holder)
+        .await
+        .expect("hold reservation lock");
+
+    let (offer_wait, reservation_wait) = tokio::join!(
+        sqlx::query("SELECT id FROM reservations WHERE id = $1 FOR UPDATE")
+            .bind(reservation_id)
+            .execute(&mut offer_holder),
+        sqlx::query("SELECT id FROM offers WHERE id = $1 FOR UPDATE")
+            .bind(offer_uuid)
+            .execute(&mut reservation_holder),
+    );
+    let deadlock = match (offer_wait, reservation_wait) {
+        (Err(error), _) | (_, Err(error)) => error,
+        (Ok(_), Ok(_)) => panic!("opposite lock order must produce a deadlock"),
+    };
+    assert_eq!(
+        deadlock
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("40P01")
+    );
+    let _ = sqlx::query("ROLLBACK").execute(&mut offer_holder).await;
+    let _ = sqlx::query("ROLLBACK")
+        .execute(&mut reservation_holder)
+        .await;
+
+    let expired = marketplace_service::workers::expire_due_offers(&app.pool, now)
+        .await
+        .expect("fresh expiry transaction succeeds after deadlock");
+    assert_eq!(expired, 1, "fresh expiry transaction completes after retry");
+    let state: String = sqlx::query_scalar("SELECT state FROM offers WHERE id = $1")
+        .bind(offer_uuid)
+        .fetch_one(&app.pool)
+        .await
+        .expect("offer state");
+    assert_eq!(state, "expired");
+}
+
+#[sqlx::test]
 async fn changed_listing_snapshot_between_fetch_and_offer_lock_is_refused(pool: PgPool) {
     let source = Arc::new(MutatingListingSnapshotSource::new(
         pool.clone(),
@@ -982,7 +1061,10 @@ async fn raw_listing_snapshot_bounds_and_money_shape_are_refused(pool: PgPool) {
             "format": "fixed_price",
             "unitPrice": {"amountMinor": 1000, "currency": "USD", "exponent": 2}
         },
-        "variants": [{"id": "boots_01", "enabled": true, "quantity": 1}],
+        "variants": [
+            {"id": "boots_01", "enabled": true, "quantity": 1},
+            {"enabled": false, "quantity": "not-a-number"}
+        ],
         "shippingOptions": [{"pricing": "free"}]
     });
     homeserver.put_record(&seller.pubky, "boots_01", valid.clone());
@@ -1139,6 +1221,26 @@ async fn raw_listing_snapshot_bounds_and_money_shape_are_refused(pool: PgPool) {
             "{command_id}: {body}"
         );
     }
+    homeserver.put_record(&seller.pubky, "boots_01", valid);
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &json!({
+            "version": 1,
+            "command_id": "00000000-0000-4000-8000-000000001127",
+            "aggregate_id": "offer:00000000-0000-4000-8000-000000001115",
+            "expected_revision": 1,
+            "issued_at": "2026-08-19T22:00:00.000Z",
+            "kind": "offer.accept",
+            "payload": {"offer_id": "00000000-0000-4000-8000-000000001115"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "disabled sibling must be ignored: {body}"
+    );
 }
 
 #[sqlx::test]
