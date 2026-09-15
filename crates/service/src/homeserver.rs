@@ -21,7 +21,8 @@ use marketplace_domain::commands::{AuctionTerms, RegisterListingPayload, SaleFor
 use marketplace_domain::money::Money;
 use marketplace_domain::ValidationIssue;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 /// Environment variable naming the homeserver base URL used to fetch
 /// canonical seller-signed listing records. Required: the service refuses to
@@ -29,6 +30,7 @@ use serde_json::Value;
 pub const ENV_HOMESERVER_URL: &str = "HOMESERVER_URL";
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_AWARD_LISTING_BYTES: usize = 1024 * 1024;
 
 /// One listing-record fetch result. Transport failures, non-2xx responses
 /// other than a definitive 404, and non-JSON bodies are `Unavailable`
@@ -41,6 +43,253 @@ pub enum HomeserverFetchOutcome {
     Unavailable,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum HomeserverRawFetchOutcome {
+    Found(Vec<u8>),
+    NotFound,
+    TooLarge,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AwardVariantSnapshot {
+    pub id: String,
+    pub sku: Option<String>,
+    pub options: Value,
+    pub quantity: i64,
+    pub price: Option<Money>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AwardListingSnapshot {
+    pub raw_sha256: String,
+    pub revision: i64,
+    pub title: String,
+    pub currency: String,
+    pub exponent: i32,
+    pub shipping_minor: i64,
+    pub variants: Vec<AwardVariantSnapshot>,
+}
+
+/// Extracts only the authority-bearing fixed-price terms from the exact
+/// seller record bytes. Unknown display fields remain forward-compatible;
+/// malformed money, variants, or shipping are rejected.
+pub fn award_terms_from_bytes(bytes: &[u8]) -> Result<AwardListingSnapshot, &'static str> {
+    award_terms_from_bytes_for_variant(bytes, None)
+}
+
+/// Extracts award terms while validating only the variant consumed by the
+/// offer. When no variant has been selected yet, all enabled variants are
+/// retained so the caller can resolve a sole enabled variant.
+pub fn award_terms_from_bytes_for_variant(
+    bytes: &[u8],
+    selected_variant_id: Option<&str>,
+) -> Result<AwardListingSnapshot, &'static str> {
+    if bytes.len() > MAX_AWARD_LISTING_BYTES {
+        return Err("record exceeds size limit");
+    }
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| "record is not JSON")?;
+    let object = value.as_object().ok_or("record is not an object")?;
+    let revision = object
+        .get("revision")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or("invalid revision")?;
+    let title = object
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Marketplace item")
+        .to_string();
+    let sale = object
+        .get("sale")
+        .and_then(Value::as_object)
+        .ok_or("missing sale")?;
+    if sale.get("format").and_then(Value::as_str) != Some("fixed_price") {
+        return Err("offer requires fixed-price listing");
+    }
+    let money = |value: &Value| -> Result<Money, &'static str> {
+        let object = value.as_object().ok_or("invalid money")?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "amountMinor" | "currency" | "exponent"))
+        {
+            return Err("unknown money shape");
+        }
+        let amount = object
+            .get("amountMinor")
+            .and_then(Value::as_i64)
+            .ok_or("invalid money amount")?;
+        let currency = object
+            .get("currency")
+            .and_then(Value::as_str)
+            .ok_or("invalid money currency")?;
+        let exponent = object
+            .get("exponent")
+            .and_then(Value::as_i64)
+            .ok_or("invalid money exponent")?;
+        if amount <= 0 || !(0..=18).contains(&exponent) || currency.is_empty() {
+            return Err("invalid money");
+        }
+        Ok(Money {
+            amount_minor: amount,
+            currency: currency.to_string(),
+            exponent: exponent as i32,
+        })
+    };
+    let unit = money(sale.get("unitPrice").ok_or("missing unit price")?)?;
+    let raw_variants = object
+        .get("variants")
+        .and_then(Value::as_array)
+        .ok_or("missing variants")?;
+    if let Some(selected_variant_id) = selected_variant_id {
+        let selected = raw_variants
+            .iter()
+            .find(|variant| variant.get("id").and_then(Value::as_str) == Some(selected_variant_id))
+            .ok_or("selected variant missing")?;
+        if selected.get("enabled").and_then(Value::as_bool) != Some(true) {
+            return Err("selected variant disabled");
+        }
+    }
+    let variants = raw_variants
+        .iter()
+        .filter(|variant| {
+            variant.get("enabled").and_then(Value::as_bool) == Some(true)
+                && (selected_variant_id.is_none()
+                    || variant.get("id").and_then(Value::as_str) == selected_variant_id)
+        })
+        .map(|variant| {
+            let object = variant.as_object().ok_or("invalid variant")?;
+            if object.get("enabled").and_then(Value::as_bool) != Some(true) {
+                return Err("selected variant disabled");
+            }
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or("invalid variant id")?
+                .to_string();
+            let quantity = object
+                .get("quantity")
+                .and_then(Value::as_i64)
+                .filter(|quantity| *quantity > 0)
+                .ok_or("invalid variant quantity")?;
+            let mut options = object
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .map(|option| {
+                            let object = option.as_object().ok_or("invalid variant option")?;
+                            let name = object
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .filter(|value| !value.is_empty())
+                                .ok_or("invalid variant option name")?;
+                            let value = object
+                                .get("value")
+                                .and_then(Value::as_str)
+                                .filter(|value| !value.is_empty())
+                                .ok_or("invalid variant option value")?;
+                            Ok(json!({"name": name, "value": value}))
+                        })
+                        .collect::<Result<Vec<_>, &'static str>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            options.sort_by(|left, right| {
+                left["name"]
+                    .as_str()
+                    .cmp(&right["name"].as_str())
+                    .then_with(|| left["value"].as_str().cmp(&right["value"].as_str()))
+            });
+            if options.len() > 100 {
+                return Err("too many variant options");
+            }
+            let sku = match object.get("sku") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .filter(|sku| !sku.is_empty())
+                        .ok_or("invalid variant sku")?
+                        .to_string(),
+                ),
+            };
+            let price = match object.get("priceOverride") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(money(value)?),
+            };
+            Ok(AwardVariantSnapshot {
+                id,
+                sku,
+                options: Value::Array(options),
+                quantity,
+                price,
+            })
+        })
+        .collect::<Result<Vec<_>, &'static str>>()?;
+    if variants.is_empty()
+        || variants
+            .iter()
+            .map(|variant| &variant.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != variants.len()
+    {
+        return Err("invalid enabled variants");
+    }
+    if variants.iter().any(|variant| {
+        variant
+            .price
+            .as_ref()
+            .is_some_and(|price| price.currency != unit.currency || price.exponent != unit.exponent)
+    }) {
+        return Err("variant money mismatch");
+    }
+    let shipping_minor = match object.get("shippingOptions") {
+        None => 0,
+        Some(value) => {
+            let options = value.as_array().ok_or("invalid shipping options")?;
+            if options.is_empty() {
+                return Err("unpriceable shipping");
+            }
+            options
+                .iter()
+                .map(|option| {
+                    let object = option.as_object().ok_or("invalid shipping option")?;
+                    match object.get("pricing").and_then(Value::as_str) {
+                        Some("free") => Ok(0),
+                        Some("flat") => {
+                            let price =
+                                money(object.get("price").ok_or("missing shipping price")?)?;
+                            if price.currency != unit.currency || price.exponent != unit.exponent {
+                                return Err("shipping money mismatch");
+                            }
+                            Ok(price.amount_minor)
+                        }
+                        _ => Err("unpriceable shipping"),
+                    }
+                })
+                .collect::<Result<Vec<_>, &'static str>>()?
+                .into_iter()
+                .min()
+                .ok_or("unpriceable shipping")?
+        }
+    };
+    let raw_sha256 = hex::encode(Sha256::digest(bytes));
+    Ok(AwardListingSnapshot {
+        raw_sha256,
+        revision,
+        title,
+        currency: unit.currency,
+        exponent: unit.exponent,
+        shipping_minor,
+        variants,
+    })
+}
+
 /// The homeserver record fetch (listings and drops). The trait exists so
 /// integration tests can stand in a local listener; production only ever
 /// constructs [`HttpHomeserverClient`].
@@ -50,6 +299,34 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
         seller_pubky: &'a str,
         listing_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>>;
+
+    fn fetch_listing_bytes<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move { self.fetch_listing(seller_pubky, listing_id).await })
+    }
+
+    fn fetch_listing_raw<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverRawFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            match self.fetch_listing(seller_pubky, listing_id).await {
+                HomeserverFetchOutcome::Found(value) => match serde_json::to_vec(&value) {
+                    Ok(raw) if raw.len() <= MAX_AWARD_LISTING_BYTES => {
+                        HomeserverRawFetchOutcome::Found(raw)
+                    }
+                    Ok(_) => HomeserverRawFetchOutcome::TooLarge,
+                    Err(_) => HomeserverRawFetchOutcome::Unavailable,
+                },
+                HomeserverFetchOutcome::NotFound => HomeserverRawFetchOutcome::NotFound,
+                HomeserverFetchOutcome::Unavailable => HomeserverRawFetchOutcome::Unavailable,
+            }
+        })
+    }
 
     /// Fetches the seller-signed drop record at
     /// `/pub/pubky.app/marketplace/v1/drops/{drop_id}` — the same path
@@ -111,6 +388,36 @@ impl HttpHomeserverClient {
             }
         }
     }
+
+    async fn fetch_inner_bytes(&self, seller_pubky: &str, path: &str) -> HomeserverFetchOutcome {
+        const MAX_RECORD_BYTES: usize = 1024 * 1024;
+        let response = match self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .header("pubky-host", seller_pubky)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return HomeserverFetchOutcome::Unavailable,
+        };
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return HomeserverFetchOutcome::NotFound;
+        }
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > MAX_RECORD_BYTES as u64)
+        {
+            return HomeserverFetchOutcome::Unavailable;
+        }
+        match response.bytes().await {
+            Ok(bytes) if bytes.len() <= MAX_RECORD_BYTES => serde_json::from_slice(&bytes)
+                .map(HomeserverFetchOutcome::Found)
+                .unwrap_or(HomeserverFetchOutcome::Unavailable),
+            _ => HomeserverFetchOutcome::Unavailable,
+        }
+    }
 }
 
 impl HomeserverListingClient for HttpHomeserverClient {
@@ -125,6 +432,78 @@ impl HomeserverListingClient for HttpHomeserverClient {
                 &format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}"),
             )
             .await
+        })
+    }
+
+    fn fetch_listing_bytes<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.fetch_inner_bytes(
+                seller_pubky,
+                &format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}"),
+            )
+            .await
+        })
+    }
+
+    fn fetch_listing_raw<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverRawFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let mut response = match self
+                .http
+                .get(format!(
+                    "{}/pub/pubky.app/marketplace/v1/listings/{listing_id}",
+                    self.base_url
+                ))
+                .header("pubky-host", seller_pubky)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => return HomeserverRawFetchOutcome::Unavailable,
+            };
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return HomeserverRawFetchOutcome::NotFound;
+            }
+            if !response.status().is_success()
+                || response
+                    .content_length()
+                    .is_some_and(|length| length > MAX_AWARD_LISTING_BYTES as u64)
+            {
+                return if response.status().is_success() {
+                    HomeserverRawFetchOutcome::TooLarge
+                } else {
+                    HomeserverRawFetchOutcome::Unavailable
+                };
+            }
+
+            let mut raw = Vec::with_capacity(
+                response
+                    .content_length()
+                    .unwrap_or_default()
+                    .min(MAX_AWARD_LISTING_BYTES as u64) as usize,
+            );
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        let Some(next_len) = raw.len().checked_add(chunk.len()) else {
+                            return HomeserverRawFetchOutcome::TooLarge;
+                        };
+                        if next_len > MAX_AWARD_LISTING_BYTES {
+                            return HomeserverRawFetchOutcome::TooLarge;
+                        }
+                        raw.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => return HomeserverRawFetchOutcome::Found(raw),
+                    Err(_) => return HomeserverRawFetchOutcome::Unavailable,
+                }
+            }
         })
     }
 

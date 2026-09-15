@@ -6,6 +6,7 @@ pub mod drops;
 pub mod fulfillment;
 pub mod holds;
 pub mod locks;
+pub mod offer_checkout;
 pub mod offers;
 pub mod payment;
 pub mod pickup;

@@ -53,6 +53,7 @@ pub const SELLER_STATS_TYP: &str = "pubky-seller-stats+v1";
 /// record published on their own homeserver, verifiable against the
 /// attestor pubky alone after this operator disappears.
 pub const RECEIPT_ATTESTATION_TYP: &str = "pubky-order-receipt+v1";
+pub const RECEIPT_ATTESTATION_V2_TYP: &str = "pubky-order-receipt+v2";
 /// JOSE `typ` of a v1 drop edition attestation (ADR-0026 layer 2): the
 /// compact JWS attesting which numbered edition of a drop a paid order
 /// received, verifiable against the attestor pubky alone.
@@ -101,6 +102,20 @@ struct ReceiptAttestationClaims {
     iat: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ReceiptAttestationClaimsV2 {
+    v: i64,
+    iss: String,
+    buyer: String,
+    seller: String,
+    order: String,
+    receipt: String,
+    settlement_total: Value,
+    merchandise_total: Value,
+    paid_at: String,
+    iat: i64,
+}
+
 /// A freshly issued drop edition attestation: the compact JWS plus its
 /// claims. Like the receipt attestation, never stored — every claim derives
 /// from stored rows, so re-issuance is deterministic.
@@ -128,6 +143,33 @@ struct DropEditionAttestationClaims {
 }
 
 impl Attestor {
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_receipt_attestation_v2(
+        &self,
+        order_id: Uuid,
+        receipt_id: Uuid,
+        buyer_pubky: &str,
+        seller_pubky: &str,
+        settlement_total: Value,
+        merchandise_total: Value,
+        paid_at: DateTime<Utc>,
+    ) -> IssuedReceiptAttestation {
+        let claims = ReceiptAttestationClaimsV2 {
+            v: 2,
+            iss: self.pubky.clone(),
+            buyer: buyer_pubky.to_string(),
+            seller: seller_pubky.to_string(),
+            order: order_id.to_string(),
+            receipt: receipt_id.to_string(),
+            settlement_total,
+            merchandise_total,
+            paid_at: format_timestamp(paid_at),
+            iat: paid_at.timestamp(),
+        };
+        let claims = serde_json::to_value(claims).expect("claims serialize infallibly");
+        let jws = self.sign_compact(RECEIPT_ATTESTATION_V2_TYP, &claims);
+        IssuedReceiptAttestation { jws, claims }
+    }
     /// Builds the attestor from `ATTESTOR_SECRET_KEY` and
     /// `ATTESTOR_ORDER_SALT` (both 64 hex chars). Fail closed on partial
     /// configuration: either both are set or attestation support is off.
@@ -450,6 +492,50 @@ mod tests {
             )
         };
         let issued = issue();
+        if std::env::var_os("UPDATE_RECEIPT_SAMPLES").is_some() {
+            let write_sample = |name: &str, issued: IssuedReceiptAttestation| {
+                let sample = json!({
+                    "receipt_attestation": {
+                        "jws": issued.jws,
+                        "claims": issued.claims,
+                    },
+                    "attestor_pubky": attestor.pubky(),
+                });
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/samples")
+                    .join(format!("receipt-attestation-{name}.json"));
+                std::fs::write(
+                    path,
+                    serde_json::to_vec_pretty(&sample).expect("sample serializes"),
+                )
+                .expect("sample writes");
+            };
+            write_sample("v1", issued.clone());
+            write_sample(
+                "v2-bitcoin",
+                attestor.issue_receipt_attestation_v2(
+                    Uuid::parse_str("97c2ff18-cf54-4727-bbc4-4463df5c5084").unwrap(),
+                    Uuid::parse_str("de7fa583-bbc3-415d-96c6-d6a54a185221").unwrap(),
+                    "hnhabjbjbjjxzbcif7stmqi9p76qubombhsujfrgezkmfgqydm8o",
+                    "obh36yni5ctgxac4wwicubxj9hdksx5aqrmsqb8undokqqekhpfy",
+                    json!({"amount_minor": 51_637, "currency": "SAT", "exponent": 0}),
+                    json!({"amount_minor": 13_700, "currency": "USD", "exponent": 2}),
+                    paid_at,
+                ),
+            );
+            write_sample(
+                "v2-same-currency",
+                attestor.issue_receipt_attestation_v2(
+                    Uuid::parse_str("7bdd4ba2-ac6f-4370-a6ef-8edd469b28d2").unwrap(),
+                    Uuid::parse_str("e5752e58-9b32-40e8-86c3-2a80c908a955").unwrap(),
+                    "6m3819xgydzdrc1hihdj9r9k45zze5qjbzcs5mh98sp5abi9x87y",
+                    "ddkhtthrpa7m94apwy6437ddz47a61jpyq9n5zo8kdozqbu4phuy",
+                    json!({"amount_minor": 13_700, "currency": "USD", "exponent": 2}),
+                    json!({"amount_minor": 13_700, "currency": "USD", "exponent": 2}),
+                    paid_at,
+                ),
+            );
+        }
         // Deterministic: no `now` input, so re-issuance is byte-identical.
         assert_eq!(issued.jws, issue().jws);
 

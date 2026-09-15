@@ -150,6 +150,7 @@ pub fn offer_machine() -> AggregateMachine {
             "pending",
             "countered",
             "accepted",
+            "converted",
             "rejected",
             "withdrawn",
             "expired",
@@ -166,6 +167,8 @@ pub fn offer_machine() -> AggregateMachine {
             t("countered", "rejected", vec![Command("offer.reject")]),
             t("countered", "withdrawn", vec![Command("offer.withdraw")]),
             t("countered", "expired", vec![Server("offer_expiry")]),
+            t("accepted", "converted", vec![Command("offer.checkout")]),
+            t("accepted", "expired", vec![Server("award_expiry")]),
         ],
         commands: vec![
             "offer.create",
@@ -173,6 +176,7 @@ pub fn offer_machine() -> AggregateMachine {
             "offer.accept",
             "offer.reject",
             "offer.withdraw",
+            "offer.checkout",
         ],
         unreachable_states: vec![],
     }

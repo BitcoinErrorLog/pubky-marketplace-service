@@ -215,13 +215,53 @@ async fn dispatch(
             .await
         }
         CommandPayload::CreateOffer(payload) => {
-            crate::handlers::offers::create(tx, actor, command, payload, now).await
+            crate::handlers::offers::create(
+                tx,
+                actor,
+                command,
+                payload,
+                state.homeserver.as_deref(),
+                now,
+            )
+            .await
         }
         CommandPayload::CounterOffer(payload) => {
-            crate::handlers::offers::counter(tx, actor, command, payload, now).await
+            crate::handlers::offers::counter(
+                tx,
+                actor,
+                command,
+                payload,
+                state.homeserver.as_deref(),
+                now,
+            )
+            .await
         }
         CommandPayload::AcceptOffer(payload) => {
-            crate::handlers::offers::accept(tx, actor, command, payload, now).await
+            crate::handlers::offers::accept(
+                tx,
+                actor,
+                command,
+                payload,
+                state.homeserver.as_deref(),
+                now,
+            )
+            .await
+        }
+        CommandPayload::OfferCheckout(payload) => {
+            let hold_window_seconds = state
+                .config
+                .locks_payment_window_seconds
+                .max(state.config.fiat_payment_window_seconds)
+                .max(state.config.sandbox_payment_window_seconds);
+            crate::handlers::offer_checkout::handle(
+                tx,
+                actor,
+                command,
+                payload,
+                state.clock.as_ref(),
+                hold_window_seconds,
+            )
+            .await
         }
         CommandPayload::RejectOffer(payload) => {
             crate::handlers::offers::reject(tx, actor, command, payload, now).await

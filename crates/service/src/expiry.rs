@@ -35,6 +35,7 @@ pub async fn expire_due_reservations(pool: &PgPool, now: DateTime<Utc>) -> anyho
         "SELECT id, listing_aggregate_id, buyer_pubky, quantity, drop_aggregate_id \
          FROM reservations \
          WHERE status = 'active' AND expires_at <= $1 \
+         AND offer_award_id IS NULL \
          AND NOT EXISTS (\
              SELECT 1 FROM orders o JOIN payments p ON p.order_id = o.id \
              WHERE o.auction_aggregate_id = reservations.listing_aggregate_id \

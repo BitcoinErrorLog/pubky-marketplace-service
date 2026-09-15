@@ -329,6 +329,8 @@ pub async fn handle(
             first_revealed_at: None,
             created_at: now,
             updated_at: now,
+            offer_award_id: None,
+            priced_from: "listing".to_string(),
         };
         sqlx::query(
             "INSERT INTO orders (id, checkout_command_id, drop_aggregate_id, buyer_pubky, \
@@ -374,6 +376,9 @@ pub async fn handle(
             amount_minor: total_minor,
             currency: currency.clone(),
             exponent,
+            merchandise_amount_minor: Some(total_minor),
+            merchandise_currency: Some(currency.clone()),
+            merchandise_exponent: Some(exponent),
             manual_review_entered_at: None,
             manual_review_sla_alerted_at: None,
             resolution_id: None,
@@ -387,8 +392,9 @@ pub async fn handle(
         };
         sqlx::query(
             "INSERT INTO payments (id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
-             state, confirmations, amount_minor, currency, exponent, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)",
+             state, confirmations, amount_minor, currency, exponent, merchandise_amount_minor, \
+             merchandise_currency, merchandise_exponent, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $9, $10, $11, $12, $12)",
         )
         .bind(payment.id)
         .bind(payment.order_id)

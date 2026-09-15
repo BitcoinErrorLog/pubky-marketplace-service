@@ -184,6 +184,11 @@
         },
         "ok": true,
         "order": {
+          "bitcoin_payable": {
+            "amount_minor": 51637,
+            "currency": "SAT",
+            "exponent": 0
+          },
           "bitcoin_quote": {
             "currency": null,
             "expires_at": null,
@@ -229,6 +234,11 @@
               }
             }
           ],
+          "merchandise_total": {
+            "amount_minor": 51200,
+            "currency": "SAT",
+            "exponent": 0
+          },
           "next_actor": "seller",
           "paykit_activation_state": "active",
           "paykit_observation": {
@@ -248,6 +258,7 @@
           "payment_id": "<uuid:4>",
           "payment_method": "bitcoin",
           "payment_reported_at": null,
+          "priced_from": "listing",
           "receipt_id": "<uuid:5>",
           "return_request": null,
           "reviews": [],

@@ -990,14 +990,17 @@ pub async fn bind_payment_method(
             )
             .execute(&mut *tx)
             .await?;
-            // The payment step's displayed amount is the paykit total
-            // (price + nonce), never the pre-nonce listing total.
-            sqlx::query("UPDATE payments SET amount_minor = $2, updated_at = $3 WHERE id = $1")
-                .bind(payment.id)
-                .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
+            // Bitcoin settlement is typed as SAT/0. Merchandise terms stay
+            // in the dedicated merchandise columns.
+            sqlx::query(
+                "UPDATE payments SET amount_minor = $2, currency = 'SAT', exponent = 0, \
+                 updated_at = $3 WHERE id = $1",
+            )
+            .bind(payment.id)
+            .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query(
                 "INSERT INTO outbox (event_id, kind, payload, created_at) \
                  VALUES ($1, 'paykit.activate', $2, $3)",

@@ -150,6 +150,7 @@
         "pending",
         "countered",
         "accepted",
+        "converted",
         "rejected",
         "withdrawn",
         "expired"
@@ -255,6 +256,26 @@
               "name": "offer_expiry"
             }
           ]
+        },
+        {
+          "from": "accepted",
+          "to": "converted",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "offer.checkout"
+            }
+          ]
+        },
+        {
+          "from": "accepted",
+          "to": "expired",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "award_expiry"
+            }
+          ]
         }
       ],
       "commands": [
@@ -262,7 +283,8 @@
         "offer.counter",
         "offer.accept",
         "offer.reject",
-        "offer.withdraw"
+        "offer.withdraw",
+        "offer.checkout"
       ],
       "unreachable_states": []
     },
