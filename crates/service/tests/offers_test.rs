@@ -476,6 +476,16 @@ async fn accepted_award_projection_totals_match_converted_order_for_participants
     assert_eq!(buyer_award["subtotal"], order["subtotal"]);
     assert_eq!(buyer_award["shipping"], order["shipping"]);
     assert_eq!(buyer_award["merchandise_total"], order["total"]);
+    let accepted_total_minor: i64 =
+        sqlx::query_scalar("SELECT accepted_total_minor FROM offers WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&offer_id).expect("offer id"))
+            .fetch_one(&app.pool)
+            .await
+            .expect("accepted total");
+    assert_eq!(
+        buyer_award["merchandise_total"]["amount_minor"],
+        json!(accepted_total_minor)
+    );
 }
 
 #[sqlx::test]

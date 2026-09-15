@@ -932,6 +932,19 @@ fn insert_offer_projection(map: &mut ContractMap, key: &str, status: StatusCode,
     );
 }
 
+fn projections_snapshot_value(map: &ContractMap) -> Value {
+    let mut ordered = serde_json::Map::new();
+    for (key, value) in map {
+        if key != "accepted_offer_with_award" {
+            ordered.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(value) = map.get("accepted_offer_with_award") {
+        ordered.insert("accepted_offer_with_award".to_string(), value.clone());
+    }
+    Value::Object(ordered)
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
@@ -1121,5 +1134,5 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
             "accepted_offer_with_award",
         ],
     );
-    assert_snapshot("projections", &json!(map));
+    assert_snapshot("projections", &projections_snapshot_value(&map));
 }

@@ -286,6 +286,9 @@ impl OfferRow {
             },
             _ => None,
         };
+        let accepted_total = self
+            .accepted_total_minor
+            .map(|total| money_json(total, award_currency, award_exponent));
         json!({
             "id": self.id,
             "aggregate_id": self.aggregate_id,
@@ -329,9 +332,7 @@ impl OfferRow {
                 "shipping": award_totals.map(|(_, shipping, _)| {
                     money_json(shipping, award_currency, award_exponent)
                 }),
-                "merchandise_total": award_totals.map(|(_, _, merchandise_total)| {
-                    money_json(merchandise_total, award_currency, award_exponent)
-                }),
+                "merchandise_total": accepted_total,
                 "quantity": self.accepted_quantity,
                 "accepted_at": self.accepted_at.map(format_timestamp),
                 "convert_by": self.award_expires_at.map(format_timestamp),
