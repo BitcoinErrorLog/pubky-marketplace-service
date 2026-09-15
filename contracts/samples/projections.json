@@ -1,4 +1,110 @@
 {
+  "accepted_offer_with_award": {
+    "request": {
+      "body": null,
+      "headers_present": [
+        "authorization"
+      ],
+      "method": "GET",
+      "path": "/v1/offers"
+    },
+    "response": {
+      "body": {
+        "offers": [
+          {
+            "aggregate_id": "offer:<uuid:7>",
+            "amount": {
+              "amount_minor": 10000,
+              "currency": "USD",
+              "exponent": 2
+            },
+            "award": {
+              "accepted_at": "<timestamp:2>",
+              "convert_by": "<timestamp:6>",
+              "converted_order_id": null,
+              "id": "<uuid:8>",
+              "listing": {
+                "aggregate_id": "listing:<pubky:seller>_boots_01",
+                "listing_id": "boots_01",
+                "listing_record_sha256": "listing:<pubky:seller>_boots_01",
+                "listing_revision": 1,
+                "seller_pubky": "<pubky:seller>",
+                "title": "Marketplace item"
+              },
+              "merchandise_total": {
+                "amount_minor": 10000,
+                "currency": "USD",
+                "exponent": 2
+              },
+              "quantity": 1,
+              "shipping": {
+                "amount_minor": 0,
+                "currency": "USD",
+                "exponent": 2
+              },
+              "state": "active",
+              "subtotal": {
+                "amount_minor": 10000,
+                "currency": "USD",
+                "exponent": 2
+              },
+              "unit_price": {
+                "amount_minor": 10000,
+                "currency": "USD",
+                "exponent": 2
+              },
+              "variant": {
+                "id": "listing:<pubky:seller>_boots_01",
+                "options": [],
+                "sku": null
+              }
+            },
+            "buyer_pubky": "<pubky:buyer>",
+            "created_at": "<timestamp:2>",
+            "expires_at": "<timestamp:5>",
+            "history": [
+              {
+                "action": "created",
+                "actor_pubky": "<pubky:buyer>",
+                "amount": {
+                  "amount_minor": 10000,
+                  "currency": "USD",
+                  "exponent": 2
+                },
+                "message": "Would you take this?",
+                "occurred_at": "<timestamp:2>",
+                "quantity": 1,
+                "revision": 1
+              },
+              {
+                "action": "accepted",
+                "actor_pubky": "<pubky:seller>",
+                "amount": {
+                  "amount_minor": 10000,
+                  "currency": "USD",
+                  "exponent": 2
+                },
+                "message": "",
+                "occurred_at": "<timestamp:2>",
+                "quantity": 1,
+                "revision": 2
+              }
+            ],
+            "id": "<uuid:7>",
+            "listing_aggregate_id": "listing:<pubky:seller>_boots_01",
+            "message": "Would you take this?",
+            "offered_by": "<pubky:buyer>",
+            "quantity": 1,
+            "revision": 2,
+            "seller_pubky": "<pubky:seller>",
+            "state": "accepted",
+            "updated_at": "<timestamp:2>"
+          }
+        ]
+      },
+      "status": 200
+    }
+  },
   "auction_bidder_viewer_bid": {
     "request": {
       "body": null,

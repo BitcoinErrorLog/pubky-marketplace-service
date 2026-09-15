@@ -7,7 +7,7 @@ use common::paykit_review::{
 };
 use common::{
     create_pending_order, execute, listing_aggregate, new_actor, place_bid_command,
-    register_auction_command, send, test_app_with_payments, TestActor, TestApp,
+    register_auction_command, register_command, send, test_app_with_payments, TestActor, TestApp,
 };
 use marketplace_service::contracts::{
     assert_no_sensitive_values, endpoint_contracts, normalized_snapshot, ReviewReason,
@@ -914,6 +914,37 @@ fn insert_listing_projection(
     );
 }
 
+fn insert_offer_projection(map: &mut ContractMap, key: &str, status: StatusCode, response: Value) {
+    assert!(
+        map.insert(
+            key.to_string(),
+            request_record(
+                "GET",
+                "/v1/offers".to_string(),
+                &["authorization"],
+                Value::Null,
+                status,
+                response,
+            ),
+        )
+        .is_none(),
+        "duplicate offer projection case {key}"
+    );
+}
+
+fn projections_snapshot_value(map: &ContractMap) -> Value {
+    let mut ordered = serde_json::Map::new();
+    for (key, value) in map {
+        if key != "accepted_offer_with_award" {
+            ordered.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(value) = map.get("accepted_offer_with_award") {
+        ordered.insert("accepted_offer_with_award".to_string(), value.clone());
+    }
+    Value::Object(ordered)
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
@@ -1055,6 +1086,40 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
         response,
     );
 
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::create_offer_command(&seller.pubky, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "offer create failed: {body}");
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &common::offer_action("offer.accept", 1, "00000000-0000-4000-8000-000000000701"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "offer accept failed: {body}");
+    let (status, response) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/offers",
+        Some(&buyer.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "offer projection failed: {response}"
+    );
+    assert_eq!(response["offers"][0]["state"], json!("accepted"));
+    assert!(response["offers"][0]["award"].is_object());
+    insert_offer_projection(&mut map, "accepted_offer_with_award", status, response);
+
     assert_exact_keys(
         &map,
         &[
@@ -1066,7 +1131,8 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
             "buyer_manual_review_late",
             "auction_seller_no_viewer_bid",
             "auction_bidder_viewer_bid",
+            "accepted_offer_with_award",
         ],
     );
-    assert_snapshot("projections", &json!(map));
+    assert_snapshot("projections", &projections_snapshot_value(&map));
 }

@@ -383,6 +383,112 @@ async fn offer_checkout_transfers_the_accepted_hold_and_preserves_merchandise_te
 }
 
 #[sqlx::test]
+async fn accepted_award_projection_totals_match_converted_order_for_participants(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let other = new_actor(&app).await;
+    let (offer_id, award_id, listing, revision, hash, quantity) =
+        accepted_offer_fixture(&app, &seller, &buyer).await;
+
+    let (status, buyer_offers) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/offers",
+        Some(&buyer.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "buyer offer projection failed: {buyer_offers}"
+    );
+    let buyer_award = &buyer_offers["offers"][0]["award"];
+    assert_eq!(
+        buyer_award["subtotal"],
+        json!({
+            "amount_minor": 10_000,
+            "currency": "USD",
+            "exponent": 2
+        })
+    );
+    assert_eq!(
+        buyer_award["shipping"],
+        json!({
+            "amount_minor": 0,
+            "currency": "USD",
+            "exponent": 2
+        })
+    );
+    assert_eq!(
+        buyer_award["merchandise_total"],
+        json!({
+            "amount_minor": 10_000,
+            "currency": "USD",
+            "exponent": 2
+        })
+    );
+
+    let (status, seller_offers) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/offers",
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "seller offer projection failed: {seller_offers}"
+    );
+    assert_eq!(&seller_offers["offers"][0]["award"], buyer_award);
+
+    let (status, other_offers) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/offers",
+        Some(&other.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "non-participant offer projection failed: {other_offers}"
+    );
+    assert_eq!(other_offers["offers"], json!([]));
+
+    let command = offer_checkout_command(
+        &offer_id,
+        &award_id,
+        &listing,
+        revision,
+        &hash,
+        "boots_01",
+        quantity,
+        "00000000-0000-4000-8000-000000001103",
+    );
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "offer checkout failed: {body}");
+    let order = &body["result"]["order"];
+    assert_eq!(buyer_award["subtotal"], order["subtotal"]);
+    assert_eq!(buyer_award["shipping"], order["shipping"]);
+    assert_eq!(buyer_award["merchandise_total"], order["total"]);
+    let accepted_total_minor: i64 =
+        sqlx::query_scalar("SELECT accepted_total_minor FROM offers WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&offer_id).expect("offer id"))
+            .fetch_one(&app.pool)
+            .await
+            .expect("accepted total");
+    assert_eq!(
+        buyer_award["merchandise_total"]["amount_minor"],
+        json!(accepted_total_minor)
+    );
+}
+
+#[sqlx::test]
 async fn offer_checkout_uses_injected_clock_and_longest_configured_hold_window(pool: PgPool) {
     let mut config = config_durable();
     config.locks_payment_window_seconds = 4_200;
