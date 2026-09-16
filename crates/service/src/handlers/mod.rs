@@ -154,9 +154,7 @@ pub fn seller_order_json_with_reviews(
     reviews: &[ReviewRow],
     authenticated_actor: &str,
 ) -> Value {
-    let mut view = order.project(ProjectionContext::CommandResult {
-        authenticated_actor,
-    });
+    let mut view = order.projection_for_actor_with_payment(authenticated_actor, None);
     view["reviews"] = Value::Array(reviews.iter().map(ReviewRow::view).collect());
     view
 }
