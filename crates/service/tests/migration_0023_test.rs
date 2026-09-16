@@ -621,7 +621,7 @@ fn every_manual_review_writer_stamps_the_entry_time() {
             ("bitcoin_review.rs".to_string(), 1),
             ("payment.rs".to_string(), 1),
             ("payment_methods.rs".to_string(), 2),
-            ("workers.rs".to_string(), 6),
+            ("workers.rs".to_string(), 5),
         ]),
         "the manual_review writer set drifted; stamp and enumerate the new writer"
     );

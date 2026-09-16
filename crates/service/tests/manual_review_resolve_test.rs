@@ -17,9 +17,8 @@ use common::paykit_review::{
 };
 use common::*;
 use marketplace_service::bitcoin_review::{
-    add_business_days, condition_seven_clear, route_due_seller_confirmation_windows,
-    watch_manual_reviews, MANUAL_REVIEW_INACTIVITY_DAYS, SELLER_CONFIRMATION_WINDOW_SECONDS,
-    SELLER_RESPONSE_SLA_BUSINESS_DAYS,
+    condition_seven_clear, route_due_seller_confirmation_windows, watch_manual_reviews,
+    MANUAL_REVIEW_INACTIVITY_DAYS, SELLER_CONFIRMATION_WINDOW_SECONDS,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::payments::order_reference;
@@ -81,17 +80,15 @@ async fn outbox_facts(pool: &PgPool, order_id: &str) -> Vec<(String, String, Str
     .expect("outbox rows")
 }
 
-async fn mark_legacy_unpinned(pool: &PgPool, order_id: &str) {
+async fn clear_resolution_pins(pool: &PgPool, order_id: &str) {
     sqlx::query(
         "UPDATE orders SET paykit_request_reference = NULL, paykit_invoice_id = NULL, \
-         paykit_stack_id = NULL, paykit_stack_endpoint = NULL, \
-         paykit_observation = COALESCE(paykit_observation, '{}'::jsonb) \
-             || '{\"legacy_unpinned\": true}'::jsonb WHERE id = $1",
+         paykit_stack_id = NULL, paykit_stack_endpoint = NULL WHERE id = $1",
     )
     .bind(Uuid::parse_str(order_id).unwrap())
     .execute(pool)
     .await
-    .expect("mark legacy unpinned");
+    .expect("clear resolution pins");
 }
 
 // ---------------------------------------------------------------------------
@@ -857,12 +854,12 @@ async fn resolve_refuses_a_missing_pin_and_a_non_review_payment(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn marked_legacy_review_api_refuses_without_creating_outbox(pool: PgPool) {
+async fn unpinned_manual_review_api_refuses_without_creating_outbox(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _reference) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;
-    mark_legacy_unpinned(&pool, &order_id).await;
+    clear_resolution_pins(&pool, &order_id).await;
 
     let (status, body) = resolve_call(
         &app,
@@ -879,12 +876,12 @@ async fn marked_legacy_review_api_refuses_without_creating_outbox(pool: PgPool) 
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn marked_legacy_shared_resolution_refuses_before_outbox(pool: PgPool) {
+async fn unpinned_shared_resolution_refuses_before_outbox(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _reference) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;
-    mark_legacy_unpinned(&pool, &order_id).await;
+    clear_resolution_pins(&pool, &order_id).await;
     let entered_at: DateTime<Utc> =
         sqlx::query_scalar("SELECT manual_review_entered_at FROM payments WHERE order_id = $1")
             .bind(Uuid::parse_str(&order_id).unwrap())
@@ -900,55 +897,6 @@ async fn marked_legacy_shared_resolution_refuses_before_outbox(pool: PgPool) {
     .expect("watch runs");
     assert_eq!(abandoned, 0);
     assert_eq!(payment_facts(&pool, &order_id).await.state, "manual_review");
-    assert!(outbox_facts(&pool, &order_id).await.is_empty());
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn marked_legacy_review_is_included_in_sla_watch(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let (order_id, _reference) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;
-    mark_legacy_unpinned(&pool, &order_id).await;
-    let entered_at: DateTime<Utc> =
-        sqlx::query_scalar("SELECT manual_review_entered_at FROM payments WHERE order_id = $1")
-            .bind(Uuid::parse_str(&order_id).unwrap())
-            .fetch_one(&pool)
-            .await
-            .expect("entry stamp");
-    let sla_deadline = add_business_days(entered_at, SELLER_RESPONSE_SLA_BUSINESS_DAYS);
-    let eligible: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM payments p JOIN orders o ON o.id = p.order_id \
-         WHERE p.order_id = $1 AND p.adapter = 'paykit' AND p.state = 'manual_review' \
-         AND p.resolution_outcome IS NULL AND o.payment_method = 'bitcoin'",
-    )
-    .bind(Uuid::parse_str(&order_id).unwrap())
-    .fetch_one(&pool)
-    .await
-    .expect("eligible review");
-    assert_eq!(eligible, 1);
-    let watcher_eligible: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM payments p JOIN orders o ON o.id = p.order_id \
-         WHERE p.adapter = 'paykit' AND o.payment_method = 'bitcoin' \
-         AND p.state = 'manual_review' AND p.resolution_outcome IS NULL",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("watcher eligible");
-    assert_eq!(watcher_eligible, 1);
-    let (alerts, abandoned) =
-        watch_manual_reviews(&app.state, sla_deadline + chrono::Duration::seconds(1))
-            .await
-            .expect("watch runs");
-    assert_eq!(alerts, 1);
-    assert_eq!(abandoned, 0);
-    let alerted: Option<DateTime<Utc>> =
-        sqlx::query_scalar("SELECT manual_review_sla_alerted_at FROM payments WHERE order_id = $1")
-            .bind(Uuid::parse_str(&order_id).unwrap())
-            .fetch_one(&pool)
-            .await
-            .expect("SLA stamp");
-    assert!(alerted.is_some());
     assert!(outbox_facts(&pool, &order_id).await.is_empty());
 }
 
