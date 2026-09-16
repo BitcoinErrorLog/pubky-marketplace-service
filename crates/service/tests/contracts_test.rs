@@ -54,14 +54,16 @@ fn delivery_address_serialization_has_one_source_guarded_path() {
             return Some("raw delivery-address API".to_string());
         }
         if path.file_name().and_then(|name| name.to_str()) == Some("model.rs") {
-            let count = source.matches("\"delivery_address\":").count();
+            let count = source.matches("view[\"delivery_address\"] = json!").count();
             return (count != 1)
                 .then(|| format!("model serialization site count is {count}, expected one"));
         }
         if source.contains("json!({ \"delivery_address\"")
+            || source.contains("json!({\"delivery_address\"")
             || source.contains("json!({\n            \"delivery_address\"")
             || source.contains(".insert(\"delivery_address\"")
             || source.contains("[\"delivery_address\"] =")
+            || source.contains("\"delivery_address\":")
         {
             return Some("direct HTTP response serialization".to_string());
         }
@@ -99,6 +101,22 @@ fn delivery_address_serialization_has_one_source_guarded_path() {
         )
         .is_some(),
         "a direct handler serialization fixture must be rejected"
+    );
+    assert!(
+        violation(
+            Path::new("handlers/fixture.rs"),
+            r#"let response = json!({"delivery_address": address});"#,
+        )
+        .is_some(),
+        "a compact direct handler serialization fixture must be rejected"
+    );
+    assert!(
+        violation(
+            Path::new("handlers/fixture.rs"),
+            r#"let response = "delivery_address": address;"#,
+        )
+        .is_some(),
+        "a bare delivery-address key literal must be rejected"
     );
 }
 
