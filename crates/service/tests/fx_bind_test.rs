@@ -635,6 +635,62 @@ async fn shared_manual_extension_and_late_settlement_retain_the_quote(pool: PgPo
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn quote_divergent_observation_clears_an_active_seller_window(pool: PgPool) {
+    let fixture = fx_fixture(pool.clone()).await;
+    let now = fixture.app.clock.now();
+    seed_fx_samples(&pool, RATE, now, 3).await;
+    fixture.paykit.set_allocation_mode("shared_manual");
+    let order = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
+    let (status, body) = bind_bitcoin(&fixture.app, &fixture.buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    activate_bound(&fixture).await;
+    let total_sats = order_facts(&pool, &order.order_id)
+        .await
+        .paykit_total_sats
+        .expect("invoice total");
+    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    fixture.paykit.set_status(
+        &reference,
+        bitcoin_status_v2(
+            "confirmed",
+            true,
+            "shared_manual",
+            Some("fx-window-txid"),
+            Some(total_sats as u64),
+            Some(2),
+        ),
+    );
+    assert_eq!(poll_now(&fixture.app, now).await, 1);
+    fixture.paykit.set_allocation_mode("exclusive");
+    fixture.paykit.set_status(
+        &reference,
+        bitcoin_status_v2(
+            "confirmed",
+            true,
+            "exclusive",
+            Some("fx-window-txid"),
+            Some(total_sats as u64 + 1),
+            Some(3),
+        ),
+    );
+    assert_eq!(poll_now(&fixture.app, now + Duration::seconds(60)).await, 1);
+
+    let facts = order_facts(&pool, &order.order_id).await;
+    assert_eq!(facts.paykit_request_state.as_deref(), Some("confirmed"));
+    assert_eq!(payment_state(&pool, &order.order_id).await, "manual_review");
+    let (entered, deadline): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT paykit_seller_confirmation_entered_at, \
+         paykit_seller_confirmation_deadline FROM orders WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&order.order_id).unwrap())
+    .fetch_one(&pool)
+    .await
+    .expect("seller window columns");
+    assert_eq!(entered, None);
+    assert_eq!(deadline, None);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn settlement_only_exact_non_late_exclusive_auto_pays(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     let now = fixture.app.clock.now();

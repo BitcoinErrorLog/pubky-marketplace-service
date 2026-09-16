@@ -1537,7 +1537,9 @@ async fn apply_confirmed_paykit_payment(
         )
         .await?;
         sqlx::query(
-            "UPDATE orders SET paykit_request_state = 'confirmed', paykit_observation = $3, updated_at = $2 \
+            "UPDATE orders SET paykit_request_state = 'confirmed', \
+             paykit_seller_confirmation_entered_at = NULL, \
+             paykit_seller_confirmation_deadline = NULL, paykit_observation = $3, updated_at = $2 \
              WHERE id = $1",
         )
         .bind(row.id)
