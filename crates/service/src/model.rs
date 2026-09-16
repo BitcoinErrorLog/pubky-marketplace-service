@@ -6,6 +6,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::clock::format_timestamp;
+use crate::payments::ShippoDestination;
 
 /// Serde adapter for the canonical wire timestamp format (RFC 3339 with
 /// milliseconds and `Z`), used inside the auction JSONB document.
@@ -620,7 +621,7 @@ impl OrderRow {
             | ProjectionContext::Notification => None,
         };
         if let Some(actor) = authenticated_actor {
-            if let Some(address) = self.delivery_address_for_shipping(actor) {
+            if let Some(address) = self.eligible_delivery_address(actor) {
                 view["delivery_address"] = json!({
                     "format": "plaintext_v1",
                     "address": address,
@@ -630,15 +631,32 @@ impl OrderRow {
         view
     }
 
-    pub(crate) fn delivery_address_for_shipping(&self, actor: &str) -> Option<&Value> {
+    fn eligible_delivery_address(&self, actor: &str) -> Option<&Value> {
         allow_plaintext_delivery_address(self, actor)
             .then_some(self.delivery_address.as_ref())
             .flatten()
     }
 
     pub(crate) fn shippo_destination(&self, actor: &str) -> Option<ShippoDestination> {
-        self.delivery_address_for_shipping(actor)
-            .map(ShippoDestination::from_stored)
+        let address = self.eligible_delivery_address(actor)?.as_object()?;
+        let field = |name: &str| {
+            address
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        Some(ShippoDestination::new(
+            field("name"),
+            field("line1"),
+            field("line2"),
+            field("city"),
+            field("region"),
+            field("postal_code"),
+            field("country_code"),
+            field("phone"),
+            field("email"),
+        ))
     }
 
     /// The participant projection with seller-only Paykit review evidence.
@@ -801,29 +819,6 @@ impl OrderRow {
             .map(|amount| money_json(amount, "SAT", 0))
             .into();
         view
-    }
-}
-
-pub(crate) struct ShippoDestination(Value);
-
-impl ShippoDestination {
-    fn from_stored(stored: &Value) -> Self {
-        let field = |name: &str| stored.get(name).and_then(Value::as_str).unwrap_or_default();
-        Self(json!({
-            "name": field("name"),
-            "street1": field("line1"),
-            "street2": field("line2"),
-            "city": field("city"),
-            "state": field("region"),
-            "zip": field("postal_code"),
-            "country": field("country_code"),
-            "phone": field("phone"),
-            "email": field("email"),
-        }))
-    }
-
-    pub(crate) fn as_value(&self) -> &Value {
-        &self.0
     }
 }
 

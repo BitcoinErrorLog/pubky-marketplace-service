@@ -507,7 +507,7 @@ pub async fn quote_shipping_rates(
         .shipment_rates(
             &api_key,
             &shippo_address(&ship_from),
-            address_to.as_value(),
+            &address_to,
             &parcel.shippo_parcel(),
         )
         .await
