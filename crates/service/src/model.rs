@@ -368,7 +368,7 @@ impl BidRow {
     }
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Clone, FromRow)]
 pub struct OrderRow {
     pub id: Uuid,
     /// Internal correlation to the winning auction, never serialized.
@@ -502,6 +502,84 @@ pub struct OrderRow {
     pub updated_at: DateTime<Utc>,
     pub offer_award_id: Option<Uuid>,
     pub priced_from: String,
+}
+
+impl std::fmt::Debug for OrderRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OrderRow")
+            .field("id", &self.id)
+            .field("auction_aggregate_id", &self.auction_aggregate_id)
+            .field("drop_aggregate_id", &self.drop_aggregate_id)
+            .field("buyer_pubky", &self.buyer_pubky)
+            .field("seller_pubky", &self.seller_pubky)
+            .field("seller_has_rail", &self.seller_has_rail)
+            .field("revision", &self.revision)
+            .field("state", &self.state)
+            .field("lines", &self.lines)
+            .field("subtotal_minor", &self.subtotal_minor)
+            .field("shipping_minor", &self.shipping_minor)
+            .field("total_minor", &self.total_minor)
+            .field("currency", &self.currency)
+            .field("exponent", &self.exponent)
+            .field("guarantee_policy_version", &self.guarantee_policy_version)
+            .field("payment_id", &self.payment_id)
+            .field("receipt_id", &self.receipt_id)
+            .field("edition", &self.edition)
+            .field("cancellation_reason", &self.cancellation_reason)
+            .field("stock_held", &self.stock_held)
+            .field("hold_expires_at", &self.hold_expires_at)
+            .field("shipment", &self.shipment)
+            .field("delivery_assumed", &self.delivery_assumed)
+            .field("return_request", &self.return_request)
+            .field("external_refund", &self.external_refund)
+            .field("payment_method", &self.payment_method)
+            .field("fiat_checkout_url", &self.fiat_checkout_url)
+            .field("payment_reported_at", &self.payment_reported_at)
+            .field("fiat_transaction_ref", &self.fiat_transaction_ref)
+            .field("fiat_verified_by", &self.fiat_verified_by)
+            .field("paykit_request_reference", &self.paykit_request_reference)
+            .field("paykit_request_state", &self.paykit_request_state)
+            .field("paykit_last_checked_at", &self.paykit_last_checked_at)
+            .field("paykit_invoice_id", &self.paykit_invoice_id)
+            .field("paykit_stack_id", &self.paykit_stack_id)
+            .field("paykit_stack_endpoint", &self.paykit_stack_endpoint)
+            .field("paykit_total_sats", &self.paykit_total_sats)
+            .field("bitcoin_quote_rate", &self.bitcoin_quote_rate)
+            .field("bitcoin_quote_source", &self.bitcoin_quote_source)
+            .field("bitcoin_quote_fetched_at", &self.bitcoin_quote_fetched_at)
+            .field("bitcoin_quoted_sats", &self.bitcoin_quoted_sats)
+            .field("bitcoin_quote_expires_at", &self.bitcoin_quote_expires_at)
+            .field("bitcoin_quote_currency", &self.bitcoin_quote_currency)
+            .field("bitcoin_quote_exponent", &self.bitcoin_quote_exponent)
+            .field("bitcoin_quote_spread_bps", &self.bitcoin_quote_spread_bps)
+            .field("paykit_observed_sats", &self.paykit_observed_sats)
+            .field("paykit_expires_at", &self.paykit_expires_at)
+            .field("paykit_prepare_expires_at", &self.paykit_prepare_expires_at)
+            .field("paykit_allocation_mode", &self.paykit_allocation_mode)
+            .field(
+                "paykit_address_fingerprint",
+                &self.paykit_address_fingerprint,
+            )
+            .field("paykit_bind_attempt", &self.paykit_bind_attempt)
+            .field("paykit_activation_state", &self.paykit_activation_state)
+            .field("paykit_observation", &self.paykit_observation)
+            .field(
+                "paykit_seller_confirmation_entered_at",
+                &self.paykit_seller_confirmation_entered_at,
+            )
+            .field(
+                "paykit_seller_confirmation_deadline",
+                &self.paykit_seller_confirmation_deadline,
+            )
+            .field("fulfillment", &self.fulfillment)
+            .field("first_revealed_at", &self.first_revealed_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("offer_award_id", &self.offer_award_id)
+            .field("priced_from", &self.priced_from)
+            .finish()
+    }
 }
 
 impl OrderRow {
@@ -903,9 +981,11 @@ pub(crate) fn seller_observation(observation: Option<&Value>) -> Value {
 mod tests {
     use super::{
         can_reveal_delivery_address, next_actor_for_order, redact_command_result,
-        seller_observation,
+        seller_observation, OrderRow,
     };
+    use chrono::Utc;
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn unknown_delivery_state_denies() {
@@ -934,6 +1014,33 @@ mod tests {
         assert!(!can_reveal_delivery_address(
             "seller", "seller", "pickup", "paid",
         ));
+    }
+
+    #[test]
+    fn order_row_debug_omits_delivery_address() {
+        let row = OrderRow::new_for_insert(
+            Uuid::nil(),
+            None,
+            None,
+            "buyer".to_string(),
+            "seller".to_string(),
+            false,
+            json!([]),
+            Some(json!({"line1": "123 Distinctive Privacy Lane"})),
+            0,
+            0,
+            0,
+            "SAT".to_string(),
+            0,
+            1,
+            Uuid::nil(),
+            false,
+            None,
+            "shipping".to_string(),
+            Utc::now(),
+            "listing".to_string(),
+        );
+        assert!(!format!("{row:?}").contains("123 Distinctive Privacy Lane"));
     }
 
     #[test]
