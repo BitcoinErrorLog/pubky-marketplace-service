@@ -788,6 +788,63 @@ async fn a_legacy_unpinned_amount_mismatch_enters_manual_review(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn exclusive_confirmation_races_in_window_cancellation_with_one_terminal_outcome(
+    pool: PgPool,
+) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _payment_id, reference) =
+        bound_shared_manual_order(&app, &paykit, &seller, &buyer).await;
+
+    paykit.set_status(&reference, status_detected("shared_manual", 1));
+    assert_eq!(poll_now(&app, app.clock.now()).await, 1);
+    paykit.set_allocation_mode("exclusive");
+    paykit.set_status(&reference, status_confirmed("exclusive", true, 6));
+    let cancellation = async {
+        sqlx::query(
+            "UPDATE orders SET state = 'cancelled', stock_held = FALSE, \
+             cancellation_reason = 'cancelled during seller confirmation window' \
+             WHERE id = $1 AND state = 'pending'",
+        )
+        .bind(Uuid::parse_str(&order_id).unwrap())
+        .execute(&pool)
+        .await
+        .expect("cancel during confirmation race");
+    };
+    let (applied, _) = tokio::join!(
+        poll_now(&app, app.clock.now() + chrono::Duration::seconds(60)),
+        cancellation
+    );
+    assert!(applied <= 1);
+
+    let (order_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
+    assert!(
+        ((order_state == "paid" || order_state == "confirmed") && payment_state == "confirmed")
+            || (order_state == "cancelled" && payment_state == "manual_review"),
+        "unexpected terminal pair: {order_state}/{payment_state}"
+    );
+    let receipts = count(&pool, "SELECT COUNT(*) FROM receipts").await;
+    let terminal_events = count(
+        &pool,
+        "SELECT COUNT(*) FROM events WHERE kind IN ('payment.confirmed', 'payment.manual_review')",
+    )
+    .await;
+    assert_eq!(terminal_events, 1);
+    assert_eq!(receipts, if payment_state == "confirmed" { 1 } else { 0 });
+    let (entered, deadline): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT paykit_seller_confirmation_entered_at, \
+             paykit_seller_confirmation_deadline FROM orders WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&order_id).unwrap())
+    .fetch_one(&pool)
+    .await
+    .expect("seller window columns");
+    assert_eq!(entered, None);
+    assert_eq!(deadline, None);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn seller_confirm_pays_with_observation_derived_audit(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
