@@ -6,11 +6,13 @@ use common::paykit_review::{
     into_manual_review_late, resolve_call, OBSERVED_TXID, TOTAL_SATS,
 };
 use common::{
-    create_pending_order, execute, listing_aggregate, new_actor, place_bid_command,
-    register_auction_command, register_command, send, test_app_with_payments, TestActor, TestApp,
+    create_paid_order, create_pending_order, execute, listing_aggregate, new_actor,
+    place_bid_command, register_auction_command, register_command, send, test_app,
+    test_app_with_payments, TestActor, TestApp,
 };
 use marketplace_service::contracts::{
-    assert_no_sensitive_values, endpoint_contracts, normalized_snapshot, ReviewReason,
+    assert_no_sensitive_values, assert_no_sensitive_values_for_contract, endpoint_contracts,
+    normalized_snapshot, ReviewReason,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -32,12 +34,72 @@ fn snapshot_path(name: &str) -> PathBuf {
     }
 }
 
-fn rendered_snapshot(value: &Value) -> Vec<u8> {
+fn rendered_snapshot(name: &str, value: &Value) -> Vec<u8> {
     let normalized = normalized_snapshot(value);
-    assert_no_sensitive_values(&normalized);
+    assert_no_sensitive_values_for_contract(
+        &normalized,
+        (name == "projections").then_some("seller_paid_shipping_address"),
+    );
     let mut rendered = serde_json::to_vec_pretty(&normalized).expect("snapshot serializes");
     rendered.push(b'\n');
     rendered
+}
+
+#[test]
+fn delivery_address_serialization_has_one_source_guarded_path() {
+    fn violation(path: &Path, source: &str) -> Option<String> {
+        if source.contains("delivery_address_for_shipping")
+            || source.contains("ShippoDestination::as_value")
+        {
+            return Some("raw delivery-address API".to_string());
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some("model.rs") {
+            let count = source.matches("\"delivery_address\":").count();
+            return (count != 1)
+                .then(|| format!("model serialization site count is {count}, expected one"));
+        }
+        if source.contains("json!({ \"delivery_address\"")
+            || source.contains("json!({\n            \"delivery_address\"")
+            || source.contains(".insert(\"delivery_address\"")
+            || source.contains("[\"delivery_address\"] =")
+        {
+            return Some("direct HTTP response serialization".to_string());
+        }
+        None
+    }
+
+    fn visit(path: &Path, violations: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(path).expect("source directory reads") {
+            let entry = entry.expect("source entry reads");
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, violations);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                let source = std::fs::read_to_string(&path).expect("source reads");
+                if violation(&path, &source).is_some() {
+                    violations.push(path);
+                }
+            }
+        }
+    }
+
+    let mut violations = Vec::new();
+    visit(
+        &repository_root().join("crates/service/src"),
+        &mut violations,
+    );
+    assert!(
+        violations.is_empty(),
+        "unsafe delivery_address serialization/API path: {violations:?}"
+    );
+    assert!(
+        violation(
+            Path::new("handlers/fixture.rs"),
+            r#"let response = json!({ "delivery_address": address });"#,
+        )
+        .is_some(),
+        "a direct handler serialization fixture must be rejected"
+    );
 }
 
 fn compare_snapshot(path: &Path, actual: &[u8], update: bool) -> Result<(), String> {
@@ -57,7 +119,7 @@ fn compare_snapshot(path: &Path, actual: &[u8], update: bool) -> Result<(), Stri
 }
 
 fn assert_snapshot(name: &str, value: &Value) {
-    let actual = rendered_snapshot(value);
+    let actual = rendered_snapshot(name, value);
     compare_snapshot(
         &snapshot_path(name),
         &actual,
@@ -223,6 +285,71 @@ fn nested_values_and_residual_sensitive_values_are_rejected() {
 }
 
 #[test]
+fn delivery_address_contract_requires_tagged_plaintext_variant() {
+    let accepted = json!({
+        "seller_paid_shipping_address": {
+            "response": {
+                "body": {
+                    "delivery_address": {
+                        "format": "plaintext_v1",
+                        "address": {"name": "Buyer", "country_code": "US"}
+                    }
+                }
+            }
+        }
+    });
+    assert_no_sensitive_values_for_contract(&accepted, Some("seller_paid_shipping_address"));
+    for rejected in [
+        json!({"delivery_address": {"name": "Buyer"}}),
+        json!({"delivery_address": {"format": "ciphertext_v1", "address": {}}}),
+        json!({"delivery_address": {"format": "plaintext_v2", "address": {}}}),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| assert_no_sensitive_values(&rejected)).is_err(),
+            "delivery address variant must fail closed: {rejected}"
+        );
+    }
+}
+
+#[test]
+fn buyer_sample_tagged_delivery_address_is_rejected() {
+    let buyer_sample = json!({
+        "buyer_paid_shipping_address": {
+            "response": {
+                "body": {
+                    "delivery_address": {
+                        "format": "plaintext_v1",
+                        "address": {"line1": "not allowed"}
+                    }
+                }
+            }
+        }
+    });
+    assert!(std::panic::catch_unwind(|| {
+        assert_no_sensitive_values_for_contract(&buyer_sample, Some("seller_paid_shipping_address"))
+    })
+    .is_err());
+}
+
+#[test]
+fn seller_list_tagged_delivery_address_is_rejected() {
+    let list_sample = json!({
+        "seller_paid_shipping_address": {
+            "list": [{
+                "delivery_address": {
+                    "format": "plaintext_v1",
+                    "address": {"line1": "not allowed"}
+                }
+            }]
+        }
+    });
+    assert!(std::panic::catch_unwind(|| {
+        assert_no_sensitive_values_for_contract(&list_sample, Some("seller_paid_shipping_address"))
+    })
+    .is_err());
+}
+
+#[test]
 fn normalizer_replaces_embedded_only_pubkys() {
     let pubky = "y".repeat(52);
     let raw = json!({"aggregate_id": format!("listing:{pubky}:boots")});
@@ -330,7 +457,7 @@ fn raw_paykit_reference_fails_residual_assertion() {
 #[test]
 fn one_byte_snapshot_mutation_is_rejected_by_canonical_compare() {
     let path = std::env::temp_dir().join(format!("contract-drift-{}.json", Uuid::new_v4()));
-    let mut actual = rendered_snapshot(&json!({"case": {"status": 422}}));
+    let mut actual = rendered_snapshot("unit", &json!({"case": {"status": 422}}));
     compare_snapshot(&path, &actual, true).expect("calibration snapshot writes");
     let index = actual
         .iter()
@@ -1120,6 +1247,55 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
     assert!(response["offers"][0]["award"].is_object());
     insert_offer_projection(&mut map, "accepted_offer_with_award", status, response);
 
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let paid = create_paid_order(&app, &seller, &buyer).await;
+    let (status, response) = projection_request(&app, &seller, &paid.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["delivery_address"]["format"],
+        json!("plaintext_v1")
+    );
+    assert!(response["delivery_address"]["address"].is_object());
+    insert_projection(
+        &mut map,
+        "seller_paid_shipping_address",
+        &paid.order_id,
+        status,
+        response,
+    );
+    let (status, response) = projection_request(&app, &buyer, &paid.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(response.get("delivery_address").is_none());
+    insert_projection(
+        &mut map,
+        "buyer_paid_shipping_address",
+        &paid.order_id,
+        status,
+        response,
+    );
+    let (status, response) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/orders",
+        Some(&seller.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(response["orders"]
+        .as_array()
+        .expect("order list")
+        .iter()
+        .all(|order| order.get("delivery_address").is_none()));
+    insert_projection(
+        &mut map,
+        "seller_list_paid_shipping_address",
+        &paid.order_id,
+        status,
+        response,
+    );
+
     assert_exact_keys(
         &map,
         &[
@@ -1132,7 +1308,115 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
             "auction_seller_no_viewer_bid",
             "auction_bidder_viewer_bid",
             "accepted_offer_with_award",
+            "seller_paid_shipping_address",
+            "buyer_paid_shipping_address",
+            "seller_list_paid_shipping_address",
         ],
     );
     assert_snapshot("projections", &projections_snapshot_value(&map));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn seller_delivery_address_matrix_uses_real_single_order_route(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let third_party = new_actor(&app).await;
+    let order = create_paid_order(&app, &seller, &buyer).await;
+    let order_id = Uuid::parse_str(&order.order_id).expect("order id");
+    let states = [
+        "paid",
+        "processing",
+        "pending_payment",
+        "ready_for_pickup",
+        "shipped",
+        "delivered",
+        "completed",
+        "cancel_requested",
+        "cancelled",
+        "return_requested",
+        "return_approved",
+        "return_received",
+        "refunded_external",
+        "closed",
+    ];
+
+    for state in states {
+        sqlx::query("UPDATE orders SET state = $2, fulfillment = 'shipping' WHERE id = $1")
+            .bind(order_id)
+            .bind(state)
+            .execute(&app.pool)
+            .await
+            .unwrap_or_else(|error| panic!("state fixture {state}: {error}"));
+
+        let (status, seller_body) = projection_request(&app, &seller, &order.order_id).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "seller state {state}: {seller_body}"
+        );
+        let seller_address = seller_body.get("delivery_address");
+        if matches!(state, "paid" | "processing") {
+            assert_eq!(
+                seller_address.and_then(|value| value.get("format")),
+                Some(&json!("plaintext_v1")),
+                "seller state {state}: {seller_body}"
+            );
+            assert!(seller_address
+                .and_then(|value| value.get("address"))
+                .is_some_and(Value::is_object));
+        } else {
+            assert!(
+                seller_address.is_none(),
+                "seller state {state} must redact address: {seller_body}"
+            );
+        }
+
+        let (status, buyer_body) = projection_request(&app, &buyer, &order.order_id).await;
+        assert_eq!(status, StatusCode::OK, "buyer state {state}: {buyer_body}");
+        assert!(buyer_body.get("delivery_address").is_none());
+
+        let (status, third_body) = projection_request(&app, &third_party, &order.order_id).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "third-party state {state}: {third_body}"
+        );
+        let (status, unauthenticated_body) = send(
+            app.router.clone(),
+            "GET",
+            &format!("/v1/orders/{}", order.order_id),
+            None,
+            &Value::Null,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated state {state}: {unauthenticated_body}"
+        );
+    }
+
+    sqlx::query("UPDATE orders SET state = 'paid', fulfillment = 'shipping', buyer_pubky = seller_pubky WHERE id = $1")
+        .bind(order_id)
+        .execute(&app.pool)
+        .await
+        .expect("same-party defensive fixture");
+    let (status, same_party_body) = projection_request(&app, &seller, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        same_party_body["delivery_address"]["format"],
+        json!("plaintext_v1")
+    );
+
+    let (status, list_body) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/orders",
+        Some(&seller.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list_body}");
+    assert!(list_body["orders"][0].get("delivery_address").is_none());
 }

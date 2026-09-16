@@ -16,6 +16,7 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::logging::{log_command, log_invalid_command};
+use crate::model::redact_command_result;
 use crate::result::{success_body, CommandFailure, HandlerResult};
 use crate::AppState;
 
@@ -69,6 +70,15 @@ pub async fn execute(
                 stored_result["revision"].as_i64().unwrap_or_default(),
                 started.elapsed().as_millis() as u64,
             );
+            if command.kind() == "checkout.create" {
+                let Some(stored_result) = redact_command_result(stored_result) else {
+                    return Ok(failure_response(&CommandFailure::new(
+                        ErrorCode::InvariantViolation,
+                        "The stored command result could not be processed.",
+                    )));
+                };
+                return Ok((StatusCode::OK, stored_result));
+            }
             return Ok((StatusCode::OK, stored_result));
         }
         let failure = CommandFailure::new(

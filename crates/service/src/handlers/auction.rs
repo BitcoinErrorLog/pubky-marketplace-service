@@ -20,7 +20,8 @@ use uuid::Uuid;
 use crate::executor::insert_event;
 use crate::handlers::{fetch_listing_for_update, insert_notification_intent, LISTING_COLUMNS};
 use crate::model::{
-    money_json, AuctionState, BidRow, ListingRow, OrderRow, PaymentRow, ReservationRow,
+    money_json, AuctionState, BidRow, ListingRow, OrderRow, PaymentRow, ProjectionContext,
+    ReservationRow,
 };
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -307,7 +308,11 @@ impl AuctionCloseOutcome {
             "winner_pubky": self.winner_pubky,
             "listing": self.listing.view(),
             "reservation": self.reservation.as_ref().map(ReservationRow::view),
-            "order": self.order.as_ref().map(OrderRow::projection),
+            "order": self.order.as_ref().map(|order| {
+                order.project(ProjectionContext::CommandResult {
+                    authenticated_actor: "",
+                })
+            }),
             "payment": self.payment.as_ref().map(PaymentRow::projection),
         })
     }
@@ -425,75 +430,28 @@ pub async fn close_locked_auction(
                 "exponent": final_price.exponent,
             },
         }]);
-        let order = OrderRow {
-            id: order_id,
-            auction_aggregate_id: Some(listing.aggregate_id.clone()),
-            drop_aggregate_id: None,
-            buyer_pubky: winner_pubky.clone(),
-            seller_pubky: listing.seller_pubky.clone(),
-            seller_has_rail: crate::queries::seller_has_rail(tx, &listing.seller_pubky).await?,
-            revision: 1,
-            state: "pending_payment".to_string(),
+        let order = OrderRow::new_for_insert(
+            order_id,
+            Some(listing.aggregate_id.clone()),
+            None,
+            winner_pubky.clone(),
+            listing.seller_pubky.clone(),
+            crate::queries::seller_has_rail(tx, &listing.seller_pubky).await?,
             lines,
-            delivery_address: None,
+            None,
             subtotal_minor,
             shipping_minor,
             total_minor,
-            currency: final_price.currency.clone(),
-            exponent: final_price.exponent,
-            guarantee_policy_version: 1,
+            final_price.currency.clone(),
+            final_price.exponent,
+            1,
             payment_id,
-            receipt_id: None,
-            edition: None,
-            cancellation_reason: None,
-            // The winner's hold lives in the reservation row above, swept
-            // by reservation expiry — never in the order's own hold flags.
-            stock_held: false,
-            hold_expires_at: None,
-            shipment: None,
-            delivery_assumed: false,
-            return_request: None,
-            external_refund: None,
-            payment_method: None,
-            fiat_checkout_url: None,
-            payment_reported_at: None,
-            fiat_transaction_ref: None,
-            fiat_verified_by: None,
-            shipping_label: None,
-            paykit_request_reference: None,
-            paykit_request_state: None,
-            paykit_last_checked_at: None,
-            paykit_invoice_id: None,
-            paykit_stack_id: None,
-            paykit_stack_endpoint: None,
-            paykit_total_sats: None,
-            bitcoin_quote_rate: None,
-            bitcoin_quote_source: None,
-            bitcoin_quote_fetched_at: None,
-            bitcoin_quoted_sats: None,
-            bitcoin_quote_expires_at: None,
-            bitcoin_quote_currency: None,
-            bitcoin_quote_exponent: None,
-            bitcoin_quote_spread_bps: None,
-            paykit_observed_sats: None,
-            paykit_expires_at: None,
-            paykit_prepare_expires_at: None,
-            paykit_allocation_mode: None,
-            paykit_address_fingerprint: None,
-            paykit_bind_attempt: 0,
-            paykit_activation_state: None,
-            paykit_observation: None,
-            paykit_seller_confirmation_entered_at: None,
-            paykit_seller_confirmation_deadline: None,
-            // Auction listings are shipping-only (§A2 v1 scope, enforced at
-            // registration): an auction order is always a shipped order.
-            fulfillment: "shipping".to_string(),
-            first_revealed_at: None,
-            created_at: now,
-            updated_at: now,
-            offer_award_id: None,
-            priced_from: "listing".to_string(),
-        };
+            false,
+            None,
+            "shipping".to_string(),
+            now,
+            "listing".to_string(),
+        );
         sqlx::query(
             "INSERT INTO orders (id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
              state, lines, delivery_address, subtotal_minor, shipping_minor, \

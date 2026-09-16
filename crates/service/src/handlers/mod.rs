@@ -23,7 +23,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::executor::insert_event;
-use crate::model::{ListingRow, OrderRow, ReviewRow};
+use crate::model::{ListingRow, OrderRow, ProjectionContext, ReviewRow};
 use crate::queries::ORDER_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -139,7 +139,9 @@ pub async fn fetch_order_reviews(
 /// The redacted order projection with its reviews attached, the shape every
 /// order-action command result returns (never the delivery address).
 pub fn order_json_with_reviews(order: &OrderRow, reviews: &[ReviewRow]) -> Value {
-    let mut view = order.projection();
+    let mut view = order.project(ProjectionContext::CommandResult {
+        authenticated_actor: "",
+    });
     view["reviews"] = Value::Array(reviews.iter().map(ReviewRow::view).collect());
     view
 }
@@ -152,7 +154,7 @@ pub fn seller_order_json_with_reviews(
     reviews: &[ReviewRow],
     authenticated_actor: &str,
 ) -> Value {
-    let mut view = order.seller_projection_for_actor(authenticated_actor);
+    let mut view = order.projection_for_actor_with_payment(authenticated_actor, None);
     view["reviews"] = Value::Array(reviews.iter().map(ReviewRow::view).collect());
     view
 }

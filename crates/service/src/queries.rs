@@ -367,9 +367,17 @@ fn order_with_payment(
     payment: Option<&PaymentRow>,
     reviews: &[&ReviewRow],
     actor: &str,
+    single_order: bool,
 ) -> Value {
-    let mut view = order
-        .projection_for_actor_with_payment(actor, payment.map(|payment| payment.state.as_str()));
+    let mut view = if single_order && actor == order.seller_pubky {
+        order.seller_single_projection_for_actor_with_payment(
+            actor,
+            payment.map(|payment| payment.state.as_str()),
+        )
+    } else {
+        order
+            .projection_for_actor_with_payment(actor, payment.map(|payment| payment.state.as_str()))
+    };
     if let Some(payment) = payment {
         let synthesize_legacy =
             order.paykit_total_sats.is_none() || matches!(payment.currency.as_str(), "SAT" | "BTC");
@@ -431,7 +439,7 @@ pub async fn list_orders(
                 .iter()
                 .filter(|review| review.order_id == order.id)
                 .collect();
-            order_with_payment(order, payment, &order_reviews, &actor.0)
+            order_with_payment(order, payment, &order_reviews, &actor.0, false)
         })
         .collect();
     if let Err(error) = attach_pickup_terms_flags(&state.pool, &orders, &mut views).await {
@@ -501,7 +509,8 @@ pub async fn get_order(
     match reviews {
         Ok(reviews) => {
             let order_reviews: Vec<&ReviewRow> = reviews.iter().collect();
-            let mut view = order_with_payment(&order, payment.as_ref(), &order_reviews, &actor.0);
+            let mut view =
+                order_with_payment(&order, payment.as_ref(), &order_reviews, &actor.0, true);
             let orders = [order];
             let mut views = [view];
             if let Err(error) = attach_pickup_terms_flags(&state.pool, &orders, &mut views).await {

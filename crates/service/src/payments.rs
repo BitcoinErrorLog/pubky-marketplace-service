@@ -260,6 +260,59 @@ pub enum ShippoError {
     Unavailable,
 }
 
+pub(crate) struct ShippoDestination {
+    name: String,
+    street1: String,
+    street2: String,
+    city: String,
+    state: String,
+    zip: String,
+    country: String,
+    phone: String,
+    email: String,
+}
+
+impl ShippoDestination {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        name: String,
+        street1: String,
+        street2: String,
+        city: String,
+        state: String,
+        zip: String,
+        country: String,
+        phone: String,
+        email: String,
+    ) -> Self {
+        Self {
+            name,
+            street1,
+            street2,
+            city,
+            state,
+            zip,
+            country,
+            phone,
+            email,
+        }
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "street1": self.street1,
+            "street2": self.street2,
+            "city": self.city,
+            "state": self.state,
+            "zip": self.zip,
+            "country": self.country,
+            "phone": self.phone,
+            "email": self.email,
+        })
+    }
+}
+
 /// One purchasable rate from a Shippo shipment quote.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShippoRate {
@@ -423,16 +476,16 @@ impl ShippoClient {
     }
 
     /// Quotes a synchronous shipment and returns its purchasable rates.
-    pub async fn shipment_rates(
+    pub(crate) async fn shipment_rates(
         &self,
         api_key: &str,
         address_from: &serde_json::Value,
-        address_to: &serde_json::Value,
+        address_to: &ShippoDestination,
         parcel: &serde_json::Value,
     ) -> Result<Vec<ShippoRate>, ShippoError> {
         let body = serde_json::json!({
             "address_from": address_from,
-            "address_to": address_to,
+            "address_to": address_to.as_json(),
             "parcels": [parcel],
             "async": false,
         });

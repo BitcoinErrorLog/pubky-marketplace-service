@@ -988,7 +988,7 @@ pub(crate) async fn apply_manual_review_resolution(
 
     let response = json!({
         "ok": true,
-        "order": updated_order.seller_projection_for_actor(input.event_actor),
+        "order": updated_order.projection_for_actor_with_payment(input.event_actor, None),
         "resolution": {
             "order_id": order_id,
             "resolution_id": input.resolution_id,

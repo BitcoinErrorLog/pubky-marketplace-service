@@ -310,27 +310,57 @@ fn is_pubky(value: &str) -> bool {
 }
 
 pub fn assert_no_sensitive_values(value: &Value) {
-    fn walk(value: &Value, key: Option<&str>) {
+    assert_no_sensitive_values_for_contract(value, None);
+}
+
+pub fn assert_no_sensitive_values_for_contract(
+    value: &Value,
+    allowed_single_order_case: Option<&str>,
+) {
+    let allowed_delivery_path = allowed_single_order_case
+        .map(|case| vec![case.to_string(), "response".to_string(), "body".to_string()]);
+    fn walk(
+        value: &Value,
+        key: Option<&str>,
+        path: &mut Vec<String>,
+        allowed_delivery_path: Option<&[String]>,
+    ) {
         match value {
             Value::Object(object) => {
                 for (key, value) in object {
-                    assert!(
-                        !matches!(
-                            key.as_str(),
-                            "delivery_address"
-                                | "endpoint"
-                                | "invoice"
-                                | "invoice_id"
-                                | "request_hash"
-                                | "provider_response"
-                                | "token"
-                        ),
-                        "contract artifact contains forbidden field '{key}'"
-                    );
-                    walk(value, Some(key));
+                    if key == "delivery_address" {
+                        let tagged = value
+                            .as_object()
+                            .and_then(|object| object.get("format").and_then(Value::as_str))
+                            == Some("plaintext_v1")
+                            && value.get("address").is_some_and(Value::is_object);
+                        assert!(
+                            tagged
+                                && allowed_delivery_path.is_some_and(|allowed| path == allowed),
+                            "delivery_address is allowed only in the seller single-order contract case"
+                        );
+                    } else {
+                        assert!(
+                            !matches!(
+                                key.as_str(),
+                                "endpoint"
+                                    | "invoice"
+                                    | "invoice_id"
+                                    | "request_hash"
+                                    | "provider_response"
+                                    | "token"
+                            ),
+                            "contract artifact contains forbidden field '{key}'"
+                        );
+                    }
+                    path.push(key.clone());
+                    walk(value, Some(key), path, allowed_delivery_path);
+                    path.pop();
                 }
             }
-            Value::Array(values) => values.iter().for_each(|value| walk(value, key)),
+            Value::Array(values) => values
+                .iter()
+                .for_each(|value| walk(value, key, path, allowed_delivery_path)),
             Value::String(value) => {
                 let lower = value.to_ascii_lowercase();
                 assert!(!lower.starts_with("bearer "), "residual bearer value");
@@ -347,7 +377,12 @@ pub fn assert_no_sensitive_values(value: &Value) {
             _ => {}
         }
     }
-    walk(value, None);
+    walk(
+        value,
+        None,
+        &mut Vec::new(),
+        allowed_delivery_path.as_deref(),
+    );
 }
 
 fn replace_embedded_uuids(value: &str, values: &mut HashMap<String, String>) -> String {
