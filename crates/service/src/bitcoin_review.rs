@@ -537,7 +537,16 @@ pub async fn confirm_bitcoin_payment(
     )
     .await
     {
-        return internal("resolve outbox", &error);
+        let _ = tx.rollback().await;
+        return match error {
+            ResolutionFailure::MissingPin => review_error(
+                ErrorCode::InvalidState,
+                review_reason(ReviewReason::MissingPin),
+                "This order has no pinned paykit stack to resolve against.",
+            ),
+            ResolutionFailure::Internal(context, error) => internal(&context, &error),
+            _ => internal("resolve outbox", &"unexpected resolution failure"),
+        };
     }
     let reviews = match crate::handlers::fetch_order_reviews(&mut tx, order_id).await {
         Ok(reviews) => reviews,
@@ -577,7 +586,7 @@ async fn enqueue_resolve_row(
     event_id: Uuid,
     resolution: &str,
     now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), ResolutionFailure> {
     let (Some(invoice_id), Some(stack_id), Some(endpoint)) = (
         order.paykit_invoice_id,
         order.paykit_stack_id.clone(),
@@ -585,9 +594,7 @@ async fn enqueue_resolve_row(
     ) else {
         // Scope was validated by the caller (pin presence is a
         // precondition); reaching here is an invariant violation.
-        return Err(sqlx::Error::Protocol(
-            "resolve outbox row without a persisted paykit pin".to_string(),
-        ));
+        return Err(ResolutionFailure::MissingPin);
     };
     sqlx::query(
         "INSERT INTO paykit_resolve_outbox (order_id, payment_id, event_id, invoice_id, \
@@ -607,7 +614,8 @@ async fn enqueue_resolve_row(
     .bind(now + chrono::Duration::seconds(RESOLVE_DELIVERY_DEADLINE_SECONDS))
     .bind(now)
     .execute(&mut **tx)
-    .await?;
+    .await
+    .map_err(|error| ResolutionFailure::Internal("resolve outbox".into(), error.to_string()))?;
     Ok(())
 }
 
@@ -723,19 +731,6 @@ pub async fn resolve_bitcoin_payment(
             "Bitcoin resolution applies only to bitcoin-bound orders.",
         );
     }
-    if order
-        .paykit_observation
-        .as_ref()
-        .and_then(|observation| observation.get("legacy_unpinned"))
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        return review_error(
-            ErrorCode::InvalidState,
-            review_reason(ReviewReason::MissingPin),
-            "This legacy payment cannot emit a paykit resolution.",
-        );
-    }
     let pins_present = order.paykit_request_reference.is_some()
         && order.paykit_stack_id.is_some()
         && order.paykit_stack_endpoint.is_some();
@@ -820,6 +815,11 @@ pub async fn resolve_bitcoin_payment(
             review_reason(ReviewReason::StockUnavailable),
             "The order's inventory can no longer be reacquired; choose refunded or abandoned.",
         ),
+        Err(ResolutionFailure::MissingPin) => review_error(
+            ErrorCode::InvalidState,
+            review_reason(ReviewReason::MissingPin),
+            "This order has no pinned paykit stack to resolve against.",
+        ),
         Err(ResolutionFailure::Internal(context, error)) => internal(&context, &error),
     }
 }
@@ -848,6 +848,8 @@ pub(crate) enum ResolutionFailure {
     /// The `paid` branch could not hold or reacquire the inventory
     /// (sold-out / drop / auction late cases): named 409, nothing changed.
     StockUnavailable,
+    /// The resolution cannot emit a `paykit.resolve` without bind-time pins.
+    MissingPin,
     Internal(String, String),
 }
 
@@ -898,15 +900,6 @@ pub(crate) async fn apply_manual_review_resolution(
             "order row missing".into(),
         ));
     };
-    if order
-        .paykit_observation
-        .as_ref()
-        .and_then(|observation| observation.get("legacy_unpinned"))
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        return Err(ResolutionFailure::NotInManualReview);
-    }
     let exit_state = match input.outcome {
         "paid" | "refunded" => "confirmed",
         _ => "expired",
@@ -1042,8 +1035,7 @@ pub(crate) async fn apply_manual_review_resolution(
         paykit_resolution,
         now,
     )
-    .await
-    .map_err(|e| ResolutionFailure::Internal("resolve outbox".into(), e.to_string()))?;
+    .await?;
 
     tx.commit()
         .await
@@ -1580,21 +1572,18 @@ pub async fn watch_manual_reviews(
     now: DateTime<Utc>,
 ) -> anyhow::Result<(u64, u64)> {
     let pool = &state.pool;
-    // Eligible scope (r12): Paykit adapter, bitcoin method, unresolved,
-    // pins present. Read without row locks; each row's own CAS decides.
+    // Eligible scope (r12): Paykit adapter, bitcoin method, unresolved.
+    // Read without row locks; each row's own CAS decides.
     let rows: Vec<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
         "SELECT p.order_id, p.manual_review_entered_at, p.manual_review_sla_alerted_at \
          FROM payments p JOIN orders o ON o.id = p.order_id \
          WHERE p.adapter = 'paykit' AND o.payment_method = 'bitcoin' \
          AND p.state = 'manual_review' AND p.resolution_outcome IS NULL \
-         AND o.paykit_request_reference IS NOT NULL \
-         AND o.paykit_stack_id IS NOT NULL AND o.paykit_stack_endpoint IS NOT NULL \
-         AND COALESCE((o.paykit_observation->>'legacy_unpinned')::boolean, FALSE) = FALSE \
+         /* legacy reviews remain in the normal SLA queue */ \
          ORDER BY p.manual_review_entered_at LIMIT 100",
     )
     .fetch_all(pool)
     .await?;
-
     let mut alerts = 0u64;
     let mut abandoned = 0u64;
     for (order_id, entered_at, sla_alerted_at) in rows {
