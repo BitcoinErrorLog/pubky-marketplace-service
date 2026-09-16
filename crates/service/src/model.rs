@@ -383,7 +383,7 @@ pub struct OrderRow {
     pub revision: i64,
     pub state: String,
     pub lines: Value,
-    pub delivery_address: Option<Value>,
+    pub(crate) delivery_address: Option<Value>,
     pub subtotal_minor: i64,
     pub shipping_minor: i64,
     pub total_minor: i64,
@@ -504,27 +504,66 @@ pub struct OrderRow {
 }
 
 impl OrderRow {
-    /// The participant-facing read projection: [`Self::view`] minus the
-    /// delivery address, which is a private delivery detail that read
-    /// projections must not expose (ADR-0019 §8). The buyer receives the
-    /// address back once, in the checkout command result they authored.
-    pub fn projection(&self) -> Value {
-        let mut view = self.view();
-        view.as_object_mut()
-            .expect("order view is an object")
-            .remove("delivery_address");
+    pub(crate) fn project(&self, context: ProjectionContext<'_>) -> Value {
+        let mut view = self.raw_view();
+        let authenticated_actor = match context {
+            ProjectionContext::BuyerSingleOrder {
+                authenticated_actor,
+            }
+            | ProjectionContext::SellerSingleOrder {
+                authenticated_actor,
+            }
+            | ProjectionContext::ParticipantList {
+                authenticated_actor,
+            }
+            | ProjectionContext::CommandResult {
+                authenticated_actor,
+            } => {
+                if matches!(context, ProjectionContext::SellerSingleOrder { .. }) {
+                    Some(authenticated_actor)
+                } else {
+                    None
+                }
+            }
+            ProjectionContext::Receipt
+            | ProjectionContext::Attestation
+            | ProjectionContext::Notification => None,
+        };
+        if let Some(actor) = authenticated_actor {
+            if let Some(address) = self.delivery_address_for_shipping(actor) {
+                view["delivery_address"] = json!({
+                    "format": "plaintext_v1",
+                    "address": address,
+                });
+            }
+        }
         view
+    }
+
+    pub(crate) fn delivery_address_for_shipping(&self, actor: &str) -> Option<&Value> {
+        allow_plaintext_delivery_address(self, actor)
+            .then_some(self.delivery_address.as_ref())
+            .flatten()
+    }
+
+    pub(crate) fn shippo_destination(&self, actor: &str) -> Option<ShippoDestination> {
+        self.delivery_address_for_shipping(actor)
+            .map(ShippoDestination::from_stored)
     }
 
     /// The participant projection with seller-only Paykit review evidence.
     /// The stored observation is intentionally reduced to the facts needed
     /// for the seller's attestation decision.
     pub fn projection_for_actor(&self, actor: &str) -> Value {
-        self.projection_for_actor_with_payment(actor, None)
+        self.project(ProjectionContext::BuyerSingleOrder {
+            authenticated_actor: actor,
+        })
     }
 
     pub fn seller_projection_for_actor(&self, actor: &str) -> Value {
-        self.projection_for_actor_with_payment(actor, None)
+        self.project(ProjectionContext::SellerSingleOrder {
+            authenticated_actor: actor,
+        })
     }
 
     pub fn projection_for_actor_with_payment(
@@ -532,7 +571,31 @@ impl OrderRow {
         actor: &str,
         payment_state: Option<&str>,
     ) -> Value {
-        let mut view = self.projection();
+        let mut view = self.project(ProjectionContext::ParticipantList {
+            authenticated_actor: actor,
+        });
+        self.add_seller_payment_evidence(&mut view, actor, payment_state);
+        view
+    }
+
+    pub fn seller_single_projection_for_actor_with_payment(
+        &self,
+        actor: &str,
+        payment_state: Option<&str>,
+    ) -> Value {
+        let mut view = self.project(ProjectionContext::SellerSingleOrder {
+            authenticated_actor: actor,
+        });
+        self.add_seller_payment_evidence(&mut view, actor, payment_state);
+        view
+    }
+
+    fn add_seller_payment_evidence(
+        &self,
+        view: &mut Value,
+        actor: &str,
+        payment_state: Option<&str>,
+    ) {
         if payment_state == Some("manual_review") {
             view["next_actor"] = json!("seller");
         }
@@ -548,7 +611,6 @@ impl OrderRow {
                 .map(format_timestamp)
                 .into();
         }
-        view
     }
 
     /// How the bound fiat method is verified: `processor` (Stripe, via the
@@ -587,7 +649,7 @@ impl OrderRow {
         )
     }
 
-    pub fn view(&self) -> Value {
+    fn raw_view(&self) -> Value {
         let displayed_total = if matches!(self.currency.as_str(), "SAT" | "BTC")
             && self.paykit_total_sats.is_some()
         {
@@ -602,7 +664,6 @@ impl OrderRow {
             "revision": self.revision,
             "state": self.state,
             "lines": self.lines,
-            "delivery_address": self.delivery_address.clone().unwrap_or(Value::Null),
             "subtotal": money_json(self.subtotal_minor, &self.currency, self.exponent),
             "shipping": money_json(self.shipping_minor, &self.currency, self.exponent),
             "total": money_json(displayed_total, &self.currency, self.exponent),
@@ -653,6 +714,64 @@ impl OrderRow {
     }
 }
 
+pub(crate) struct ShippoDestination(Value);
+
+impl ShippoDestination {
+    fn from_stored(stored: &Value) -> Self {
+        let field = |name: &str| stored.get(name).and_then(Value::as_str).unwrap_or_default();
+        Self(json!({
+            "name": field("name"),
+            "street1": field("line1"),
+            "street2": field("line2"),
+            "city": field("city"),
+            "state": field("region"),
+            "zip": field("postal_code"),
+            "country": field("country_code"),
+            "phone": field("phone"),
+            "email": field("email"),
+        }))
+    }
+
+    pub(crate) fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ProjectionContext<'a> {
+    BuyerSingleOrder { authenticated_actor: &'a str },
+    SellerSingleOrder { authenticated_actor: &'a str },
+    ParticipantList { authenticated_actor: &'a str },
+    CommandResult { authenticated_actor: &'a str },
+    Receipt,
+    Attestation,
+    Notification,
+}
+
+pub(crate) fn redact_command_result(mut body: Value) -> Option<Value> {
+    let result = body.get_mut("result")?.as_object_mut()?;
+    let orders = result.get_mut("orders")?.as_array_mut()?;
+    for order in orders {
+        let object = order.as_object_mut()?;
+        object.remove("delivery_address");
+    }
+    Some(body)
+}
+
+fn allow_plaintext_delivery_address(order: &OrderRow, actor: &str) -> bool {
+    can_reveal_delivery_address(actor, &order.seller_pubky, &order.fulfillment, &order.state)
+}
+
+pub(crate) fn can_reveal_delivery_address(
+    actor: &str,
+    seller: &str,
+    fulfillment: &str,
+    state: &str,
+) -> bool {
+    actor == seller && fulfillment == "shipping" && matches!(state, "paid" | "processing")
+}
+
 fn next_actor_for_order(
     state: &str,
     payment_method_bound: bool,
@@ -697,8 +816,57 @@ pub(crate) fn seller_observation(observation: Option<&Value>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_actor_for_order, seller_observation};
+    use super::{
+        can_reveal_delivery_address, next_actor_for_order, redact_command_result,
+        seller_observation,
+    };
     use serde_json::json;
+
+    #[test]
+    fn unknown_delivery_state_denies() {
+        assert!(!can_reveal_delivery_address(
+            "seller",
+            "seller",
+            "shipping",
+            "future_state",
+        ));
+    }
+
+    #[test]
+    fn only_paid_or_processing_shipping_seller_is_allowed() {
+        assert!(can_reveal_delivery_address(
+            "seller", "seller", "shipping", "paid"
+        ));
+        assert!(can_reveal_delivery_address(
+            "seller",
+            "seller",
+            "shipping",
+            "processing",
+        ));
+        assert!(!can_reveal_delivery_address(
+            "buyer", "seller", "shipping", "paid",
+        ));
+        assert!(!can_reveal_delivery_address(
+            "seller", "seller", "pickup", "paid",
+        ));
+    }
+
+    #[test]
+    fn command_result_redaction_removes_legacy_delivery_address() {
+        let body = json!({
+            "ok": true,
+            "result": {
+                "orders": [{
+                    "delivery_address": {"line1": "distinctive"}
+                }]
+            }
+        });
+        let redacted = redact_command_result(body).expect("valid checkout result");
+        assert!(redacted["result"]["orders"][0]
+            .get("delivery_address")
+            .is_none());
+        assert!(redact_command_result(json!({"ok": true})).is_none());
+    }
 
     #[test]
     fn next_actor_matches_order_state_and_payment_facts() {

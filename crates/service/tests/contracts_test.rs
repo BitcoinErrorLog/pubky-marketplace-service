@@ -40,6 +40,37 @@ fn rendered_snapshot(value: &Value) -> Vec<u8> {
     rendered
 }
 
+#[test]
+fn delivery_address_serialization_has_one_source_guarded_path() {
+    fn visit(path: &Path, violations: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(path).expect("source directory reads") {
+            let entry = entry.expect("source entry reads");
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, violations);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+                && path.file_name().and_then(|name| name.to_str()) != Some("model.rs")
+                && path.file_name().and_then(|name| name.to_str()) != Some("shipping.rs")
+            {
+                let source = std::fs::read_to_string(&path).expect("source reads");
+                if source.contains("\"delivery_address\":") {
+                    violations.push(path);
+                }
+            }
+        }
+    }
+
+    let mut violations = Vec::new();
+    visit(
+        &repository_root().join("crates/service/src"),
+        &mut violations,
+    );
+    assert!(
+        violations.is_empty(),
+        "direct delivery_address serialization outside model.rs or shipping.rs: {violations:?}"
+    );
+}
+
 fn compare_snapshot(path: &Path, actual: &[u8], update: bool) -> Result<(), String> {
     if update {
         std::fs::create_dir_all(path.parent().expect("snapshot parent"))
@@ -219,6 +250,27 @@ fn nested_values_and_residual_sensitive_values_are_rejected() {
     ] {
         let result = std::panic::catch_unwind(|| assert_no_sensitive_values(&value));
         assert!(result.is_err(), "sensitive nested value must fail closed");
+    }
+}
+
+#[test]
+fn delivery_address_contract_requires_tagged_plaintext_variant() {
+    let accepted = json!({
+        "delivery_address": {
+            "format": "plaintext_v1",
+            "address": {"name": "Buyer", "country_code": "US"}
+        }
+    });
+    assert_no_sensitive_values(&accepted);
+    for rejected in [
+        json!({"delivery_address": {"name": "Buyer"}}),
+        json!({"delivery_address": {"format": "ciphertext_v1", "address": {}}}),
+        json!({"delivery_address": {"format": "plaintext_v2", "address": {}}}),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| assert_no_sensitive_values(&rejected)).is_err(),
+            "delivery address variant must fail closed: {rejected}"
+        );
     }
 }
 

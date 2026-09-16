@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::executor::insert_event;
 use crate::handlers::{current_listing_revision, fetch_listing};
-use crate::model::{money_json, ListingRow, OrderRow, PaymentRow};
+use crate::model::{money_json, ListingRow, OrderRow, PaymentRow, ProjectionContext};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 pub async fn handle(
@@ -349,7 +349,11 @@ pub async fn handle(
         .bind(order.revision)
         .bind(&order.state)
         .bind(&order.lines)
-        .bind(&order.delivery_address)
+        .bind(if pickup {
+            None
+        } else {
+            delivery_address.clone()
+        })
         .bind(order.subtotal_minor)
         .bind(order.shipping_minor)
         .bind(order.total_minor)
@@ -438,7 +442,9 @@ pub async fn handle(
         )
         .await?;
 
-        orders.push(order.view());
+        orders.push(order.project(ProjectionContext::CommandResult {
+            authenticated_actor: actor,
+        }));
         // Same redaction as the read projections: the bundle id is bearer
         // material, so it never crosses the wire, not even to the buyer who
         // triggered the checkout. Nothing client-side consumes it.

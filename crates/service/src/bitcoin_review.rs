@@ -51,7 +51,7 @@ use crate::handlers::{
     fetch_listing, fetch_order_for_update, insert_notification_intent,
     seller_order_json_with_reviews,
 };
-use crate::model::{seller_observation, OrderRow, PaymentRow};
+use crate::model::{seller_observation, OrderRow, PaymentRow, ProjectionContext};
 use crate::payments::PaykitObservation;
 use crate::queries::{ORDER_COLUMNS, PAYMENT_COLUMNS};
 use crate::workers::SYSTEM_ACTOR;
@@ -973,7 +973,9 @@ pub(crate) async fn apply_manual_review_resolution(
 
     let response = json!({
         "ok": true,
-        "order": updated_order.seller_projection_for_actor(input.event_actor),
+        "order": updated_order.project(ProjectionContext::CommandResult {
+            authenticated_actor: input.event_actor,
+        }),
         "resolution": {
             "order_id": order_id,
             "resolution_id": input.resolution_id,

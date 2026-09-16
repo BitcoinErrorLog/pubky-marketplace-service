@@ -15,7 +15,7 @@
 //! number.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
@@ -407,7 +407,7 @@ async fn seller_order_for_shipping(
             "Shipping labels apply to paid orders that have not shipped yet.",
         )));
     }
-    if order.delivery_address.is_none() {
+    if order.shippo_destination(actor).is_none() {
         return Err(Box::new(shipping_error(
             ErrorCode::InvalidState,
             "no_delivery_address",
@@ -462,9 +462,11 @@ fn shippo_failure(error: ShippoError) -> Response {
             "shippo_key_invalid",
             "Shippo rejected the configured API token; update your shipping settings.",
         ),
-        ShippoError::Rejected(message) => {
-            shipping_error(ErrorCode::InvalidState, "shippo_rejected", &message)
-        }
+        ShippoError::Rejected(_) => shipping_error(
+            ErrorCode::InvalidState,
+            "shippo_rejected",
+            "Shippo rejected the shipping request.",
+        ),
         ShippoError::Unavailable => shipping_error(
             ErrorCode::UpstreamUnavailable,
             "shippo_unavailable",
@@ -497,18 +499,25 @@ pub async fn quote_shipping_rates(
         Ok(credentials) => credentials,
         Err(response) => return *response,
     };
-    let address_to = shippo_address(order.delivery_address.as_ref().expect("checked above"));
+    let address_to = order
+        .shippo_destination(&actor.0)
+        .expect("shipping gate checked above");
     match payments
         .shippo
         .shipment_rates(
             &api_key,
             &shippo_address(&ship_from),
-            &address_to,
+            address_to.as_value(),
             &parcel.shippo_parcel(),
         )
         .await
     {
-        Ok(rates) => (StatusCode::OK, Json(json!({ "ok": true, "rates": rates }))).into_response(),
+        Ok(rates) => (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({ "ok": true, "rates": rates })),
+        )
+            .into_response(),
         Err(error) => shippo_failure(error),
     }
 }
@@ -545,7 +554,12 @@ pub async fn purchase_shipping_label(
         Err(response) => return *response,
     };
     if let Some(label) = order.shipping_label {
-        return (StatusCode::OK, Json(json!({ "ok": true, "label": label }))).into_response();
+        return (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({ "ok": true, "label": label })),
+        )
+            .into_response();
     }
     let (api_key, _ship_from) = match shipping_credentials(&state, &payments, &actor.0).await {
         Ok(credentials) => credentials,
@@ -585,9 +599,12 @@ pub async fn purchase_shipping_label(
     .execute(&state.pool)
     .await;
     match written {
-        Ok(result) if result.rows_affected() == 1 => {
-            (StatusCode::OK, Json(json!({ "ok": true, "label": stored }))).into_response()
-        }
+        Ok(result) if result.rows_affected() == 1 => (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({ "ok": true, "label": stored })),
+        )
+            .into_response(),
         Ok(_) => {
             let current: Result<Option<(Value,)>, sqlx::Error> =
                 sqlx::query_as("SELECT shipping_label FROM orders WHERE id = $1")
@@ -595,9 +612,12 @@ pub async fn purchase_shipping_label(
                     .fetch_optional(&state.pool)
                     .await;
             match current {
-                Ok(Some((label,))) => {
-                    (StatusCode::OK, Json(json!({ "ok": true, "label": label }))).into_response()
-                }
+                Ok(Some((label,))) => (
+                    StatusCode::OK,
+                    [(header::CACHE_CONTROL, "no-store")],
+                    Json(json!({ "ok": true, "label": label })),
+                )
+                    .into_response(),
                 Ok(None) => internal("label readback", &"order disappeared"),
                 Err(error) => internal("label readback", &error),
             }
@@ -613,33 +633,17 @@ pub async fn get_shipping_label(
     Extension(actor): Extension<Actor>,
     Path(order_id): Path<Uuid>,
 ) -> Response {
-    let order: Option<OrderRow> =
-        match sqlx::query_as(&format!("SELECT {ORDER_COLUMNS} FROM orders WHERE id = $1"))
-            .bind(order_id)
-            .fetch_optional(&state.pool)
-            .await
-        {
-            Ok(order) => order,
-            Err(error) => return internal("order lookup", &error),
-        };
-    let Some(order) = order else {
-        return shipping_error(
-            ErrorCode::NotFound,
-            "order_not_found",
-            "The order was not found.",
-        );
+    let order = match seller_order_for_shipping(&state, &actor.0, order_id).await {
+        Ok(order) => order,
+        Err(response) => return *response,
     };
-    if order.seller_pubky != actor.0 {
-        return shipping_error(
-            ErrorCode::Unauthorized,
-            "not_seller",
-            "Only the seller may read this order's shipping label.",
-        );
-    }
     match order.shipping_label {
-        Some(label) => {
-            (StatusCode::OK, Json(json!({ "ok": true, "label": label }))).into_response()
-        }
+        Some(label) => (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({ "ok": true, "label": label })),
+        )
+            .into_response(),
         None => shipping_error(
             ErrorCode::NotFound,
             "label_not_found",

@@ -314,19 +314,27 @@ pub fn assert_no_sensitive_values(value: &Value) {
         match value {
             Value::Object(object) => {
                 for (key, value) in object {
-                    assert!(
-                        !matches!(
-                            key.as_str(),
-                            "delivery_address"
-                                | "endpoint"
-                                | "invoice"
-                                | "invoice_id"
-                                | "request_hash"
-                                | "provider_response"
-                                | "token"
-                        ),
-                        "contract artifact contains forbidden field '{key}'"
-                    );
+                    if key == "delivery_address" {
+                        let tagged = value
+                            .as_object()
+                            .and_then(|object| object.get("format").and_then(Value::as_str))
+                            == Some("plaintext_v1")
+                            && value.get("address").is_some_and(Value::is_object);
+                        assert!(tagged, "delivery_address must use plaintext_v1");
+                    } else {
+                        assert!(
+                            !matches!(
+                                key.as_str(),
+                                "endpoint"
+                                    | "invoice"
+                                    | "invoice_id"
+                                    | "request_hash"
+                                    | "provider_response"
+                                    | "token"
+                            ),
+                            "contract artifact contains forbidden field '{key}'"
+                        );
+                    }
                     walk(value, Some(key));
                 }
             }

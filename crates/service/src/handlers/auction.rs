@@ -20,7 +20,8 @@ use uuid::Uuid;
 use crate::executor::insert_event;
 use crate::handlers::{fetch_listing_for_update, insert_notification_intent, LISTING_COLUMNS};
 use crate::model::{
-    money_json, AuctionState, BidRow, ListingRow, OrderRow, PaymentRow, ReservationRow,
+    money_json, AuctionState, BidRow, ListingRow, OrderRow, PaymentRow, ProjectionContext,
+    ReservationRow,
 };
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -307,7 +308,11 @@ impl AuctionCloseOutcome {
             "winner_pubky": self.winner_pubky,
             "listing": self.listing.view(),
             "reservation": self.reservation.as_ref().map(ReservationRow::view),
-            "order": self.order.as_ref().map(OrderRow::projection),
+            "order": self.order.as_ref().map(|order| {
+                order.project(ProjectionContext::CommandResult {
+                    authenticated_actor: "",
+                })
+            }),
             "payment": self.payment.as_ref().map(PaymentRow::projection),
         })
     }

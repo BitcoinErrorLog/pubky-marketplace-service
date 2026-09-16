@@ -250,17 +250,18 @@ async fn shippo_failures_surface_honestly(pool: PgPool) {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["reason"], json!("shippo_key_invalid"));
 
-    // A refused purchase carries Shippo's own message.
+    // A refused purchase uses stable service copy and does not reflect carrier text.
     shippo.accept_key(SHIPPO_KEY);
     shippo.add_rate("rate_ground", "USPS", "7.85");
     shippo.reject_purchase("Insufficient funds in your Shippo account.");
     let (status, body) = buy_label(&app, &seller.token, &order.order_id, "rate_ground").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["reason"], json!("shippo_rejected"));
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Insufficient funds"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("Shippo rejected the shipping request.")
+    );
+    assert!(!body.to_string().contains("Insufficient funds"));
 }
 
 #[sqlx::test(migrations = "./migrations")]
