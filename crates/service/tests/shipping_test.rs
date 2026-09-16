@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use common::*;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 const SHIPPO_KEY: &str = "shippo_test_1234567890abcdef";
 
@@ -78,6 +79,25 @@ async fn buy_label(
         &json!({ "rate_id": rate_id }),
     )
     .await
+}
+
+async fn set_order_state(app: &TestApp, order_id: &str, state: &str, fulfillment: &str) {
+    sqlx::query("UPDATE orders SET state = $2, fulfillment = $3 WHERE id = $1")
+        .bind(Uuid::parse_str(order_id).expect("order id"))
+        .bind(state)
+        .bind(fulfillment)
+        .execute(&app.pool)
+        .await
+        .expect("state fixture");
+}
+
+fn assert_no_store(headers: &axum::http::HeaderMap) {
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
 }
 
 fn parcel_body() -> Value {
@@ -157,8 +177,16 @@ async fn rates_are_quoted_with_the_sellers_token_and_real_order_address(pool: Pg
     let (status, _) = quote_rates(&app, &buyer.token, &order.order_id, &parcel_body()).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    let (status, body) = quote_rates(&app, &seller.token, &order.order_id, &parcel_body()).await;
+    let (status, headers, body) = send_with_headers(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/shipping/rates", order.order_id),
+        Some(&seller.token),
+        &parcel_body(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_no_store(&headers);
     let rates = body["rates"].as_array().expect("rates array");
     assert_eq!(rates.len(), 2);
     assert_eq!(rates[0]["provider"], json!("USPS"));
@@ -185,8 +213,16 @@ async fn label_purchase_stores_the_label_seller_only_and_is_idempotent(pool: PgP
     configure_shipping(&app, &seller.token).await;
     let order = create_paid_order(&app, &seller, &buyer).await;
 
-    let (status, body) = buy_label(&app, &seller.token, &order.order_id, "rate_ground").await;
+    let (status, headers, body) = send_with_headers(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/shipping/label", order.order_id),
+        Some(&seller.token),
+        &json!({ "rate_id": "rate_ground" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_no_store(&headers);
     let label = &body["label"];
     assert_eq!(label["carrier"], json!("USPS"));
     assert_eq!(label["amount"], json!("7.85"));
@@ -194,13 +230,21 @@ async fn label_purchase_stores_the_label_seller_only_and_is_idempotent(pool: PgP
     assert!(label["label_url"].as_str().unwrap().ends_with(".pdf"));
 
     // Idempotent: a second purchase returns the stored label, buying nothing.
-    let (status, body) = buy_label(&app, &seller.token, &order.order_id, "rate_ground").await;
+    let (status, headers, body) = send_with_headers(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/shipping/label", order.order_id),
+        Some(&seller.token),
+        &json!({ "rate_id": "rate_ground" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_store(&headers);
     assert_eq!(body["label"]["transaction_id"], json!("txn_1"));
     assert_eq!(shippo.purchases().len(), 1);
 
     // The label is seller-readable...
-    let (status, body) = send(
+    let (status, headers, body) = send_with_headers(
         app.router.clone(),
         "GET",
         &format!("/v0/orders/{}/shipping/label", order.order_id),
@@ -209,6 +253,7 @@ async fn label_purchase_stores_the_label_seller_only_and_is_idempotent(pool: PgP
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_no_store(&headers);
     // ...never buyer-readable (the PDF embeds the delivery address)...
     let (status, _) = send(
         app.router.clone(),
@@ -235,6 +280,102 @@ async fn label_purchase_stores_the_label_seller_only_and_is_idempotent(pool: PgP
             "the shared projection must not leak the label: {body}"
         );
     }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn processing_allows_shipping_disclosures_and_denied_states_redact_label(pool: PgPool) {
+    let (app, shippo) = test_app_with_shippo(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    shippo.accept_key(SHIPPO_KEY);
+    shippo.add_rate("rate_ground", "USPS", "7.85");
+    configure_shipping(&app, &seller.token).await;
+    let order = create_paid_order(&app, &seller, &buyer).await;
+    set_order_state(&app, &order.order_id, "processing", "shipping").await;
+
+    let (status, headers, body) = send_with_headers(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/shipping/rates", order.order_id),
+        Some(&seller.token),
+        &parcel_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_no_store(&headers);
+
+    let (status, headers, body) = send_with_headers(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/shipping/label", order.order_id),
+        Some(&seller.token),
+        &json!({ "rate_id": "rate_ground" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_no_store(&headers);
+
+    let (status, headers, body) = send_with_headers(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/shipping/label", order.order_id),
+        Some(&seller.token),
+        &json!({ "rate_id": "rate_ground" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_no_store(&headers);
+    assert_eq!(shippo.purchases().len(), 1);
+
+    let (status, headers, body) = send_with_headers(
+        app.router.clone(),
+        "GET",
+        &format!("/v0/orders/{}/shipping/label", order.order_id),
+        Some(&seller.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_no_store(&headers);
+
+    for state in [
+        "shipped",
+        "delivered",
+        "completed",
+        "cancel_requested",
+        "cancelled",
+        "return_requested",
+        "return_approved",
+        "return_received",
+        "refunded_external",
+        "closed",
+    ] {
+        set_order_state(&app, &order.order_id, state, "shipping").await;
+        let (status, _) = quote_rates(&app, &seller.token, &order.order_id, &parcel_body()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "rates state {state}");
+        let (status, _) = send(
+            app.router.clone(),
+            "GET",
+            &format!("/v0/orders/{}/shipping/label", order.order_id),
+            Some(&seller.token),
+            &Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "label state {state}");
+    }
+
+    set_order_state(&app, &order.order_id, "paid", "pickup").await;
+    let (status, _) = quote_rates(&app, &seller.token, &order.order_id, &parcel_body()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "pickup rates");
+    let (status, _) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v0/orders/{}/shipping/label", order.order_id),
+        Some(&seller.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "pickup cached label");
 }
 
 #[sqlx::test(migrations = "./migrations")]

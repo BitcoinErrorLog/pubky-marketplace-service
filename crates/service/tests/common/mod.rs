@@ -9,7 +9,7 @@ pub mod paykit_review;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::Router;
 use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
@@ -662,6 +662,42 @@ pub async fn send(
         serde_json::from_slice(&bytes).expect("body is JSON")
     };
     (status, value)
+}
+
+pub async fn send_with_headers(
+    router: Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: &Value,
+) -> (StatusCode, HeaderMap, Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let request = request
+        .body(Body::from(
+            serde_json::to_vec(body).expect("body serializes"),
+        ))
+        .expect("request builds");
+    let response = router.oneshot(request).await.expect("request executes");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("body is JSON")
+    };
+    (status, headers, value)
 }
 
 /// Sends a request whose body is raw bytes (the AuthToken wire form).
