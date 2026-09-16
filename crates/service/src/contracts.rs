@@ -310,7 +310,19 @@ fn is_pubky(value: &str) -> bool {
 }
 
 pub fn assert_no_sensitive_values(value: &Value) {
-    fn walk(value: &Value, key: Option<&str>) {
+    assert_no_sensitive_values_for_contract(value, None);
+}
+
+pub fn assert_no_sensitive_values_for_contract(
+    value: &Value,
+    allowed_single_order_case: Option<&str>,
+) {
+    fn walk(
+        value: &Value,
+        key: Option<&str>,
+        path: &mut Vec<String>,
+        allowed_single_order_case: Option<&str>,
+    ) {
         match value {
             Value::Object(object) => {
                 for (key, value) in object {
@@ -320,7 +332,12 @@ pub fn assert_no_sensitive_values(value: &Value) {
                             .and_then(|object| object.get("format").and_then(Value::as_str))
                             == Some("plaintext_v1")
                             && value.get("address").is_some_and(Value::is_object);
-                        assert!(tagged, "delivery_address must use plaintext_v1");
+                        assert!(
+                            tagged
+                                && allowed_single_order_case
+                                    .is_some_and(|case| path.iter().any(|part| part == case)),
+                            "delivery_address is allowed only in the seller single-order contract case"
+                        );
                     } else {
                         assert!(
                             !matches!(
@@ -335,10 +352,14 @@ pub fn assert_no_sensitive_values(value: &Value) {
                             "contract artifact contains forbidden field '{key}'"
                         );
                     }
-                    walk(value, Some(key));
+                    path.push(key.clone());
+                    walk(value, Some(key), path, allowed_single_order_case);
+                    path.pop();
                 }
             }
-            Value::Array(values) => values.iter().for_each(|value| walk(value, key)),
+            Value::Array(values) => values
+                .iter()
+                .for_each(|value| walk(value, key, path, allowed_single_order_case)),
             Value::String(value) => {
                 let lower = value.to_ascii_lowercase();
                 assert!(!lower.starts_with("bearer "), "residual bearer value");
@@ -355,7 +376,7 @@ pub fn assert_no_sensitive_values(value: &Value) {
             _ => {}
         }
     }
-    walk(value, None);
+    walk(value, None, &mut Vec::new(), allowed_single_order_case);
 }
 
 fn replace_embedded_uuids(value: &str, values: &mut HashMap<String, String>) -> String {
