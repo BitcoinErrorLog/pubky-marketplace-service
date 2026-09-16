@@ -312,6 +312,44 @@ fn delivery_address_contract_requires_tagged_plaintext_variant() {
 }
 
 #[test]
+fn buyer_sample_tagged_delivery_address_is_rejected() {
+    let buyer_sample = json!({
+        "buyer_paid_shipping_address": {
+            "response": {
+                "body": {
+                    "delivery_address": {
+                        "format": "plaintext_v1",
+                        "address": {"line1": "not allowed"}
+                    }
+                }
+            }
+        }
+    });
+    assert!(std::panic::catch_unwind(|| {
+        assert_no_sensitive_values_for_contract(&buyer_sample, Some("seller_paid_shipping_address"))
+    })
+    .is_err());
+}
+
+#[test]
+fn seller_list_tagged_delivery_address_is_rejected() {
+    let list_sample = json!({
+        "seller_paid_shipping_address": {
+            "list": [{
+                "delivery_address": {
+                    "format": "plaintext_v1",
+                    "address": {"line1": "not allowed"}
+                }
+            }]
+        }
+    });
+    assert!(std::panic::catch_unwind(|| {
+        assert_no_sensitive_values_for_contract(&list_sample, Some("seller_paid_shipping_address"))
+    })
+    .is_err());
+}
+
+#[test]
 fn normalizer_replaces_embedded_only_pubkys() {
     let pubky = "y".repeat(52);
     let raw = json!({"aggregate_id": format!("listing:{pubky}:boots")});
