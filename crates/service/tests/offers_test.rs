@@ -673,6 +673,10 @@ async fn offer_checkout_success_replay_is_idempotent(pool: PgPool) {
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 1);
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM payments").await, 1);
     command["command_id"] = json!("00000000-0000-4000-8000-000000001105");
+    command["expected_revision"] = json!(2);
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], json!("AWARD_ALREADY_CONVERTED"));
     command["expected_revision"] = json!(3);
     let (status, body) = execute(&app, &buyer.token, &command).await;
     assert_eq!(status, StatusCode::CONFLICT);

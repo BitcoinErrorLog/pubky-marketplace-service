@@ -54,6 +54,12 @@ pub async fn handle(
             "Only the accepted offer's buyer may place this order.",
         )));
     }
+    if offer.state == "converted" {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::AwardAlreadyConverted,
+            "This accepted offer has already been converted to an order.",
+        )));
+    }
     if command.expected_revision != offer.revision {
         return Ok(Err(CommandFailure::with_revision(
             ErrorCode::RevisionConflict,
@@ -71,12 +77,6 @@ pub async fn handle(
         return Ok(Err(CommandFailure::new(
             ErrorCode::AwardExpired,
             "This accepted offer's checkout window has expired. Nothing was ordered.",
-        )));
-    }
-    if offer.state == "converted" {
-        return Ok(Err(CommandFailure::new(
-            ErrorCode::AwardAlreadyConverted,
-            "This accepted offer has already been converted to an order.",
         )));
     }
     if offer.state != "accepted" {
