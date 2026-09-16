@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use marketplace_service::clock::Clock;
 use serde_json::json;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use common::{
     checkout_command, count, execute, listing_aggregate, new_actor, random_keypair,
@@ -76,6 +77,44 @@ async fn returns_exact_stored_result_for_idempotent_replay(pool: PgPool) {
     assert_eq!(replay_status, StatusCode::OK);
     assert_eq!(replay, first);
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM events").await, 1);
+}
+
+#[sqlx::test]
+async fn checkout_fresh_and_legacy_replays_redact_delivery_address(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+
+    let command = checkout_command(&seller.pubky);
+    let command_id = Uuid::parse_str(command["command_id"].as_str().expect("command id")).unwrap();
+    let (status, fresh) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "{fresh}");
+    assert!(fresh["result"]["orders"][0]
+        .get("delivery_address")
+        .is_none());
+
+    sqlx::query(
+        "UPDATE command_results
+         SET result = jsonb_set(
+             result,
+             '{result,orders,0,delivery_address}',
+             '{\"line1\":\"DISTINCTIVE_LEGACY_ADDRESS\"}'::jsonb
+         )
+         WHERE actor_pubky = $1 AND command_id = $2",
+    )
+    .bind(&buyer.pubky)
+    .bind(command_id)
+    .execute(&app.pool)
+    .await
+    .expect("seed legacy replay result");
+
+    let (status, replay) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert!(replay["result"]["orders"][0]
+        .get("delivery_address")
+        .is_none());
+    assert!(!replay.to_string().contains("DISTINCTIVE_LEGACY_ADDRESS"));
 }
 
 // TS case: "rejects changed input under an already accepted command id"
