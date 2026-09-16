@@ -46,7 +46,7 @@
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::ids;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Transaction};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1397,16 +1397,12 @@ async fn apply_confirmed_paykit_payment(
     let Some(payment) = payment else {
         anyhow::bail!("paykit order {} references a missing payment", row.id);
     };
+    if !resolution_pins_present {
+        tx.rollback().await?;
+        return apply_legacy_unpinned_manual_review(pool, row, amount_matched, observation, now)
+            .await;
+    }
     if payment.state == "expired" || (late_settlement && payment.state == "awaiting_entitlement") {
-        if !resolution_pins_present {
-            tx.rollback().await?;
-            tracing::error!(
-                order_id = %row.id,
-                code = "paykit_resolution_pins_missing",
-                "blocked late paykit manual-review entry for an unpinned legacy order"
-            );
-            return Ok(false);
-        }
         // The settlement is real but cannot auto-pay: either the hold
         // window already elapsed (the sweep released the stock and
         // cancelled the order), or the producer flagged the settlement as
@@ -1467,15 +1463,6 @@ async fn apply_confirmed_paykit_payment(
     }
     if !amount_matched {
         // Money arrived but not the required amount: never silently confirm.
-        if !resolution_pins_present {
-            tx.rollback().await?;
-            tracing::error!(
-                order_id = %row.id,
-                code = "paykit_resolution_pins_missing",
-                "blocked amount-mismatch paykit manual-review entry for an unpinned legacy order"
-            );
-            return Ok(false);
-        }
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
              manual_review_entered_at = $2, updated_at = $2 WHERE id = $1 RETURNING revision",
@@ -1527,15 +1514,6 @@ async fn apply_confirmed_paykit_payment(
             .observed_sats
             .is_some_and(|observed| i64::try_from(observed).ok() != order.paykit_total_sats);
     if observed_amount_mismatch {
-        if !resolution_pins_present {
-            tx.rollback().await?;
-            tracing::error!(
-                order_id = %row.id,
-                code = "paykit_resolution_pins_missing",
-                "blocked amount-mismatch paykit manual-review entry for an unpinned legacy order"
-            );
-            return Ok(false);
-        }
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
              manual_review_entered_at = $2, updated_at = $2 WHERE id = $1 RETURNING revision",
@@ -1645,14 +1623,6 @@ async fn apply_confirmed_paykit_payment(
         }
         Err(failure) => {
             tx.rollback().await?;
-            if !resolution_pins_present {
-                tracing::error!(
-                    order_id = %row.id,
-                    code = "paykit_resolution_pins_missing",
-                    "blocked confirm-failure paykit manual-review entry for an unpinned legacy order"
-                );
-                return Ok(false);
-            }
             tracing::warn!(
                 order_id = %row.id,
                 code = ?failure.code,
@@ -1704,6 +1674,67 @@ async fn apply_confirmed_paykit_payment(
             Ok(updated.is_some())
         }
     }
+}
+
+async fn apply_legacy_unpinned_manual_review(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    amount_matched: bool,
+    observation: &crate::payments::PaykitObservation,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let updated: Option<(i64,)> = sqlx::query_as(
+        "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+         manual_review_entered_at = $2, updated_at = $2 \
+         WHERE id = $1 AND state IN ('awaiting_entitlement', 'expired') \
+         RETURNING revision",
+    )
+    .bind(row.payment_id)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((revision,)) = updated else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    crate::executor::insert_event(
+        &mut tx,
+        row.id,
+        &ids::payment_aggregate_id(row.payment_id),
+        revision,
+        &row.buyer_pubky,
+        "payment.manual_review",
+        now,
+    )
+    .await?;
+    let mut observation_doc = crate::bitcoin_review::observation_json(
+        "confirmed",
+        amount_matched,
+        observation,
+        now,
+        false,
+    );
+    observation_doc["legacy_unpinned"] = json!(true);
+    sqlx::query(
+        "UPDATE orders SET paykit_request_state = 'confirmed', \
+         paykit_seller_confirmation_entered_at = NULL, \
+         paykit_seller_confirmation_deadline = NULL, paykit_observation = $3, updated_at = $2 \
+         WHERE id = $1",
+    )
+    .bind(row.id)
+    .bind(now)
+    .bind(observation_doc)
+    .execute(&mut *tx)
+    .await?;
+    freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
+    tx.commit().await?;
+    tracing::error!(
+        order_id = %row.id,
+        code = "paykit_legacy_unpinned_manual_review",
+        "confirmed paykit settlement entered manual review because the legacy order has no resolution pin"
+    );
+    Ok(true)
 }
 
 /// The display-only `detected` flip: an on-chain detection advances the

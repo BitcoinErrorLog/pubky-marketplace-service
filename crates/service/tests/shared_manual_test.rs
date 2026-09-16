@@ -705,7 +705,7 @@ async fn a_confirm_failure_clears_an_active_seller_window(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn a_legacy_unpinned_order_cannot_enter_w1_15_resolution(pool: PgPool) {
+async fn a_legacy_unpinned_exact_confirmation_enters_manual_review_once(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -719,27 +719,48 @@ async fn a_legacy_unpinned_order_cannot_enter_w1_15_resolution(pool: PgPool) {
     .await
     .expect("simulate a pre-0022 row without resolution pins");
 
-    paykit.set_status(&reference, status_detected("shared_manual", 0));
-    assert_eq!(poll_now(&app, app.clock.now()).await, 0);
+    paykit.set_allocation_mode("exclusive");
+    paykit.set_status(&reference, status_confirmed("exclusive", true, 6));
+    assert_eq!(poll_now(&app, app.clock.now()).await, 1);
     let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
-    assert_eq!(request_state, "pending");
-    assert_eq!(payment_state, "awaiting_entitlement");
-
-    paykit.set_status(
-        &reference,
-        captured_late_status(LIVE_SHARED_MANUAL_LATE_STATUS),
+    assert_eq!(request_state, "confirmed");
+    assert_eq!(payment_state, "manual_review");
+    let marker: bool = sqlx::query_scalar(
+        "SELECT paykit_observation->>'legacy_unpinned' = 'true' FROM orders WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&order_id).unwrap())
+    .fetch_one(&pool)
+    .await
+    .expect("legacy marker");
+    assert!(marker);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'payment.manual_review'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM paykit_resolve_outbox").await,
+        0
     );
     assert_eq!(
         poll_now(&app, app.clock.now() + chrono::Duration::seconds(60)).await,
         0
     );
-    let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
-    assert_eq!(request_state, "pending");
-    assert_eq!(payment_state, "awaiting_entitlement");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'payment.manual_review'"
+        )
+        .await,
+        1
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn a_legacy_unpinned_amount_mismatch_stays_out_of_manual_review(pool: PgPool) {
+async fn a_legacy_unpinned_amount_mismatch_enters_manual_review(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -759,11 +780,11 @@ async fn a_legacy_unpinned_amount_mismatch_stays_out_of_manual_review(pool: PgPo
     paykit.set_status(&reference, status_confirmed("exclusive", false, 6));
     assert_eq!(
         poll_now(&app, app.clock.now() + chrono::Duration::seconds(60)).await,
-        0
+        1
     );
     let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
-    assert_eq!(request_state, "pending");
-    assert_eq!(payment_state, "awaiting_entitlement");
+    assert_eq!(request_state, "confirmed");
+    assert_eq!(payment_state, "manual_review");
 }
 
 #[sqlx::test(migrations = "./migrations")]

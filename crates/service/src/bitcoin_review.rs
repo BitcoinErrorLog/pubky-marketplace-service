@@ -723,6 +723,19 @@ pub async fn resolve_bitcoin_payment(
             "Bitcoin resolution applies only to bitcoin-bound orders.",
         );
     }
+    if order
+        .paykit_observation
+        .as_ref()
+        .and_then(|observation| observation.get("legacy_unpinned"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return review_error(
+            ErrorCode::InvalidState,
+            review_reason(ReviewReason::MissingPin),
+            "This legacy payment cannot emit a paykit resolution.",
+        );
+    }
     let pins_present = order.paykit_request_reference.is_some()
         && order.paykit_stack_id.is_some()
         && order.paykit_stack_endpoint.is_some();
@@ -885,6 +898,15 @@ pub(crate) async fn apply_manual_review_resolution(
             "order row missing".into(),
         ));
     };
+    if order
+        .paykit_observation
+        .as_ref()
+        .and_then(|observation| observation.get("legacy_unpinned"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Err(ResolutionFailure::NotInManualReview);
+    }
     let exit_state = match input.outcome {
         "paid" | "refunded" => "confirmed",
         _ => "expired",
@@ -1567,6 +1589,7 @@ pub async fn watch_manual_reviews(
          AND p.state = 'manual_review' AND p.resolution_outcome IS NULL \
          AND o.paykit_request_reference IS NOT NULL \
          AND o.paykit_stack_id IS NOT NULL AND o.paykit_stack_endpoint IS NOT NULL \
+         AND COALESCE((o.paykit_observation->>'legacy_unpinned')::boolean, FALSE) = FALSE \
          ORDER BY p.manual_review_entered_at LIMIT 100",
     )
     .fetch_all(pool)
