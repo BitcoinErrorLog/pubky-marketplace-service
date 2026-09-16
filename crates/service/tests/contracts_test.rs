@@ -11,7 +11,8 @@ use common::{
     test_app_with_payments, TestActor, TestApp,
 };
 use marketplace_service::contracts::{
-    assert_no_sensitive_values, endpoint_contracts, normalized_snapshot, ReviewReason,
+    assert_no_sensitive_values, assert_no_sensitive_values_for_contract, endpoint_contracts,
+    normalized_snapshot, ReviewReason,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -33,9 +34,12 @@ fn snapshot_path(name: &str) -> PathBuf {
     }
 }
 
-fn rendered_snapshot(value: &Value) -> Vec<u8> {
+fn rendered_snapshot(name: &str, value: &Value) -> Vec<u8> {
     let normalized = normalized_snapshot(value);
-    assert_no_sensitive_values(&normalized);
+    assert_no_sensitive_values_for_contract(
+        &normalized,
+        (name == "projections").then_some("seller_paid_shipping_address"),
+    );
     let mut rendered = serde_json::to_vec_pretty(&normalized).expect("snapshot serializes");
     rendered.push(b'\n');
     rendered
@@ -43,18 +47,36 @@ fn rendered_snapshot(value: &Value) -> Vec<u8> {
 
 #[test]
 fn delivery_address_serialization_has_one_source_guarded_path() {
+    fn violation(path: &Path, source: &str) -> Option<String> {
+        if source.contains("delivery_address_for_shipping")
+            || source.contains("ShippoDestination::as_value")
+        {
+            return Some("raw delivery-address API".to_string());
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some("model.rs") {
+            let count = source.matches("\"delivery_address\":").count();
+            return (count != 1)
+                .then(|| format!("model serialization site count is {count}, expected one"));
+        }
+        if source.contains("json!({ \"delivery_address\"")
+            || source.contains("json!({\n            \"delivery_address\"")
+            || source.contains(".insert(\"delivery_address\"")
+            || source.contains("[\"delivery_address\"] =")
+        {
+            return Some("direct HTTP response serialization".to_string());
+        }
+        None
+    }
+
     fn visit(path: &Path, violations: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(path).expect("source directory reads") {
             let entry = entry.expect("source entry reads");
             let path = entry.path();
             if path.is_dir() {
                 visit(&path, violations);
-            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs")
-                && path.file_name().and_then(|name| name.to_str()) != Some("model.rs")
-                && path.file_name().and_then(|name| name.to_str()) != Some("shipping.rs")
-            {
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
                 let source = std::fs::read_to_string(&path).expect("source reads");
-                if source.contains("\"delivery_address\":") {
+                if violation(&path, &source).is_some() {
                     violations.push(path);
                 }
             }
@@ -68,7 +90,15 @@ fn delivery_address_serialization_has_one_source_guarded_path() {
     );
     assert!(
         violations.is_empty(),
-        "direct delivery_address serialization outside model.rs or shipping.rs: {violations:?}"
+        "unsafe delivery_address serialization/API path: {violations:?}"
+    );
+    assert!(
+        violation(
+            Path::new("handlers/fixture.rs"),
+            r#"let response = json!({ "delivery_address": address });"#,
+        )
+        .is_some(),
+        "a direct handler serialization fixture must be rejected"
     );
 }
 
@@ -89,7 +119,7 @@ fn compare_snapshot(path: &Path, actual: &[u8], update: bool) -> Result<(), Stri
 }
 
 fn assert_snapshot(name: &str, value: &Value) {
-    let actual = rendered_snapshot(value);
+    let actual = rendered_snapshot(name, value);
     compare_snapshot(
         &snapshot_path(name),
         &actual,
@@ -257,12 +287,18 @@ fn nested_values_and_residual_sensitive_values_are_rejected() {
 #[test]
 fn delivery_address_contract_requires_tagged_plaintext_variant() {
     let accepted = json!({
-        "delivery_address": {
-            "format": "plaintext_v1",
-            "address": {"name": "Buyer", "country_code": "US"}
+        "seller_paid_shipping_address": {
+            "response": {
+                "body": {
+                    "delivery_address": {
+                        "format": "plaintext_v1",
+                        "address": {"name": "Buyer", "country_code": "US"}
+                    }
+                }
+            }
         }
     });
-    assert_no_sensitive_values(&accepted);
+    assert_no_sensitive_values_for_contract(&accepted, Some("seller_paid_shipping_address"));
     for rejected in [
         json!({"delivery_address": {"name": "Buyer"}}),
         json!({"delivery_address": {"format": "ciphertext_v1", "address": {}}}),
@@ -383,7 +419,7 @@ fn raw_paykit_reference_fails_residual_assertion() {
 #[test]
 fn one_byte_snapshot_mutation_is_rejected_by_canonical_compare() {
     let path = std::env::temp_dir().join(format!("contract-drift-{}.json", Uuid::new_v4()));
-    let mut actual = rendered_snapshot(&json!({"case": {"status": 422}}));
+    let mut actual = rendered_snapshot("unit", &json!({"case": {"status": 422}}));
     compare_snapshot(&path, &actual, true).expect("calibration snapshot writes");
     let index = actual
         .iter()
