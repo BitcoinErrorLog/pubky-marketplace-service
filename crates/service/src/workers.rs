@@ -1467,6 +1467,15 @@ async fn apply_confirmed_paykit_payment(
     }
     if !amount_matched {
         // Money arrived but not the required amount: never silently confirm.
+        if !resolution_pins_present {
+            tx.rollback().await?;
+            tracing::error!(
+                order_id = %row.id,
+                code = "paykit_resolution_pins_missing",
+                "blocked amount-mismatch paykit manual-review entry for an unpinned legacy order"
+            );
+            return Ok(false);
+        }
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
              manual_review_entered_at = $2, updated_at = $2 WHERE id = $1 RETURNING revision",
@@ -1518,6 +1527,15 @@ async fn apply_confirmed_paykit_payment(
             .observed_sats
             .is_some_and(|observed| i64::try_from(observed).ok() != order.paykit_total_sats);
     if observed_amount_mismatch {
+        if !resolution_pins_present {
+            tx.rollback().await?;
+            tracing::error!(
+                order_id = %row.id,
+                code = "paykit_resolution_pins_missing",
+                "blocked amount-mismatch paykit manual-review entry for an unpinned legacy order"
+            );
+            return Ok(false);
+        }
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
              manual_review_entered_at = $2, updated_at = $2 WHERE id = $1 RETURNING revision",
@@ -1627,6 +1645,14 @@ async fn apply_confirmed_paykit_payment(
         }
         Err(failure) => {
             tx.rollback().await?;
+            if !resolution_pins_present {
+                tracing::error!(
+                    order_id = %row.id,
+                    code = "paykit_resolution_pins_missing",
+                    "blocked confirm-failure paykit manual-review entry for an unpinned legacy order"
+                );
+                return Ok(false);
+            }
             tracing::warn!(
                 order_id = %row.id,
                 code = ?failure.code,
@@ -1656,7 +1682,10 @@ async fn apply_confirmed_paykit_payment(
                 .await?;
             }
             sqlx::query(
-                "UPDATE orders SET paykit_request_state = 'confirmed', paykit_observation = $3, updated_at = $2 \
+                "UPDATE orders SET paykit_request_state = 'confirmed', \
+                 paykit_seller_confirmation_entered_at = NULL, \
+                 paykit_seller_confirmation_deadline = NULL, \
+                 paykit_observation = $3, updated_at = $2 \
                  WHERE id = $1",
             )
             .bind(row.id)

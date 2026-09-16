@@ -666,6 +666,45 @@ async fn an_amount_mismatch_clears_an_active_seller_window(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn a_confirm_failure_clears_an_active_seller_window(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _payment_id, reference) =
+        bound_shared_manual_order(&app, &paykit, &seller, &buyer).await;
+
+    let now = app.clock.now();
+    paykit.set_status(&reference, status_detected("shared_manual", 0));
+    assert_eq!(poll_now(&app, now).await, 1);
+    sqlx::query(
+        "UPDATE orders SET state = 'cancelled', stock_held = FALSE, \
+         cancellation_reason = 'cancelled during seller confirmation window' \
+         WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&order_id).unwrap())
+    .execute(&pool)
+    .await
+    .expect("cancel order during seller window");
+    paykit.set_allocation_mode("exclusive");
+    paykit.set_status(&reference, status_confirmed("exclusive", true, 6));
+    assert_eq!(poll_now(&app, now + chrono::Duration::seconds(60)).await, 1);
+
+    let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
+    assert_eq!(request_state, "confirmed");
+    assert_eq!(payment_state, "manual_review");
+    let (entered, deadline): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT paykit_seller_confirmation_entered_at, \
+             paykit_seller_confirmation_deadline FROM orders WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&order_id).unwrap())
+    .fetch_one(&pool)
+    .await
+    .expect("seller window columns");
+    assert_eq!(entered, None);
+    assert_eq!(deadline, None);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn a_legacy_unpinned_order_cannot_enter_w1_15_resolution(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -690,6 +729,34 @@ async fn a_legacy_unpinned_order_cannot_enter_w1_15_resolution(pool: PgPool) {
         &reference,
         captured_late_status(LIVE_SHARED_MANUAL_LATE_STATUS),
     );
+    assert_eq!(
+        poll_now(&app, app.clock.now() + chrono::Duration::seconds(60)).await,
+        0
+    );
+    let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
+    assert_eq!(request_state, "pending");
+    assert_eq!(payment_state, "awaiting_entitlement");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_legacy_unpinned_amount_mismatch_stays_out_of_manual_review(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _payment_id, reference) =
+        bound_shared_manual_order(&app, &paykit, &seller, &buyer).await;
+    sqlx::query(
+        "UPDATE orders SET paykit_stack_id = NULL, paykit_stack_endpoint = NULL WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&order_id).unwrap())
+    .execute(&pool)
+    .await
+    .expect("simulate a pre-0022 row without resolution pins");
+
+    paykit.set_status(&reference, status_detected("shared_manual", 0));
+    assert_eq!(poll_now(&app, app.clock.now()).await, 0);
+    paykit.set_allocation_mode("exclusive");
+    paykit.set_status(&reference, status_confirmed("exclusive", false, 6));
     assert_eq!(
         poll_now(&app, app.clock.now() + chrono::Duration::seconds(60)).await,
         0
