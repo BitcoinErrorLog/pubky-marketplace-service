@@ -900,6 +900,45 @@ async fn unpinned_shared_resolution_refuses_before_outbox(pool: PgPool) {
     assert!(outbox_facts(&pool, &order_id).await.is_empty());
 }
 
+#[sqlx::test(migrations = "./migrations")]
+async fn unpinned_reviews_are_not_selected_by_the_sla_watcher(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (unpinned_order_id, _reference) =
+        into_manual_review_held(&app, &paykit, &seller, &buyer).await;
+    clear_resolution_pins(&pool, &unpinned_order_id).await;
+    let entered_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT manual_review_entered_at FROM payments WHERE order_id = $1")
+            .bind(Uuid::parse_str(&unpinned_order_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("unpinned entry stamp");
+
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (pinned_order_id, _reference) =
+        into_manual_review_held(&app, &paykit, &seller, &buyer).await;
+
+    let (alerts, abandoned) = watch_manual_reviews(
+        &app.state,
+        entered_at + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS),
+    )
+    .await
+    .expect("watch runs");
+    assert_eq!(alerts, 1, "only the pinned review is SLA-scanned");
+    assert_eq!(abandoned, 1, "only the pinned review is reaped");
+    assert_eq!(
+        payment_facts(&pool, &unpinned_order_id).await.state,
+        "manual_review"
+    );
+    assert!(outbox_facts(&pool, &unpinned_order_id).await.is_empty());
+    assert_eq!(
+        payment_facts(&pool, &pinned_order_id).await.state,
+        "expired"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The seven-day inactivity reaper
 // ---------------------------------------------------------------------------

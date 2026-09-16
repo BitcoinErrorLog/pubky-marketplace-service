@@ -1572,14 +1572,15 @@ pub async fn watch_manual_reviews(
     now: DateTime<Utc>,
 ) -> anyhow::Result<(u64, u64)> {
     let pool = &state.pool;
-    // Eligible scope (r12): Paykit adapter, bitcoin method, unresolved.
-    // Read without row locks; each row's own CAS decides.
+    // Eligible scope (r12): Paykit adapter, bitcoin method, unresolved,
+    // pins present. Read without row locks; each row's own CAS decides.
     let rows: Vec<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
         "SELECT p.order_id, p.manual_review_entered_at, p.manual_review_sla_alerted_at \
          FROM payments p JOIN orders o ON o.id = p.order_id \
          WHERE p.adapter = 'paykit' AND o.payment_method = 'bitcoin' \
          AND p.state = 'manual_review' AND p.resolution_outcome IS NULL \
-         /* legacy reviews remain in the normal SLA queue */ \
+         AND o.paykit_request_reference IS NOT NULL \
+         AND o.paykit_stack_id IS NOT NULL AND o.paykit_stack_endpoint IS NOT NULL \
          ORDER BY p.manual_review_entered_at LIMIT 100",
     )
     .fetch_all(pool)
