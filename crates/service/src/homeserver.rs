@@ -17,7 +17,9 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use marketplace_domain::commands::{AuctionTerms, RegisterListingPayload, SaleFormat};
+use marketplace_domain::commands::{
+    parse_lock_resource, AuctionTerms, DigitalLockMetadata, RegisterListingPayload, SaleFormat,
+};
 use marketplace_domain::money::Money;
 use marketplace_domain::ValidationIssue;
 use serde::Deserialize;
@@ -337,6 +339,19 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
         seller_pubky: &'a str,
         drop_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>>;
+
+    /// Fetches the seller's public content-lock document. This mirrors
+    /// `pubky/locks@ba49a777:locks-sdk/src/discovery.rs:13-52`: the request
+    /// is addressed through the creator's homeserver identity and callers
+    /// validate the returned creator and canonical resource path.
+    fn fetch_content_lock<'a>(
+        &'a self,
+        creator_pubky: &'a str,
+        content_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        let _ = (creator_pubky, content_path);
+        Box::pin(async { HomeserverFetchOutcome::Unavailable })
+    }
 }
 
 /// The production client: a real
@@ -520,6 +535,14 @@ impl HomeserverListingClient for HttpHomeserverClient {
             .await
         })
     }
+
+    fn fetch_content_lock<'a>(
+        &'a self,
+        creator_pubky: &'a str,
+        content_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move { self.fetch_inner(creator_pubky, content_path).await })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +613,13 @@ struct RecordShippingOption {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RecordDigitalLock {
+    policy_uri: String,
+    criterion_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListingRecord {
     #[serde(default)]
     title: Option<String>,
@@ -607,6 +637,8 @@ struct ListingRecord {
     /// only to the service, so no sync path can null them (§A4).
     #[serde(default)]
     fulfillment_methods: Vec<String>,
+    #[serde(default)]
+    digital_lock: Option<RecordDigitalLock>,
 }
 
 /// The flat shipping the service will charge per order line: the cheapest
@@ -631,6 +663,14 @@ fn shipping_minor_from_options(options: &[RecordShippingOption], listing_currenc
         .unwrap_or(0)
 }
 
+/// The record carried a `digitalLock` that is not a valid Locks payment
+/// lock. Absent metadata means the listing has no lock, but PRESENT
+/// malformed metadata must refuse the sync: silently deriving `None` would
+/// heal the listing to no lock and strip the seller's authority (Sol Wave
+/// 1A review, P2-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedDigitalLock;
+
 /// Derives the registration payload from a fetched record, mirroring the
 /// reference client's `registerListing` field mapping EXACTLY: the title,
 /// `listingRevision = record.revision`, `contentHash = media[0].contentHash`,
@@ -638,34 +678,54 @@ fn shipping_minor_from_options(options: &[RecordShippingOption], listing_currenc
 /// unit price from `sale.unitPrice` (fixed price) or `sale.startingPrice`
 /// (auction), and — for auctions — the terms from the sale object.
 ///
-/// Returns `None` when the record cannot be interpreted as a listing record
-/// at all; field-level invariants are left to
+/// Returns `Ok(None)` when the record cannot be interpreted as a listing
+/// record at all; field-level invariants are left to
 /// `validate_register_listing_payload`, which the sync handler runs on the
-/// result.
+/// result. A present-but-invalid `digitalLock` is `Err(MalformedDigitalLock)`.
 pub fn registration_payload_from_record(
     seller_pubky: &str,
     listing_id: &str,
     record: &Value,
-) -> Option<RegisterListingPayload> {
-    let record: ListingRecord = serde_json::from_value(record.clone()).ok()?;
+) -> Result<Option<RegisterListingPayload>, MalformedDigitalLock> {
+    let Ok(record) = serde_json::from_value::<ListingRecord>(record.clone()) else {
+        return Ok(None);
+    };
     let sale_format = match record.sale.format.as_str() {
         "fixed_price" => SaleFormat::FixedPrice,
         "auction" => SaleFormat::Auction,
-        _ => return None,
+        _ => return Ok(None),
     };
-    let unit_price = match sale_format {
+    let Some(unit_price) = (match sale_format {
         SaleFormat::FixedPrice => record.sale.unit_price,
         SaleFormat::Auction => record.sale.starting_price,
-    }?
-    .into_money();
+    }) else {
+        return Ok(None);
+    };
+    let unit_price = unit_price.into_money();
     let auction_terms = if sale_format == SaleFormat::Auction {
+        let (
+            Some(starts_at),
+            Some(ends_at),
+            Some(minimum_increment),
+            Some(window),
+            Some(extension),
+        ) = (
+            record.sale.starts_at,
+            record.sale.ends_at,
+            record.sale.minimum_increment,
+            record.sale.anti_sniping_window_seconds,
+            record.sale.anti_sniping_extension_seconds,
+        )
+        else {
+            return Ok(None);
+        };
         Some(AuctionTerms {
-            starts_at: record.sale.starts_at?,
-            ends_at: record.sale.ends_at?,
-            minimum_increment: record.sale.minimum_increment?.into_money(),
+            starts_at,
+            ends_at,
+            minimum_increment: minimum_increment.into_money(),
             reserve_price: record.sale.reserve_price.map(RecordMoney::into_money),
-            anti_sniping_window_seconds: record.sale.anti_sniping_window_seconds?,
-            anti_sniping_extension_seconds: record.sale.anti_sniping_extension_seconds?,
+            anti_sniping_window_seconds: window,
+            anti_sniping_extension_seconds: extension,
         })
     } else {
         None
@@ -693,7 +753,22 @@ pub fn registration_payload_from_record(
     if fulfillment_methods.is_empty() {
         fulfillment_methods = marketplace_domain::commands::default_fulfillment_methods();
     }
-    Some(RegisterListingPayload {
+    let digital_lock = match record.digital_lock {
+        None => None,
+        Some(lock) => {
+            if parse_lock_resource(&lock.policy_uri).is_some()
+                && marketplace_domain::commands::is_valid_entity_id(&lock.criterion_id)
+            {
+                Some(DigitalLockMetadata {
+                    policy_uri: lock.policy_uri,
+                    criterion_id: lock.criterion_id,
+                })
+            } else {
+                return Err(MalformedDigitalLock);
+            }
+        }
+    };
+    Ok(Some(RegisterListingPayload {
         seller_pubky: seller_pubky.to_string(),
         listing_id: listing_id.to_string(),
         title: record
@@ -712,7 +787,8 @@ pub fn registration_payload_from_record(
         sale_format,
         auction_terms,
         fulfillment_methods,
-    })
+        digital_lock,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -922,7 +998,8 @@ mod tests {
     fn derives_the_registration_payload_like_the_client() {
         let seller = "y".repeat(52);
         let payload = registration_payload_from_record(&seller, "listing_01", &record_json())
-            .expect("record parses");
+            .expect("record parses")
+            .expect("listing record");
         assert_eq!(payload.title, "Pokemon / Snorlax");
         assert_eq!(payload.listing_revision, 1);
         assert_eq!(payload.content_hash, "f".repeat(64));
@@ -939,7 +1016,8 @@ mod tests {
         record["title"] = json!(null);
         record["someFutureField"] = json!({ "nested": true });
         let payload = registration_payload_from_record(&"y".repeat(52), "l", &record)
-            .expect("lenient parse succeeds");
+            .expect("lenient parse succeeds")
+            .expect("listing record");
         assert_eq!(payload.title, "Marketplace item");
     }
 
@@ -957,7 +1035,8 @@ mod tests {
             "antiSnipingExtensionSeconds": 120,
         });
         let payload = registration_payload_from_record(&"y".repeat(52), "l", &record)
-            .expect("auction record parses");
+            .expect("auction record parses")
+            .expect("listing record");
         assert_eq!(payload.sale_format, SaleFormat::Auction);
         assert_eq!(payload.unit_price.amount_minor, 4_500);
         let terms = payload.auction_terms.expect("terms derived");
@@ -970,18 +1049,73 @@ mod tests {
     fn refuses_records_it_cannot_interpret() {
         let mut no_sale = record_json();
         no_sale.as_object_mut().unwrap().remove("sale");
-        assert!(registration_payload_from_record(&"y".repeat(52), "l", &no_sale).is_none());
+        assert!(matches!(
+            registration_payload_from_record(&"y".repeat(52), "l", &no_sale),
+            Ok(None)
+        ));
 
         let mut bad_format = record_json();
         bad_format["sale"]["format"] = json!("raffle");
-        assert!(registration_payload_from_record(&"y".repeat(52), "l", &bad_format).is_none());
+        assert!(matches!(
+            registration_payload_from_record(&"y".repeat(52), "l", &bad_format),
+            Ok(None)
+        ));
 
         let mut auction_without_terms = record_json();
         auction_without_terms["sale"]["format"] = json!("auction");
-        assert!(
-            registration_payload_from_record(&"y".repeat(52), "l", &auction_without_terms)
-                .is_none()
+        assert!(matches!(
+            registration_payload_from_record(&"y".repeat(52), "l", &auction_without_terms),
+            Ok(None)
+        ));
+    }
+
+    // Absent `digitalLock` metadata derives no lock; a valid one is kept;
+    // a PRESENT but malformed one is a hard refusal, never a silent heal to
+    // no lock.
+    #[test]
+    fn digital_lock_absent_valid_and_malformed_are_distinguished() {
+        let seller = "y".repeat(52);
+        let policy_uri = format!(
+            "{seller}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
         );
+
+        // Absent: the record carries no lock at all.
+        let payload = registration_payload_from_record(&seller, "l", &record_json())
+            .expect("record parses")
+            .expect("listing record");
+        assert_eq!(payload.digital_lock, None);
+
+        // Valid: the metadata is preserved verbatim.
+        let mut valid = record_json();
+        valid["digitalLock"] = json!({
+            "policyUri": policy_uri,
+            "criterionId": "paykit",
+        });
+        let payload = registration_payload_from_record(&seller, "l", &valid)
+            .expect("record parses")
+            .expect("listing record");
+        assert_eq!(
+            payload.digital_lock,
+            Some(DigitalLockMetadata {
+                policy_uri: policy_uri.clone(),
+                criterion_id: "paykit".to_string(),
+            })
+        );
+
+        // Malformed: a policy uri that is not a canonical lock resource,
+        // and a criterion id that is not a valid entity id, both refuse.
+        for digital_lock in [
+            json!({ "policyUri": "https://example.com/not-a-lock", "criterionId": "paykit" }),
+            json!({ "policyUri": policy_uri, "criterionId": "" }),
+        ] {
+            let mut malformed = record_json();
+            malformed["digitalLock"] = digital_lock;
+            assert_eq!(
+                registration_payload_from_record(&seller, "l", &malformed),
+                Err(MalformedDigitalLock),
+                "present-but-invalid lock metadata refuses the derivation"
+            );
+        }
     }
 
     fn drop_record_json(seller: &str) -> Value {

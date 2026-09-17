@@ -79,6 +79,26 @@ pub async fn execute(
                 };
                 return Ok((StatusCode::OK, stored_result));
             }
+            if command.kind() == "payment.prepare_locks" {
+                // The stored result is sealed to this payment and buyer; it
+                // is opened only for the same authenticated actor (the
+                // command_results lookup above is actor-scoped).
+                let Some(locks) = state.locks.as_deref() else {
+                    return Ok(failure_response(&CommandFailure::new(
+                        ErrorCode::InvariantViolation,
+                        "The stored command result could not be processed.",
+                    )));
+                };
+                let Some(stored_result) =
+                    unseal_prepare_locks_result(locks, &command, actor, &stored_result)
+                else {
+                    return Ok(failure_response(&CommandFailure::new(
+                        ErrorCode::InvariantViolation,
+                        "The stored command result could not be processed.",
+                    )));
+                };
+                return Ok((StatusCode::OK, stored_result));
+            }
             return Ok((StatusCode::OK, stored_result));
         }
         let failure = CommandFailure::new(
@@ -104,6 +124,25 @@ pub async fn execute(
     match outcome {
         Ok(Ok(success)) => {
             let body = success_body(&command, &success);
+            // The minted Locks client reference exists in plaintext only in
+            // the authenticated response: the durable copy of a prepare
+            // result is sealed to the payment and buyer (ADR-0019 §8 —
+            // persist only ciphertext).
+            let stored_body = if command.kind() == "payment.prepare_locks" {
+                let protected = state
+                    .locks
+                    .as_deref()
+                    .and_then(|locks| seal_prepare_locks_result(locks, &command, actor, &body));
+                let Some(stored_body) = protected else {
+                    return Ok(failure_response(&CommandFailure::new(
+                        ErrorCode::InvariantViolation,
+                        "The command result could not be protected.",
+                    )));
+                };
+                stored_body
+            } else {
+                body.clone()
+            };
             sqlx::query(
                 "INSERT INTO command_results (actor_pubky, command_id, request_hash, result, created_at) \
                  VALUES ($1, $2, $3, $4, $5)",
@@ -111,7 +150,7 @@ pub async fn execute(
             .bind(actor)
             .bind(command.command_id)
             .bind(&request_hash)
-            .bind(&body)
+            .bind(&stored_body)
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -219,6 +258,7 @@ async fn dispatch(
                 actor,
                 command,
                 payload,
+                state.locks.as_deref().map(|runtime| &runtime.keys),
                 state.config.drop_claim_window_seconds,
                 now,
             )
@@ -313,6 +353,18 @@ async fn dispatch(
                 command,
                 payload,
                 state.locks.as_deref(),
+                now,
+            )
+            .await
+        }
+        CommandPayload::PrepareLocks(payload) => {
+            crate::handlers::locks::prepare(
+                tx,
+                actor,
+                command,
+                payload,
+                state.locks.as_deref(),
+                state.homeserver.as_deref(),
                 state.config.locks_payment_window_seconds,
                 now,
             )
@@ -411,6 +463,62 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
         error,
         sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")
     )
+}
+
+/// The durable form of a `payment.prepare_locks` result: the plaintext
+/// `client_reference` is replaced by its payment-and-buyer-bound seal, so
+/// the stored row holds ciphertext only.
+fn seal_prepare_locks_result(
+    locks: &crate::locks::LocksRuntime,
+    command: &Command,
+    actor: &str,
+    body: &Value,
+) -> Option<Value> {
+    let CommandPayload::PrepareLocks(payload) = &command.payload else {
+        return None;
+    };
+    let reference = body.get("result")?.get("client_reference")?.as_str()?;
+    let sealed = locks
+        .keys
+        .seal_result_client_reference(payload.payment_id, actor, reference);
+    let mut stored = body.clone();
+    let result = stored.get_mut("result")?.as_object_mut()?;
+    result.remove("client_reference");
+    result.insert(
+        "client_reference_sealed".to_string(),
+        Value::String(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            sealed,
+        )),
+    );
+    Some(stored)
+}
+
+/// Reverses [`seal_prepare_locks_result`] for the same authenticated buyer
+/// replaying their own command; any tamper, transplant, or key mismatch
+/// fails closed.
+fn unseal_prepare_locks_result(
+    locks: &crate::locks::LocksRuntime,
+    command: &Command,
+    actor: &str,
+    stored: &Value,
+) -> Option<Value> {
+    let CommandPayload::PrepareLocks(payload) = &command.payload else {
+        return None;
+    };
+    let sealed = stored
+        .get("result")?
+        .get("client_reference_sealed")?
+        .as_str()?;
+    let sealed = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sealed).ok()?;
+    let reference = locks
+        .keys
+        .open_result_client_reference(payload.payment_id, actor, &sealed)?;
+    let mut body = stored.clone();
+    let result = body.get_mut("result")?.as_object_mut()?;
+    result.remove("client_reference_sealed");
+    result.insert("client_reference".to_string(), Value::String(reference));
+    Some(body)
 }
 
 /// Appends one immutable domain event and returns its id.

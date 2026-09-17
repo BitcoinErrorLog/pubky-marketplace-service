@@ -69,6 +69,7 @@ pub enum CommandPayload {
     PlaceBid(PlaceBidPayload),
     CloseAuction(CloseAuctionPayload),
     AdvanceSandboxPayment(AdvanceSandboxPaymentPayload),
+    PrepareLocks(PrepareLocksPayload),
     RegisterLocks(RegisterLocksPayload),
     RequestCancellation(RequestCancellationPayload),
     ApproveCancellation(OrderActionPayload),
@@ -106,6 +107,7 @@ impl Command {
             CommandPayload::PlaceBid(_) => "auction.place_bid",
             CommandPayload::CloseAuction(_) => "auction.close",
             CommandPayload::AdvanceSandboxPayment(_) => "payment.sandbox_advance",
+            CommandPayload::PrepareLocks(_) => "payment.prepare_locks",
             CommandPayload::RegisterLocks(_) => "payment.register_locks",
             CommandPayload::RequestCancellation(_) => "order.cancel_request",
             CommandPayload::ApproveCancellation(_) => "order.cancel_approve",
@@ -146,6 +148,7 @@ impl Command {
             CommandPayload::PlaceBid(p) => serde_json::to_value(p),
             CommandPayload::CloseAuction(p) => serde_json::to_value(p),
             CommandPayload::AdvanceSandboxPayment(p) => serde_json::to_value(p),
+            CommandPayload::PrepareLocks(p) => serde_json::to_value(p),
             CommandPayload::RegisterLocks(p) => serde_json::to_value(p),
             CommandPayload::RequestCancellation(p) => serde_json::to_value(p),
             CommandPayload::ShipOrder(p) => serde_json::to_value(p),
@@ -270,6 +273,19 @@ pub struct RegisterListingPayload {
         skip_serializing_if = "is_default_fulfillment_methods"
     )]
     pub fulfillment_methods: Vec<FulfillmentMethod>,
+    /// Optional Locks policy selected by the seller-authored listing. This
+    /// remains out of projections; `payment.prepare_locks` re-reads it from
+    /// the seller-authoritative listing rows and seals it into the
+    /// correlation, so it is never snapshotted onto projected order lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digital_lock: Option<DigitalLockMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DigitalLockMetadata {
+    pub policy_uri: String,
+    pub criterion_id: String,
 }
 
 /// `listing.sync` (any authenticated actor): asks the service to fetch the
@@ -487,22 +503,24 @@ pub struct RegisterLocksPayload {
     /// 128-bit viewer-generated bundle identity (the Locks `BundleId` wire
     /// form).
     pub bundle_id: String,
-    /// The addressed public lock resource,
-    /// `<creator>/pub/locks.app/<lock_id>.json`, whose creator must be the
-    /// order's seller.
-    pub pubky_lock_resource: String,
 }
 
-/// The bundle id is a bearer secret and the lock resource is correlation
-/// material (ADR-0019 §8): neither may reach logs through a derived Debug.
+/// The bundle id is bearer material and must not reach logs through Debug.
 impl std::fmt::Debug for RegisterLocksPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegisterLocksPayload")
             .field("payment_id", &self.payment_id)
             .field("bundle_id", &"<redacted>")
-            .field("pubky_lock_resource", &"<redacted>")
             .finish()
     }
+}
+
+/// Starts a seller-authoritative Locks payment preparation. The server mints
+/// the returned opaque client reference and persists it only sealed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareLocksPayload {
+    pub payment_id: Uuid,
 }
 
 /// The Locks content-lock path prefix inside a pubky lock resource.
@@ -821,6 +839,9 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         "payment.sandbox_advance" => {
             parse_payload(&envelope.payload).and_then(validate_advance_sandbox_payment)?
         }
+        "payment.prepare_locks" => {
+            parse_payload(&envelope.payload).map(CommandPayload::PrepareLocks)?
+        }
         "payment.register_locks" => {
             parse_payload(&envelope.payload).and_then(validate_register_locks)?
         }
@@ -1103,6 +1124,20 @@ pub fn validate_register_listing_payload(
             "Auction listings are shipping-only",
         ));
     }
+    if let Some(lock) = &payload.digital_lock {
+        if parse_lock_resource(&lock.policy_uri).is_none() {
+            issues.push(issue(
+                "payload.digital_lock.policyUri",
+                "Expected a canonical Locks public resource",
+            ));
+        }
+        if !entity_id_regex().is_match(&lock.criterion_id) {
+            issues.push(issue(
+                "payload.digital_lock.criterionId",
+                "Expected a path-safe commerce identifier",
+            ));
+        }
+    }
 
     if issues.is_empty() {
         Ok(payload)
@@ -1290,13 +1325,6 @@ fn validate_register_locks(
         issues.push(issue(
             "payload.bundle_id",
             "Expected a canonical 26-character Crockford-base32 bundle id",
-        ));
-    }
-    if parse_lock_resource(&payload.pubky_lock_resource).is_none() {
-        issues.push(issue(
-            "payload.pubky_lock_resource",
-            "Expected <creator>/pub/locks.app/<lock_id>.json with a z-base-32 \
-             creator and a canonical 52-character Crockford lock id",
         ));
     }
     if issues.is_empty() {
@@ -2039,7 +2067,6 @@ mod tests {
     }
 
     const TEST_BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
-    const TEST_LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
 
     fn register_locks_command_json() -> Value {
         order_command_json(
@@ -2047,8 +2074,6 @@ mod tests {
             json!({
                 "payment_id": "00000000-0000-4000-8000-00000000bbbb",
                 "bundle_id": TEST_BUNDLE_ID,
-                "pubky_lock_resource":
-                    format!("{}/pub/locks.app/{TEST_LOCK_ID}.json", "y".repeat(52)),
             }),
         )
     }
@@ -2060,10 +2085,7 @@ mod tests {
         let CommandPayload::RegisterLocks(payload) = &command.payload else {
             panic!("expected register-locks payload");
         };
-        let (creator, lock_id) =
-            parse_lock_resource(&payload.pubky_lock_resource).expect("resource parses");
-        assert_eq!(creator, "y".repeat(52));
-        assert_eq!(lock_id, TEST_LOCK_ID);
+        assert_eq!(payload.bundle_id, TEST_BUNDLE_ID);
     }
 
     #[test]
@@ -2082,22 +2104,6 @@ mod tests {
             let serialized = serde_json::to_string(&issues).expect("issues serialize");
             assert!(!serialized.contains(TEST_BUNDLE_ID));
         }
-
-        for resource in [
-            "",
-            "not-a-resource",
-            &format!("{}/pub/other.app/{TEST_LOCK_ID}.json", "y".repeat(52)),
-            &format!("{}/pub/locks.app/{TEST_LOCK_ID}", "y".repeat(52)),
-            &format!("{}/pub/locks.app/short.json", "y".repeat(52)),
-            &format!("UPPER/pub/locks.app/{TEST_LOCK_ID}.json"),
-        ] {
-            let mut raw = register_locks_command_json();
-            raw["payload"]["pubky_lock_resource"] = json!(resource);
-            let issues = parse_command(&raw).expect_err("malformed lock resource invalid");
-            assert!(issues
-                .iter()
-                .any(|i| i.path == "payload.pubky_lock_resource"));
-        }
     }
 
     #[test]
@@ -2106,7 +2112,6 @@ mod tests {
         let debug = format!("{:?}", command.payload);
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains(TEST_BUNDLE_ID));
-        assert!(!debug.contains(TEST_LOCK_ID));
     }
 
     fn checkout_command_json() -> Value {

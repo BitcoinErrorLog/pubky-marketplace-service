@@ -25,7 +25,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
 use hmac::{Hmac, Mac};
+use rand::RngCore;
 use serde::Deserialize;
 use sha2::Sha256;
 use uuid::Uuid;
@@ -108,6 +110,69 @@ impl LocksKeys {
         String::from_utf8(plaintext).map_err(|_| anyhow::anyhow!("bundle id is not valid UTF-8"))
     }
 
+    /// Seals correlation material under a domain-separated payment binding.
+    pub fn encrypt_prepared_value(&self, payment_id: Uuid, domain: &[u8], value: &str) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(domain.len() + 16);
+        aad.extend_from_slice(domain);
+        aad.extend_from_slice(payment_id.as_bytes());
+        seal::seal(&self.encryption, &aad, value.as_bytes())
+    }
+
+    /// Opens a value sealed by [`Self::encrypt_prepared_value`] for exactly
+    /// this payment and domain. Fails closed on any transplant, tamper, or
+    /// key mismatch.
+    pub fn open_prepared_value(
+        &self,
+        payment_id: Uuid,
+        domain: &[u8],
+        sealed: &[u8],
+    ) -> Option<String> {
+        let mut aad = Vec::with_capacity(domain.len() + 16);
+        aad.extend_from_slice(domain);
+        aad.extend_from_slice(payment_id.as_bytes());
+        let plaintext = seal::open(&self.encryption, &aad, sealed).ok()?;
+        String::from_utf8(plaintext).ok()
+    }
+
+    /// Seals the minted client reference for the durable prepare command
+    /// result: the same domain separation as the sealed correlation column,
+    /// additionally bound to the buyer so the stored result can only be
+    /// replayed to the buyer it was minted for.
+    pub fn seal_result_client_reference(
+        &self,
+        payment_id: Uuid,
+        buyer: &str,
+        client_reference: &str,
+    ) -> Vec<u8> {
+        let mut aad = b"locks-client-reference:".to_vec();
+        aad.extend_from_slice(payment_id.as_bytes());
+        aad.extend_from_slice(buyer.as_bytes());
+        seal::seal(&self.encryption, &aad, client_reference.as_bytes())
+    }
+
+    /// Opens a sealed prepare-result client reference. Fails unless the
+    /// ciphertext was sealed for exactly this payment and buyer.
+    pub fn open_result_client_reference(
+        &self,
+        payment_id: Uuid,
+        buyer: &str,
+        sealed: &[u8],
+    ) -> Option<String> {
+        let mut aad = b"locks-client-reference:".to_vec();
+        aad.extend_from_slice(payment_id.as_bytes());
+        aad.extend_from_slice(buyer.as_bytes());
+        let plaintext = seal::open(&self.encryption, &aad, sealed).ok()?;
+        String::from_utf8(plaintext).ok()
+    }
+
+    /// Produces the opaque 32-byte reference used solely for future Locks
+    /// task correlation. It contains no business or identity data.
+    pub fn mint_client_reference() -> String {
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
     /// The deterministic lookup/uniqueness token for a lifecycle identity:
     /// HMAC-SHA256(lookup key, creator ‖ 0x0A ‖ bundle id).
     pub fn lookup_token(&self, creator: &str, bundle_id: &str) -> Vec<u8> {
@@ -122,6 +187,34 @@ impl LocksKeys {
 
 fn parse_key(name: &str, hex_value: &str) -> anyhow::Result<[u8; KEY_LEN]> {
     seal::parse_key(name, hex_value)
+}
+
+/// The checkout-snapshot retention purge: snapshot rows whose payment
+/// reached a terminal state (`confirmed`/`expired`) and whose snapshot is
+/// older than `retention_days` are hard-deleted, OLDEST FIRST, at most
+/// 500 per call, so a large backlog drains incrementally across worker
+/// passes and one purge transaction stays short. The rows carry sealed
+/// authority ciphertext, a hash, the criterion, the parties, and the
+/// economics, so they must not be retained indefinitely; the worker runs
+/// this UNDER the locks-verification lease (never after releasing it).
+pub async fn purge_terminal_locks_checkout_snapshots(
+    pool: &sqlx::PgPool,
+    now: chrono::DateTime<chrono::Utc>,
+    retention_days: i64,
+) -> Result<u64, sqlx::Error> {
+    let cutoff = now - chrono::Duration::days(retention_days);
+    let purged = sqlx::query(
+        "DELETE FROM payment_locks_checkout_snapshots WHERE payment_id IN ( \
+             SELECT s.payment_id FROM payment_locks_checkout_snapshots s \
+             JOIN payments p ON p.id = s.payment_id \
+             WHERE p.state IN ('confirmed', 'expired') AND s.created_at < $1 \
+             ORDER BY s.created_at LIMIT 500 \
+         )",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(purged.rows_affected())
 }
 
 /// The Locks verification-task lifecycle statuses (Locks `docs/API.md` at
@@ -361,6 +454,42 @@ mod tests {
     }
 
     #[test]
+    fn result_client_reference_binds_the_payment_and_the_buyer() {
+        let keys = keys();
+        let payment_id = Uuid::new_v4();
+        let buyer = "y".repeat(52);
+        let reference = LocksKeys::mint_client_reference();
+        let sealed = keys.seal_result_client_reference(payment_id, &buyer, &reference);
+        assert!(
+            !sealed
+                .windows(reference.len())
+                .any(|window| window == reference.as_bytes()),
+            "the sealed result never contains the plaintext reference"
+        );
+        assert_eq!(
+            keys.open_result_client_reference(payment_id, &buyer, &sealed)
+                .as_deref(),
+            Some(reference.as_str())
+        );
+        assert_eq!(
+            keys.open_result_client_reference(payment_id, &"o".repeat(52), &sealed),
+            None,
+            "another buyer cannot open the stored result"
+        );
+        assert_eq!(
+            keys.open_result_client_reference(Uuid::new_v4(), &buyer, &sealed),
+            None,
+            "another payment cannot open the stored result"
+        );
+        let other_keys = LocksKeys::from_hex(MAC_KEY, ENC_KEY).expect("swapped keys parse");
+        assert_eq!(
+            other_keys.open_result_client_reference(payment_id, &buyer, &sealed),
+            None,
+            "a different key cannot open the stored result"
+        );
+    }
+
+    #[test]
     fn key_parsing_fails_closed() {
         LocksKeys::from_hex("not-hex", MAC_KEY).expect_err("non-hex encryption key rejected");
         LocksKeys::from_hex(ENC_KEY, "abcd").expect_err("short HMAC key rejected");
@@ -378,6 +507,104 @@ mod tests {
         assert!(
             HttpLocksClient::new("https://locks.example/").is_ok(),
             "https URL accepted"
+        );
+    }
+
+    /// A full upstream-shaped test document (every required `ContentLock`
+    /// field, normalized creator/recipient): the typed canonical bytes and
+    /// the raw canonical bytes are identical for this dialect.
+    fn content_lock_document(creator: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "creator": format!("pubky{creator}"),
+            "primary_resource": {
+                "path": "/priv/locks.app/content/post.json",
+                "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+                "content_type": "application/json",
+                "size": 5,
+            },
+            "criteria": [{
+                "criterion_id": "paykit",
+                "verifier_type": "paykit-payment",
+                "params": {
+                    "amount": "13700",
+                    "asset": "USD",
+                    "recipient_pubky": format!("pubky{creator}"),
+                },
+            }],
+            "lock_logic": { "type": "all", "criteria": ["paykit"] },
+            "access_policy": { "requested_credential_ttl_seconds": 900 },
+            "lock_server": { "override": null },
+            "created_at": "2026-05-29T12:00:00Z",
+        })
+    }
+
+    fn resource_for(document: &serde_json::Value, creator: &str) -> String {
+        let lock: crate::content_lock::ContentLock =
+            serde_json::from_value(document.clone()).expect("test document matches the schema");
+        let lock_id = lock.lock_id().expect("test lock canonicalizes");
+        format!("{creator}/pub/locks.app/{lock_id}.json")
+    }
+
+    #[test]
+    fn content_lock_identity_matches_canonical_document_path() {
+        let creator = "y".repeat(52);
+        let document = content_lock_document(&creator);
+        let resource = resource_for(&document, &creator);
+        assert_eq!(
+            crate::content_lock::validate_content_lock_value(&document, &resource).map(|_| ()),
+            Ok(())
+        );
+    }
+
+    /// The pinned upstream vector: a real `ContentLock` rendered by
+    /// `pubky/locks@ba49a777` (`locks-core/src/lock_policy.rs`
+    /// `canonical_json_string()` and `content_lock_path()`) and pinned here
+    /// under the name of its derived path. The marketplace mirror must
+    /// decode the document and reproduce the same lock id from its typed
+    /// canonical bytes.
+    #[test]
+    fn upstream_content_lock_vector_reproduces_the_canonical_path() {
+        const LOCK_ID: &str = "5Z4FC0QEAFTTTE1DFH7DNZW2HVVPTDNJY5MERMD3Y0CQKH1P2SM0";
+        let document: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            "../tests/fixtures/locks/",
+            "5Z4FC0QEAFTTTE1DFH7DNZW2HVVPTDNJY5MERMD3Y0CQKH1P2SM0.json"
+        )))
+        .expect("upstream fixture parses");
+        let creator = document["creator"]
+            .as_str()
+            .expect("fixture creator")
+            .strip_prefix("pubky")
+            .expect("fixture creator carries the pubky scheme prefix");
+        let resource = format!("{creator}/pub/locks.app/{LOCK_ID}.json");
+        let lock = crate::content_lock::validate_content_lock_value(&document, &resource)
+            .expect("the marketplace mirror reproduces the upstream path");
+        assert_eq!(lock.lock_id().as_deref(), Some(LOCK_ID));
+        assert_eq!(
+            lock.validate_paykit_payment_v1_policy(),
+            Ok(()),
+            "the pinned upstream vector satisfies the Paykit v1 policy"
+        );
+    }
+
+    #[test]
+    fn content_lock_identity_refuses_changed_bytes_and_creator() {
+        let creator = "y".repeat(52);
+        let document = content_lock_document(&creator);
+        let resource = resource_for(&document, &creator);
+
+        let mut changed = document.clone();
+        changed["criteria"][0]["params"]["amount"] = serde_json::json!("13701");
+        assert_eq!(
+            crate::content_lock::validate_content_lock_value(&changed, &resource),
+            Err(crate::content_lock::ContentLockIdentityRejection::PathMismatch)
+        );
+
+        let mut wrong_creator = document;
+        wrong_creator["creator"] = serde_json::json!(format!("pubky{}", "o".repeat(52)));
+        assert_eq!(
+            crate::content_lock::validate_content_lock_value(&wrong_creator, &resource),
+            Err(crate::content_lock::ContentLockIdentityRejection::CreatorMismatch)
         );
     }
 }

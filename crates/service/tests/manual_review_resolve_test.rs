@@ -626,12 +626,23 @@ async fn resolve_refuses_a_locks_manual_review(pool: PgPool) {
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let order = create_pending_order(&app, &seller, &buyer).await;
+    let prepare = json!({
+        "version": 1,
+        "command_id": common::indexed_command_id(0x8002, 699),
+        "aggregate_id": format!("payment:{}", order.payment_id),
+        "expected_revision": 1,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "payment.prepare_locks",
+        "payload": { "payment_id": order.payment_id },
+    });
+    let (status, body) = execute(&app, &buyer.token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "locks prepare failed: {body}");
     let (status, body) = execute(
         &app,
         &buyer.token,
         &register_locks_command(
             &order.payment_id,
-            1,
+            2,
             TEST_BUNDLE_ID,
             &lock_resource_for(&seller.pubky),
             700,

@@ -361,3 +361,87 @@ async fn sync_still_enforces_the_committed_inventory_invariant(pool: PgPool) {
         json!("The seller's listing record does not satisfy registration invariants.")
     );
 }
+
+// A present-but-malformed `digitalLock` on the seller-signed record refuses
+// the sync with a static error: the service must distinguish absent
+// metadata (no lock) from invalid metadata, and never heal a listing's
+// existing lock away (Sol Wave 1A review, P2-4).
+#[sqlx::test(migrations = "./migrations")]
+async fn a_malformed_digital_lock_refuses_the_sync_without_healing(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let aggregate_id = format!("listing:{}_{LISTING_ID}", seller.pubky);
+    let valid_uri = format!(
+        "{}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+        seller.pubky
+    );
+
+    // A valid record with a valid lock syncs and retains the metadata.
+    let mut valid = homeserver_record(1, &[2]);
+    valid["digitalLock"] = json!({
+        "policyUri": valid_uri,
+        "criterionId": "paykit",
+    });
+    homeserver.put_record(&seller.pubky, LISTING_ID, valid);
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "valid sync failed: {body}");
+    assert_eq!(
+        lock_columns(&app.pool, &aggregate_id).await,
+        (Some(valid_uri.clone()), Some("paykit".to_string()))
+    );
+
+    // A new record revision whose digitalLock is present but malformed:
+    // refused with the static copy, and the stored lock is NOT healed away.
+    let mut malformed = homeserver_record(2, &[2]);
+    malformed["digitalLock"] = json!({
+        "policyUri": "https://example.com/not-a-canonical-lock",
+        "criterionId": "paykit",
+    });
+    homeserver.put_record(&seller.pubky, LISTING_ID, malformed);
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The seller's listing record carries an invalid Locks payment lock.")
+    );
+    assert_eq!(
+        lock_columns(&app.pool, &aggregate_id).await,
+        (Some(valid_uri), Some("paykit".to_string())),
+        "a malformed record never strips the seller's lock"
+    );
+
+    // Absent metadata still syncs cleanly (no lock on the record).
+    let absent = homeserver_record(3, &[2]);
+    homeserver.put_record(&seller.pubky, LISTING_ID, absent);
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 3),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "absent-lock sync failed: {body}");
+    assert_eq!(lock_columns(&app.pool, &aggregate_id).await, (None, None));
+}
+
+async fn lock_columns(pool: &PgPool, aggregate_id: &str) -> (Option<String>, Option<String>) {
+    sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT digital_lock_policy_uri, digital_lock_criterion_id FROM listings \
+         WHERE aggregate_id = $1",
+    )
+    .bind(aggregate_id)
+    .fetch_one(pool)
+    .await
+    .expect("listing row exists")
+}

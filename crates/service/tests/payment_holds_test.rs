@@ -188,9 +188,21 @@ async fn register_locks_acquires_the_hold_and_arms_the_locks_window(pool: PgPool
     let order = create_pending_order(&app, &seller, &buyer).await;
     assert_eq!(order_hold(&app, &order.order_id).await, (false, None));
 
+    let prepare = json!({
+        "version": 1,
+        "command_id": common::indexed_command_id(0x8002, 199),
+        "aggregate_id": format!("payment:{}", order.payment_id),
+        "expected_revision": 1,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "payment.prepare_locks",
+        "payload": { "payment_id": order.payment_id },
+    });
+    let (status, body) = execute(&app, &buyer.token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "preparation failed: {body}");
+
     let registration = register_locks_command(
         &order.payment_id,
-        1,
+        2,
         TEST_BUNDLE_ID,
         &lock_resource_for(&seller.pubky),
         200,
