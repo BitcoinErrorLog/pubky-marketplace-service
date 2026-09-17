@@ -8,19 +8,95 @@
 
 mod common;
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use axum::http::StatusCode;
-use marketplace_service::clock::Clock;
-use marketplace_service::locks::{LocksLookupOutcome, LocksTaskStatus};
+use marketplace_service::clock::{AdjustableClock, Clock};
+use marketplace_service::config::Config;
+use marketplace_service::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
+use marketplace_service::http::build_router;
+use marketplace_service::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
 use marketplace_service::workers::{self, run_once, try_acquire_lease};
+use marketplace_service::AppState;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use common::{
-    checkout_command_with_id, count, create_pending_order, execute, lock_resource_for, new_actor,
-    payment_command, register_command, register_locks_command, send, test_app, test_app_with_locks,
-    PendingOrder, TestApp, TEST_BUNDLE_ID, TEST_LOCK_ID,
+    checkout_command_with_id, count, create_pending_order, execute, lock_document_for,
+    lock_resource_for, lock_resource_for_payment, new_actor, payment_command, register_command,
+    register_listing_command, register_locks_command, send, test_app, test_app_with_locks,
+    test_locks_keys, FakeLocksClient, PendingOrder, TestActor, TestApp, TEST_BUNDLE_ID,
+    TEST_LOCK_ID,
 };
+
+/// A content-lock homeserver double serving exactly the documents the test
+/// scripts, keyed by `(creator, content path)`; every other fetch is a clean
+/// not-found. It exists so identity-validation negatives can serve tampered
+/// or foreign documents at the seller-authoritative resource path.
+struct ScriptedLocksHomeserver {
+    documents: HashMap<(String, String), Value>,
+}
+
+impl HomeserverListingClient for ScriptedLocksHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async { HomeserverFetchOutcome::NotFound })
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async { HomeserverFetchOutcome::NotFound })
+    }
+
+    fn fetch_content_lock<'a>(
+        &'a self,
+        creator_pubky: &'a str,
+        content_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            match self
+                .documents
+                .get(&(creator_pubky.to_string(), content_path.to_string()))
+            {
+                Some(document) => HomeserverFetchOutcome::Found(document.clone()),
+                None => HomeserverFetchOutcome::NotFound,
+            }
+        })
+    }
+}
+
+/// A Locks-enabled test app whose homeserver serves the scripted
+/// content-lock documents and nothing else.
+async fn test_app_with_lock_documents(
+    pool: PgPool,
+    documents: HashMap<(String, String), Value>,
+) -> TestApp {
+    let now: chrono::DateTime<chrono::Utc> = common::NOW.parse().expect("timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let locks = Arc::new(LocksRuntime {
+        keys: test_locks_keys(),
+        client: Arc::new(FakeLocksClient::default()),
+    });
+    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
+        .with_locks(Some(locks))
+        .with_homeserver(Some(Arc::new(ScriptedLocksHomeserver { documents })));
+    TestApp {
+        router: build_router(state.clone()),
+        pool,
+        clock,
+        state,
+    }
+}
 
 /// A second canonical bundle id, distinct from [`TEST_BUNDLE_ID`].
 const OTHER_BUNDLE_ID: &str = "111G40R40M30E209185GR38E1W";
@@ -31,6 +107,12 @@ async fn register_locks(
     order: &PendingOrder,
     seller_pubky: &str,
 ) -> Value {
+    let prepare = payment_command(&order.payment_id, 1, "prepare_locks", 0, 90);
+    let mut prepare = prepare;
+    prepare["kind"] = json!("payment.prepare_locks");
+    prepare["payload"] = json!({ "payment_id": order.payment_id });
+    let (status, body) = execute(app, buyer_token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "preparation failed: {body}");
     let (status, body) = execute(
         app,
         buyer_token,
@@ -176,8 +258,8 @@ async fn registration_enforces_participant_state_and_creator_guards(pool: PgPool
         13,
     );
     let (status, body) = execute(&app, &buyer.token, &foreign).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"));
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
 
     // A payment no longer awaiting entitlement refuses registration.
     let (status, _) = execute(
@@ -205,7 +287,12 @@ async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
     let resource = lock_resource_for(&seller.pubky);
 
     // Two units so the same buyer/seller pair can hold two orders.
-    let (status, _) = execute(&app, &seller.token, &register_command(&seller.pubky, 2)).await;
+    let mut listing = register_command(&seller.pubky, 2);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller.pubky),
+        "criterionId": "paykit",
+    });
+    let (status, _) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK);
     let (status, first_checkout) = execute(
         &app,
@@ -226,6 +313,19 @@ async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
         .as_str()
         .expect("payment id");
 
+    for (payment_id, command_id) in [(first_payment, 18), (second_payment, 19)] {
+        let prepare = json!({
+            "version": 1,
+            "command_id": common::indexed_command_id(0x8002, command_id),
+            "aggregate_id": format!("payment:{payment_id}"),
+            "expected_revision": 1,
+            "issued_at": "2026-08-19T22:00:00.000Z",
+            "kind": "payment.prepare_locks",
+            "payload": { "payment_id": payment_id },
+        });
+        let (status, body) = execute(&app, &buyer.token, &prepare).await;
+        assert_eq!(status, StatusCode::OK, "preparation failed: {body}");
+    }
     let command = register_locks_command(first_payment, 1, TEST_BUNDLE_ID, &resource, 20);
     let (status, original) = execute(&app, &buyer.token, &command).await;
     assert_eq!(status, StatusCode::OK, "{original}");
@@ -236,7 +336,7 @@ async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
     assert_eq!(replay, original);
     assert_eq!(
         count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
-        1
+        2
     );
 
     // Changed replay under the same command id: idempotency conflict.
@@ -875,4 +975,206 @@ async fn bundle_and_lock_resource_never_leave_the_correlation_store(pool: PgPool
         .any(|window| window == TEST_BUNDLE_ID.as_bytes()));
     assert_ne!(token, TEST_BUNDLE_ID.as_bytes().to_vec());
     assert_redacted("lock resource hash", &hash);
+}
+
+// Exactly one seller-authored payment lock per order: a cart with zero
+// Locks policies is refused at prepare with the static copy, and so is a
+// cart whose lines carry two DISTINCT locks (multi-lock aggregation is a
+// future design, never an implicit pick).
+#[sqlx::test]
+async fn prepare_refuses_orders_with_zero_or_multiple_distinct_locks(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+
+    // Zero locks: a plain listing checkout carries no payment lock.
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000002000"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(payment_id, 60),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The order must contain exactly one seller-authored Locks payment lock.")
+    );
+
+    // Multiple distinct locks: two lines from the same seller carrying two
+    // different policies collapse to one order, which prepare refuses.
+    let mut first = register_listing_command(&seller.pubky, "boots_02", 1, 61);
+    first["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for_payment(&seller.pubky, 13_700, "USD"),
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&app, &seller.token, &first).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut second = register_listing_command(&seller.pubky, "boots_03", 1, 63);
+    second["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for_payment(&seller.pubky, 12_500, "USD"),
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&app, &seller.token, &second).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let checkout = json!({
+        "version": 1,
+        "command_id": "00000000-0000-4000-8000-000000002001",
+        "aggregate_id": "checkout:00000000-0000-4000-8000-000000002001",
+        "expected_revision": 0,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "checkout.create",
+        "payload": {
+            "lines": [
+                {
+                    "listing_aggregate_id": format!("listing:{}_boots_02", seller.pubky),
+                    "expected_revision": 1,
+                    "quantity": 1,
+                },
+                {
+                    "listing_aggregate_id": format!("listing:{}_boots_03", seller.pubky),
+                    "expected_revision": 1,
+                    "quantity": 1,
+                },
+            ],
+            "delivery_address": {
+                "name": "Alice Buyer",
+                "line1": "1 Market Street",
+                "line2": "",
+                "city": "New York",
+                "region": "NY",
+                "postal_code": "10001",
+                "country_code": "US",
+            },
+            "guarantee_policy_version": 1,
+        },
+    });
+    let (status, body) = execute(&app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["orders"].as_array().expect("orders").len(),
+        1,
+        "same seller and fulfillment split into one order"
+    );
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(payment_id, 62),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The order must contain exactly one seller-authored Locks payment lock.")
+    );
+}
+
+// Identity validation through the handler (not only the pure function): a
+// document served at the seller-authoritative path whose bytes no longer
+// hash to that path is refused at prepare, and no correlation is created.
+#[sqlx::test]
+async fn prepare_refuses_a_lock_document_with_changed_bytes(pool: PgPool) {
+    let seller_key = common::random_keypair();
+    let seller_pubky = seller_key.1.clone();
+    let mut tampered = lock_document_for(&seller_pubky, 13_700, "USD");
+    // One flipped byte: the amount changes, so the canonical bytes no longer
+    // derive the advertised lock id (a path mismatch, fail closed).
+    tampered["criteria"][0]["params"]["amount"] = json!("13701");
+    let resource = lock_resource_for(&seller_pubky);
+    let path = resource
+        .strip_prefix(&seller_pubky)
+        .expect("creator prefixes resource")
+        .to_string();
+    let app = test_app_with_lock_documents(
+        pool,
+        HashMap::from([((seller_pubky.clone(), path), tampered)]),
+    )
+    .await;
+    let seller = TestActor {
+        token: common::authenticate(&app, &seller_key.0).await,
+        keypair: seller_key.0,
+        pubky: seller_pubky,
+    };
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 70),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The seller's Locks document does not match the payment.")
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        0,
+        "a path mismatch never creates a correlation"
+    );
+}
+
+// The creator swap: a document naming a different creator served at the
+// seller's path is an identity mismatch and is refused at prepare.
+#[sqlx::test]
+async fn prepare_refuses_a_lock_document_with_a_swapped_creator(pool: PgPool) {
+    let seller_key = common::random_keypair();
+    let seller_pubky = seller_key.1.clone();
+    let (_, other_pubky) = common::random_keypair();
+    let mut swapped = lock_document_for(&seller_pubky, 13_700, "USD");
+    swapped["creator"] = json!(other_pubky);
+    let resource = lock_resource_for(&seller_pubky);
+    let path = resource
+        .strip_prefix(&seller_pubky)
+        .expect("creator prefixes resource")
+        .to_string();
+    let app = test_app_with_lock_documents(
+        pool,
+        HashMap::from([((seller_pubky.clone(), path), swapped)]),
+    )
+    .await;
+    let seller = TestActor {
+        token: common::authenticate(&app, &seller_key.0).await,
+        keypair: seller_key.0,
+        pubky: seller_pubky,
+    };
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 71),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The seller's Locks document does not match the payment.")
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        0,
+        "a creator mismatch never creates a correlation"
+    );
 }

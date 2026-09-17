@@ -186,8 +186,14 @@ pub async fn test_app_with_pickup(pool: PgPool, sandbox: bool) -> TestApp {
     config.sandbox_payments_enabled = sandbox;
     let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
-    let state =
-        AppState::new(pool.clone(), clock.clone(), config).with_pickup(Some(test_pickup_keys()));
+    let locks = Arc::new(LocksRuntime {
+        keys: test_locks_keys(),
+        client: Arc::new(FakeLocksClient::default()),
+    });
+    let state = AppState::new(pool.clone(), clock.clone(), config)
+        .with_locks(Some(locks))
+        .with_homeserver(Some(Arc::new(TestLocksHomeserver)))
+        .with_pickup(Some(test_pickup_keys()));
     TestApp {
         router: build_router(state.clone()),
         pool,
@@ -209,6 +215,7 @@ pub async fn test_app_with_pickup_and_locks(pool: PgPool) -> (TestApp, Arc<FakeL
     });
     let state = AppState::new(pool.clone(), clock.clone(), config_durable())
         .with_locks(Some(locks))
+        .with_homeserver(Some(Arc::new(TestLocksHomeserver)))
         .with_pickup(Some(test_pickup_keys()));
     (
         TestApp {
@@ -280,8 +287,9 @@ pub async fn test_app_with_locks(pool: PgPool) -> (TestApp, Arc<FakeLocksClient>
         keys: test_locks_keys(),
         client: fake.clone(),
     });
-    let state =
-        AppState::new(pool.clone(), clock.clone(), Config::for_tests()).with_locks(Some(runtime));
+    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
+        .with_locks(Some(runtime))
+        .with_homeserver(Some(Arc::new(TestLocksHomeserver)));
     (
         TestApp {
             router: build_router(state.clone()),
@@ -295,7 +303,96 @@ pub async fn test_app_with_locks(pool: PgPool) -> (TestApp, Arc<FakeLocksClient>
 
 /// The canonical addressed lock resource for a seller's test lock.
 pub fn lock_resource_for(seller_pubky: &str) -> String {
-    format!("{seller_pubky}/pub/locks.app/{TEST_LOCK_ID}.json")
+    lock_resource_for_payment(seller_pubky, 13_700, "USD")
+}
+
+pub fn lock_resource_for_payment(seller_pubky: &str, amount: i64, asset: &str) -> String {
+    let document = lock_document_for(seller_pubky, amount, asset);
+    let canonical = serde_json_canonicalizer::to_vec(&document).expect("test lock canonicalizes");
+    let lock_id = base32::encode(
+        base32::Alphabet::Crockford,
+        blake3::hash(&canonical).as_bytes(),
+    );
+    format!("{seller_pubky}/pub/locks.app/{lock_id}.json")
+}
+
+pub fn lock_document_for(seller_pubky: &str, amount: i64, asset: &str) -> Value {
+    json!({
+        "creator": seller_pubky,
+        "criteria": [{
+            "criterion_id": "paykit",
+            "verifier_type": "paykit-payment",
+            "params": {
+                "amount": amount.to_string(),
+                "asset": asset,
+                "recipient_pubky": seller_pubky,
+            },
+        }],
+    })
+}
+
+/// The content-lock-serving homeserver double used by every Locks-enabled
+/// test app: it answers `fetch_content_lock` for exactly the resources
+/// [`lock_resource_for_payment`] derives at the listed `(amount, asset)`
+/// fixtures, and nothing else.
+pub fn test_locks_homeserver() -> Arc<dyn HomeserverListingClient> {
+    Arc::new(TestLocksHomeserver)
+}
+
+struct TestLocksHomeserver;
+
+impl HomeserverListingClient for TestLocksHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _listing_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { marketplace_service::homeserver::HomeserverFetchOutcome::NotFound })
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _drop_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { marketplace_service::homeserver::HomeserverFetchOutcome::NotFound })
+    }
+
+    fn fetch_content_lock<'a>(
+        &'a self,
+        creator_pubky: &'a str,
+        content_path: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            for (amount, asset) in [(13_700, "USD"), (12_500, "USD"), (25_000, "USD")] {
+                let resource = lock_resource_for_payment(creator_pubky, amount, asset);
+                if resource.strip_prefix(creator_pubky) == Some(content_path) {
+                    return marketplace_service::homeserver::HomeserverFetchOutcome::Found(
+                        lock_document_for(creator_pubky, amount, asset),
+                    );
+                }
+            }
+            marketplace_service::homeserver::HomeserverFetchOutcome::NotFound
+        })
+    }
 }
 
 type HomeserverRecordMap = Arc<Mutex<HashMap<(String, String), Value>>>;
@@ -565,7 +662,7 @@ pub fn register_locks_command(
     payment_id: &str,
     expected_revision: i64,
     bundle_id: &str,
-    pubky_lock_resource: &str,
+    _resource: &str,
     command_number: u64,
 ) -> Value {
     json!({
@@ -578,8 +675,19 @@ pub fn register_locks_command(
         "payload": {
             "payment_id": payment_id,
             "bundle_id": bundle_id,
-            "pubky_lock_resource": pubky_lock_resource,
         },
+    })
+}
+
+pub fn prepare_locks_command(payment_id: &str, command_number: u64) -> Value {
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x8002, command_number),
+        "aggregate_id": format!("payment:{payment_id}"),
+        "expected_revision": 1,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "payment.prepare_locks",
+        "payload": { "payment_id": payment_id },
     })
 }
 
@@ -595,7 +703,12 @@ pub async fn create_pending_order(
     seller: &TestActor,
     buyer: &TestActor,
 ) -> PendingOrder {
-    let (status, body) = execute(app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    let mut listing = register_command(&seller.pubky, 1);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller.pubky),
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
     let (status, body) = execute(app, &buyer.token, &checkout_command(&seller.pubky)).await;
     assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");

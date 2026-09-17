@@ -21,10 +21,11 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use common::{
-    checkout_command_with_id, count, execute, indexed_command_id, lock_resource_for, new_actor,
-    order_command, register_command, register_listing_command, register_locks_command, send,
-    spawn_fake_homeserver, test_app, test_app_with_pickup, test_app_with_pickup_and_locks,
-    test_attestor, test_locks_keys, FakeLocksClient, TestActor, TestApp, TEST_BUNDLE_ID,
+    checkout_command_with_id, count, execute, indexed_command_id, lock_resource_for,
+    lock_resource_for_payment, new_actor, order_command, register_command,
+    register_listing_command, register_locks_command, send, spawn_fake_homeserver, test_app,
+    test_app_with_pickup, test_app_with_pickup_and_locks, test_attestor, test_locks_keys,
+    FakeLocksClient, TestActor, TestApp, TEST_BUNDLE_ID,
 };
 use marketplace_service::clock::AdjustableClock;
 use marketplace_service::http::build_router;
@@ -45,6 +46,23 @@ fn listing_agg(seller: &str, listing_id: &str) -> String {
 fn register_pickup_listing(seller: &str, listing_id: &str, quantity: i64, n: u64) -> Value {
     let mut command = register_listing_command(seller, listing_id, quantity, n);
     command["payload"]["fulfillment_methods"] = json!(["shipping", "pickup"]);
+    command
+}
+
+/// A pickup listing that also publishes the seller-authored Locks policy, so
+/// orders on it carry exactly one snapshotted payment lock at checkout.
+fn register_pickup_listing_with_lock(
+    seller: &str,
+    listing_id: &str,
+    quantity: i64,
+    n: u64,
+    lock_amount: i64,
+) -> Value {
+    let mut command = register_pickup_listing(seller, listing_id, quantity, n);
+    command["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for_payment(seller, lock_amount, "USD"),
+        "criterionId": "paykit",
+    });
     command
 }
 
@@ -136,12 +154,12 @@ async fn create_pickup_order(
     register_n: u64,
     checkout_id: &str,
 ) -> PickupOrder {
-    let (status, body) = execute(
-        app,
-        &seller.token,
-        &register_pickup_listing(&seller.pubky, listing_id, 5, register_n),
-    )
-    .await;
+    let mut listing = register_pickup_listing(&seller.pubky, listing_id, 5, register_n);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for_payment(&seller.pubky, 12_500, "USD"),
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "register failed: {body}");
     let (status, body) = execute(
         app,
@@ -178,6 +196,17 @@ async fn confirm_via_locks(
     bundle_id: &str,
     n: u64,
 ) {
+    let prepare = json!({
+        "version": 1,
+        "command_id": common::indexed_command_id(0x8002, n + 10_000),
+        "aggregate_id": format!("payment:{}", order.payment_id),
+        "expected_revision": 1,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "payment.prepare_locks",
+        "payload": { "payment_id": order.payment_id },
+    });
+    let (status, body) = execute(app, &buyer.token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "locks preparation failed: {body}");
     let (status, body) = execute(
         app,
         &buyer.token,
@@ -1010,6 +1039,7 @@ async fn sandbox_deployments_refuse_pickup_writes_and_reveals(pool: PgPool) {
     config.sandbox_payments_enabled = true;
     let state = AppState::new(pool.clone(), clock.clone(), config)
         .with_locks(Some(locks))
+        .with_homeserver(Some(common::test_locks_homeserver()))
         .with_pickup(Some(common::test_pickup_keys()));
     let app_locks = TestApp {
         router: build_router(state.clone()),
@@ -2068,6 +2098,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
     let clock = Arc::new(AdjustableClock::new(now));
     let state = AppState::new(pool.clone(), clock.clone(), common::config_durable())
         .with_locks(Some(locks))
+        .with_homeserver(Some(common::test_locks_homeserver()))
         .with_pickup(Some(common::test_pickup_keys()))
         .with_attestor(Some(test_attestor()));
     let app = TestApp {
@@ -2083,8 +2114,12 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
     let seller_a = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     // A shipped order delivered + completed (the completion baseline).
-    let (status, body) =
-        execute(&app, &seller_a.token, &register_command(&seller_a.pubky, 1)).await;
+    let mut listing_a = register_command(&seller_a.pubky, 1);
+    listing_a["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller_a.pubky),
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&app, &seller_a.token, &listing_a).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
         &app,
@@ -2102,6 +2137,9 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
         .expect("id")
         .to_string();
     // Confirm through the sandbox rail? No — sandbox is off; use locks.
+    let prepare = common::prepare_locks_command(&shipped_payment, 0x300);
+    let (status, body) = execute(&app, &buyer.token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let registration = register_locks_command(
         &shipped_payment,
         1,
@@ -2214,8 +2252,12 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
     // --- Seller B: identical shape, but an ORDINARY approved cancel with
     // the same refund leg — which still counts as terminated_badly.
     let seller_b = new_actor(&app).await;
-    let (status, body) =
-        execute(&app, &seller_b.token, &register_command(&seller_b.pubky, 1)).await;
+    let mut listing_b = register_command(&seller_b.pubky, 1);
+    listing_b["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller_b.pubky),
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&app, &seller_b.token, &listing_b).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
         &app,
@@ -2232,6 +2274,9 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
         .as_str()
         .expect("id")
         .to_string();
+    let prepare = common::prepare_locks_command(&b_payment, 0x30e);
+    let (status, body) = execute(&app, &buyer.token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -2290,11 +2335,14 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
     .await;
     // Sold out — quantity was 1. Register more stock instead.
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    let (status, body) = execute(
-        &app,
-        &seller_b.token,
-        &register_listing_command(&seller_b.pubky, "boots_02", 1, 0x207),
-    )
+    let (status, body) = execute(&app, &seller_b.token, &{
+        let mut command = register_listing_command(&seller_b.pubky, "boots_02", 1, 0x207);
+        command["payload"]["digital_lock"] = json!({
+            "policyUri": lock_resource_for(&seller_b.pubky),
+            "criterionId": "paykit",
+        });
+        command
+    })
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
@@ -2316,6 +2364,9 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
         .as_str()
         .expect("id")
         .to_string();
+    let prepare = common::prepare_locks_command(&b_payment2, 0x30f);
+    let (status, body) = execute(&app, &buyer.token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -2428,6 +2479,7 @@ async fn reputation_counts_pickup_completions_by_confirming_actor(pool: PgPool) 
     let clock = Arc::new(AdjustableClock::new(now));
     let state = AppState::new(pool.clone(), clock.clone(), common::config_durable())
         .with_locks(Some(locks))
+        .with_homeserver(Some(common::test_locks_homeserver()))
         .with_pickup(Some(common::test_pickup_keys()))
         .with_attestor(Some(test_attestor()));
     let app = TestApp {
@@ -2501,6 +2553,9 @@ async fn reputation_counts_pickup_completions_by_confirming_actor(pool: PgPool) 
         (&o2, BUNDLE_2, 0x322),
         (&o3, BUNDLE_3, 0x323),
     ] {
+        let prepare = common::prepare_locks_command(&order.payment_id, n + 0x1000);
+        let (status, body) = execute(&app, &buyer.token, &prepare).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         let (status, body) = execute(
             &app,
             &buyer.token,
@@ -2719,7 +2774,8 @@ async fn key_absent_refuses_writes_and_reveals(pool: PgPool) {
     let clock = Arc::new(AdjustableClock::new(now));
     // Sandbox OFF, locks on, pickup keys ABSENT.
     let state = AppState::new(pool.clone(), clock.clone(), common::config_durable())
-        .with_locks(Some(locks));
+        .with_locks(Some(locks))
+        .with_homeserver(Some(common::test_locks_homeserver()));
     let app = TestApp {
         router: build_router(state.clone()),
         pool: pool.clone(),
@@ -3101,7 +3157,7 @@ async fn reveal_refuses_an_order_that_pinned_nothing(pool: PgPool) {
     let (status, body) = execute(
         &app,
         &seller.token,
-        &register_pickup_listing(&seller.pubky, "boots_01", 5, 0x601),
+        &register_pickup_listing_with_lock(&seller.pubky, "boots_01", 5, 0x601, 12_500),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3255,14 +3311,14 @@ async fn reveal_serves_the_pinned_subset_of_a_partially_detailed_order(pool: PgP
     let (status, body) = execute(
         &app,
         &seller.token,
-        &register_pickup_listing(&seller.pubky, "boots_01", 5, 0xc51),
+        &register_pickup_listing_with_lock(&seller.pubky, "boots_01", 5, 0xc51, 25_000),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
         &app,
         &seller.token,
-        &register_pickup_listing(&seller.pubky, "boots_02", 5, 0xc52),
+        &register_pickup_listing_with_lock(&seller.pubky, "boots_02", 5, 0xc52, 25_000),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3504,6 +3560,9 @@ async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
     // A completed Locks outcome arrives; the pass logs the unopenable row
     // and continues the batch — an Err per item, NOT a panic that kills
     // the loop and not an Err out of run_once.
+    let prepare = common::prepare_locks_command(&order.payment_id, 0x803);
+    let (status, body) = execute(&app, &buyer.token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -3633,6 +3692,9 @@ async fn a_failed_claimed_item_does_not_stall_the_rest_of_the_batch(pool: PgPool
         (&failing, TEST_BUNDLE_ID, 0x854),
         (&healthy, BUNDLE_2, 0x855),
     ] {
+        let prepare = common::prepare_locks_command(&order.payment_id, n + 0x1000);
+        let (status, body) = execute(&app, &buyer.token, &prepare).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         let (status, body) = execute(
             &app,
             &buyer.token,
@@ -3809,7 +3871,7 @@ async fn details_update_notifies_each_paid_order_of_the_same_buyer(pool: PgPool)
     let (status, body) = execute(
         &app,
         &seller.token,
-        &register_pickup_listing(&seller.pubky, "boots_01", 5, 0x901),
+        &register_pickup_listing_with_lock(&seller.pubky, "boots_01", 5, 0x901, 12_500),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
