@@ -292,8 +292,8 @@ pub async fn prepare(
     .bind(payment.id)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some((state, Some(sealed_reference), expires_at)) = existing.as_ref() {
-        if state == "prepared" {
+    match existing.as_ref() {
+        Some((state, Some(sealed_reference), expires_at)) if state == "prepared" => {
             if now >= *expires_at {
                 record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_EXPIRED, now).await?;
                 return Ok(Err(CommandFailure::new(
@@ -315,12 +315,23 @@ pub async fn prepare(
                     result: json!({"kind": "payment", "client_reference": client_reference, "window_expires_at": format_timestamp(*expires_at)}),
                 }));
             }
+            // A prepared row whose sealed reference cannot be opened fails
+            // closed (tampering or a key rotation) rather than minting a
+            // second preparation.
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidState,
+                "The payment already has a Locks preparation.",
+            )));
         }
-    } else if existing.is_some() {
-        return Ok(Err(CommandFailure::new(
-            ErrorCode::InvalidState,
-            "The payment already has a Locks preparation.",
-        )));
+        // Any other existing row (notably `registered`) is a stable
+        // INVALID_STATE — never a fall-through to a uniqueness conflict.
+        Some(_) => {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidState,
+                "The payment already has a Locks preparation.",
+            )));
+        }
+        None => {}
     }
     if command.expected_revision != payment.revision {
         return Ok(Err(CommandFailure::with_revision(

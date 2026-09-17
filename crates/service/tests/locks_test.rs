@@ -950,6 +950,45 @@ async fn an_elapsed_preparation_is_never_replayed(pool: PgPool) {
     assert_eq!(state, "expired");
 }
 
+// Prepare after registration is a stable INVALID_STATE — it must never
+// fall through to a second insert and surface a uniqueness conflict
+// (Sol Wave 1A review, P3-2).
+#[sqlx::test]
+async fn prepare_after_registration_is_a_stable_invalid_state(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 160),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The payment already has a Locks preparation.")
+    );
+    // Idempotent under repetition: the same refusal again, never an
+    // INVARIANT_VIOLATION uniqueness fall-through.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 161),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        1
+    );
+}
+
 // Registration stores only an encrypted correlation bound to the order's
 // participants, amount, asset, policy version, and lock resource hash; the
 // payment flips to the 'locks' adapter and the bundle id appears nowhere in
