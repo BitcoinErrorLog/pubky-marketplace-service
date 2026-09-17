@@ -368,11 +368,13 @@ impl HttpHomeserverClient {
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
             anyhow::bail!("{ENV_HOMESERVER_URL} must be an http(s) URL");
         }
+        tracing::info!(base_url = %base_url, "homeserver client configured");
         let http = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
         Ok(Self { base_url, http })
     }
 
     async fn fetch_inner(&self, seller_pubky: &str, path: &str) -> HomeserverFetchOutcome {
+        let prefix = pubky_host_prefix(seller_pubky);
         let url = format!("{}{path}", self.base_url);
         let response = self
             .http
@@ -389,10 +391,21 @@ impl HttpHomeserverClient {
         };
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
+            tracing::warn!(
+                path = %path,
+                pubky_host_prefix = %prefix,
+                status = %status,
+                "homeserver record fetch not found"
+            );
             return HomeserverFetchOutcome::NotFound;
         }
         if !status.is_success() {
-            tracing::warn!(status = %status, "homeserver record fetch rejected");
+            tracing::warn!(
+                path = %path,
+                pubky_host_prefix = %prefix,
+                status = %status,
+                "homeserver record fetch rejected"
+            );
             return HomeserverFetchOutcome::Unavailable;
         }
         match response.json::<Value>().await {
@@ -406,6 +419,7 @@ impl HttpHomeserverClient {
 
     async fn fetch_inner_bytes(&self, seller_pubky: &str, path: &str) -> HomeserverFetchOutcome {
         const MAX_RECORD_BYTES: usize = 1024 * 1024;
+        let prefix = pubky_host_prefix(seller_pubky);
         let response = match self
             .http
             .get(format!("{}{path}", self.base_url))
@@ -416,14 +430,29 @@ impl HttpHomeserverClient {
             Ok(response) => response,
             Err(_) => return HomeserverFetchOutcome::Unavailable,
         };
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            tracing::warn!(
+                path = %path,
+                pubky_host_prefix = %prefix,
+                status = %status,
+                "homeserver record fetch not found"
+            );
             return HomeserverFetchOutcome::NotFound;
         }
-        if !response.status().is_success()
+        if !status.is_success()
             || response
                 .content_length()
                 .is_some_and(|length| length > MAX_RECORD_BYTES as u64)
         {
+            if !status.is_success() {
+                tracing::warn!(
+                    path = %path,
+                    pubky_host_prefix = %prefix,
+                    status = %status,
+                    "homeserver record fetch rejected"
+                );
+            }
             return HomeserverFetchOutcome::Unavailable;
         }
         match response.bytes().await {
@@ -433,6 +462,10 @@ impl HttpHomeserverClient {
             _ => HomeserverFetchOutcome::Unavailable,
         }
     }
+}
+
+fn pubky_host_prefix(seller_pubky: &str) -> &str {
+    seller_pubky.get(..8).unwrap_or(seller_pubky)
 }
 
 impl HomeserverListingClient for HttpHomeserverClient {
@@ -470,12 +503,11 @@ impl HomeserverListingClient for HttpHomeserverClient {
         listing_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverRawFetchOutcome> + Send + 'a>> {
         Box::pin(async move {
+            let path = format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}");
+            let prefix = pubky_host_prefix(seller_pubky);
             let mut response = match self
                 .http
-                .get(format!(
-                    "{}/pub/pubky.app/marketplace/v1/listings/{listing_id}",
-                    self.base_url
-                ))
+                .get(format!("{}{path}", self.base_url))
                 .header("pubky-host", seller_pubky)
                 .send()
                 .await
@@ -483,15 +515,30 @@ impl HomeserverListingClient for HttpHomeserverClient {
                 Ok(response) => response,
                 Err(_) => return HomeserverRawFetchOutcome::Unavailable,
             };
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                tracing::warn!(
+                    path = %path,
+                    pubky_host_prefix = %prefix,
+                    status = %status,
+                    "homeserver record fetch not found"
+                );
                 return HomeserverRawFetchOutcome::NotFound;
             }
-            if !response.status().is_success()
+            if !status.is_success()
                 || response
                     .content_length()
                     .is_some_and(|length| length > MAX_AWARD_LISTING_BYTES as u64)
             {
-                return if response.status().is_success() {
+                if !status.is_success() {
+                    tracing::warn!(
+                        path = %path,
+                        pubky_host_prefix = %prefix,
+                        status = %status,
+                        "homeserver record fetch rejected"
+                    );
+                }
+                return if status.is_success() {
                     HomeserverRawFetchOutcome::TooLarge
                 } else {
                     HomeserverRawFetchOutcome::Unavailable
@@ -969,6 +1016,7 @@ pub fn client_from_env() -> anyhow::Result<HttpHomeserverClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use serde_json::json;
 
     fn record_json() -> Value {
@@ -1202,5 +1250,25 @@ mod tests {
     fn http_client_requires_an_http_base_url() {
         assert!(HttpHomeserverClient::new("ftp://homeserver.example").is_err());
         assert!(HttpHomeserverClient::new("https://homeserver.example/").is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_client_maps_not_found_to_not_found() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock homeserver binds");
+        let address = listener.local_addr().expect("mock homeserver address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new())
+                .await
+                .expect("mock homeserver serves");
+        });
+        let client =
+            HttpHomeserverClient::new(&format!("http://{address}")).expect("client builds");
+
+        let outcome = client.fetch_listing(&"s".repeat(52), "missing").await;
+
+        assert_eq!(outcome, HomeserverFetchOutcome::NotFound);
+        server.abort();
     }
 }
