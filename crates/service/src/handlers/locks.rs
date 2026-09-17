@@ -106,6 +106,31 @@ pub async fn register(
             "The payment already has a registered Locks bundle.",
         )));
     }
+    // Receiver-clock eligibility, under the payment/order locks: attachment
+    // is allowed only while the prepared window is still open and the order
+    // still holds exactly that window. Without this an elapsed preparation
+    // could attach (and later confirm) before the expiry sweep runs.
+    let Some(order) = fetch_order_for_update(tx, payment.order_id).await? else {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvariantViolation,
+            "Payment order is missing.",
+        )));
+    };
+    if order.state != "pending_payment"
+        || !order.stock_held
+        || order.hold_expires_at != Some(window_expires_at)
+    {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The order no longer holds the prepared Locks payment window.",
+        )));
+    }
+    if now >= window_expires_at {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The Locks preparation has expired.",
+        )));
+    }
     let bundle_id_ciphertext = locks.keys.encrypt_bundle_id(payment.id, &payload.bundle_id);
     let bundle_lookup_token = locks.keys.lookup_token(&creator, &payload.bundle_id);
 

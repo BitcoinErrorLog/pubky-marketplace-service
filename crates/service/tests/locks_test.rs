@@ -277,6 +277,150 @@ async fn a_prepared_row_survives_a_worker_pass_untouched(pool: PgPool) {
     );
 }
 
+// Receiver-clock eligibility at attachment: once the prepared window has
+// elapsed on the service clock, registration is refused with a static
+// INVALID_STATE even when the expiry sweep has not run yet; the sweep then
+// terminalises the preparation (payment expired, order cancelled, hold
+// restocked). A cancelled order likewise refuses attachment.
+#[sqlx::test]
+async fn registration_after_window_expiry_before_the_sweep_is_refused(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 90),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+
+    // The receiver clock passes the preparation/hold deadline without a
+    // sweep: attachment must refuse, never confirm later.
+    app.clock.advance_seconds(3_601);
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &register_locks_command(
+            &order.payment_id,
+            1,
+            TEST_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            91,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The Locks preparation has expired.")
+    );
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(
+        state, "awaiting_entitlement",
+        "a refused registration advances nothing"
+    );
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'payment.locks_registered'"
+        )
+        .await,
+        0
+    );
+    let (preparation_state, bundle): (String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT preparation_state, bundle_id_ciphertext FROM payment_locks_correlations",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("correlation row exists");
+    assert_eq!(preparation_state, "prepared");
+    assert!(bundle.is_none());
+
+    // The sweep then terminalises the preparation on marketplace time.
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 1);
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "expired");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+
+    // Registration stays refused after the sweep (the payment is terminal).
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &register_locks_command(
+            &order.payment_id,
+            2,
+            TEST_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            92,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+}
+
+// A buyer-cancelled order no longer holds the prepared window: attachment
+// is refused even though the payment itself is still awaiting entitlement.
+#[sqlx::test]
+async fn registration_after_order_cancellation_is_refused(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 95),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+
+    let cancel = common::order_command(
+        "order.cancel_request",
+        &order.order_id,
+        1,
+        json!({ "reason": "Changed my mind" }),
+        96,
+    );
+    let (status, body) = execute(&app, &buyer.token, &cancel).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &register_locks_command(
+            &order.payment_id,
+            1,
+            TEST_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            97,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The order no longer holds the prepared Locks payment window.")
+    );
+    let (preparation_state, bundle): (String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT preparation_state, bundle_id_ciphertext FROM payment_locks_correlations",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("correlation row exists");
+    assert_eq!(preparation_state, "prepared");
+    assert!(bundle.is_none());
+}
+
 // Registration stores only an encrypted correlation bound to the order's
 // participants, amount, asset, policy version, and lock resource hash; the
 // payment flips to the 'locks' adapter and the bundle id appears nowhere in
