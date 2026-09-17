@@ -212,7 +212,7 @@ async fn confirm_via_locks(
         &buyer.token,
         &register_locks_command(
             &order.payment_id,
-            1,
+            2,
             bundle_id,
             &lock_resource_for(&seller.pubky),
             n,
@@ -2142,7 +2142,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "{body}");
     let registration = register_locks_command(
         &shipped_payment,
-        1,
+        2,
         TEST_BUNDLE_ID,
         &lock_resource_for(&seller_a.pubky),
         0x301,
@@ -2282,7 +2282,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
         &buyer.token,
         &register_locks_command(
             &b_payment,
-            1,
+            2,
             BUNDLE_3,
             &lock_resource_for(&seller_b.pubky),
             0x309,
@@ -2372,7 +2372,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
         &buyer.token,
         &register_locks_command(
             &b_payment2,
-            1,
+            2,
             BUNDLE_4,
             &lock_resource_for(&seller_b.pubky),
             0x30c,
@@ -2561,7 +2561,7 @@ async fn reputation_counts_pickup_completions_by_confirming_actor(pool: PgPool) 
             &buyer.token,
             &register_locks_command(
                 &order.payment_id,
-                1,
+                2,
                 bundle,
                 &lock_resource_for(&seller.pubky),
                 n,
@@ -3568,7 +3568,7 @@ async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
         &buyer.token,
         &common::register_locks_command(
             &order.payment_id,
-            1,
+            2,
             TEST_BUNDLE_ID,
             &lock_resource_for(&seller.pubky),
             0x802,
@@ -3700,7 +3700,7 @@ async fn a_failed_claimed_item_does_not_stall_the_rest_of_the_batch(pool: PgPool
             &buyer.token,
             &common::register_locks_command(
                 &order.payment_id,
-                1,
+                2,
                 bundle,
                 &lock_resource_for(&seller.pubky),
                 n,

@@ -118,7 +118,7 @@ async fn register_locks(
         buyer_token,
         &register_locks_command(
             &order.payment_id,
-            1,
+            2,
             TEST_BUNDLE_ID,
             &lock_resource_for(seller_pubky),
             1,
@@ -207,7 +207,7 @@ async fn a_prepared_row_survives_a_worker_pass_untouched(pool: PgPool) {
         &buyer.token,
         &register_locks_command(
             &payments[1],
-            1,
+            2,
             TEST_BUNDLE_ID,
             &lock_resource_for(&seller.pubky),
             82,
@@ -254,7 +254,7 @@ async fn a_prepared_row_survives_a_worker_pass_untouched(pool: PgPool) {
         &buyer.token,
         &register_locks_command(
             &payments[0],
-            1,
+            2,
             OTHER_BUNDLE_ID,
             &lock_resource_for(&seller.pubky),
             83,
@@ -305,7 +305,7 @@ async fn registration_after_window_expiry_before_the_sweep_is_refused(pool: PgPo
         &buyer.token,
         &register_locks_command(
             &order.payment_id,
-            1,
+            2,
             TEST_BUNDLE_ID,
             &lock_resource_for(&seller.pubky),
             91,
@@ -355,7 +355,7 @@ async fn registration_after_window_expiry_before_the_sweep_is_refused(pool: PgPo
         &buyer.token,
         &register_locks_command(
             &order.payment_id,
-            2,
+            3,
             TEST_BUNDLE_ID,
             &lock_resource_for(&seller.pubky),
             92,
@@ -398,7 +398,7 @@ async fn registration_after_order_cancellation_is_refused(pool: PgPool) {
         &buyer.token,
         &register_locks_command(
             &order.payment_id,
-            1,
+            2,
             TEST_BUNDLE_ID,
             &lock_resource_for(&seller.pubky),
             97,
@@ -471,6 +471,50 @@ async fn the_prepare_result_is_sealed_at_rest_and_unsealed_on_replay(pool: PgPoo
     assert!(!replay.to_string().contains(&client_reference));
 }
 
+// The adapter is pinned atomically with the preparation (DESIGN §3.2):
+// immediately after prepare — before any bundle attaches — the payment
+// adapter is `locks`, the revision has advanced, and the sandbox command
+// can no longer drive the payment.
+#[sqlx::test]
+async fn prepare_pins_the_locks_adapter_atomically(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    let command = common::prepare_locks_command(&order.payment_id, 110);
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+    assert_eq!(body["revision"], json!(2));
+    let (state, adapter, revision) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(
+        (state.as_str(), adapter.as_str(), revision),
+        ("awaiting_entitlement", "locks", 2),
+        "the prepared row, the hold, and the adapter switch commit together"
+    );
+    let (preparation_state,): (String,) =
+        sqlx::query_as("SELECT preparation_state FROM payment_locks_correlations")
+            .fetch_one(&app.pool)
+            .await
+            .expect("correlation row exists");
+    assert_eq!(preparation_state, "prepared");
+
+    // The sandbox path is already closed, ahead of attachment.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &payment_command(&order.payment_id, 2, "confirmed", 1, 111),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    let (state, adapter, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(
+        (state.as_str(), adapter.as_str()),
+        ("awaiting_entitlement", "locks")
+    );
+}
+
 // Registration stores only an encrypted correlation bound to the order's
 // participants, amount, asset, policy version, and lock resource hash; the
 // payment flips to the 'locks' adapter and the bundle id appears nowhere in
@@ -483,7 +527,7 @@ async fn registration_stores_an_encrypted_bound_correlation(pool: PgPool) {
     let order = create_pending_order(&app, &seller, &buyer).await;
 
     let body = register_locks(&app, &buyer.token, &order, &seller.pubky).await;
-    assert_eq!(body["revision"], json!(2));
+    assert_eq!(body["revision"], json!(3));
     assert_eq!(body["result"]["payment"]["adapter"], json!("locks"));
     assert_eq!(
         body["result"]["payment"]["state"],
@@ -649,7 +693,7 @@ async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
         let (status, body) = execute(&app, &buyer.token, &prepare).await;
         assert_eq!(status, StatusCode::OK, "preparation failed: {body}");
     }
-    let command = register_locks_command(first_payment, 1, TEST_BUNDLE_ID, &resource, 20);
+    let command = register_locks_command(first_payment, 2, TEST_BUNDLE_ID, &resource, 20);
     let (status, original) = execute(&app, &buyer.token, &command).await;
     assert_eq!(status, StatusCode::OK, "{original}");
 
@@ -671,14 +715,14 @@ async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
 
     // A different registration for the already-correlated payment: refused.
     let second_registration =
-        register_locks_command(first_payment, 2, OTHER_BUNDLE_ID, &resource, 21);
+        register_locks_command(first_payment, 3, OTHER_BUNDLE_ID, &resource, 21);
     let (status, body) = execute(&app, &buyer.token, &second_registration).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
 
     // The same {creator, bundle_id} identity on another order: rejected by
     // the unique lookup token, not application logic.
-    let reused_identity = register_locks_command(second_payment, 1, TEST_BUNDLE_ID, &resource, 22);
+    let reused_identity = register_locks_command(second_payment, 2, TEST_BUNDLE_ID, &resource, 22);
     let (status, body) = execute(&app, &buyer.token, &reused_identity).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], json!("INVARIANT_VIOLATION"));
@@ -698,7 +742,7 @@ async fn sandbox_advance_is_refused_for_a_locks_correlated_payment(pool: PgPool)
         let (status, body) = execute(
             &app,
             &buyer.token,
-            &payment_command(&order.payment_id, 2, target, 1, 30),
+            &payment_command(&order.payment_id, 3, target, 1, 30),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{target}: {body}");
@@ -1008,7 +1052,7 @@ async fn late_completion_after_window_expiry_goes_to_manual_review(pool: PgPool)
     assert_eq!(summary.payment_windows_expired, 1);
     let (state, _, revision) = payment_state(&app.pool, &order.payment_id).await;
     assert_eq!(state, "expired");
-    assert_eq!(revision, 3);
+    assert_eq!(revision, 4);
     assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
     let (reason, stock_held): (Option<String>, bool) =
         sqlx::query_as("SELECT cancellation_reason, stock_held FROM orders WHERE id = $1::uuid")

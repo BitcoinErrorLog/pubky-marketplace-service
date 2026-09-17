@@ -642,7 +642,7 @@ async fn resolve_refuses_a_locks_manual_review(pool: PgPool) {
         &buyer.token,
         &register_locks_command(
             &order.payment_id,
-            1,
+            2,
             TEST_BUNDLE_ID,
             &lock_resource_for(&seller.pubky),
             700,

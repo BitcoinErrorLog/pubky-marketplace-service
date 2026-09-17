@@ -146,8 +146,9 @@ pub async fn register(
     .execute(&mut **tx)
     .await?;
 
-    // The 'locks' adapter permanently closes the sandbox path for this
-    // payment: from here only server-side verification advances it.
+    // The adapter was pinned to 'locks' atomically with the preparation;
+    // restating it here keeps attachment self-contained while the revision
+    // bump serializes this transition against any concurrent command.
     let updated_payment: PaymentRow = sqlx::query_as(&format!(
         "UPDATE payments SET revision = revision + 1, adapter = 'locks', updated_at = $2 \
          WHERE id = $1 RETURNING {PAYMENT_COLUMNS}"
@@ -404,8 +405,20 @@ pub async fn prepare(
     .bind(&criterion_id)
     .bind(locks.keys.encrypt_prepared_value(payment.id, b"locks-client-reference:", &client_reference))
     .bind(now).execute(&mut **tx).await?;
+    // The hold, the prepared row, and the adapter switch commit atomically
+    // (DESIGN §3.2): from here only server-side verification can advance
+    // this payment — the sandbox path is already closed, not only once a
+    // bundle attaches.
+    let updated_payment: PaymentRow = sqlx::query_as(&format!(
+        "UPDATE payments SET revision = revision + 1, adapter = 'locks', updated_at = $2 \
+         WHERE id = $1 RETURNING {PAYMENT_COLUMNS}"
+    ))
+    .bind(payment.id)
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await?;
     Ok(Ok(HandlerSuccess {
-        revision: payment.revision,
+        revision: updated_payment.revision,
         event_ids: vec![],
         result: json!({"kind": "payment", "client_reference": client_reference, "window_expires_at": format_timestamp(window_expires_at)}),
     }))

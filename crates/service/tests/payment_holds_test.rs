@@ -202,7 +202,7 @@ async fn register_locks_acquires_the_hold_and_arms_the_locks_window(pool: PgPool
 
     let registration = register_locks_command(
         &order.payment_id,
-        1,
+        2,
         TEST_BUNDLE_ID,
         &lock_resource_for(&seller.pubky),
         200,
