@@ -1406,6 +1406,86 @@ async fn prepare_refuses_a_lock_document_with_changed_bytes(pool: PgPool) {
     );
 }
 
+// Paykit v1 policy refusals through the handler: a document carrying an
+// unknown criterion param (`exponent`) or a lock logic that does not name
+// exactly the sole criterion is refused at prepare even though it is served
+// at its OWN content-addressed path — upstream rejects both
+// (`PaykitPaymentPolicyValidationError::InvalidParams(UnknownField)` /
+// `InvalidLockLogic`), and so does the mirror.
+#[sqlx::test]
+async fn prepare_refuses_policy_invalid_documents_at_their_own_path(pool: PgPool) {
+    for (case, mutate) in [
+        (
+            "unknown paykit param",
+            Box::new(|document: &mut Value| {
+                document["criteria"][0]["params"]["exponent"] = json!("2");
+            }) as Box<dyn Fn(&mut Value)>,
+        ),
+        (
+            "criterion not the sole lock-logic member",
+            Box::new(|document: &mut Value| {
+                document["lock_logic"] = json!({"type": "all", "criteria": ["paykit", "paykit"]});
+            }) as Box<dyn Fn(&mut Value)>,
+        ),
+    ] {
+        let seller_key = common::random_keypair();
+        let seller_pubky = seller_key.1.clone();
+        let mut document = lock_document_for(&seller_pubky, 13_700, "USD");
+        mutate(&mut document);
+        let typed: marketplace_service::content_lock::ContentLock =
+            serde_json::from_value(document.clone()).expect("document decodes");
+        let lock_id = typed.lock_id().expect("typed lock id");
+        let resource = format!("{seller_pubky}/pub/locks.app/{lock_id}.json");
+        let path = format!("/pub/locks.app/{lock_id}.json");
+        let app = test_app_with_lock_documents(
+            pool.clone(),
+            HashMap::from([((seller_pubky.clone(), path), document)]),
+        )
+        .await;
+        let seller = TestActor {
+            token: common::authenticate(&app, &seller_key.0).await,
+            keypair: seller_key.0,
+            pubky: seller_pubky,
+        };
+        let buyer = new_actor(&app).await;
+        let mut listing = register_command(&seller.pubky, 1);
+        listing["payload"]["digital_lock"] = json!({
+            "policyUri": resource,
+            "criterionId": "paykit",
+        });
+        let (status, body) = execute(&app, &seller.token, &listing).await;
+        assert_eq!(status, StatusCode::OK, "{case} listing: {body}");
+        let (status, body) = execute(
+            &app,
+            &buyer.token,
+            &checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000003000"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{case} checkout: {body}");
+        let payment_id = body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id");
+        let (status, body) = execute(
+            &app,
+            &buyer.token,
+            &common::prepare_locks_command(payment_id, 72),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{case}: {body}");
+        assert_eq!(body["error"]["code"], json!("INVALID_STATE"), "{case}");
+        assert_eq!(
+            body["error"]["message"],
+            json!("The seller's Locks document does not match the payment."),
+            "{case}"
+        );
+        assert_eq!(
+            count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+            0,
+            "{case}: a policy-invalid document never creates a correlation"
+        );
+    }
+}
+
 // The creator swap: a document naming a different creator served at the
 // seller's path is an identity mismatch and is refused at prepare.
 #[sqlx::test]

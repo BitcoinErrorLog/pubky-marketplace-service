@@ -341,10 +341,18 @@ pub async fn prepare(
             )))
         }
     };
-    if !crate::locks::validate_content_lock_identity(&content, &resource)
-        || !content_lock_matches(
-            &content,
-            creator,
+    let content_lock = match crate::content_lock::validate_content_lock_value(&content, &resource) {
+        Ok(content_lock) => content_lock,
+        Err(_) => {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidState,
+                "The seller's Locks document does not match the payment.",
+            )))
+        }
+    };
+    if content_lock.validate_paykit_payment_v1_policy().is_err()
+        || !criterion_matches_payment(
+            &content_lock,
             &criterion_id,
             payment.amount_minor,
             &payment.currency,
@@ -385,46 +393,36 @@ pub async fn prepare(
     }))
 }
 
-fn content_lock_matches(
-    content: &serde_json::Value,
-    creator: &str,
+/// The marketplace economics gate on top of the upstream policy invariants:
+/// the sole `paykit-payment` criterion must be the seller-authored criterion
+/// from the checkout snapshot, and its amount/asset must equal the immutable
+/// payment facts exactly (no conversion, no unit guessing).
+fn criterion_matches_payment(
+    content_lock: &crate::content_lock::ContentLock,
     criterion_id: &str,
     amount_minor: i64,
     asset: &str,
 ) -> bool {
-    let Some(object) = content.as_object() else {
+    let [criterion] = &content_lock.criteria[..] else {
         return false;
     };
-    let Some(criteria) = object.get("criteria").and_then(serde_json::Value::as_array) else {
-        return false;
-    };
-    let Some(criterion) = (criteria.len() == 1)
-        .then_some(criteria[0].as_object())
-        .flatten()
-    else {
-        return false;
-    };
-    criterion
-        .get("criterion_id")
-        .and_then(serde_json::Value::as_str)
-        == Some(criterion_id)
+    criterion.criterion_id == criterion_id
+        && criterion.verifier_type == crate::content_lock::VerifierType::PaykitPayment
         && criterion
-            .get("verifier_type")
+            .params
+            .get("recipient_pubky")
             .and_then(serde_json::Value::as_str)
-            == Some("paykit-payment")
+            .and_then(crate::content_lock::PubkyIdentity::parse)
+            .as_ref()
+            == Some(&content_lock.creator)
         && criterion
-            .get("params")
-            .and_then(|params| params.get("recipient_pubky"))
-            .and_then(serde_json::Value::as_str)
-            == Some(creator)
-        && criterion
-            .get("params")
-            .and_then(|params| params.get("asset"))
+            .params
+            .get("asset")
             .and_then(serde_json::Value::as_str)
             == Some(asset)
         && criterion
-            .get("params")
-            .and_then(|params| params.get("amount"))
+            .params
+            .get("amount")
             .and_then(serde_json::Value::as_str)
             == Some(amount_minor.to_string().as_str())
 }

@@ -25,10 +25,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base32::Alphabet;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use pubky_common::crypto::PublicKey;
 use rand::RngCore;
 use serde::Deserialize;
 use sha2::Sha256;
@@ -47,42 +45,6 @@ pub const ENV_BUNDLE_ENCRYPTION_KEY: &str = "LOCKS_BUNDLE_ENCRYPTION_KEY";
 pub const ENV_LOOKUP_HMAC_KEY: &str = "LOCKS_LOOKUP_HMAC_KEY";
 
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Validates a fetched public content-lock document against its advertised
-/// resource. This mirrors `pubky/locks@ba49a777:locks-core/src/lock_policy.rs:192-215`
-/// and `locks-sdk/src/discovery.rs:35-52`: canonical RFC 8785 bytes are BLAKE3
-/// hashed and Crockford-base32 encoded to derive the 52-character lock id, and
-/// both creator values are compared as `pubky_common::PublicKey` identities.
-pub fn validate_content_lock_identity(document: &serde_json::Value, resource: &str) -> bool {
-    let Some((resource_creator, path)) = resource.split_once("/pub/locks.app/") else {
-        return false;
-    };
-    let Some(lock_id) = path.strip_suffix(".json") else {
-        return false;
-    };
-    if lock_id.len() != 52 {
-        return false;
-    }
-    let parse_key =
-        |value: &str| PublicKey::try_from_z32(value.strip_prefix("pubky").unwrap_or(value));
-    let Ok(expected_creator) = parse_key(resource_creator) else {
-        return false;
-    };
-    let Some(actual_creator) = document.get("creator").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    let Ok(actual_creator) = parse_key(actual_creator) else {
-        return false;
-    };
-    if actual_creator != expected_creator {
-        return false;
-    }
-    let Ok(canonical) = serde_json_canonicalizer::to_vec(document) else {
-        return false;
-    };
-    let derived = base32::encode(Alphabet::Crockford, blake3::hash(&canonical).as_bytes());
-    derived.len() == 52 && derived == lock_id
-}
 
 /// The configured Locks secret material. Both keys are required together
 /// and must differ; the service refuses to start otherwise.
@@ -437,36 +399,59 @@ mod tests {
         );
     }
 
+    /// A full upstream-shaped test document (every required `ContentLock`
+    /// field, normalized creator/recipient): the typed canonical bytes and
+    /// the raw canonical bytes are identical for this dialect.
     fn content_lock_document(creator: &str) -> serde_json::Value {
         serde_json::json!({
-            "creator": creator,
+            "version": 1,
+            "creator": format!("pubky{creator}"),
+            "primary_resource": {
+                "path": "/priv/locks.app/content/post.json",
+                "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+                "content_type": "application/json",
+                "size": 5,
+            },
             "criteria": [{
                 "criterion_id": "paykit",
                 "verifier_type": "paykit-payment",
                 "params": {
                     "amount": "13700",
                     "asset": "USD",
-                    "recipient_pubky": creator,
+                    "recipient_pubky": format!("pubky{creator}"),
                 },
             }],
+            "lock_logic": { "type": "all", "criteria": ["paykit"] },
+            "access_policy": { "requested_credential_ttl_seconds": 900 },
+            "lock_server": { "override": null },
+            "created_at": "2026-05-29T12:00:00Z",
         })
+    }
+
+    fn resource_for(document: &serde_json::Value, creator: &str) -> String {
+        let lock: crate::content_lock::ContentLock =
+            serde_json::from_value(document.clone()).expect("test document matches the schema");
+        let lock_id = lock.lock_id().expect("test lock canonicalizes");
+        format!("{creator}/pub/locks.app/{lock_id}.json")
     }
 
     #[test]
     fn content_lock_identity_matches_canonical_document_path() {
         let creator = "y".repeat(52);
         let document = content_lock_document(&creator);
-        let canonical = serde_json_canonicalizer::to_vec(&document).expect("canonical JSON");
-        let lock_id = base32::encode(Alphabet::Crockford, blake3::hash(&canonical).as_bytes());
-        let resource = format!("{creator}/pub/locks.app/{lock_id}.json");
-        assert!(validate_content_lock_identity(&document, &resource));
+        let resource = resource_for(&document, &creator);
+        assert_eq!(
+            crate::content_lock::validate_content_lock_value(&document, &resource).map(|_| ()),
+            Ok(())
+        );
     }
 
     /// The pinned upstream vector: a real `ContentLock` rendered by
     /// `pubky/locks@ba49a777` (`locks-core/src/lock_policy.rs`
     /// `canonical_json_string()` and `content_lock_path()`) and pinned here
-    /// under the name of its derived path. The marketplace derivation must
-    /// reproduce the same lock id from the raw document bytes.
+    /// under the name of its derived path. The marketplace mirror must
+    /// decode the document and reproduce the same lock id from its typed
+    /// canonical bytes.
     #[test]
     fn upstream_content_lock_vector_reproduces_the_canonical_path() {
         const LOCK_ID: &str = "5Z4FC0QEAFTTTE1DFH7DNZW2HVVPTDNJY5MERMD3Y0CQKH1P2SM0";
@@ -481,9 +466,13 @@ mod tests {
             .strip_prefix("pubky")
             .expect("fixture creator carries the pubky scheme prefix");
         let resource = format!("{creator}/pub/locks.app/{LOCK_ID}.json");
-        assert!(
-            validate_content_lock_identity(&document, &resource),
-            "the marketplace derivation reproduces the upstream path"
+        let lock = crate::content_lock::validate_content_lock_value(&document, &resource)
+            .expect("the marketplace mirror reproduces the upstream path");
+        assert_eq!(lock.lock_id().as_deref(), Some(LOCK_ID));
+        assert_eq!(
+            lock.validate_paykit_payment_v1_policy(),
+            Ok(()),
+            "the pinned upstream vector satisfies the Paykit v1 policy"
         );
     }
 
@@ -491,16 +480,20 @@ mod tests {
     fn content_lock_identity_refuses_changed_bytes_and_creator() {
         let creator = "y".repeat(52);
         let document = content_lock_document(&creator);
-        let canonical = serde_json_canonicalizer::to_vec(&document).expect("canonical JSON");
-        let lock_id = base32::encode(Alphabet::Crockford, blake3::hash(&canonical).as_bytes());
-        let resource = format!("{creator}/pub/locks.app/{lock_id}.json");
+        let resource = resource_for(&document, &creator);
 
         let mut changed = document.clone();
         changed["criteria"][0]["params"]["amount"] = serde_json::json!("13701");
-        assert!(!validate_content_lock_identity(&changed, &resource));
+        assert_eq!(
+            crate::content_lock::validate_content_lock_value(&changed, &resource),
+            Err(crate::content_lock::ContentLockIdentityRejection::PathMismatch)
+        );
 
         let mut wrong_creator = document;
-        wrong_creator["creator"] = serde_json::json!("o".repeat(52));
-        assert!(!validate_content_lock_identity(&wrong_creator, &resource));
+        wrong_creator["creator"] = serde_json::json!(format!("pubky{}", "o".repeat(52)));
+        assert_eq!(
+            crate::content_lock::validate_content_lock_value(&wrong_creator, &resource),
+            Err(crate::content_lock::ContentLockIdentityRejection::CreatorMismatch)
+        );
     }
 }

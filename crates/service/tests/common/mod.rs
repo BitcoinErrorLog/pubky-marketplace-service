@@ -308,26 +308,39 @@ pub fn lock_resource_for(seller_pubky: &str) -> String {
 
 pub fn lock_resource_for_payment(seller_pubky: &str, amount: i64, asset: &str) -> String {
     let document = lock_document_for(seller_pubky, amount, asset);
-    let canonical = serde_json_canonicalizer::to_vec(&document).expect("test lock canonicalizes");
-    let lock_id = base32::encode(
-        base32::Alphabet::Crockford,
-        blake3::hash(&canonical).as_bytes(),
-    );
+    let lock: marketplace_service::content_lock::ContentLock =
+        serde_json::from_value(document).expect("test lock document matches the upstream schema");
+    let lock_id = lock.lock_id().expect("test lock canonicalizes");
     format!("{seller_pubky}/pub/locks.app/{lock_id}.json")
 }
 
+/// A full upstream-shaped content-lock document: every field upstream's
+/// strict typed `ContentLock` requires (`pubky/locks@ba49a777:locks-core/src/lock_policy.rs:35-59`),
+/// with the creator and recipient already in normalized `pubky<z32>` form,
+/// so the raw canonical bytes equal the typed canonical bytes.
 pub fn lock_document_for(seller_pubky: &str, amount: i64, asset: &str) -> Value {
     json!({
-        "creator": seller_pubky,
+        "version": 1,
+        "creator": format!("pubky{seller_pubky}"),
+        "primary_resource": {
+            "path": "/priv/locks.app/content/post.json",
+            "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+            "content_type": "application/json",
+            "size": 5,
+        },
         "criteria": [{
             "criterion_id": "paykit",
             "verifier_type": "paykit-payment",
             "params": {
                 "amount": amount.to_string(),
                 "asset": asset,
-                "recipient_pubky": seller_pubky,
+                "recipient_pubky": format!("pubky{seller_pubky}"),
             },
         }],
+        "lock_logic": { "type": "all", "criteria": ["paykit"] },
+        "access_policy": { "requested_credential_ttl_seconds": 900 },
+        "lock_server": { "override": null },
+        "created_at": "2026-05-29T12:00:00Z",
     })
 }
 
