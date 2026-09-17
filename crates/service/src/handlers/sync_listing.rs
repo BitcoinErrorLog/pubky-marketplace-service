@@ -26,6 +26,7 @@ use crate::handlers::fetch_listing_for_update;
 use crate::handlers::register_listing::apply_registration;
 use crate::homeserver::{
     registration_payload_from_record, HomeserverFetchOutcome, HomeserverListingClient,
+    MalformedDigitalLock,
 };
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -74,14 +75,25 @@ pub async fn handle(
         }
     };
 
-    let Some(registration) =
-        registration_payload_from_record(&payload.seller_pubky, &payload.listing_id, &record)
-    else {
-        return Ok(Err(CommandFailure::new(
-            ErrorCode::InvalidState,
-            "The seller's listing record could not be interpreted for registration.",
-        )));
-    };
+    let registration =
+        match registration_payload_from_record(&payload.seller_pubky, &payload.listing_id, &record)
+        {
+            Ok(Some(registration)) => registration,
+            Ok(None) => {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::InvalidState,
+                    "The seller's listing record could not be interpreted for registration.",
+                )))
+            }
+            // A present-but-invalid digitalLock refuses the sync rather than
+            // healing the listing to no lock.
+            Err(MalformedDigitalLock) => {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::InvalidState,
+                    "The seller's listing record carries an invalid Locks payment lock.",
+                )))
+            }
+        };
     // The derived payload must satisfy exactly the invariants
     // `listing.register` enforces; a record that fails them cannot back a
     // registered aggregate.
