@@ -481,7 +481,11 @@ pub fn payment_machine() -> AggregateMachine {
                 vec![Server("paykit_resolution")],
             ),
         ],
-        commands: vec!["payment.sandbox_advance", "payment.register_locks"],
+        commands: vec![
+            "payment.sandbox_advance",
+            "payment.prepare_locks",
+            "payment.register_locks",
+        ],
         unreachable_states: vec![],
     }
 }

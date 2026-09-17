@@ -741,6 +741,7 @@
       ],
       "commands": [
         "payment.sandbox_advance",
+        "payment.prepare_locks",
         "payment.register_locks"
       ],
       "unreachable_states": []
