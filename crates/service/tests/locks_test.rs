@@ -11,7 +11,7 @@ mod common;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
 use marketplace_service::clock::{AdjustableClock, Clock};
@@ -82,6 +82,113 @@ async fn test_app_with_lock_documents(
     documents: HashMap<(String, String), Value>,
 ) -> TestApp {
     test_app_with_homeserver(pool, Arc::new(ScriptedLocksHomeserver { documents })).await
+}
+
+/// A homeserver double that serves seller listing records from an
+/// interior-mutable map — so `listing.sync` can heal a post-checkout lock
+/// change through the real sync path — AND the fixture content-lock
+/// documents, so prepare can fetch them.
+#[derive(Default)]
+struct SyncableLocksHomeserver {
+    records: Mutex<HashMap<(String, String), Value>>,
+}
+
+impl SyncableLocksHomeserver {
+    fn put_record(&self, seller_pubky: &str, listing_id: &str, record: Value) {
+        self.records
+            .lock()
+            .expect("records lock")
+            .insert((seller_pubky.to_string(), listing_id.to_string()), record);
+    }
+}
+
+impl HomeserverListingClient for SyncableLocksHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            match self
+                .records
+                .lock()
+                .expect("records lock")
+                .get(&(seller_pubky.to_string(), listing_id.to_string()))
+            {
+                Some(record) => HomeserverFetchOutcome::Found(record.clone()),
+                None => HomeserverFetchOutcome::NotFound,
+            }
+        })
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async { HomeserverFetchOutcome::NotFound })
+    }
+
+    fn fetch_content_lock<'a>(
+        &'a self,
+        creator_pubky: &'a str,
+        content_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            for (amount, asset) in [(13_700, "USD"), (12_500, "USD"), (25_000, "USD")] {
+                let resource = lock_resource_for_payment(creator_pubky, amount, asset);
+                if resource.strip_prefix(creator_pubky) == Some(content_path) {
+                    return HomeserverFetchOutcome::Found(lock_document_for(
+                        creator_pubky,
+                        amount,
+                        asset,
+                    ));
+                }
+            }
+            HomeserverFetchOutcome::NotFound
+        })
+    }
+}
+
+/// A canonical camelCase listing record carrying a `digitalLock`, mirroring
+/// the registered fixture listing (same revision, price, shipping, and
+/// quantity) so an equal-revision sync heals exactly the lock fields.
+fn listing_record_with_lock(revision: i64, policy_uri: &str) -> Value {
+    json!({
+        "recordType": "listing",
+        "schemaVersion": 1,
+        "title": "Winter boots",
+        "revision": revision,
+        "location": { "countryCode": "US", "region": null },
+        "media": [{
+            "id": "media_01",
+            "type": "image",
+            "mimeType": "image/jpeg",
+            "contentHash": "a".repeat(64),
+            "byteSize": 999_533,
+        }],
+        "variants": [{
+            "id": "variant_0",
+            "enabled": true,
+            "quantity": 1,
+            "sku": null,
+            "priceOverride": null,
+        }],
+        "shippingOptions": [{
+            "id": "ship_flat",
+            "pricing": "flat",
+            "label": "Seller shipping",
+            "price": { "amountMinor": 1_200, "currency": "USD", "exponent": 2 },
+            "estimatedMinDays": 2,
+            "estimatedMaxDays": 7,
+        }],
+        "sale": {
+            "acceptsOffers": true,
+            "format": "fixed_price",
+            "unitPrice": { "amountMinor": 12_500, "currency": "USD", "exponent": 2 },
+        },
+        "digitalLock": { "policyUri": policy_uri, "criterionId": "paykit" },
+    })
 }
 
 /// A homeserver double whose content-lock fetches are always a transient
@@ -1832,6 +1939,24 @@ async fn bundle_and_lock_resource_never_leave_the_correlation_store(pool: PgPool
         .any(|window| window == TEST_BUNDLE_ID.as_bytes()));
     assert_ne!(token, TEST_BUNDLE_ID.as_bytes().to_vec());
     assert_redacted("lock resource hash", &hash);
+
+    // At rest, the immutable checkout-time snapshot — planted dynamically
+    // with the SAME seller-authored resource the sentinel scans for — holds
+    // that resource only as ciphertext plus its hash.
+    let (snapshot_ciphertext, snapshot_hash): (Vec<u8>, String) = sqlx::query_as(
+        "SELECT expected_resource_ciphertext, expected_resource_hash \
+         FROM payment_locks_checkout_snapshots",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("checkout snapshot row exists");
+    assert!(
+        !snapshot_ciphertext
+            .windows(expected_resource.len())
+            .any(|window| window == expected_resource.as_bytes()),
+        "the checkout snapshot never stores the resource in plaintext"
+    );
+    assert_redacted("checkout snapshot hash", &snapshot_hash);
 }
 
 // Exactly one seller-authored payment lock per order: a cart with zero
@@ -1867,7 +1992,7 @@ async fn prepare_refuses_orders_with_zero_or_multiple_distinct_locks(pool: PgPoo
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
     assert_eq!(
         body["error"]["message"],
-        json!("The order must contain exactly one seller-authored Locks payment lock.")
+        json!("The order has no seller-authored Locks payment lock snapshot.")
     );
 
     // Multiple distinct locks: two lines from the same seller carrying two
@@ -1938,7 +2063,7 @@ async fn prepare_refuses_orders_with_zero_or_multiple_distinct_locks(pool: PgPoo
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
     assert_eq!(
         body["error"]["message"],
-        json!("The order must contain exactly one seller-authored Locks payment lock.")
+        json!("The order has no seller-authored Locks payment lock snapshot.")
     );
 }
 
@@ -2068,6 +2193,147 @@ async fn prepare_refuses_policy_invalid_documents_at_their_own_path(pool: PgPool
             "{case}: a policy-invalid document never creates a correlation"
         );
     }
+}
+
+// The immutable checkout-time lock snapshot (Sol Wave 1A review round 2,
+// P1-4): a post-checkout mutation of the mutable listing lock columns —
+// here an equal-revision `listing.sync` healing lock A to lock B, which is
+// expressly permitted — must NOT move an existing order's authority.
+// Prepare seals the checkout-time snapshot (A), never the healed row (B).
+#[sqlx::test]
+async fn prepare_seals_the_checkout_snapshot_not_a_post_checkout_lock_mutation(pool: PgPool) {
+    let homeserver = Arc::new(SyncableLocksHomeserver::default());
+    let app = test_app_with_homeserver(pool, homeserver.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let lock_a = lock_resource_for(&seller.pubky);
+    let lock_b = lock_resource_for_payment(&seller.pubky, 12_500, "USD");
+    assert_ne!(lock_a, lock_b);
+    let mut listing = register_command(&seller.pubky, 1);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_a,
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&app, &seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000005000"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+
+    // The checkout transaction planted the immutable snapshot of lock A.
+    let (snapshot_hash,): (String,) = sqlx::query_as(
+        "SELECT expected_resource_hash FROM payment_locks_checkout_snapshots \
+         WHERE payment_id = $1::uuid",
+    )
+    .bind(&payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("checkout snapshot row exists");
+    assert_eq!(
+        snapshot_hash,
+        blake3::hash(lock_a.as_bytes()).to_hex().to_string()
+    );
+
+    // The interleaving from the review: an equal-revision sync heals the
+    // mutable listing rows from lock A to lock B AFTER checkout.
+    homeserver.put_record(
+        &seller.pubky,
+        "boots_01",
+        listing_record_with_lock(1, &lock_b),
+    );
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::sync_command(&seller.pubky, "boots_01", 510),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "healing sync: {body}");
+    let (current,): (Option<String>,) =
+        sqlx::query_as("SELECT digital_lock_policy_uri FROM listings WHERE aggregate_id = $1")
+            .bind(format!("listing:{}_boots_01", seller.pubky))
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing row exists");
+    assert_eq!(
+        current.as_deref(),
+        Some(lock_b.as_str()),
+        "the mutable listing row really moved to lock B"
+    );
+
+    // Prepare seals the checkout snapshot (A), never the healed row (B).
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&payment_id, 511),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "prepare: {body}");
+    let (hash, ciphertext): (String, Vec<u8>) = sqlx::query_as(
+        "SELECT expected_resource_hash, expected_resource_ciphertext \
+         FROM payment_locks_correlations WHERE payment_id = $1::uuid",
+    )
+    .bind(&payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("correlation row exists");
+    assert_eq!(
+        hash,
+        blake3::hash(lock_a.as_bytes()).to_hex().to_string(),
+        "the correlation seals the checkout-time lock A, not the healed B"
+    );
+    let opened = common::test_locks_keys().open_prepared_value(
+        Uuid::parse_str(&payment_id).expect("payment id is a uuid"),
+        b"locks-resource:",
+        &ciphertext,
+    );
+    assert_eq!(opened.as_deref(), Some(lock_a.as_str()));
+}
+
+// Legacy orders — and carts whose checkout saw zero or multiple distinct
+// locks — carry no snapshot row: prepare refuses them statically rather
+// than falling back to the mutable listing rows.
+#[sqlx::test]
+async fn prepare_refuses_a_payment_without_a_checkout_snapshot(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    // Simulate a legacy order: its checkout predates the snapshot row.
+    sqlx::query("DELETE FROM payment_locks_checkout_snapshots WHERE payment_id = $1::uuid")
+        .bind(&order.payment_id)
+        .execute(&app.pool)
+        .await
+        .expect("snapshot row deleted");
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 520),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The order has no seller-authored Locks payment lock snapshot.")
+    );
+    assert_eq!(
+        binding_outcomes(&app.pool, &order.payment_id).await,
+        vec!["refused_identity".to_string()]
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        0,
+        "a snapshot-less payment never creates a correlation"
+    );
 }
 
 // The creator swap: a document naming a different creator served at the

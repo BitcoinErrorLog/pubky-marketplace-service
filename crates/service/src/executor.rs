@@ -258,6 +258,7 @@ async fn dispatch(
                 actor,
                 command,
                 payload,
+                state.locks.as_deref().map(|runtime| &runtime.keys),
                 state.config.drop_claim_window_seconds,
                 now,
             )

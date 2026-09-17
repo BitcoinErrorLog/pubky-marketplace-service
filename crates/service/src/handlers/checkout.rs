@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::executor::insert_event;
 use crate::handlers::{current_listing_revision, fetch_listing};
+use crate::locks::LocksKeys;
 use crate::model::{money_json, ListingRow, OrderRow, PaymentRow, ProjectionContext};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -18,6 +19,7 @@ pub async fn handle(
     actor: &str,
     command: &Command,
     payload: &CreateCheckoutPayload,
+    locks_keys: Option<&LocksKeys>,
     drop_claim_window_seconds: i64,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -217,9 +219,11 @@ pub async fn handle(
                 // snapshotted onto the order line: `lines` is projected to
                 // participants and persisted in durable command results, and
                 // the expected lock resource is correlation-sensitive
-                // authority metadata. `payment.prepare_locks` re-reads it
-                // from the seller-authoritative listing rows and retains it
-                // only in the sealed correlation columns.
+                // authority metadata. It is instead snapshotted below into
+                // the private per-payment `payment_locks_checkout_snapshots`
+                // row (sealed, never projected), which
+                // `payment.prepare_locks` treats as the sole immutable
+                // authority — the listing rows are mutable seller state.
                 // The buyer's variant snapshot rides the order line so
                 // packing slips and order rows can show which variant was
                 // bought. It is display data validated for shape only:
@@ -376,6 +380,59 @@ pub async fn handle(
         .bind(now)
         .execute(&mut **tx)
         .await?;
+
+        // The immutable checkout-time Locks authority snapshot (DESIGN
+        // §§3.1–3.2): when the deployment can seal and this order's
+        // listings carry EXACTLY ONE distinct seller-authored payment lock,
+        // fix that lock — sealed resource, hash, criterion, and the
+        // expected economics — on a private per-payment row in this same
+        // transaction. The row is never projected, logged, or emitted, and
+        // nothing ever updates it; a post-checkout change to the mutable
+        // listing lock columns (e.g. equal-revision sync healing) cannot
+        // reach it. Zero or multiple distinct locks write NO row, so
+        // `payment.prepare_locks` refuses statically, exactly as it does
+        // for legacy orders.
+        if let Some(keys) = locks_keys {
+            let mut lock_pairs: std::collections::BTreeSet<(&str, &str)> =
+                std::collections::BTreeSet::new();
+            for &index in indices {
+                let listing = &resolved[index].1;
+                if let (Some(policy_uri), Some(criterion_id)) = (
+                    &listing.digital_lock_policy_uri,
+                    &listing.digital_lock_criterion_id,
+                ) {
+                    lock_pairs.insert((policy_uri.as_str(), criterion_id.as_str()));
+                }
+            }
+            if lock_pairs.len() == 1 {
+                let (policy_uri, criterion_id) =
+                    lock_pairs.into_iter().next().expect("non-empty lock pair");
+                sqlx::query(
+                    "INSERT INTO payment_locks_checkout_snapshots (payment_id, order_id, \
+                     expected_resource_ciphertext, expected_resource_hash, criterion_id, \
+                     amount_minor, asset, exponent, expected_reader_pubky, \
+                     expected_recipient_pubky, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                )
+                .bind(payment.id)
+                .bind(order_id)
+                .bind(keys.encrypt_prepared_value(
+                    payment.id,
+                    b"locks-checkout-resource:",
+                    policy_uri,
+                ))
+                .bind(blake3::hash(policy_uri.as_bytes()).to_hex().to_string())
+                .bind(criterion_id)
+                .bind(payment.amount_minor)
+                .bind(&payment.currency)
+                .bind(payment.exponent)
+                .bind(&payment.buyer_pubky)
+                .bind(&payment.seller_pubky)
+                .bind(now)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
 
         let order_aggregate_id = ids::order_aggregate_id(order_id);
         let event_id = insert_event(

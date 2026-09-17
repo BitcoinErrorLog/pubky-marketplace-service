@@ -2,9 +2,10 @@
 //! lifecycle binding for a payment.
 //!
 //! PREPARATION is the authority-creation step (DESIGN §3.2): under the
-//! payment and order locks it re-reads the seller-authored lock from the
-//! listing rows, validates the fetched content lock through the strict
-//! typed upstream mirror and the payment economics, mints and seals the
+//! payment and order locks it loads the immutable checkout-time lock
+//! snapshot (never the mutable listing rows), validates the fetched
+//! content lock through the strict
+//! typed upstream mirror and the snapshotted payment economics, mints and seals the
 //! server-originated `client_reference`, inserts the sole `prepared`
 //! correlation (sealed expected resource, hash, criterion, reader,
 //! recipient, amount, asset, exponent, policy version), acquires the
@@ -377,43 +378,41 @@ pub async fn prepare(
             "Only a pending order can prepare Locks.",
         )));
     }
-    // The seller-authoritative lock snapshot lives on the listing rows, not
-    // on the projected order lines (ADR-0019 §8): collect the distinct
-    // seller-authored Locks payment locks across the order's listings and
-    // require exactly one (multi-lock aggregation is a future design).
-    let mut lock_pairs: std::collections::BTreeSet<(String, String)> =
-        std::collections::BTreeSet::new();
-    for line in order.lines.as_array().into_iter().flatten() {
-        let Some(aggregate_id) = line
-            .get("listing_aggregate_id")
-            .and_then(serde_json::Value::as_str)
-        else {
-            return Ok(Err(CommandFailure::new(
-                ErrorCode::InvariantViolation,
-                "An order line is missing its listing.",
-            )));
-        };
-        let Some(listing) = crate::handlers::fetch_listing_for_update(tx, aggregate_id).await?
-        else {
-            return Ok(Err(CommandFailure::new(
-                ErrorCode::InvariantViolation,
-                "An order line's listing is missing.",
-            )));
-        };
-        if let (Some(policy_uri), Some(criterion_id)) = (
-            listing.digital_lock_policy_uri,
-            listing.digital_lock_criterion_id,
-        ) {
-            lock_pairs.insert((policy_uri, criterion_id));
-        }
-    }
-    if lock_pairs.len() != 1 {
+    // The seller-authoritative lock is the IMMUTABLE checkout-time snapshot
+    // (DESIGN §§3.1–3.2): prepare reads only this private per-payment row,
+    // never the mutable listing rows — a post-checkout lock change
+    // (including equal-revision sync healing) cannot move an existing
+    // order's authority. A payment without a snapshot (legacy orders, or
+    // zero/multiple distinct locks at checkout — multi-lock aggregation is
+    // a future design) is refused statically.
+    let snapshot: Option<(Vec<u8>, String, i64, String)> = sqlx::query_as(
+        "SELECT expected_resource_ciphertext, criterion_id, amount_minor, asset \
+         FROM payment_locks_checkout_snapshots WHERE payment_id = $1",
+    )
+    .bind(payment.id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((sealed_resource, criterion_id, snapshot_amount_minor, snapshot_asset)) = snapshot
+    else {
+        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
-            "The order must contain exactly one seller-authored Locks payment lock.",
+            "The order has no seller-authored Locks payment lock snapshot.",
         )));
-    }
-    let (resource, criterion_id) = lock_pairs.into_iter().next().expect("non-empty lock pair");
+    };
+    let Some(resource) =
+        locks
+            .keys
+            .open_prepared_value(payment.id, b"locks-checkout-resource:", &sealed_resource)
+    else {
+        // A snapshot that does not authenticate under the configured key
+        // fails closed (tampering or a key rotation) rather than falling
+        // back to the mutable listing rows.
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvariantViolation,
+            "The checkout Locks snapshot could not be opened.",
+        )));
+    };
     let Some((creator, _)) = parse_lock_resource(&resource) else {
         record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
         return Ok(Err(CommandFailure::new(
@@ -473,8 +472,8 @@ pub async fn prepare(
     if !criterion_matches_payment(
         &content_lock,
         &criterion_id,
-        payment.amount_minor,
-        &payment.currency,
+        snapshot_amount_minor,
+        &snapshot_asset,
     ) {
         record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_CRITERION, now).await?;
         return Ok(Err(CommandFailure::new(

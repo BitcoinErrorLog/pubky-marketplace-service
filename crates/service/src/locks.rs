@@ -118,6 +118,22 @@ impl LocksKeys {
         seal::seal(&self.encryption, &aad, value.as_bytes())
     }
 
+    /// Opens a value sealed by [`Self::encrypt_prepared_value`] for exactly
+    /// this payment and domain. Fails closed on any transplant, tamper, or
+    /// key mismatch.
+    pub fn open_prepared_value(
+        &self,
+        payment_id: Uuid,
+        domain: &[u8],
+        sealed: &[u8],
+    ) -> Option<String> {
+        let mut aad = Vec::with_capacity(domain.len() + 16);
+        aad.extend_from_slice(domain);
+        aad.extend_from_slice(payment_id.as_bytes());
+        let plaintext = seal::open(&self.encryption, &aad, sealed).ok()?;
+        String::from_utf8(plaintext).ok()
+    }
+
     /// Seals the minted client reference for the durable prepare command
     /// result: the same domain separation as the sealed correlation column,
     /// additionally bound to the buyer so the stored result can only be
