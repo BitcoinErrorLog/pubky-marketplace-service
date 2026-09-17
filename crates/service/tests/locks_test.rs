@@ -148,6 +148,135 @@ async fn order_state(pool: &PgPool, order_id: &str) -> String {
     state
 }
 
+// A prepared-but-never-registered row is invisible to the lifecycle claim:
+// a worker pass between prepare and register completes without error,
+// performs no lookup and no claim stamp for the prepared row, and still
+// processes other registered rows; attaching afterwards resumes ordinary
+// polling for the prepared payment.
+#[sqlx::test]
+async fn a_prepared_row_survives_a_worker_pass_untouched(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+
+    // Two units so the buyer holds two payments: one stays prepared-only,
+    // the other registers and completes during the interleaved pass.
+    let mut listing = register_command(&seller.pubky, 2);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller.pubky),
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&app, &seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut payments = Vec::new();
+    for command_id in [
+        "00000000-0000-4000-8000-000000000100",
+        "00000000-0000-4000-8000-000000000101",
+    ] {
+        let (status, checkout) = execute(
+            &app,
+            &buyer.token,
+            &checkout_command_with_id(&seller.pubky, command_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{checkout}");
+        payments.push(
+            checkout["result"]["payments"][0]["id"]
+                .as_str()
+                .expect("payment id")
+                .to_string(),
+        );
+    }
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&payments[0], 80),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first preparation: {body}");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&payments[1], 81),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second preparation: {body}");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &register_locks_command(
+            &payments[1],
+            1,
+            TEST_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            82,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "registration: {body}");
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+    );
+
+    // The interleaved pass: the prepared row must not be claimed, and the
+    // batch must not fail because of it.
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass completes with a prepared row present");
+    assert_eq!(summary.locks_completions_applied, 1);
+    assert_eq!(
+        fake.lookups(),
+        vec![(seller.pubky.clone(), TEST_BUNDLE_ID.to_string())],
+        "only the registered correlation is looked up"
+    );
+    let (preparation_state, last_checked_at): (String, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as(
+            "SELECT preparation_state, last_checked_at FROM payment_locks_correlations \
+             WHERE payment_id = $1::uuid",
+        )
+        .bind(&payments[0])
+        .fetch_one(&app.pool)
+        .await
+        .expect("prepared correlation exists");
+    assert_eq!(preparation_state, "prepared");
+    assert!(
+        last_checked_at.is_none(),
+        "a prepared row is never claim-stamped"
+    );
+    let (state, _, _) = payment_state(&app.pool, &payments[1]).await;
+    assert_eq!(state, "confirmed", "the registered row was processed");
+
+    // Attaching afterwards resumes ordinary polling for the first payment.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &register_locks_command(
+            &payments[0],
+            1,
+            OTHER_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            83,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "late registration: {body}");
+    app.clock.advance_seconds(31);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 0);
+    assert_eq!(
+        fake.lookups(),
+        vec![
+            (seller.pubky.clone(), TEST_BUNDLE_ID.to_string()),
+            (seller.pubky.clone(), OTHER_BUNDLE_ID.to_string()),
+        ],
+        "the newly registered correlation polls normally"
+    );
+}
+
 // Registration stores only an encrypted correlation bound to the order's
 // participants, amount, asset, policy version, and lock resource hash; the
 // payment flips to the 'locks' adapter and the bundle id appears nowhere in

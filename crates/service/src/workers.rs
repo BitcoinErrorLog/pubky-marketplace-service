@@ -932,7 +932,10 @@ struct ClaimedCorrelation {
 /// Claims a batch of pending correlations due for a lifecycle lookup by
 /// stamping `last_checked_at`. The stamp is the only pre-effect write, so a
 /// holder that dies after claiming loses nothing: the row stays `pending`
-/// and is re-verified once the poll interval elapses.
+/// and is re-verified once the poll interval elapses. Only `registered`
+/// rows with a non-null bundle are claimable (the same predicates as the
+/// `payment_locks_correlations_pending_idx` partial index): a prepared row
+/// has no bundle to look up and must never enter the batch.
 async fn claim_due_correlations(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -943,6 +946,8 @@ async fn claim_due_correlations(
          WHERE id IN (\
              SELECT id FROM payment_locks_correlations \
              WHERE verification_state = 'pending' \
+             AND preparation_state = 'registered' \
+             AND bundle_id_ciphertext IS NOT NULL \
              AND (last_checked_at IS NULL OR last_checked_at <= $2) \
              ORDER BY last_checked_at ASC NULLS FIRST LIMIT $3 FOR UPDATE SKIP LOCKED\
          ) RETURNING id, payment_id, creator_pubky, bundle_id_ciphertext, last_observed_status",
