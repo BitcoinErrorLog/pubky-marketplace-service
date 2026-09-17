@@ -1,17 +1,36 @@
-//! `payment.register_locks` (plan task 4.5): the buyer registers the Locks
-//! lifecycle correlation for their payment.
+//! `payment.prepare_locks` / `payment.register_locks`: the two-step Locks
+//! lifecycle binding for a payment.
 //!
-//! Registration binds the encrypted lifecycle identity to the order, buyer,
-//! creator (the seller), lock resource hash, amount, asset, and policy
-//! version (upstream-integration "Transaction-service correlation"). It
-//! never advances the payment: only the background worker's independent
-//! verification of a completed Locks result does that (ADR-0019 §7 — the
-//! service must not forge completion from client input).
+//! PREPARATION is the authority-creation step (DESIGN §3.2): under the
+//! payment and order locks it re-reads the seller-authored lock from the
+//! listing rows, validates the fetched content lock through the strict
+//! typed upstream mirror and the payment economics, mints and seals the
+//! server-originated `client_reference`, inserts the sole `prepared`
+//! correlation (sealed expected resource, hash, criterion, reader,
+//! recipient, amount, asset, exponent, policy version), acquires the
+//! inventory hold, and pins the payment adapter to `locks` — atomically.
+//! The minted reference exists in plaintext only in the authenticated
+//! buyer's response; its durable command-result copy is sealed to the
+//! payment and buyer.
+//!
+//! REGISTRATION only attaches the buyer-generated bundle id to that
+//! prepared row: it accepts no resource, criterion, economics, or reference
+//! from the client, requires receiver-clock eligibility (the prepared
+//! window open, the order still holding it), and seals the bundle with the
+//! payment-bound key. Neither step advances the payment: only the
+//! background worker's independent verification of a completed Locks
+//! result does that (ADR-0019 §7 — the service must not forge completion
+//! from client input).
 //!
 //! Replay discipline:
-//! - an exact replay of the command returns the stored result (executor);
+//! - an exact replay of either command returns the stored result
+//!   (executor); a prepare replay unseals the buyer-scoped reference;
 //! - a changed replay under the same command id is an idempotency conflict
 //!   (executor);
+//! - a repeated prepare recovers the same live reference for the same
+//!   buyer, is `UNAUTHORIZED` for any other actor, is a stable
+//!   `INVALID_STATE` after registration or expiry, and a concurrent double
+//!   prepare produces exactly one row, one hold, and one reference;
 //! - a second registration for the same payment or order is refused
 //!   (`INVALID_STATE`, backstopped by the table's UNIQUE constraints);
 //! - the same `{creator, bundle_id}` identity can never correlate a second
