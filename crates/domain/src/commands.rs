@@ -501,20 +501,14 @@ pub struct RegisterLocksPayload {
     /// 128-bit viewer-generated bundle identity (the Locks `BundleId` wire
     /// form).
     pub bundle_id: String,
-    /// The addressed public lock resource,
-    /// `<creator>/pub/locks.app/<lock_id>.json`, whose creator must be the
-    /// order's seller.
-    pub pubky_lock_resource: String,
 }
 
-/// The bundle id is a bearer secret and the lock resource is correlation
-/// material (ADR-0019 §8): neither may reach logs through a derived Debug.
+/// The bundle id is bearer material and must not reach logs through Debug.
 impl std::fmt::Debug for RegisterLocksPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegisterLocksPayload")
             .field("payment_id", &self.payment_id)
             .field("bundle_id", &"<redacted>")
-            .field("pubky_lock_resource", &"<redacted>")
             .finish()
     }
 }
@@ -1331,13 +1325,6 @@ fn validate_register_locks(
             "Expected a canonical 26-character Crockford-base32 bundle id",
         ));
     }
-    if parse_lock_resource(&payload.pubky_lock_resource).is_none() {
-        issues.push(issue(
-            "payload.pubky_lock_resource",
-            "Expected <creator>/pub/locks.app/<lock_id>.json with a z-base-32 \
-             creator and a canonical 52-character Crockford lock id",
-        ));
-    }
     if issues.is_empty() {
         Ok(CommandPayload::RegisterLocks(payload))
     } else {
@@ -2078,7 +2065,6 @@ mod tests {
     }
 
     const TEST_BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
-    const TEST_LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
 
     fn register_locks_command_json() -> Value {
         order_command_json(
@@ -2086,8 +2072,6 @@ mod tests {
             json!({
                 "payment_id": "00000000-0000-4000-8000-00000000bbbb",
                 "bundle_id": TEST_BUNDLE_ID,
-                "pubky_lock_resource":
-                    format!("{}/pub/locks.app/{TEST_LOCK_ID}.json", "y".repeat(52)),
             }),
         )
     }
@@ -2099,10 +2083,7 @@ mod tests {
         let CommandPayload::RegisterLocks(payload) = &command.payload else {
             panic!("expected register-locks payload");
         };
-        let (creator, lock_id) =
-            parse_lock_resource(&payload.pubky_lock_resource).expect("resource parses");
-        assert_eq!(creator, "y".repeat(52));
-        assert_eq!(lock_id, TEST_LOCK_ID);
+        assert_eq!(payload.bundle_id, TEST_BUNDLE_ID);
     }
 
     #[test]
@@ -2121,22 +2102,6 @@ mod tests {
             let serialized = serde_json::to_string(&issues).expect("issues serialize");
             assert!(!serialized.contains(TEST_BUNDLE_ID));
         }
-
-        for resource in [
-            "",
-            "not-a-resource",
-            &format!("{}/pub/other.app/{TEST_LOCK_ID}.json", "y".repeat(52)),
-            &format!("{}/pub/locks.app/{TEST_LOCK_ID}", "y".repeat(52)),
-            &format!("{}/pub/locks.app/short.json", "y".repeat(52)),
-            &format!("UPPER/pub/locks.app/{TEST_LOCK_ID}.json"),
-        ] {
-            let mut raw = register_locks_command_json();
-            raw["payload"]["pubky_lock_resource"] = json!(resource);
-            let issues = parse_command(&raw).expect_err("malformed lock resource invalid");
-            assert!(issues
-                .iter()
-                .any(|i| i.path == "payload.pubky_lock_resource"));
-        }
     }
 
     #[test]
@@ -2145,7 +2110,6 @@ mod tests {
         let debug = format!("{:?}", command.payload);
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains(TEST_BUNDLE_ID));
-        assert!(!debug.contains(TEST_LOCK_ID));
     }
 
     fn checkout_command_json() -> Value {

@@ -436,4 +436,71 @@ mod tests {
             "https URL accepted"
         );
     }
+
+    fn content_lock_document(creator: &str) -> serde_json::Value {
+        serde_json::json!({
+            "creator": creator,
+            "criteria": [{
+                "criterion_id": "paykit",
+                "verifier_type": "paykit-payment",
+                "params": {
+                    "amount": "13700",
+                    "asset": "USD",
+                    "recipient_pubky": creator,
+                },
+            }],
+        })
+    }
+
+    #[test]
+    fn content_lock_identity_matches_canonical_document_path() {
+        let creator = "y".repeat(52);
+        let document = content_lock_document(&creator);
+        let canonical = serde_json_canonicalizer::to_vec(&document).expect("canonical JSON");
+        let lock_id = base32::encode(Alphabet::Crockford, blake3::hash(&canonical).as_bytes());
+        let resource = format!("{creator}/pub/locks.app/{lock_id}.json");
+        assert!(validate_content_lock_identity(&document, &resource));
+    }
+
+    /// The pinned upstream vector: a real `ContentLock` rendered by
+    /// `pubky/locks@ba49a777` (`locks-core/src/lock_policy.rs`
+    /// `canonical_json_string()` and `content_lock_path()`) and pinned here
+    /// under the name of its derived path. The marketplace derivation must
+    /// reproduce the same lock id from the raw document bytes.
+    #[test]
+    fn upstream_content_lock_vector_reproduces_the_canonical_path() {
+        const LOCK_ID: &str = "5Z4FC0QEAFTTTE1DFH7DNZW2HVVPTDNJY5MERMD3Y0CQKH1P2SM0";
+        let document: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            "../tests/fixtures/locks/",
+            "5Z4FC0QEAFTTTE1DFH7DNZW2HVVPTDNJY5MERMD3Y0CQKH1P2SM0.json"
+        )))
+        .expect("upstream fixture parses");
+        let creator = document["creator"]
+            .as_str()
+            .expect("fixture creator")
+            .strip_prefix("pubky")
+            .expect("fixture creator carries the pubky scheme prefix");
+        let resource = format!("{creator}/pub/locks.app/{LOCK_ID}.json");
+        assert!(
+            validate_content_lock_identity(&document, &resource),
+            "the marketplace derivation reproduces the upstream path"
+        );
+    }
+
+    #[test]
+    fn content_lock_identity_refuses_changed_bytes_and_creator() {
+        let creator = "y".repeat(52);
+        let document = content_lock_document(&creator);
+        let canonical = serde_json_canonicalizer::to_vec(&document).expect("canonical JSON");
+        let lock_id = base32::encode(Alphabet::Crockford, blake3::hash(&canonical).as_bytes());
+        let resource = format!("{creator}/pub/locks.app/{lock_id}.json");
+
+        let mut changed = document.clone();
+        changed["criteria"][0]["params"]["amount"] = serde_json::json!("13701");
+        assert!(!validate_content_lock_identity(&changed, &resource));
+
+        let mut wrong_creator = document;
+        wrong_creator["creator"] = serde_json::json!("o".repeat(52));
+        assert!(!validate_content_lock_identity(&wrong_creator, &resource));
+    }
 }

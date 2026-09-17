@@ -313,7 +313,6 @@ async fn dispatch(
                 command,
                 payload,
                 state.locks.as_deref(),
-                state.config.locks_payment_window_seconds,
                 now,
             )
             .await

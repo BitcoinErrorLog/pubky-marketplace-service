@@ -41,7 +41,6 @@ pub async fn register(
     command: &Command,
     payload: &RegisterLocksPayload,
     locks: Option<&LocksRuntime>,
-    payment_window_seconds: i64,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     // Fail closed: without configured keys the bundle id cannot be stored
@@ -90,75 +89,34 @@ pub async fn register(
             "Only a payment awaiting entitlement can register a Locks correlation.",
         )));
     }
-    let already_correlated: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM payment_locks_correlations WHERE payment_id = $1")
+    let prepared: Option<(Uuid, String, String, DateTime<Utc>)> =
+        sqlx::query_as("SELECT id, creator_pubky, preparation_state, window_expires_at FROM payment_locks_correlations WHERE payment_id = $1 FOR UPDATE")
             .bind(payment.id)
             .fetch_optional(&mut **tx)
             .await?;
-    if already_correlated.is_some() {
+    let Some((correlation_id, creator, preparation_state, window_expires_at)) = prepared else {
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
-            "The payment already has a Locks correlation; a changed registration is refused.",
-        )));
-    }
-
-    // Bind the lifecycle to the order's seller: the lock creator (and the
-    // payment recipient, which Locks v1 requires to equal the creator) must
-    // be the seller, so a buyer cannot point the order at an unrelated lock.
-    let (creator, _lock_id) = parse_lock_resource(&payload.pubky_lock_resource)
-        .expect("lock resource format validated by the command contract");
-    if creator != payment.seller_pubky {
-        return Ok(Err(CommandFailure::new(
-            ErrorCode::InvalidCommand,
-            "The lock resource creator must be the order's seller.",
-        )));
-    }
-
-    // The payment lock point: registering the correlation is the payment
-    // start, so it acquires the order's inventory hold and arms the payment
-    // window — the correlation window IS the hold window (one window
-    // concept, not two).
-    let Some(order) = fetch_order_for_update(tx, payment.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
-            ErrorCode::InvariantViolation,
-            "Payment order is missing.",
+            "Prepare the seller-authorized Locks payment before registering a bundle.",
         )));
     };
-    if let Err(failure) =
-        holds::acquire_payment_hold(tx, order, payment_window_seconds, now).await?
-    {
-        return Ok(Err(failure));
+    if preparation_state != "prepared" {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The payment already has a registered Locks bundle.",
+        )));
     }
-
-    let correlation_id = Uuid::new_v4();
     let bundle_id_ciphertext = locks.keys.encrypt_bundle_id(payment.id, &payload.bundle_id);
-    let bundle_lookup_token = locks.keys.lookup_token(creator, &payload.bundle_id);
-    let lock_resource_hash = blake3::hash(payload.pubky_lock_resource.as_bytes())
-        .to_hex()
-        .to_string();
-    let window_expires_at = now + chrono::Duration::seconds(payment_window_seconds);
+    let bundle_lookup_token = locks.keys.lookup_token(&creator, &payload.bundle_id);
 
     sqlx::query(
-        "INSERT INTO payment_locks_correlations (id, payment_id, order_id, buyer_pubky, \
-         creator_pubky, lock_resource_hash, amount_minor, asset, exponent, policy_version, \
-         bundle_id_ciphertext, bundle_lookup_token, verification_state, window_expires_at, \
-         created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-         (SELECT guarantee_policy_version FROM orders WHERE id = $3), \
-         $10, $11, 'pending', $12, $13, $13)",
+        "UPDATE payment_locks_correlations SET bundle_id_ciphertext = $2, \
+         bundle_lookup_token = $3, preparation_state = 'registered', verification_state = 'pending', \
+         updated_at = $4 WHERE id = $1",
     )
     .bind(correlation_id)
-    .bind(payment.id)
-    .bind(payment.order_id)
-    .bind(&payment.buyer_pubky)
-    .bind(&payment.seller_pubky)
-    .bind(&lock_resource_hash)
-    .bind(payment.amount_minor)
-    .bind(payment.currency)
-    .bind(payment.exponent)
     .bind(&bundle_id_ciphertext)
     .bind(&bundle_lookup_token)
-    .bind(window_expires_at)
     .bind(now)
     .execute(&mut **tx)
     .await?;
