@@ -213,13 +213,13 @@ pub async fn handle(
                     ),
                     "fulfillment": group_method.as_str(),
                 });
-                if let (Some(policy_uri), Some(criterion_id)) = (
-                    listing.digital_lock_policy_uri.as_ref(),
-                    listing.digital_lock_criterion_id.as_ref(),
-                ) {
-                    line_json["digital_lock_policy_uri"] = json!(policy_uri);
-                    line_json["digital_lock_criterion_id"] = json!(criterion_id);
-                }
+                // The seller-authored Locks metadata is deliberately NOT
+                // snapshotted onto the order line: `lines` is projected to
+                // participants and persisted in durable command results, and
+                // the expected lock resource is correlation-sensitive
+                // authority metadata. `payment.prepare_locks` re-reads it
+                // from the seller-authoritative listing rows and retains it
+                // only in the sealed correlation columns.
                 // The buyer's variant snapshot rides the order line so
                 // packing slips and order rows can show which variant was
                 // bought. It is display data validated for shape only:

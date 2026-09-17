@@ -1127,9 +1127,11 @@ async fn locks_verification_respects_worker_leases(pool: PgPool) {
     assert_eq!(state, "confirmed");
 }
 
-// Redaction (ADR-0019 §8): the bundle id and the lock resource appear in no
-// command result, read projection, event, outbox intent, or notification —
-// across the whole registration-to-confirmation flow.
+// Redaction (ADR-0019 §8): the bundle id and the expected lock resource
+// appear in no command result, read projection, event, outbox intent, or
+// notification — across the whole checkout-prepare-register-confirm flow.
+// The resource sentinel is the DYNAMICALLY derived seller-authored lock
+// resource planted at checkout, not a fixed constant.
 #[sqlx::test]
 async fn bundle_and_lock_resource_never_leave_the_correlation_store(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
@@ -1137,6 +1139,7 @@ async fn bundle_and_lock_resource_never_leave_the_correlation_store(pool: PgPool
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let order = create_pending_order(&app, &seller, &buyer).await;
+    let expected_resource = lock_resource_for(&seller.pubky);
     let registration = register_locks(&app, &buyer.token, &order, &seller.pubky).await;
     fake.set_outcome(
         TEST_BUNDLE_ID,
@@ -1152,8 +1155,16 @@ async fn bundle_and_lock_resource_never_leave_the_correlation_store(pool: PgPool
             "{surface} leaks the bundle id"
         );
         assert!(
+            !serialized.contains(&expected_resource),
+            "{surface} leaks the expected lock resource planted at checkout"
+        );
+        assert!(
             !serialized.contains(TEST_LOCK_ID),
             "{surface} leaks the lock resource"
+        );
+        assert!(
+            !serialized.contains("/pub/locks.app/"),
+            "{surface} leaks a content-lock path"
         );
         assert!(
             !serialized.contains("locks_bundle_id"),
@@ -1207,9 +1218,14 @@ async fn bundle_and_lock_resource_never_leave_the_correlation_store(pool: PgPool
         assert_redacted("notifications projection", &notifications.to_string());
     }
 
-    // Durable side-channel surfaces: events, outbox intents, notifications,
-    // and the observation history hold statuses and ids only.
+    // Durable side-channel surfaces: the stored order lines, events, outbox
+    // intents, notifications, and the observation history hold statuses and
+    // ids only.
     for (surface, sql) in [
+        (
+            "order lines at rest",
+            "SELECT COALESCE(string_agg(lines::text, ','), '') FROM orders",
+        ),
         (
             "events",
             "SELECT COALESCE(string_agg(kind, ','), '') FROM events",

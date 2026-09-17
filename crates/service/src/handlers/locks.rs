@@ -287,18 +287,36 @@ pub async fn prepare(
             "Only a pending order can prepare Locks.",
         )));
     }
-    let lock_pairs: std::collections::BTreeSet<(String, String)> = order
-        .lines
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|line| {
-            Some((
-                line.get("digital_lock_policy_uri")?.as_str()?.to_owned(),
-                line.get("digital_lock_criterion_id")?.as_str()?.to_owned(),
-            ))
-        })
-        .collect();
+    // The seller-authoritative lock snapshot lives on the listing rows, not
+    // on the projected order lines (ADR-0019 §8): collect the distinct
+    // seller-authored Locks payment locks across the order's listings and
+    // require exactly one (multi-lock aggregation is a future design).
+    let mut lock_pairs: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
+    for line in order.lines.as_array().into_iter().flatten() {
+        let Some(aggregate_id) = line
+            .get("listing_aggregate_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvariantViolation,
+                "An order line is missing its listing.",
+            )));
+        };
+        let Some(listing) = crate::handlers::fetch_listing_for_update(tx, aggregate_id).await?
+        else {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvariantViolation,
+                "An order line's listing is missing.",
+            )));
+        };
+        if let (Some(policy_uri), Some(criterion_id)) = (
+            listing.digital_lock_policy_uri,
+            listing.digital_lock_criterion_id,
+        ) {
+            lock_pairs.insert((policy_uri, criterion_id));
+        }
+    }
     if lock_pairs.len() != 1 {
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,

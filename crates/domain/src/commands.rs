@@ -274,7 +274,9 @@ pub struct RegisterListingPayload {
     )]
     pub fulfillment_methods: Vec<FulfillmentMethod>,
     /// Optional Locks policy selected by the seller-authored listing. This
-    /// remains out of projections and is snapshotted only at checkout.
+    /// remains out of projections; `payment.prepare_locks` re-reads it from
+    /// the seller-authoritative listing rows and seals it into the
+    /// correlation, so it is never snapshotted onto projected order lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digital_lock: Option<DigitalLockMetadata>,
 }
