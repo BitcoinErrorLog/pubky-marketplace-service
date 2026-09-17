@@ -798,6 +798,158 @@ async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
     );
 }
 
+// Prepare state-machine proofs (Sol Wave 1A review, P3-1): same-reference
+// replay by the same buyer; a different actor refused before any
+// correlation detail; a concurrent double prepare producing exactly one row
+// with both callers observing the same reference; and an elapsed
+// preparation never replayed. The worker-pass-between-prepare-and-register
+// interleaving is pinned by `a_prepared_row_survives_a_worker_pass_untouched`,
+// and prepare-after-registration by `prepare_after_registration_is_a_stable_invalid_state`.
+#[sqlx::test]
+async fn prepare_replay_returns_the_same_reference_only_to_the_buyer(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let outsider = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    let first = common::prepare_locks_command(&order.payment_id, 130);
+    let (status, first_body) = execute(&app, &buyer.token, &first).await;
+    assert_eq!(status, StatusCode::OK, "preparation: {first_body}");
+
+    // A fresh command id from the same buyer recovers the SAME reference
+    // and window — no new hold, no new row, no revision change.
+    let second = common::prepare_locks_command(&order.payment_id, 131);
+    let (status, second_body) = execute(&app, &buyer.token, &second).await;
+    assert_eq!(status, StatusCode::OK, "replay: {second_body}");
+    assert_eq!(
+        second_body["result"]["client_reference"], first_body["result"]["client_reference"],
+        "the same buyer recovers the same server-minted reference"
+    );
+    assert_eq!(
+        second_body["result"]["window_expires_at"],
+        first_body["result"]["window_expires_at"]
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        1
+    );
+    let (_, _, revision) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(revision, 2, "a replay mints nothing and bumps nothing");
+
+    // Neither the seller nor an outsider can prepare (or recover the
+    // reference): refused before any correlation detail is exposed.
+    for actor in [&seller, &outsider] {
+        let command = common::prepare_locks_command(&order.payment_id, 132);
+        let (status, body) = execute(&app, &actor.token, &command).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
+        assert!(!body.to_string().contains(
+            first_body["result"]["client_reference"]
+                .as_str()
+                .expect("reference")
+        ));
+    }
+}
+
+#[sqlx::test]
+async fn concurrent_double_prepare_mints_exactly_one_reference(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    // Two distinct command ids race the same payment: the payment row lock
+    // serializes them, the winner mints, and the loser observes the
+    // winner's prepared row and recovers the same reference.
+    let first = common::prepare_locks_command(&order.payment_id, 140);
+    let second = common::prepare_locks_command(&order.payment_id, 141);
+    let (first_result, second_result) = tokio::join!(
+        send(
+            app.router.clone(),
+            "POST",
+            "/v1/commands",
+            Some(&buyer.token),
+            &first
+        ),
+        send(
+            app.router.clone(),
+            "POST",
+            "/v1/commands",
+            Some(&buyer.token),
+            &second
+        ),
+    );
+    let (first_status, first_body) = first_result;
+    let (second_status, second_body) = second_result;
+    assert_eq!(first_status, StatusCode::OK, "first: {first_body}");
+    assert_eq!(second_status, StatusCode::OK, "second: {second_body}");
+    assert_eq!(
+        first_body["result"]["client_reference"], second_body["result"]["client_reference"],
+        "both callers observe the same server-minted reference"
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        1,
+        "exactly one prepared row wins"
+    );
+    let (state, adapter, revision) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(
+        (state.as_str(), adapter.as_str(), revision),
+        ("awaiting_entitlement", "locks", 2),
+        "one hold, one adapter switch, one revision bump"
+    );
+}
+
+#[sqlx::test]
+async fn an_elapsed_preparation_is_never_replayed(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 150),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+    let reference = body["result"]["client_reference"]
+        .as_str()
+        .expect("reference")
+        .to_string();
+
+    // The window lapses with no sweep: a replay must NOT hand back the
+    // elapsed reference.
+    app.clock.advance_seconds(3_601);
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 151),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The Locks preparation has expired.")
+    );
+    assert!(!body.to_string().contains(&reference));
+    assert_eq!(
+        binding_outcomes(&app.pool, &order.payment_id).await,
+        vec!["prepared".to_string(), "refused_expired".to_string()]
+    );
+
+    // The sweep terminalises the elapsed preparation.
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 1);
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "expired");
+}
+
 // Registration stores only an encrypted correlation bound to the order's
 // participants, amount, asset, policy version, and lock resource hash; the
 // payment flips to the 'locks' adapter and the bundle id appears nowhere in

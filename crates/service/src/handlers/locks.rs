@@ -280,13 +280,11 @@ pub async fn prepare(
             "The payment aggregate id is invalid.",
         )));
     }
-    if command.expected_revision != payment.revision {
-        return Ok(Err(CommandFailure::with_revision(
-            ErrorCode::RevisionConflict,
-            "The payment revision is stale.",
-            payment.revision,
-        )));
-    }
+    // The prepared-row replay is checked BEFORE the revision gate: a second
+    // prepare — including the loser of a concurrent double prepare, which
+    // observes the winner's revision bump — recovers the same live
+    // reference rather than conflicting (DESIGN §3.2). An elapsed
+    // preparation is never replayed.
     let existing: Option<(String, Option<Vec<u8>>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT preparation_state, client_reference_ciphertext, window_expires_at \
          FROM payment_locks_correlations WHERE payment_id = $1 FOR UPDATE",
@@ -296,6 +294,13 @@ pub async fn prepare(
     .await?;
     if let Some((state, Some(sealed_reference), expires_at)) = existing.as_ref() {
         if state == "prepared" {
+            if now >= *expires_at {
+                record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_EXPIRED, now).await?;
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::InvalidState,
+                    "The Locks preparation has expired.",
+                )));
+            }
             let reference = crate::seal::open(
                 locks.keys.encryption_bytes(),
                 &[b"locks-client-reference:".as_slice(), payment.id.as_bytes()].concat(),
@@ -315,6 +320,13 @@ pub async fn prepare(
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The payment already has a Locks preparation.",
+        )));
+    }
+    if command.expected_revision != payment.revision {
+        return Ok(Err(CommandFailure::with_revision(
+            ErrorCode::RevisionConflict,
+            "The payment revision is stale.",
+            payment.revision,
         )));
     }
     if payment.state != "awaiting_entitlement" {
