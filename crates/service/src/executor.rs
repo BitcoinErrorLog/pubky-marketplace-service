@@ -352,6 +352,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.locks.as_deref(),
+                &state.pool,
                 now,
             )
             .await
@@ -364,6 +365,7 @@ async fn dispatch(
                 payload,
                 state.locks.as_deref(),
                 state.homeserver.as_deref(),
+                &state.pool,
                 state.config.locks_payment_window_seconds,
                 now,
             )

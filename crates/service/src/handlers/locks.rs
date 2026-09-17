@@ -35,12 +35,55 @@ use crate::model::PaymentRow;
 use crate::queries::PAYMENT_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
+/// The designed binding outcomes (migration 0028 enforces this vocabulary).
+/// Row outcomes are also stamped on the correlation's `binding_outcome`
+/// column in the same transaction; refusals are audit-only rows, written
+/// independently of the rolled-back command transaction so a retry stays
+/// possible. `refused_identity` covers any identity/availability failure of
+/// the seller's document at its content address (invalid resource, creator
+/// or path mismatch, strict-schema or Paykit-policy rejection, 404);
+/// `refused_unavailable` covers transient transport/5xx failure only.
+const OUTCOME_PREPARED: &str = "prepared";
+const OUTCOME_REGISTERED: &str = "registered";
+const OUTCOME_REFUSED_IDENTITY: &str = "refused_identity";
+const OUTCOME_REFUSED_CRITERION: &str = "refused_criterion";
+const OUTCOME_REFUSED_UNAVAILABLE: &str = "refused_unavailable";
+const OUTCOME_REFUSED_EXPIRED: &str = "refused_expired";
+const OUTCOME_REFUSED_NO_PREPARE: &str = "refused_no_prepare";
+
+/// Appends one binding-outcome audit row. Row outcomes are inserted inside
+/// the command transaction so they commit with the state change; refusals
+/// are inserted through the pool because the refusal rolls the command
+/// transaction back and the audit row must survive it.
+async fn record_binding_outcome<'e, E>(
+    executor: E,
+    payment_id: Uuid,
+    outcome: &'static str,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    sqlx::query(
+        "INSERT INTO payment_locks_binding_outcomes (id, payment_id, outcome, recorded_at) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(payment_id)
+    .bind(outcome)
+    .bind(now)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 pub async fn register(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &RegisterLocksPayload,
     locks: Option<&LocksRuntime>,
+    pool: &sqlx::PgPool,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     // Fail closed: without configured keys the bundle id cannot be stored
@@ -95,6 +138,7 @@ pub async fn register(
             .fetch_optional(&mut **tx)
             .await?;
     let Some((correlation_id, creator, preparation_state, window_expires_at)) = prepared else {
+        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_NO_PREPARE, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "Prepare the seller-authorized Locks payment before registering a bundle.",
@@ -126,6 +170,7 @@ pub async fn register(
         )));
     }
     if now >= window_expires_at {
+        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_EXPIRED, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The Locks preparation has expired.",
@@ -137,7 +182,7 @@ pub async fn register(
     sqlx::query(
         "UPDATE payment_locks_correlations SET bundle_id_ciphertext = $2, \
          bundle_lookup_token = $3, preparation_state = 'registered', verification_state = 'pending', \
-         updated_at = $4 WHERE id = $1",
+         binding_outcome = 'registered', updated_at = $4 WHERE id = $1",
     )
     .bind(correlation_id)
     .bind(&bundle_id_ciphertext)
@@ -145,6 +190,7 @@ pub async fn register(
     .bind(now)
     .execute(&mut **tx)
     .await?;
+    record_binding_outcome(&mut **tx, payment.id, OUTCOME_REGISTERED, now).await?;
 
     // The adapter was pinned to 'locks' atomically with the preparation;
     // restating it here keeps attachment self-contained while the revision
@@ -200,6 +246,7 @@ pub async fn prepare(
     payload: &PrepareLocksPayload,
     locks: Option<&LocksRuntime>,
     homeserver: Option<&dyn HomeserverListingClient>,
+    pool: &sqlx::PgPool,
     payment_window_seconds: i64,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -326,12 +373,14 @@ pub async fn prepare(
     }
     let (resource, criterion_id) = lock_pairs.into_iter().next().expect("non-empty lock pair");
     let Some((creator, _)) = parse_lock_resource(&resource) else {
+        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The seller's Locks resource is invalid.",
         )));
     };
     if creator != payment.seller_pubky {
+        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The seller's Locks resource creator does not match the order.",
@@ -348,35 +397,44 @@ pub async fn prepare(
     {
         HomeserverFetchOutcome::Found(value) => value,
         HomeserverFetchOutcome::NotFound => {
+            record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
             return Ok(Err(CommandFailure::new(
                 ErrorCode::InvalidState,
                 "The seller's Locks document is unavailable.",
-            )))
+            )));
         }
         HomeserverFetchOutcome::Unavailable => {
+            record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_UNAVAILABLE, now).await?;
             return Ok(Err(CommandFailure::new(
                 ErrorCode::UpstreamUnavailable,
                 "The seller's Locks document could not be reached.",
-            )))
+            )));
         }
     };
     let content_lock = match crate::content_lock::validate_content_lock_value(&content, &resource) {
         Ok(content_lock) => content_lock,
         Err(_) => {
+            record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
             return Ok(Err(CommandFailure::new(
                 ErrorCode::InvalidState,
                 "The seller's Locks document does not match the payment.",
-            )))
+            )));
         }
     };
-    if content_lock.validate_paykit_payment_v1_policy().is_err()
-        || !criterion_matches_payment(
-            &content_lock,
-            &criterion_id,
-            payment.amount_minor,
-            &payment.currency,
-        )
-    {
+    if content_lock.validate_paykit_payment_v1_policy().is_err() {
+        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The seller's Locks document does not match the payment.",
+        )));
+    }
+    if !criterion_matches_payment(
+        &content_lock,
+        &criterion_id,
+        payment.amount_minor,
+        &payment.currency,
+    ) {
+        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_CRITERION, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The seller's Locks document does not match the payment.",
@@ -395,8 +453,8 @@ pub async fn prepare(
         "INSERT INTO payment_locks_correlations (id, payment_id, order_id, buyer_pubky, creator_pubky, \
          lock_resource_hash, amount_minor, asset, exponent, policy_version, verification_state, window_expires_at, \
          expected_resource_ciphertext, expected_resource_hash, criterion_id, expected_reader_pubky, expected_recipient_pubky, \
-         client_reference_ciphertext, preparation_state, created_at, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT guarantee_policy_version FROM orders WHERE id=$3),'pending',$10,$11,$6,$12,$4,$5,$13,'prepared',$14,$14)",
+         client_reference_ciphertext, preparation_state, binding_outcome, created_at, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT guarantee_policy_version FROM orders WHERE id=$3),'pending',$10,$11,$6,$12,$4,$5,$13,'prepared','prepared',$14,$14)",
     )
     .bind(correlation_id).bind(payment.id).bind(payment.order_id).bind(&payment.buyer_pubky)
     .bind(&payment.seller_pubky).bind(&resource_hash).bind(payment.amount_minor).bind(&payment.currency)
@@ -405,6 +463,7 @@ pub async fn prepare(
     .bind(&criterion_id)
     .bind(locks.keys.encrypt_prepared_value(payment.id, b"locks-client-reference:", &client_reference))
     .bind(now).execute(&mut **tx).await?;
+    record_binding_outcome(&mut **tx, payment.id, OUTCOME_PREPARED, now).await?;
     // The hold, the prepared row, and the adapter switch commit atomically
     // (DESIGN §3.2): from here only server-side verification can advance
     // this payment — the sandbox path is already closed, not only once a

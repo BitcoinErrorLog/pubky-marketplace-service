@@ -81,6 +81,43 @@ async fn test_app_with_lock_documents(
     pool: PgPool,
     documents: HashMap<(String, String), Value>,
 ) -> TestApp {
+    test_app_with_homeserver(pool, Arc::new(ScriptedLocksHomeserver { documents })).await
+}
+
+/// A homeserver double whose content-lock fetches are always a transient
+/// failure (transport/5xx class), never a definitive not-found.
+struct UnavailableLocksHomeserver;
+
+impl HomeserverListingClient for UnavailableLocksHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async { HomeserverFetchOutcome::Unavailable })
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async { HomeserverFetchOutcome::Unavailable })
+    }
+
+    fn fetch_content_lock<'a>(
+        &'a self,
+        _creator_pubky: &'a str,
+        _content_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async { HomeserverFetchOutcome::Unavailable })
+    }
+}
+
+async fn test_app_with_homeserver(
+    pool: PgPool,
+    homeserver: Arc<dyn HomeserverListingClient>,
+) -> TestApp {
     let now: chrono::DateTime<chrono::Utc> = common::NOW.parse().expect("timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
     let locks = Arc::new(LocksRuntime {
@@ -89,13 +126,34 @@ async fn test_app_with_lock_documents(
     });
     let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
         .with_locks(Some(locks))
-        .with_homeserver(Some(Arc::new(ScriptedLocksHomeserver { documents })));
+        .with_homeserver(Some(homeserver));
     TestApp {
         router: build_router(state.clone()),
         pool,
         clock,
         state,
     }
+}
+
+/// A checkout envelope for the shared fixture listing at a known server
+/// revision (each payment hold bumps it).
+fn checkout_at_listing_revision(seller_pubky: &str, command_id: &str, revision: i64) -> Value {
+    let mut checkout = checkout_command_with_id(seller_pubky, command_id);
+    checkout["payload"]["lines"][0]["expected_revision"] = json!(revision);
+    checkout
+}
+
+/// The recorded binding outcomes for one payment, as a sorted multiset.
+async fn binding_outcomes(pool: &PgPool, payment_id: &str) -> Vec<String> {
+    let mut outcomes: Vec<(String,)> = sqlx::query_as(
+        "SELECT outcome FROM payment_locks_binding_outcomes WHERE payment_id = $1::uuid",
+    )
+    .bind(payment_id)
+    .fetch_all(pool)
+    .await
+    .expect("binding outcomes listed");
+    outcomes.sort();
+    outcomes.into_iter().map(|(outcome,)| outcome).collect()
 }
 
 /// A second canonical bundle id, distinct from [`TEST_BUNDLE_ID`].
@@ -512,6 +570,231 @@ async fn prepare_pins_the_locks_adapter_atomically(pool: PgPool) {
     assert_eq!(
         (state.as_str(), adapter.as_str()),
         ("awaiting_entitlement", "locks")
+    );
+}
+
+// Every designed binding outcome is recorded in the static vocabulary:
+// `prepared`/`registered` stamp the correlation row transactionally and
+// append to the audit table; each refusal appends its own value even though
+// the refused command rolls back.
+#[sqlx::test]
+async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
+    // prepared + registered, with the column stamped transactionally.
+    let (app, _fake) = test_app_with_locks(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    // Three units: this test holds three orders on one listing.
+    let mut listing = register_command(&seller.pubky, 3);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller.pubky),
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&app, &seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000004002"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let order = common::PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    };
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    let (column,): (String,) =
+        sqlx::query_as("SELECT binding_outcome FROM payment_locks_correlations")
+            .fetch_one(&app.pool)
+            .await
+            .expect("correlation row exists");
+    assert_eq!(column, "registered");
+    assert_eq!(
+        binding_outcomes(&app.pool, &order.payment_id).await,
+        vec!["prepared".to_string(), "registered".to_string()]
+    );
+
+    // refused_no_prepare: registration without any preparation.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_at_listing_revision(&seller.pubky, "00000000-0000-4000-8000-000000004000", 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let no_prepare_payment = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &register_locks_command(
+            &no_prepare_payment,
+            1,
+            TEST_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            120,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        binding_outcomes(&app.pool, &no_prepare_payment).await,
+        vec!["refused_no_prepare".to_string()]
+    );
+
+    // refused_expired: the prepared window lapses before attachment.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_at_listing_revision(&seller.pubky, "00000000-0000-4000-8000-000000004001", 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let expired_payment = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&expired_payment, 121),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+    app.clock.advance_seconds(3_601);
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &register_locks_command(
+            &expired_payment,
+            2,
+            TEST_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            122,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        binding_outcomes(&app.pool, &expired_payment).await,
+        vec!["prepared".to_string(), "refused_expired".to_string()]
+    );
+
+    // refused_identity: a tampered document at the seller-authoritative
+    // path (its bytes no longer derive that path).
+    let seller_key = common::random_keypair();
+    let seller_pubky = seller_key.1.clone();
+    let mut tampered = lock_document_for(&seller_pubky, 13_700, "USD");
+    tampered["criteria"][0]["params"]["amount"] = json!("13701");
+    let resource = lock_resource_for(&seller_pubky);
+    let path = resource
+        .strip_prefix(&seller_pubky)
+        .expect("creator prefixes resource")
+        .to_string();
+    let identity_app = test_app_with_lock_documents(
+        pool.clone(),
+        HashMap::from([((seller_pubky.clone(), path), tampered)]),
+    )
+    .await;
+    let identity_seller = TestActor {
+        token: common::authenticate(&identity_app, &seller_key.0).await,
+        keypair: seller_key.0,
+        pubky: seller_pubky,
+    };
+    let identity_buyer = new_actor(&identity_app).await;
+    let identity_order =
+        create_pending_order(&identity_app, &identity_seller, &identity_buyer).await;
+    let (status, body) = execute(
+        &identity_app,
+        &identity_buyer.token,
+        &common::prepare_locks_command(&identity_order.payment_id, 123),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        binding_outcomes(&identity_app.pool, &identity_order.payment_id).await,
+        vec!["refused_identity".to_string()]
+    );
+
+    // refused_criterion: an identity-valid document whose sole criterion
+    // amount does not equal the payment amount, served at its own typed
+    // path.
+    let seller_key = common::random_keypair();
+    let seller_pubky = seller_key.1.clone();
+    let document = lock_document_for(&seller_pubky, 12_500, "USD");
+    let resource = lock_resource_for_payment(&seller_pubky, 12_500, "USD");
+    let path = resource
+        .strip_prefix(&seller_pubky)
+        .expect("creator prefixes resource")
+        .to_string();
+    let criterion_app = test_app_with_lock_documents(
+        pool.clone(),
+        HashMap::from([((seller_pubky.clone(), path), document)]),
+    )
+    .await;
+    let criterion_seller = TestActor {
+        token: common::authenticate(&criterion_app, &seller_key.0).await,
+        keypair: seller_key.0,
+        pubky: seller_pubky,
+    };
+    let criterion_buyer = new_actor(&criterion_app).await;
+    let mut listing = register_command(&criterion_seller.pubky, 1);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": resource,
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&criterion_app, &criterion_seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = execute(
+        &criterion_app,
+        &criterion_buyer.token,
+        &common::checkout_command(&criterion_seller.pubky),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let criterion_payment = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    let (status, body) = execute(
+        &criterion_app,
+        &criterion_buyer.token,
+        &common::prepare_locks_command(&criterion_payment, 124),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        binding_outcomes(&criterion_app.pool, &criterion_payment).await,
+        vec!["refused_criterion".to_string()]
+    );
+
+    // refused_unavailable: the seller's homeserver cannot be reached.
+    let unavailable_app =
+        test_app_with_homeserver(pool, Arc::new(UnavailableLocksHomeserver)).await;
+    let unavailable_seller = new_actor(&unavailable_app).await;
+    let unavailable_buyer = new_actor(&unavailable_app).await;
+    let unavailable_order =
+        create_pending_order(&unavailable_app, &unavailable_seller, &unavailable_buyer).await;
+    let (status, body) = execute(
+        &unavailable_app,
+        &unavailable_buyer.token,
+        &common::prepare_locks_command(&unavailable_order.payment_id, 125),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], json!("UPSTREAM_UNAVAILABLE"));
+    assert_eq!(
+        binding_outcomes(&unavailable_app.pool, &unavailable_order.payment_id).await,
+        vec!["refused_unavailable".to_string()]
     );
 }
 
