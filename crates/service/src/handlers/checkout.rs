@@ -213,6 +213,13 @@ pub async fn handle(
                     ),
                     "fulfillment": group_method.as_str(),
                 });
+                if let (Some(policy_uri), Some(criterion_id)) = (
+                    listing.digital_lock_policy_uri.as_ref(),
+                    listing.digital_lock_criterion_id.as_ref(),
+                ) {
+                    line_json["digital_lock_policy_uri"] = json!(policy_uri);
+                    line_json["digital_lock_criterion_id"] = json!(criterion_id);
+                }
                 // The buyer's variant snapshot rides the order line so
                 // packing slips and order rows can show which variant was
                 // bought. It is display data validated for shape only:

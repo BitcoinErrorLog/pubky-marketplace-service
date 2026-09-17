@@ -129,8 +129,8 @@ pub(crate) async fn apply_registration(
              listing_revision, content_hash, server_revision, state, total_quantity, \
              available_quantity, reserved_quantity, sold_quantity, unit_price_amount_minor, \
              unit_price_currency, unit_price_exponent, shipping_minor, sale_format, auction, \
-             fulfillment_methods, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
+             fulfillment_methods, digital_lock_policy_uri, digital_lock_criterion_id, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) \
              ON CONFLICT (aggregate_id) DO NOTHING",
         )
         .bind(aggregate_id)
@@ -152,6 +152,8 @@ pub(crate) async fn apply_registration(
         .bind(sale_format)
         .bind(&auction)
         .bind(&fulfillment_methods)
+        .bind(payload.digital_lock.as_ref().map(|lock| &lock.policy_uri))
+        .bind(payload.digital_lock.as_ref().map(|lock| &lock.criterion_id))
         .bind(now)
         .execute(&mut **tx)
         .await?;
@@ -162,7 +164,7 @@ pub(crate) async fn apply_registration(
              server_revision = $6, state = $7, total_quantity = $8, available_quantity = $9, \
              unit_price_amount_minor = $10, unit_price_currency = $11, unit_price_exponent = $12, \
              shipping_minor = $13, sale_format = $14, auction = $15, fulfillment_methods = $16, \
-             updated_at = $17 \
+             digital_lock_policy_uri = $17, digital_lock_criterion_id = $18, updated_at = $19 \
              WHERE aggregate_id = $1 AND server_revision = $2",
         )
         .bind(aggregate_id)
@@ -181,6 +183,8 @@ pub(crate) async fn apply_registration(
         .bind(sale_format)
         .bind(&auction)
         .bind(&fulfillment_methods)
+        .bind(payload.digital_lock.as_ref().map(|lock| &lock.policy_uri))
+        .bind(payload.digital_lock.as_ref().map(|lock| &lock.criterion_id))
         .bind(now)
         .execute(&mut **tx)
         .await?;

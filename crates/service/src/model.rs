@@ -84,6 +84,10 @@ pub struct ListingRow {
     /// (`fulfillmentMethods`, §A1): any of `shipping`/`pickup`, at least one.
     /// Public catalog data, like the rest of the listing view.
     pub fulfillment_methods: Vec<String>,
+    /// Seller-authored Locks metadata. It is retained for checkout authority
+    /// but deliberately omitted from the public listing projection.
+    pub digital_lock_policy_uri: Option<String>,
+    pub digital_lock_criterion_id: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 

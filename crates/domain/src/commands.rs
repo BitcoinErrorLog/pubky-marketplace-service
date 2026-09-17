@@ -270,6 +270,17 @@ pub struct RegisterListingPayload {
         skip_serializing_if = "is_default_fulfillment_methods"
     )]
     pub fulfillment_methods: Vec<FulfillmentMethod>,
+    /// Optional Locks policy selected by the seller-authored listing. This
+    /// remains out of projections and is snapshotted only at checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digital_lock: Option<DigitalLockMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DigitalLockMetadata {
+    pub policy_uri: String,
+    pub criterion_id: String,
 }
 
 /// `listing.sync` (any authenticated actor): asks the service to fetch the
@@ -1102,6 +1113,20 @@ pub fn validate_register_listing_payload(
             "payload.fulfillment_methods",
             "Auction listings are shipping-only",
         ));
+    }
+    if let Some(lock) = &payload.digital_lock {
+        if parse_lock_resource(&lock.policy_uri).is_none() {
+            issues.push(issue(
+                "payload.digital_lock.policyUri",
+                "Expected a canonical Locks public resource",
+            ));
+        }
+        if !entity_id_regex().is_match(&lock.criterion_id) {
+            issues.push(issue(
+                "payload.digital_lock.criterionId",
+                "Expected a path-safe commerce identifier",
+            ));
+        }
     }
 
     if issues.is_empty() {

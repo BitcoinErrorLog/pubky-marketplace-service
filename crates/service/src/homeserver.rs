@@ -17,7 +17,9 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use marketplace_domain::commands::{AuctionTerms, RegisterListingPayload, SaleFormat};
+use marketplace_domain::commands::{
+    parse_lock_resource, AuctionTerms, DigitalLockMetadata, RegisterListingPayload, SaleFormat,
+};
 use marketplace_domain::money::Money;
 use marketplace_domain::ValidationIssue;
 use serde::Deserialize;
@@ -590,6 +592,13 @@ struct RecordShippingOption {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RecordDigitalLock {
+    policy_uri: String,
+    criterion_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListingRecord {
     #[serde(default)]
     title: Option<String>,
@@ -607,6 +616,8 @@ struct ListingRecord {
     /// only to the service, so no sync path can null them (§A4).
     #[serde(default)]
     fulfillment_methods: Vec<String>,
+    #[serde(default)]
+    digital_lock: Option<RecordDigitalLock>,
 }
 
 /// The flat shipping the service will charge per order line: the cheapest
@@ -712,6 +723,14 @@ pub fn registration_payload_from_record(
         sale_format,
         auction_terms,
         fulfillment_methods,
+        digital_lock: record.digital_lock.and_then(|lock| {
+            (parse_lock_resource(&lock.policy_uri).is_some()
+                && marketplace_domain::commands::is_valid_entity_id(&lock.criterion_id))
+            .then_some(DigitalLockMetadata {
+                policy_uri: lock.policy_uri,
+                criterion_id: lock.criterion_id,
+            })
+        }),
     })
 }
 

@@ -122,11 +122,22 @@ pub async fn handle(
             // (quantity, price, state) is touched.
             if registration.listing_revision == current.listing_revision
                 && (registration.shipping_minor != current.shipping_minor
-                    || registration_methods != current.fulfillment_methods)
+                    || registration_methods != current.fulfillment_methods
+                    || registration
+                        .digital_lock
+                        .as_ref()
+                        .map(|lock| &lock.policy_uri)
+                        != current.digital_lock_policy_uri.as_ref()
+                    || registration
+                        .digital_lock
+                        .as_ref()
+                        .map(|lock| &lock.criterion_id)
+                        != current.digital_lock_criterion_id.as_ref())
             {
                 let healed: crate::model::ListingRow = sqlx::query_as(&format!(
                     "UPDATE listings SET server_revision = server_revision + 1, \
-                     shipping_minor = $2, fulfillment_methods = $3, updated_at = $4 \
+                     shipping_minor = $2, fulfillment_methods = $3, digital_lock_policy_uri = $4, \
+                     digital_lock_criterion_id = $5, updated_at = $6 \
                      WHERE aggregate_id = $1 \
                      RETURNING {}",
                     crate::handlers::LISTING_COLUMNS
@@ -134,6 +145,18 @@ pub async fn handle(
                 .bind(&command.aggregate_id)
                 .bind(registration.shipping_minor)
                 .bind(&registration_methods)
+                .bind(
+                    registration
+                        .digital_lock
+                        .as_ref()
+                        .map(|lock| &lock.policy_uri),
+                )
+                .bind(
+                    registration
+                        .digital_lock
+                        .as_ref()
+                        .map(|lock| &lock.criterion_id),
+                )
                 .bind(now)
                 .fetch_one(&mut **tx)
                 .await?;
