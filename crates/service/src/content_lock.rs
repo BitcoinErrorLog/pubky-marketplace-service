@@ -129,7 +129,7 @@ mod rfc3339 {
                 "{}{}{}",
                 value.format("%Y-%m-%dT%H:%M:%S"),
                 fraction.trim_end_matches('0'),
-                value.offset().to_string()
+                value.offset()
             )
         };
         rendered.serialize(serializer)
@@ -298,7 +298,7 @@ impl ContentLock {
             .params
             .get("recipient_pubky")
             .and_then(Value::as_str)
-            .and_then(|value| PubkyIdentity::parse(value))
+            .and_then(PubkyIdentity::parse)
             .ok_or(PaykitPaymentPolicyRejection::InvalidParams(
                 PaykitPaymentParamsRejection::InvalidRecipientPubky,
             ))?;
