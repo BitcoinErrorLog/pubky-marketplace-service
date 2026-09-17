@@ -318,6 +318,19 @@ async fn dispatch(
             )
             .await
         }
+        CommandPayload::PrepareLocks(payload) => {
+            crate::handlers::locks::prepare(
+                tx,
+                actor,
+                command,
+                payload,
+                state.locks.as_deref(),
+                state.homeserver.as_deref(),
+                state.config.locks_payment_window_seconds,
+                now,
+            )
+            .await
+        }
         CommandPayload::RequestCancellation(payload) => {
             crate::handlers::cancellation::request(tx, actor, command, payload, now).await
         }

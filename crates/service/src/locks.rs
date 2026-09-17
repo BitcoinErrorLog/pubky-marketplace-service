@@ -25,7 +25,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base32::Alphabet;
+use base64::Engine;
 use hmac::{Hmac, Mac};
+use pubky_common::crypto::PublicKey;
+use rand::RngCore;
 use serde::Deserialize;
 use sha2::Sha256;
 use uuid::Uuid;
@@ -43,6 +47,42 @@ pub const ENV_BUNDLE_ENCRYPTION_KEY: &str = "LOCKS_BUNDLE_ENCRYPTION_KEY";
 pub const ENV_LOOKUP_HMAC_KEY: &str = "LOCKS_LOOKUP_HMAC_KEY";
 
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Validates a fetched public content-lock document against its advertised
+/// resource. This mirrors `pubky/locks@ba49a777:locks-core/src/lock_policy.rs:192-215`
+/// and `locks-sdk/src/discovery.rs:35-52`: canonical RFC 8785 bytes are BLAKE3
+/// hashed and Crockford-base32 encoded to derive the 52-character lock id, and
+/// both creator values are compared as `pubky_common::PublicKey` identities.
+pub fn validate_content_lock_identity(document: &serde_json::Value, resource: &str) -> bool {
+    let Some((resource_creator, path)) = resource.split_once("/pub/locks.app/") else {
+        return false;
+    };
+    let Some(lock_id) = path.strip_suffix(".json") else {
+        return false;
+    };
+    if lock_id.len() != 52 {
+        return false;
+    }
+    let parse_key =
+        |value: &str| PublicKey::try_from_z32(value.strip_prefix("pubky").unwrap_or(value));
+    let Ok(expected_creator) = parse_key(resource_creator) else {
+        return false;
+    };
+    let Some(actual_creator) = document.get("creator").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Ok(actual_creator) = parse_key(actual_creator) else {
+        return false;
+    };
+    if actual_creator != expected_creator {
+        return false;
+    }
+    let Ok(canonical) = serde_json_canonicalizer::to_vec(document) else {
+        return false;
+    };
+    let derived = base32::encode(Alphabet::Crockford, blake3::hash(&canonical).as_bytes());
+    derived.len() == 52 && derived == lock_id
+}
 
 /// The configured Locks secret material. Both keys are required together
 /// and must differ; the service refuses to start otherwise.
@@ -106,6 +146,22 @@ impl LocksKeys {
                 )
             })?;
         String::from_utf8(plaintext).map_err(|_| anyhow::anyhow!("bundle id is not valid UTF-8"))
+    }
+
+    /// Seals correlation material under a domain-separated payment binding.
+    pub fn encrypt_prepared_value(&self, payment_id: Uuid, domain: &[u8], value: &str) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(domain.len() + 16);
+        aad.extend_from_slice(domain);
+        aad.extend_from_slice(payment_id.as_bytes());
+        seal::seal(&self.encryption, &aad, value.as_bytes())
+    }
+
+    /// Produces the opaque 32-byte reference used solely for future Locks
+    /// task correlation. It contains no business or identity data.
+    pub fn mint_client_reference() -> String {
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
     /// The deterministic lookup/uniqueness token for a lifecycle identity:

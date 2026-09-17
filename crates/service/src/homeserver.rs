@@ -339,6 +339,19 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
         seller_pubky: &'a str,
         drop_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>>;
+
+    /// Fetches the seller's public content-lock document. This mirrors
+    /// `pubky/locks@ba49a777:locks-sdk/src/discovery.rs:13-52`: the request
+    /// is addressed through the creator's homeserver identity and callers
+    /// validate the returned creator and canonical resource path.
+    fn fetch_content_lock<'a>(
+        &'a self,
+        creator_pubky: &'a str,
+        content_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        let _ = (creator_pubky, content_path);
+        Box::pin(async { HomeserverFetchOutcome::Unavailable })
+    }
 }
 
 /// The production client: a real
@@ -521,6 +534,14 @@ impl HomeserverListingClient for HttpHomeserverClient {
             )
             .await
         })
+    }
+
+    fn fetch_content_lock<'a>(
+        &'a self,
+        creator_pubky: &'a str,
+        content_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move { self.fetch_inner(creator_pubky, content_path).await })
     }
 }
 

@@ -18,7 +18,9 @@
 //!   order — the HMAC lookup token is UNIQUE.
 
 use chrono::{DateTime, Utc};
-use marketplace_domain::commands::{parse_lock_resource, RegisterLocksPayload};
+use marketplace_domain::commands::{
+    parse_lock_resource, PrepareLocksPayload, RegisterLocksPayload,
+};
 use marketplace_domain::{ids, Command, ErrorCode};
 use serde_json::json;
 use sqlx::{Postgres, Transaction};
@@ -27,7 +29,8 @@ use uuid::Uuid;
 use crate::clock::format_timestamp;
 use crate::executor::insert_event;
 use crate::handlers::{fetch_order_for_update, holds};
-use crate::locks::LocksRuntime;
+use crate::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
+use crate::locks::{LocksKeys, LocksRuntime};
 use crate::model::PaymentRow;
 use crate::queries::PAYMENT_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
@@ -151,7 +154,7 @@ pub async fn register(
     .bind(&payment.seller_pubky)
     .bind(&lock_resource_hash)
     .bind(payment.amount_minor)
-    .bind(&payment.currency)
+    .bind(payment.currency)
     .bind(payment.exponent)
     .bind(&bundle_id_ciphertext)
     .bind(&bundle_lookup_token)
@@ -200,4 +203,245 @@ pub async fn register(
             },
         }),
     }))
+}
+
+/// Creates the sole authoritative Locks preparation for a payment. The
+/// listing's seller-authored lock, rather than registration input, defines
+/// every expected fact retained on the correlation.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    command: &Command,
+    payload: &PrepareLocksPayload,
+    locks: Option<&LocksRuntime>,
+    homeserver: Option<&dyn HomeserverListingClient>,
+    payment_window_seconds: i64,
+    now: DateTime<Utc>,
+) -> Result<HandlerResult, sqlx::Error> {
+    let (Some(locks), Some(homeserver)) = (locks, homeserver) else {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidCommand,
+            "Locks preparation is not enabled on this deployment.",
+        )));
+    };
+    let payment: Option<PaymentRow> = sqlx::query_as(&format!(
+        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(payload.payment_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(payment) = payment else {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::NotFound,
+            "The payment was not found.",
+        )));
+    };
+    if payment.buyer_pubky != actor {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::Unauthorized,
+            "Only the buyer may prepare the Locks payment.",
+        )));
+    }
+    if command.aggregate_id != ids::payment_aggregate_id(payment.id) {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidCommand,
+            "The payment aggregate id is invalid.",
+        )));
+    }
+    if command.expected_revision != payment.revision {
+        return Ok(Err(CommandFailure::with_revision(
+            ErrorCode::RevisionConflict,
+            "The payment revision is stale.",
+            payment.revision,
+        )));
+    }
+    let existing: Option<(String, Option<Vec<u8>>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT preparation_state, client_reference_ciphertext, window_expires_at \
+         FROM payment_locks_correlations WHERE payment_id = $1 FOR UPDATE",
+    )
+    .bind(payment.id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((state, Some(sealed_reference), expires_at)) = existing.as_ref() {
+        if state == "prepared" {
+            let reference = crate::seal::open(
+                locks.keys.encryption_bytes(),
+                &[b"locks-client-reference:".as_slice(), payment.id.as_bytes()].concat(),
+                sealed_reference,
+            )
+            .ok()
+            .and_then(|value| String::from_utf8(value).ok());
+            if let Some(client_reference) = reference {
+                return Ok(Ok(HandlerSuccess {
+                    revision: payment.revision,
+                    event_ids: vec![],
+                    result: json!({"kind": "payment", "client_reference": client_reference, "window_expires_at": format_timestamp(*expires_at)}),
+                }));
+            }
+        }
+    } else if existing.is_some() {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The payment already has a Locks preparation.",
+        )));
+    }
+    if payment.state != "awaiting_entitlement" {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "Only a payment awaiting entitlement can prepare Locks.",
+        )));
+    }
+    let Some(order) = fetch_order_for_update(tx, payment.order_id).await? else {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvariantViolation,
+            "Payment order is missing.",
+        )));
+    };
+    if order.state != "pending_payment" {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "Only a pending order can prepare Locks.",
+        )));
+    }
+    let lock_pairs: std::collections::BTreeSet<(String, String)> = order
+        .lines
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|line| {
+            Some((
+                line.get("digital_lock_policy_uri")?.as_str()?.to_owned(),
+                line.get("digital_lock_criterion_id")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    if lock_pairs.len() != 1 {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The order must contain exactly one seller-authored Locks payment lock.",
+        )));
+    }
+    let (resource, criterion_id) = lock_pairs.into_iter().next().expect("non-empty lock pair");
+    let Some((creator, _)) = parse_lock_resource(&resource) else {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The seller's Locks resource is invalid.",
+        )));
+    };
+    if creator != payment.seller_pubky {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The seller's Locks resource creator does not match the order.",
+        )));
+    }
+    let content = match homeserver
+        .fetch_content_lock(
+            creator,
+            resource
+                .strip_prefix(creator)
+                .expect("creator prefixes canonical resource"),
+        )
+        .await
+    {
+        HomeserverFetchOutcome::Found(value) => value,
+        HomeserverFetchOutcome::NotFound => {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidState,
+                "The seller's Locks document is unavailable.",
+            )))
+        }
+        HomeserverFetchOutcome::Unavailable => {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::UpstreamUnavailable,
+                "The seller's Locks document could not be reached.",
+            )))
+        }
+    };
+    if !crate::locks::validate_content_lock_identity(&content, &resource)
+        || !content_lock_matches(
+            &content,
+            creator,
+            &criterion_id,
+            payment.amount_minor,
+            &payment.currency,
+        )
+    {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The seller's Locks document does not match the payment.",
+        )));
+    }
+    if let Err(failure) =
+        holds::acquire_payment_hold(tx, order, payment_window_seconds, now).await?
+    {
+        return Ok(Err(failure));
+    }
+    let client_reference = LocksKeys::mint_client_reference();
+    let correlation_id = Uuid::new_v4();
+    let window_expires_at = now + chrono::Duration::seconds(payment_window_seconds);
+    let resource_hash = blake3::hash(resource.as_bytes()).to_hex().to_string();
+    sqlx::query(
+        "INSERT INTO payment_locks_correlations (id, payment_id, order_id, buyer_pubky, creator_pubky, \
+         lock_resource_hash, amount_minor, asset, exponent, policy_version, verification_state, window_expires_at, \
+         expected_resource_ciphertext, expected_resource_hash, criterion_id, expected_reader_pubky, expected_recipient_pubky, \
+         client_reference_ciphertext, preparation_state, created_at, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT guarantee_policy_version FROM orders WHERE id=$3),'pending',$10,$11,$6,$12,$4,$5,$13,'prepared',$14,$14)",
+    )
+    .bind(correlation_id).bind(payment.id).bind(payment.order_id).bind(&payment.buyer_pubky)
+    .bind(&payment.seller_pubky).bind(&resource_hash).bind(payment.amount_minor).bind(&payment.currency)
+    .bind(payment.exponent).bind(window_expires_at)
+    .bind(locks.keys.encrypt_prepared_value(payment.id, b"locks-resource:", &resource))
+    .bind(&criterion_id)
+    .bind(locks.keys.encrypt_prepared_value(payment.id, b"locks-client-reference:", &client_reference))
+    .bind(now).execute(&mut **tx).await?;
+    Ok(Ok(HandlerSuccess {
+        revision: payment.revision,
+        event_ids: vec![],
+        result: json!({"kind": "payment", "client_reference": client_reference, "window_expires_at": format_timestamp(window_expires_at)}),
+    }))
+}
+
+fn content_lock_matches(
+    content: &serde_json::Value,
+    creator: &str,
+    criterion_id: &str,
+    amount_minor: i64,
+    asset: &str,
+) -> bool {
+    let Some(object) = content.as_object() else {
+        return false;
+    };
+    let Some(criteria) = object.get("criteria").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let Some(criterion) = (criteria.len() == 1)
+        .then_some(criteria[0].as_object())
+        .flatten()
+    else {
+        return false;
+    };
+    criterion
+        .get("criterion_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(criterion_id)
+        && criterion
+            .get("verifier_type")
+            .and_then(serde_json::Value::as_str)
+            == Some("paykit-payment")
+        && criterion
+            .get("params")
+            .and_then(|params| params.get("recipient_pubky"))
+            .and_then(serde_json::Value::as_str)
+            == Some(creator)
+        && criterion
+            .get("params")
+            .and_then(|params| params.get("asset"))
+            .and_then(serde_json::Value::as_str)
+            == Some(asset)
+        && criterion
+            .get("params")
+            .and_then(|params| params.get("amount"))
+            .and_then(serde_json::Value::as_str)
+            == Some(amount_minor.to_string().as_str())
 }

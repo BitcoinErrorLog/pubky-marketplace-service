@@ -69,6 +69,7 @@ pub enum CommandPayload {
     PlaceBid(PlaceBidPayload),
     CloseAuction(CloseAuctionPayload),
     AdvanceSandboxPayment(AdvanceSandboxPaymentPayload),
+    PrepareLocks(PrepareLocksPayload),
     RegisterLocks(RegisterLocksPayload),
     RequestCancellation(RequestCancellationPayload),
     ApproveCancellation(OrderActionPayload),
@@ -106,6 +107,7 @@ impl Command {
             CommandPayload::PlaceBid(_) => "auction.place_bid",
             CommandPayload::CloseAuction(_) => "auction.close",
             CommandPayload::AdvanceSandboxPayment(_) => "payment.sandbox_advance",
+            CommandPayload::PrepareLocks(_) => "payment.prepare_locks",
             CommandPayload::RegisterLocks(_) => "payment.register_locks",
             CommandPayload::RequestCancellation(_) => "order.cancel_request",
             CommandPayload::ApproveCancellation(_) => "order.cancel_approve",
@@ -146,6 +148,7 @@ impl Command {
             CommandPayload::PlaceBid(p) => serde_json::to_value(p),
             CommandPayload::CloseAuction(p) => serde_json::to_value(p),
             CommandPayload::AdvanceSandboxPayment(p) => serde_json::to_value(p),
+            CommandPayload::PrepareLocks(p) => serde_json::to_value(p),
             CommandPayload::RegisterLocks(p) => serde_json::to_value(p),
             CommandPayload::RequestCancellation(p) => serde_json::to_value(p),
             CommandPayload::ShipOrder(p) => serde_json::to_value(p),
@@ -516,6 +519,14 @@ impl std::fmt::Debug for RegisterLocksPayload {
     }
 }
 
+/// Starts a seller-authoritative Locks payment preparation. The server mints
+/// the returned opaque client reference and persists it only sealed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareLocksPayload {
+    pub payment_id: Uuid,
+}
+
 /// The Locks content-lock path prefix inside a pubky lock resource.
 pub const LOCKS_CONTENT_LOCK_PREFIX: &str = "/pub/locks.app/";
 
@@ -831,6 +842,9 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         "auction.close" => parse_payload(&envelope.payload).map(CommandPayload::CloseAuction)?,
         "payment.sandbox_advance" => {
             parse_payload(&envelope.payload).and_then(validate_advance_sandbox_payment)?
+        }
+        "payment.prepare_locks" => {
+            parse_payload(&envelope.payload).map(CommandPayload::PrepareLocks)?
         }
         "payment.register_locks" => {
             parse_payload(&envelope.payload).and_then(validate_register_locks)?
