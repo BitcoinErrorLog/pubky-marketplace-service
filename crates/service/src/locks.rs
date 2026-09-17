@@ -118,6 +118,37 @@ impl LocksKeys {
         seal::seal(&self.encryption, &aad, value.as_bytes())
     }
 
+    /// Seals the minted client reference for the durable prepare command
+    /// result: the same domain separation as the sealed correlation column,
+    /// additionally bound to the buyer so the stored result can only be
+    /// replayed to the buyer it was minted for.
+    pub fn seal_result_client_reference(
+        &self,
+        payment_id: Uuid,
+        buyer: &str,
+        client_reference: &str,
+    ) -> Vec<u8> {
+        let mut aad = b"locks-client-reference:".to_vec();
+        aad.extend_from_slice(payment_id.as_bytes());
+        aad.extend_from_slice(buyer.as_bytes());
+        seal::seal(&self.encryption, &aad, client_reference.as_bytes())
+    }
+
+    /// Opens a sealed prepare-result client reference. Fails unless the
+    /// ciphertext was sealed for exactly this payment and buyer.
+    pub fn open_result_client_reference(
+        &self,
+        payment_id: Uuid,
+        buyer: &str,
+        sealed: &[u8],
+    ) -> Option<String> {
+        let mut aad = b"locks-client-reference:".to_vec();
+        aad.extend_from_slice(payment_id.as_bytes());
+        aad.extend_from_slice(buyer.as_bytes());
+        let plaintext = seal::open(&self.encryption, &aad, sealed).ok()?;
+        String::from_utf8(plaintext).ok()
+    }
+
     /// Produces the opaque 32-byte reference used solely for future Locks
     /// task correlation. It contains no business or identity data.
     pub fn mint_client_reference() -> String {
@@ -376,6 +407,42 @@ mod tests {
         assert!(!token
             .windows(BUNDLE.len())
             .any(|window| window == BUNDLE.as_bytes()));
+    }
+
+    #[test]
+    fn result_client_reference_binds_the_payment_and_the_buyer() {
+        let keys = keys();
+        let payment_id = Uuid::new_v4();
+        let buyer = "y".repeat(52);
+        let reference = LocksKeys::mint_client_reference();
+        let sealed = keys.seal_result_client_reference(payment_id, &buyer, &reference);
+        assert!(
+            !sealed
+                .windows(reference.len())
+                .any(|window| window == reference.as_bytes()),
+            "the sealed result never contains the plaintext reference"
+        );
+        assert_eq!(
+            keys.open_result_client_reference(payment_id, &buyer, &sealed)
+                .as_deref(),
+            Some(reference.as_str())
+        );
+        assert_eq!(
+            keys.open_result_client_reference(payment_id, &"o".repeat(52), &sealed),
+            None,
+            "another buyer cannot open the stored result"
+        );
+        assert_eq!(
+            keys.open_result_client_reference(Uuid::new_v4(), &buyer, &sealed),
+            None,
+            "another payment cannot open the stored result"
+        );
+        let other_keys = LocksKeys::from_hex(MAC_KEY, ENC_KEY).expect("swapped keys parse");
+        assert_eq!(
+            other_keys.open_result_client_reference(payment_id, &buyer, &sealed),
+            None,
+            "a different key cannot open the stored result"
+        );
     }
 
     #[test]

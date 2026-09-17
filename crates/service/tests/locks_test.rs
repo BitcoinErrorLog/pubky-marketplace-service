@@ -421,6 +421,56 @@ async fn registration_after_order_cancellation_is_refused(pool: PgPool) {
     assert!(bundle.is_none());
 }
 
+// The minted client reference is plaintext only in the authenticated
+// response: the durable command_results row stores it sealed to the payment
+// and buyer, and an exact replay unseals it back to the same buyer.
+#[sqlx::test]
+async fn the_prepare_result_is_sealed_at_rest_and_unsealed_on_replay(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    let command = common::prepare_locks_command(&order.payment_id, 100);
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+    let client_reference = body["result"]["client_reference"]
+        .as_str()
+        .expect("the response carries the minted reference")
+        .to_string();
+
+    let (stored,): (Value,) =
+        sqlx::query_as("SELECT result FROM command_results WHERE command_id = $1::uuid")
+            .bind(command["command_id"].as_str().expect("command id"))
+            .fetch_one(&app.pool)
+            .await
+            .expect("stored result row exists");
+    let serialized = stored.to_string();
+    assert!(
+        !serialized.contains(&client_reference),
+        "the stored result must not contain the plaintext reference"
+    );
+    assert!(
+        stored["result"]["client_reference_sealed"].is_string(),
+        "the stored result carries the sealed reference"
+    );
+    assert!(stored["result"]["client_reference"].is_null());
+
+    // An exact replay returns the same reference, unsealed for the buyer.
+    let (status, replay) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, body, "replay restores the exact original result");
+
+    // Another actor cannot replay the buyer's sealed result: the same
+    // command id under a different actor is a NEW command, refused before
+    // any correlation detail is exposed.
+    let outsider = new_actor(&app).await;
+    let (status, replay) = execute(&app, &outsider.token, &command).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{replay}");
+    assert_eq!(replay["error"]["code"], json!("UNAUTHORIZED"));
+    assert!(!replay.to_string().contains(&client_reference));
+}
+
 // Registration stores only an encrypted correlation bound to the order's
 // participants, amount, asset, policy version, and lock resource hash; the
 // payment flips to the 'locks' adapter and the bundle id appears nowhere in
