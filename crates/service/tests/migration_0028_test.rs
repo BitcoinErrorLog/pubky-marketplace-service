@@ -21,20 +21,41 @@ const BINDING_OUTCOMES: [&str; 7] = [
 
 #[sqlx::test(migrations = "./migrations")]
 async fn migration_0028_adds_the_binding_outcome_audit(pool: PgPool) {
-    for column in ["id", "payment_id", "outcome", "recorded_at"] {
-        let (present,): (bool,) = sqlx::query_as(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-             WHERE table_name = 'payment_locks_binding_outcomes' AND column_name = $1)",
-        )
-        .bind(column)
-        .fetch_one(&pool)
-        .await
-        .expect("column catalog is readable");
-        assert!(
-            present,
-            "payment_locks_binding_outcomes.{column} is missing"
-        );
-    }
+    // The exact column set, enumerated once so a drift (or a new sensitive
+    // column) fails loudly: the audit table carries ids, the static outcome
+    // vocabulary, and a timestamp — never bundle, resource, or reference
+    // material.
+    let mut columns: Vec<(String,)> = sqlx::query_as(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_name = 'payment_locks_binding_outcomes' ORDER BY column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("column catalog is readable");
+    columns.sort();
+    assert_eq!(
+        columns,
+        vec![
+            ("id".to_string(),),
+            ("outcome".to_string(),),
+            ("payment_id".to_string(),),
+            ("recorded_at".to_string(),),
+        ],
+        "the binding-outcome audit column set drifted"
+    );
+    let (sensitive,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_name = 'payment_locks_binding_outcomes' \
+         AND (column_name LIKE '%bundle%' OR column_name LIKE '%resource%' \
+              OR column_name LIKE '%reference%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("column catalog is readable");
+    assert_eq!(
+        sensitive, 0,
+        "the audit table must never retain correlation material"
+    );
 
     // Every designed outcome is accepted.
     for outcome in BINDING_OUTCOMES {
