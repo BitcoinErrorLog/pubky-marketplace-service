@@ -100,6 +100,12 @@ pub struct Config {
     /// before the ordinary terminal-order purge takes it
     /// (`PICKUP_DISPUTE_RETENTION_DAYS`, default 30, minimum 1; §A3).
     pub pickup_dispute_retention_days: i64,
+    /// Days a Locks checkout snapshot is retained after its payment went
+    /// terminal before the worker's locks pass hard-deletes it
+    /// (`LOCKS_SNAPSHOT_RETENTION_DAYS`, default 90, minimum 1). The purge
+    /// is bounded (oldest first, 500 rows per pass) and runs under the
+    /// locks-verification lease.
+    pub locks_snapshot_retention_days: i64,
     /// The bounded sole FX source URL. Permanently the pinned Blocktank
     /// BTCUSD ticker endpoint ([`crate::fx::FX_URL`]): a release binary
     /// CANNOT be repointed by environment — `from_env` never consults
@@ -167,6 +173,7 @@ impl Config {
         )?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         let pickup_dispute_retention_days = env_days("PICKUP_DISPUTE_RETENTION_DAYS", 30)?;
+        let locks_snapshot_retention_days = env_days("LOCKS_SNAPSHOT_RETENTION_DAYS", 90)?;
         // The FX feed is the pinned Blocktank endpoint, always: the source
         // is a permanent bounded single source, so no environment variable
         // is consulted here (a release binary cannot be repointed).
@@ -195,6 +202,7 @@ impl Config {
             public_service_origin,
             sandbox_payments_enabled,
             pickup_dispute_retention_days,
+            locks_snapshot_retention_days,
             fx_feed_url,
         })
     }
@@ -223,6 +231,7 @@ impl Config {
             public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
             pickup_dispute_retention_days: 30,
+            locks_snapshot_retention_days: 90,
             fx_feed_url: crate::fx::FX_URL.to_string(),
         }
     }

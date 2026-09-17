@@ -1652,6 +1652,158 @@ async fn locks_verification_respects_worker_leases(pool: PgPool) {
     assert_eq!(state, "confirmed");
 }
 
+// The checkout-snapshot retention (the round-cap cut): snapshot rows of
+// TERMINAL payments older than the retention are purged oldest-first,
+// bounded at 500 per pass, UNDER the locks-verification lease — a
+// 1,200-row backlog drains over exactly three passes while ordinary
+// lifecycle work (a verified completion in the same first pass) is never
+// delayed. A young terminal snapshot and an aged but non-terminal one
+// survive.
+#[sqlx::test]
+async fn terminal_checkout_snapshots_drain_boundedly_under_the_lease(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    // Two units: order A registers and completes in the first pass;
+    // order B stays awaiting entitlement with an AGED snapshot.
+    let mut listing = register_command(&seller.pubky, 2);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller.pubky),
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&app, &seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) =
+        execute(&app, &buyer.token, &common::checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let order = PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    };
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+    );
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_at_listing_revision(&seller.pubky, "00000000-0000-4000-8000-000000004010", 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let survivor_payment = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    // Order B's snapshot is aged past the retention, but its payment is
+    // NOT terminal — it must survive every pass.
+    sqlx::query(
+        "UPDATE payment_locks_checkout_snapshots SET created_at = created_at - interval '91 days' \
+         WHERE payment_id = $1::uuid",
+    )
+    .bind(&survivor_payment)
+    .execute(&app.pool)
+    .await
+    .expect("snapshot aged");
+
+    // The 1,200-row backlog: aged snapshots of payments that went
+    // terminal long ago (seeded directly; each terminal payment needs
+    // its own order row).
+    sqlx::query(
+        "INSERT INTO orders (id, buyer_pubky, seller_pubky, revision, state, lines, \
+         delivery_address, subtotal_minor, shipping_minor, total_minor, currency, exponent, \
+         guarantee_policy_version, payment_id, created_at, updated_at) \
+         SELECT gen_random_uuid(), 'buyer', 'seller', 1, 'cancelled', '[]', NULL, 100, 0, 100, \
+         'SAT', 0, 1, gen_random_uuid(), $1, $1 FROM generate_series(1, 1200)",
+    )
+    .bind(app.clock.now() - chrono::Duration::days(91))
+    .execute(&app.pool)
+    .await
+    .expect("backlog orders seeded");
+    sqlx::query(
+        "INSERT INTO payments (id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
+         state, confirmations, amount_minor, currency, exponent, created_at, updated_at) \
+         SELECT gen_random_uuid(), id, 'buyer', 'seller', 1, 'sandbox', 'expired', 0, 100, \
+         'SAT', 0, $1, $1 FROM orders WHERE seller_pubky = 'seller'",
+    )
+    .bind(app.clock.now() - chrono::Duration::days(91))
+    .execute(&app.pool)
+    .await
+    .expect("backlog payments seeded");
+    sqlx::query(
+        "INSERT INTO payment_locks_checkout_snapshots (payment_id, order_id, \
+         expected_resource_ciphertext, expected_resource_hash, criterion_id, amount_minor, \
+         asset, exponent, expected_reader_pubky, expected_recipient_pubky, created_at) \
+         SELECT id, order_id, '\\x00', 'hash', 'paykit', 100, 'SAT', 0, 'buyer', 'seller', $1 \
+         FROM payments WHERE seller_pubky = 'seller'",
+    )
+    .bind(app.clock.now() - chrono::Duration::days(91))
+    .execute(&app.pool)
+    .await
+    .expect("backlog snapshots seeded");
+    let backlog = "SELECT COUNT(*) FROM payment_locks_checkout_snapshots \
+         WHERE expected_recipient_pubky = 'seller'";
+    assert_eq!(count(&app.pool, backlog).await, 1_200);
+
+    // Pass 1: lifecycle work is NOT blocked by the backlog — the
+    // completion applies — and the purge takes its bounded first 500.
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(
+        summary.locks_completions_applied, 1,
+        "lifecycle work is not blocked by the backlog"
+    );
+    assert_eq!(summary.locks_snapshots_purged, 500);
+    assert_eq!(count(&app.pool, backlog).await, 700);
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "confirmed");
+
+    // Pass 2 takes the next 500; pass 3 the final 200.
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_snapshots_purged, 500);
+    assert_eq!(count(&app.pool, backlog).await, 200);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_snapshots_purged, 200);
+    assert_eq!(count(&app.pool, backlog).await, 0, "the backlog is drained");
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_snapshots_purged, 0, "nothing left to purge");
+
+    // The survivors: order A's snapshot is terminal but young; order B's
+    // is aged but its payment never went terminal.
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM payment_locks_checkout_snapshots"
+        )
+        .await,
+        2,
+        "only the young terminal and the non-terminal snapshots remain"
+    );
+    let (survivors,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM payment_locks_checkout_snapshots WHERE payment_id = $1::uuid",
+    )
+    .bind(&survivor_payment)
+    .fetch_one(&app.pool)
+    .await
+    .expect("survivor counted");
+    assert_eq!(survivors, 1, "a non-terminal snapshot is never purged");
+}
+
 // Redaction (ADR-0019 §8): the bundle id and the expected lock resource
 // appear in no command result, read projection, event, outbox intent, or
 // notification — across the whole checkout-prepare-register-confirm flow.

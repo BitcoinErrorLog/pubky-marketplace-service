@@ -97,4 +97,35 @@ async fn migration_0029_adds_the_checkout_lock_snapshot(pool: PgPool) {
         0,
         "no plaintext resource column may exist"
     );
+
+    // The retention rule for this newly retained private authority row
+    // (the round-cap cut): the worker's locks-verification lease pass
+    // hard-deletes snapshots of TERMINAL payments by age, oldest first,
+    // bounded per pass. Both columns the rule reads are pinned here so a
+    // drift fails loudly, and the terminal payment states it selects on
+    // are part of the payments vocabulary.
+    let (age_column,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_name = 'payment_locks_checkout_snapshots' AND column_name = 'created_at')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("column catalog is readable");
+    assert!(
+        age_column,
+        "the terminal-payment retention purge deletes by created_at"
+    );
+    let (payment_states,): (String,) = sqlx::query_as(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conrelid = 'payments'::regclass AND conname = 'payments_state_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the payments state CHECK exists");
+    for terminal in ["'confirmed'", "'expired'"] {
+        assert!(
+            payment_states.contains(terminal),
+            "the purge's terminal state {terminal} stays in the payments vocabulary: {payment_states}"
+        );
+    }
 }

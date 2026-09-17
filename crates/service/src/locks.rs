@@ -189,6 +189,34 @@ fn parse_key(name: &str, hex_value: &str) -> anyhow::Result<[u8; KEY_LEN]> {
     seal::parse_key(name, hex_value)
 }
 
+/// The checkout-snapshot retention purge: snapshot rows whose payment
+/// reached a terminal state (`confirmed`/`expired`) and whose snapshot is
+/// older than `retention_days` are hard-deleted, OLDEST FIRST, at most
+/// 500 per call, so a large backlog drains incrementally across worker
+/// passes and one purge transaction stays short. The rows carry sealed
+/// authority ciphertext, a hash, the criterion, the parties, and the
+/// economics, so they must not be retained indefinitely; the worker runs
+/// this UNDER the locks-verification lease (never after releasing it).
+pub async fn purge_terminal_locks_checkout_snapshots(
+    pool: &sqlx::PgPool,
+    now: chrono::DateTime<chrono::Utc>,
+    retention_days: i64,
+) -> Result<u64, sqlx::Error> {
+    let cutoff = now - chrono::Duration::days(retention_days);
+    let purged = sqlx::query(
+        "DELETE FROM payment_locks_checkout_snapshots WHERE payment_id IN ( \
+             SELECT s.payment_id FROM payment_locks_checkout_snapshots s \
+             JOIN payments p ON p.id = s.payment_id \
+             WHERE p.state IN ('confirmed', 'expired') AND s.created_at < $1 \
+             ORDER BY s.created_at LIMIT 500 \
+         )",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(purged.rows_affected())
+}
+
 /// The Locks verification-task lifecycle statuses (Locks `docs/API.md` at
 /// pinned commit `ba49a777`; wire values are snake_case).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
