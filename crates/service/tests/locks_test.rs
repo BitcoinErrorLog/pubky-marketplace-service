@@ -2188,6 +2188,206 @@ async fn prepare_refuses_a_payment_without_a_checkout_snapshot(pool: PgPool) {
     );
 }
 
+// The snapshot is the sole authority (the round-cap cut): a payment whose
+// economics drifted from the sealed checkout snapshot is refused
+// statically BEFORE any authority row is created — here the exponent, the
+// field a SAT/0 rail rebind rewrites.
+#[sqlx::test]
+async fn prepare_refuses_a_payment_whose_exponent_drifts_from_the_snapshot(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    // Post-checkout, the payment's exponent no longer equals the sealed
+    // checkout snapshot.
+    sqlx::query("UPDATE payments SET exponent = 0 WHERE id = $1::uuid")
+        .bind(&order.payment_id)
+        .execute(&app.pool)
+        .await
+        .expect("payment exponent drifted");
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 660),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The checkout Locks snapshot does not match the payment.")
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        0,
+        "no authority row is created on a mismatch"
+    );
+    assert!(
+        binding_outcomes(&app.pool, &order.payment_id)
+            .await
+            .is_empty(),
+        "the refusal rolls back whole"
+    );
+}
+
+// The asset comparison, same authority rule: a payment whose asset no
+// longer equals the sealed checkout snapshot is refused statically.
+#[sqlx::test]
+async fn prepare_refuses_a_payment_whose_asset_drifts_from_the_snapshot(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    sqlx::query("UPDATE payments SET currency = 'SAT' WHERE id = $1::uuid")
+        .bind(&order.payment_id)
+        .execute(&app.pool)
+        .await
+        .expect("payment asset drifted");
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 661),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The checkout Locks snapshot does not match the payment.")
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        0,
+        "no authority row is created on a mismatch"
+    );
+}
+
+// A payment already bound to a non-Locks rail can never prepare Locks:
+// the bitcoin bind marked the order and rewrote the payment to SAT/0, so
+// the checkout snapshot no longer prices it. The refusal is static and
+// creates no authority row.
+#[sqlx::test]
+async fn prepare_refuses_a_payment_prebound_to_the_bitcoin_rail(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    // The bitcoin rail bind (payment_methods.rs): the order is marked and
+    // the payment economics are rewritten to SAT/0.
+    sqlx::query("UPDATE orders SET payment_method = 'bitcoin' WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&app.pool)
+        .await
+        .expect("order marked bitcoin-bound");
+    sqlx::query("UPDATE payments SET amount_minor = 42_000, currency = 'SAT', exponent = 0 WHERE id = $1::uuid")
+        .bind(&order.payment_id)
+        .execute(&app.pool)
+        .await
+        .expect("payment rebound to SAT/0");
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 662),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The payment is already bound to a non-Locks payment rail.")
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        0,
+        "no authority row is created for a bound payment"
+    );
+    assert!(
+        binding_outcomes(&app.pool, &order.payment_id)
+            .await
+            .is_empty(),
+        "the refusal rolls back whole"
+    );
+}
+
+// The happy path under the sole-source rule: the prepared correlation's
+// authority columns equal the verified checkout snapshot byte-for-byte —
+// order, reader (buyer), recipient (creator/seller), amount, asset,
+// exponent, criterion, and resource hash — and the sealed resource opens
+// to exactly the snapshotted bytes.
+#[sqlx::test]
+async fn the_prepared_correlation_copies_the_verified_snapshot_byte_for_byte(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 663),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+
+    let snapshot: (
+        uuid::Uuid,
+        String,
+        String,
+        i64,
+        String,
+        i32,
+        String,
+        String,
+        Vec<u8>,
+    ) = sqlx::query_as(
+        "SELECT order_id, expected_reader_pubky, expected_recipient_pubky, amount_minor, \
+             asset, exponent, expected_resource_hash, criterion_id, expected_resource_ciphertext \
+             FROM payment_locks_checkout_snapshots WHERE payment_id = $1::uuid",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("snapshot row exists");
+    let correlation: (uuid::Uuid, String, String, i64, String, i32, String, String, String, Vec<u8>) =
+        sqlx::query_as(
+            "SELECT order_id, buyer_pubky, creator_pubky, amount_minor, asset, exponent, \
+             expected_resource_hash, criterion_id, lock_resource_hash, expected_resource_ciphertext \
+             FROM payment_locks_correlations WHERE payment_id = $1::uuid",
+        )
+        .bind(&order.payment_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("correlation row exists");
+    assert_eq!(correlation.0, snapshot.0, "order id from the snapshot");
+    assert_eq!(correlation.1, snapshot.1, "reader from the snapshot");
+    assert_eq!(correlation.2, snapshot.2, "recipient from the snapshot");
+    assert_eq!(correlation.3, snapshot.3, "amount from the snapshot");
+    assert_eq!(correlation.4, snapshot.4, "asset from the snapshot");
+    assert_eq!(correlation.5, snapshot.5, "exponent from the snapshot");
+    assert_eq!(
+        correlation.6, snapshot.6,
+        "expected resource hash from the snapshot"
+    );
+    assert_eq!(correlation.7, snapshot.7, "criterion from the snapshot");
+    assert_eq!(
+        correlation.8, snapshot.6,
+        "the queryable hash is the snapshotted hash"
+    );
+    // The correlation's sealed resource opens to exactly the bytes the
+    // checkout snapshot sealed (each under its own payment-bound domain).
+    let keys = test_locks_keys();
+    let payment_id = uuid::Uuid::parse_str(&order.payment_id).expect("payment id parses");
+    let from_snapshot = keys
+        .open_prepared_value(payment_id, b"locks-checkout-resource:", &snapshot.8)
+        .expect("snapshot resource opens");
+    let from_correlation = keys
+        .open_prepared_value(payment_id, b"locks-resource:", &correlation.9)
+        .expect("correlation resource opens");
+    assert_eq!(from_correlation, from_snapshot);
+}
+
 // The creator swap: a document naming a different creator served at the
 // seller's path is an identity mismatch and is refused at prepare.
 #[sqlx::test]

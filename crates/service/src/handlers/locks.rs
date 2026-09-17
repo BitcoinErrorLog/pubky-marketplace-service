@@ -3,11 +3,16 @@
 //!
 //! PREPARATION is the authority-creation step (DESIGN §3.2): under the
 //! payment and order locks it loads the immutable checkout-time lock
-//! snapshot (never the mutable listing rows), validates the fetched
-//! content lock through the strict
+//! snapshot (never the mutable listing rows) — the SOLE AUTHORITY and the
+//! ONLY SOURCE — compares EVERY snapshotted fact (resource hash,
+//! criterion, amount, asset, exponent, reader, recipient, order) to the
+//! locked payment/order rows and refuses statically on any mismatch
+//! (including a payment already bound to a non-Locks rail), validates the
+//! fetched content lock through the strict
 //! typed upstream mirror and the snapshotted payment economics, mints and seals the
 //! server-originated `client_reference`, inserts the sole `prepared`
-//! correlation (sealed expected resource, hash, criterion, reader,
+//! correlation populated FROM THE VERIFIED SNAPSHOT (sealed expected
+//! resource, hash, criterion, reader,
 //! recipient, amount, asset, exponent, policy version), acquires the
 //! inventory hold, and pins the payment adapter to `locks` — atomically.
 //! The minted reference exists in plaintext only in the authenticated
@@ -255,6 +260,23 @@ pub async fn register(
     }))
 }
 
+/// The immutable checkout-time Locks authority snapshot (migration 0029),
+/// loaded whole: prepare compares every field to the locked payment/order
+/// rows before any authority row is created, then populates the
+/// correlation from these verified values only.
+#[derive(sqlx::FromRow)]
+struct CheckoutSnapshot {
+    expected_resource_ciphertext: Vec<u8>,
+    expected_resource_hash: String,
+    criterion_id: String,
+    amount_minor: i64,
+    asset: String,
+    exponent: i32,
+    expected_reader_pubky: String,
+    expected_recipient_pubky: String,
+    order_id: Uuid,
+}
+
 /// Creates the sole authoritative Locks preparation for a payment. The
 /// listing's seller-authored lock, rather than registration input, defines
 /// every expected fact retained on the correlation.
@@ -383,25 +405,56 @@ pub async fn prepare(
     // order's authority. A payment without a snapshot (legacy orders, or
     // zero/multiple distinct locks at checkout — multi-lock aggregation is
     // a future design) is refused statically.
-    let snapshot: Option<(Vec<u8>, String, i64, String)> = sqlx::query_as(
-        "SELECT expected_resource_ciphertext, criterion_id, amount_minor, asset \
-         FROM payment_locks_checkout_snapshots WHERE payment_id = $1",
+    //
+    // The snapshot is the SOLE AUTHORITY and the ONLY SOURCE: every field
+    // is loaded and compared to the locked payment/order rows BEFORE any
+    // authority row is created, and the correlation is populated from the
+    // verified snapshot values, never from the mutable current payment —
+    // whose economics a non-Locks rail bind rewrites (SAT/0).
+    let snapshot: Option<CheckoutSnapshot> = sqlx::query_as(
+        "SELECT expected_resource_ciphertext, expected_resource_hash, criterion_id, \
+         amount_minor, asset, exponent, expected_reader_pubky, expected_recipient_pubky, \
+         order_id FROM payment_locks_checkout_snapshots WHERE payment_id = $1",
     )
     .bind(payment.id)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((sealed_resource, criterion_id, snapshot_amount_minor, snapshot_asset)) = snapshot
-    else {
+    let Some(snapshot) = snapshot else {
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The order has no seller-authored Locks payment lock snapshot.",
         )));
     };
-    let Some(resource) =
-        locks
-            .keys
-            .open_prepared_value(payment.id, b"locks-checkout-resource:", &sealed_resource)
-    else {
+    // A payment whose method is already bound to a non-Locks rail can
+    // never prepare Locks: the bind (payment_methods.rs — bitcoin
+    // settlement rewrites the payment to SAT/0) priced another rail, not
+    // the snapshotted merchandise terms.
+    if order.payment_method.is_some() {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The payment is already bound to a non-Locks payment rail.",
+        )));
+    }
+    // Every snapshotted fact must equal the locked payment/order rows
+    // exactly — order, reader (buyer), recipient (seller), and the full
+    // economics — before any authority row is created.
+    if snapshot.order_id != payment.order_id
+        || snapshot.expected_reader_pubky != payment.buyer_pubky
+        || snapshot.expected_recipient_pubky != payment.seller_pubky
+        || snapshot.amount_minor != payment.amount_minor
+        || snapshot.asset != payment.currency
+        || snapshot.exponent != payment.exponent
+    {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The checkout Locks snapshot does not match the payment.",
+        )));
+    }
+    let Some(resource) = locks.keys.open_prepared_value(
+        payment.id,
+        b"locks-checkout-resource:",
+        &snapshot.expected_resource_ciphertext,
+    ) else {
         // A snapshot that does not authenticate under the configured key
         // fails closed (tampering or a key rotation) rather than falling
         // back to the mutable listing rows.
@@ -410,6 +463,15 @@ pub async fn prepare(
             "The checkout Locks snapshot could not be opened.",
         )));
     };
+    // The opened resource must be exactly the resource the snapshot
+    // sealed at checkout.
+    let resource_hash = blake3::hash(resource.as_bytes()).to_hex().to_string();
+    if resource_hash != snapshot.expected_resource_hash {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The checkout Locks snapshot does not match the payment.",
+        )));
+    }
     let Some((creator, _)) = parse_lock_resource(&resource) else {
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
@@ -462,9 +524,9 @@ pub async fn prepare(
     }
     if !criterion_matches_payment(
         &content_lock,
-        &criterion_id,
-        snapshot_amount_minor,
-        &snapshot_asset,
+        &snapshot.criterion_id,
+        snapshot.amount_minor,
+        &snapshot.asset,
     ) {
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
@@ -479,7 +541,10 @@ pub async fn prepare(
     let client_reference = LocksKeys::mint_client_reference();
     let correlation_id = Uuid::new_v4();
     let window_expires_at = now + chrono::Duration::seconds(payment_window_seconds);
-    let resource_hash = blake3::hash(resource.as_bytes()).to_hex().to_string();
+    // The authority row is populated from the VERIFIED SNAPSHOT values
+    // only — order, parties, economics, and the resource hash — never
+    // from the mutable current payment (each was compared equal above;
+    // the snapshot is the sole source).
     sqlx::query(
         "INSERT INTO payment_locks_correlations (id, payment_id, order_id, buyer_pubky, creator_pubky, \
          lock_resource_hash, amount_minor, asset, exponent, policy_version, verification_state, window_expires_at, \
@@ -487,11 +552,11 @@ pub async fn prepare(
          client_reference_ciphertext, preparation_state, binding_outcome, created_at, updated_at) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT guarantee_policy_version FROM orders WHERE id=$3),'pending',$10,$11,$6,$12,$4,$5,$13,'prepared','prepared',$14,$14)",
     )
-    .bind(correlation_id).bind(payment.id).bind(payment.order_id).bind(&payment.buyer_pubky)
-    .bind(&payment.seller_pubky).bind(&resource_hash).bind(payment.amount_minor).bind(&payment.currency)
-    .bind(payment.exponent).bind(window_expires_at)
+    .bind(correlation_id).bind(payment.id).bind(snapshot.order_id).bind(&snapshot.expected_reader_pubky)
+    .bind(&snapshot.expected_recipient_pubky).bind(&snapshot.expected_resource_hash).bind(snapshot.amount_minor).bind(&snapshot.asset)
+    .bind(snapshot.exponent).bind(window_expires_at)
     .bind(locks.keys.encrypt_prepared_value(payment.id, b"locks-resource:", &resource))
-    .bind(&criterion_id)
+    .bind(&snapshot.criterion_id)
     .bind(locks.keys.encrypt_prepared_value(payment.id, b"locks-client-reference:", &client_reference))
     .bind(now).execute(&mut **tx).await?;
     record_binding_outcome(
