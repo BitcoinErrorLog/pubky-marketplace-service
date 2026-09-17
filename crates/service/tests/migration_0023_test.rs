@@ -536,10 +536,10 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 }
 
 /// The migration catalog is strictly increasing, unique per number, and
-/// ends at 0030. Migrations 0001–0026 are never rewritten; this asserts
-/// 0030 is the latest additive feature migration.
+/// ends at 0031. Migrations 0001–0026 are never rewritten; this asserts
+/// 0031 is the latest additive feature migration.
 #[test]
-fn migration_catalog_ends_unique_at_0030() {
+fn migration_catalog_ends_unique_at_0031() {
     let mut numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -551,8 +551,8 @@ fn migration_catalog_ends_unique_at_0030() {
         .collect();
     numbers.sort_unstable();
     numbers.dedup();
-    let expected: Vec<u32> = (1..=30).collect();
-    assert_eq!(numbers, expected, "the catalog is 0001..=0030, gapless");
+    let expected: Vec<u32> = (1..=31).collect();
+    assert_eq!(numbers, expected, "the catalog is 0001..=0031, gapless");
 }
 
 /// Every writer of `payments.state = 'manual_review'` across Bitcoin,

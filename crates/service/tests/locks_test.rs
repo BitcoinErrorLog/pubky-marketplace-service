@@ -191,36 +191,6 @@ fn listing_record_with_lock(revision: i64, policy_uri: &str) -> Value {
     })
 }
 
-/// A homeserver double whose content-lock fetches are always a transient
-/// failure (transport/5xx class), never a definitive not-found.
-struct UnavailableLocksHomeserver;
-
-impl HomeserverListingClient for UnavailableLocksHomeserver {
-    fn fetch_listing<'a>(
-        &'a self,
-        _seller_pubky: &'a str,
-        _listing_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        Box::pin(async { HomeserverFetchOutcome::Unavailable })
-    }
-
-    fn fetch_drop<'a>(
-        &'a self,
-        _seller_pubky: &'a str,
-        _drop_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        Box::pin(async { HomeserverFetchOutcome::Unavailable })
-    }
-
-    fn fetch_content_lock<'a>(
-        &'a self,
-        _creator_pubky: &'a str,
-        _content_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        Box::pin(async { HomeserverFetchOutcome::Unavailable })
-    }
-}
-
 async fn test_app_with_homeserver(
     pool: PgPool,
     homeserver: Arc<dyn HomeserverListingClient>,
@@ -682,16 +652,16 @@ async fn prepare_pins_the_locks_adapter_atomically(pool: PgPool) {
 
 // Every designed binding outcome is recorded in the static vocabulary:
 // `prepared`/`registered` stamp the correlation row transactionally and
-// append to the audit table; each refusal appends its own value even though
-// the refused command rolls back.
+// append to the audit table in the transaction that performs the state
+// change. Refusals record NOTHING (the round-cap cut): a refusing command
+// rolls back whole, so the audit holds exactly the two success outcomes.
 #[sqlx::test]
 async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
-    // prepared + registered, with the column stamped transactionally.
-    let (app, _fake) = test_app_with_locks(pool.clone()).await;
+    let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    // Three units: this test holds three orders on one listing.
-    let mut listing = register_command(&seller.pubky, 3);
+    // Two units: one order binds fully, one stays unprepared.
+    let mut listing = register_command(&seller.pubky, 2);
     listing["payload"]["digital_lock"] = json!({
         "policyUri": lock_resource_for(&seller.pubky),
         "criterionId": "paykit",
@@ -723,8 +693,9 @@ async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
             .expect("correlation row exists");
     assert_eq!(column, "registered");
 
-    // refused_already_registered: a second registration for the same
-    // payment is a designed refusal, and it is recorded.
+    // A refused second registration appends nothing: the audit holds
+    // exactly the two success outcomes, each written by the transaction
+    // that performed the state change.
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -745,14 +716,11 @@ async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
     );
     assert_eq!(
         binding_outcomes(&app.pool, &order.payment_id).await,
-        vec![
-            "prepared".to_string(),
-            "refused_already_registered".to_string(),
-            "registered".to_string(),
-        ]
+        vec!["prepared".to_string(), "registered".to_string()]
     );
 
-    // refused_no_prepare: registration without any preparation.
+    // A refused registration without any preparation writes no row at
+    // all — the audit never records refusals.
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -772,251 +740,17 @@ async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
             1,
             TEST_BUNDLE_ID,
             &lock_resource_for(&seller.pubky),
-            120,
+            127,
         ),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
-    assert_eq!(
-        binding_outcomes(&app.pool, &no_prepare_payment).await,
-        vec!["refused_no_prepare".to_string()]
-    );
-
-    // refused_expired: the prepared window lapses before attachment.
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &checkout_at_listing_revision(&seller.pubky, "00000000-0000-4000-8000-000000004001", 2),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let expired_payment = body["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("payment id")
-        .to_string();
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &common::prepare_locks_command(&expired_payment, 121),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "preparation: {body}");
-    app.clock.advance_seconds(3_601);
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &register_locks_command(
-            &expired_payment,
-            2,
-            TEST_BUNDLE_ID,
-            &lock_resource_for(&seller.pubky),
-            122,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        binding_outcomes(&app.pool, &expired_payment).await,
-        vec!["prepared".to_string(), "refused_expired".to_string()]
-    );
-
-    // refused_identity: a tampered document at the seller-authoritative
-    // path (its bytes no longer derive that path).
-    let seller_key = common::random_keypair();
-    let seller_pubky = seller_key.1.clone();
-    let mut tampered = lock_document_for(&seller_pubky, 13_700, "USD");
-    tampered["criteria"][0]["params"]["amount"] = json!("13701");
-    let resource = lock_resource_for(&seller_pubky);
-    let path = resource
-        .strip_prefix(&seller_pubky)
-        .expect("creator prefixes resource")
-        .to_string();
-    let identity_app = test_app_with_lock_documents(
-        pool.clone(),
-        HashMap::from([((seller_pubky.clone(), path), tampered)]),
-    )
-    .await;
-    let identity_seller = TestActor {
-        token: common::authenticate(&identity_app, &seller_key.0).await,
-        keypair: seller_key.0,
-        pubky: seller_pubky,
-    };
-    let identity_buyer = new_actor(&identity_app).await;
-    let identity_order =
-        create_pending_order(&identity_app, &identity_seller, &identity_buyer).await;
-    let (status, body) = execute(
-        &identity_app,
-        &identity_buyer.token,
-        &common::prepare_locks_command(&identity_order.payment_id, 123),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        binding_outcomes(&identity_app.pool, &identity_order.payment_id).await,
-        vec!["refused_identity".to_string()]
-    );
-
-    // refused_criterion: an identity-valid document whose sole criterion
-    // amount does not equal the payment amount, served at its own typed
-    // path.
-    let seller_key = common::random_keypair();
-    let seller_pubky = seller_key.1.clone();
-    let document = lock_document_for(&seller_pubky, 12_500, "USD");
-    let resource = lock_resource_for_payment(&seller_pubky, 12_500, "USD");
-    let path = resource
-        .strip_prefix(&seller_pubky)
-        .expect("creator prefixes resource")
-        .to_string();
-    let criterion_app = test_app_with_lock_documents(
-        pool.clone(),
-        HashMap::from([((seller_pubky.clone(), path), document)]),
-    )
-    .await;
-    let criterion_seller = TestActor {
-        token: common::authenticate(&criterion_app, &seller_key.0).await,
-        keypair: seller_key.0,
-        pubky: seller_pubky,
-    };
-    let criterion_buyer = new_actor(&criterion_app).await;
-    let mut listing = register_command(&criterion_seller.pubky, 1);
-    listing["payload"]["digital_lock"] = json!({
-        "policyUri": resource,
-        "criterionId": "paykit",
-    });
-    let (status, body) = execute(&criterion_app, &criterion_seller.token, &listing).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = execute(
-        &criterion_app,
-        &criterion_buyer.token,
-        &common::checkout_command(&criterion_seller.pubky),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let criterion_payment = body["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("payment id")
-        .to_string();
-    let (status, body) = execute(
-        &criterion_app,
-        &criterion_buyer.token,
-        &common::prepare_locks_command(&criterion_payment, 124),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        binding_outcomes(&criterion_app.pool, &criterion_payment).await,
-        vec!["refused_criterion".to_string()]
-    );
-
-    // refused_unavailable: the seller's homeserver cannot be reached.
-    let unavailable_app =
-        test_app_with_homeserver(pool, Arc::new(UnavailableLocksHomeserver)).await;
-    let unavailable_seller = new_actor(&unavailable_app).await;
-    let unavailable_buyer = new_actor(&unavailable_app).await;
-    let unavailable_order =
-        create_pending_order(&unavailable_app, &unavailable_seller, &unavailable_buyer).await;
-    let (status, body) = execute(
-        &unavailable_app,
-        &unavailable_buyer.token,
-        &common::prepare_locks_command(&unavailable_order.payment_id, 125),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["error"]["code"], json!("UPSTREAM_UNAVAILABLE"));
-    assert_eq!(
-        binding_outcomes(&unavailable_app.pool, &unavailable_order.payment_id).await,
-        vec!["refused_unavailable".to_string()]
-    );
-
-    // refused_order_hold: the prepared order is cancelled before
-    // attachment — registration finds the order no longer holding the
-    // prepared Locks window.
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &checkout_at_listing_revision(&seller.pubky, "00000000-0000-4000-8000-000000004003", 3),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let hold_order_id = body["result"]["orders"][0]["id"]
-        .as_str()
-        .expect("order id")
-        .to_string();
-    let hold_payment = body["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("payment id")
-        .to_string();
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &common::prepare_locks_command(&hold_payment, 127),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "preparation: {body}");
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &common::order_command(
-            "order.cancel_request",
-            &hold_order_id,
-            1,
-            json!({ "reason": "Changed my mind" }),
-            55,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "cancellation: {body}");
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &register_locks_command(
-            &hold_payment,
-            2,
-            TEST_BUNDLE_ID,
-            &lock_resource_for(&seller.pubky),
-            128,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        body["error"]["message"],
-        json!("The order no longer holds the prepared Locks payment window.")
-    );
-    assert_eq!(
-        binding_outcomes(&app.pool, &hold_payment).await,
-        vec!["prepared".to_string(), "refused_order_hold".to_string()]
-    );
-
-    // refused_no_snapshot: a payment whose checkout predates the snapshot
-    // row (a legacy order) is refused statically at prepare.
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &checkout_at_listing_revision(&seller.pubky, "00000000-0000-4000-8000-000000004004", 5),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let legacy_payment = body["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("payment id")
-        .to_string();
-    sqlx::query("DELETE FROM payment_locks_checkout_snapshots WHERE payment_id = $1::uuid")
-        .bind(&legacy_payment)
-        .execute(&app.pool)
-        .await
-        .expect("snapshot row deleted");
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &common::prepare_locks_command(&legacy_payment, 129),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        binding_outcomes(&app.pool, &legacy_payment).await,
-        vec!["refused_no_snapshot".to_string()]
+    assert!(
+        binding_outcomes(&app.pool, &no_prepare_payment)
+            .await
+            .is_empty(),
+        "a refusing command rolls back whole: no audit row"
     );
 }
 
@@ -1160,7 +894,8 @@ async fn an_elapsed_preparation_is_never_replayed(pool: PgPool) {
     assert!(!body.to_string().contains(&reference));
     assert_eq!(
         binding_outcomes(&app.pool, &order.payment_id).await,
-        vec!["prepared".to_string(), "refused_expired".to_string()]
+        vec!["prepared".to_string()],
+        "the refusal rolls back whole: only the prepared outcome remains"
     );
 
     // The sweep terminalises the elapsed preparation.
@@ -2440,9 +2175,11 @@ async fn prepare_refuses_a_payment_without_a_checkout_snapshot(pool: PgPool) {
         body["error"]["message"],
         json!("The order has no seller-authored Locks payment lock snapshot.")
     );
-    assert_eq!(
-        binding_outcomes(&app.pool, &order.payment_id).await,
-        vec!["refused_no_snapshot".to_string()]
+    assert!(
+        binding_outcomes(&app.pool, &order.payment_id)
+            .await
+            .is_empty(),
+        "the refusal rolls back whole: no audit row"
     );
     assert_eq!(
         count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
@@ -2497,66 +2234,277 @@ async fn prepare_refuses_a_lock_document_with_a_swapped_creator(pool: PgPool) {
     );
 }
 
-// Refusal idempotency (Sol Wave 1A review round 2, P2-3): a refused
-// command is never stored in command_results, so an exact retry
-// re-executes — and the (payment, command) outcome key makes the retried
-// refusal append NOTHING. Three identical submissions leave exactly one
-// audit row.
-#[sqlx::test]
-async fn an_identical_retried_refusal_appends_no_second_outcome_row(pool: PgPool) {
-    let (app, _fake) = test_app_with_locks(pool).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-    let command = register_locks_command(
-        &order.payment_id,
-        1,
-        TEST_BUNDLE_ID,
-        &lock_resource_for(&seller.pubky),
-        650,
-    );
-    for _ in 0..3 {
-        let (status, body) = execute(&app, &buyer.token, &command).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+/// A two-line Locks order: listings `boots_01` and `cap_01` (one unit
+/// each) carry the same seller-authored lock, whose document prices the
+/// whole cart (12_500 × 2 subtotal + 1_200 × 2 shipping = 27_400), so
+/// prepare's snapshot and criterion checks pass and ONLY hold acquisition
+/// can fail. Returns the order and the two listing aggregate ids in line
+/// order.
+async fn two_line_locks_order(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+    checkout_command_id: &str,
+) -> (PendingOrder, String, String) {
+    let resource = lock_resource_for_payment(&seller.pubky, 27_400, "USD");
+    for (listing_id, command_number) in [("boots_01", 1_u64), ("cap_01", 2)] {
+        let mut listing = register_listing_command(&seller.pubky, listing_id, 1, command_number);
+        listing["payload"]["digital_lock"] = json!({
+            "policyUri": resource,
+            "criterionId": "paykit",
+        });
+        let (status, body) = execute(app, &seller.token, &listing).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
-    assert_eq!(
-        binding_outcomes(&app.pool, &order.payment_id).await,
-        vec!["refused_no_prepare".to_string()],
-        "three identical refusals, one audit row"
-    );
+    let listing_a = format!("listing:{}_boots_01", seller.pubky);
+    let listing_b = format!("listing:{}_cap_01", seller.pubky);
+    let checkout = json!({
+        "version": 1,
+        "command_id": checkout_command_id,
+        "aggregate_id": format!("checkout:{checkout_command_id}"),
+        "expected_revision": 0,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "checkout.create",
+        "payload": {
+            "lines": [
+                { "listing_aggregate_id": listing_a, "expected_revision": 1, "quantity": 1 },
+                { "listing_aggregate_id": listing_b, "expected_revision": 1, "quantity": 1 },
+            ],
+            "delivery_address": {
+                "name": "Alice Buyer",
+                "line1": "1 Market Street",
+                "line2": "",
+                "city": "New York",
+                "region": "NY",
+                "postal_code": "10001",
+                "country_code": "US",
+            },
+            "guarantee_policy_version": 1,
+        },
+    });
+    let (status, body) = execute(app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "two-line checkout: {body}");
+    let order = PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    };
+    (order, listing_a, listing_b)
 }
 
-// The pool-exhaustion P1 (Sol Wave 1A review round 2): refusal auditing
-// must never acquire a second pool connection while the command
-// transaction holds the payment lock. Twenty-five concurrent refusing
-// commands against a pool capped at TWENTY connections all complete — no
-// acquisition timeout, no starvation — each lock holder records its
-// refusal in its own transaction and releases; and the payment itself
-// still proceeds (a fresh prepare succeeds afterwards).
+/// The listing inventory facts a refusing prepare must never mutate.
+async fn listing_facts(pool: &PgPool, aggregate_id: &str) -> (String, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT state, available_quantity, reserved_quantity, server_revision \
+         FROM listings WHERE aggregate_id = $1",
+    )
+    .bind(aggregate_id)
+    .fetch_one(pool)
+    .await
+    .expect("listing row exists")
+}
+
+/// The order hold facts a refusing prepare must never mutate.
+async fn order_facts(
+    pool: &PgPool,
+    order_id: &str,
+) -> (String, bool, Option<chrono::DateTime<chrono::Utc>>, i64) {
+    sqlx::query_as(
+        "SELECT state, stock_held, hold_expires_at, revision FROM orders WHERE id = $1::uuid",
+    )
+    .bind(order_id)
+    .fetch_one(pool)
+    .await
+    .expect("order row exists")
+}
+
+// The rollback proof (Sol Wave 1A review round 3): a two-line order whose
+// FIRST line is available and SECOND line is sold out fails hold
+// acquisition only AFTER the first line's listing row was updated — and
+// the rollback leaves every listing, order, payment, correlation, and
+// outcome fact exactly as it was. (The round-cap cut removed the
+// commit-on-refusal path that could persist that partial mutation.)
+#[sqlx::test]
+async fn a_failed_hold_acquisition_rolls_back_every_mutation(pool: PgPool) {
+    let seller_key = common::random_keypair();
+    let seller_pubky = seller_key.1.clone();
+    let resource = lock_resource_for_payment(&seller_pubky, 27_400, "USD");
+    let path = resource
+        .strip_prefix(&seller_pubky)
+        .expect("creator prefixes resource")
+        .to_string();
+    let app = test_app_with_lock_documents(
+        pool,
+        HashMap::from([(
+            (seller_pubky.clone(), path),
+            lock_document_for(&seller_pubky, 27_400, "USD"),
+        )]),
+    )
+    .await;
+    let seller = TestActor {
+        token: common::authenticate(&app, &seller_key.0).await,
+        keypair: seller_key.0,
+        pubky: seller_pubky,
+    };
+    let buyer = new_actor(&app).await;
+    let (order, listing_a, listing_b) = two_line_locks_order(
+        &app,
+        &seller,
+        &buyer,
+        &common::indexed_command_id(0x8004, 1),
+    )
+    .await;
+
+    // Line two sells out before the buyer prepares (another buyer's hold
+    // took the unit): line one's listing stays available, so hold
+    // acquisition updates IT before failing on line two.
+    sqlx::query(
+        "UPDATE listings SET state = 'reserved', available_quantity = 0, reserved_quantity = 1, \
+         server_revision = server_revision + 1, updated_at = now() WHERE aggregate_id = $1",
+    )
+    .bind(&listing_b)
+    .execute(&app.pool)
+    .await
+    .expect("line two sells out");
+
+    // Every fact the refusing prepare must leave untouched.
+    let listing_a_before = listing_facts(&app.pool, &listing_a).await;
+    let listing_b_before = listing_facts(&app.pool, &listing_b).await;
+    let order_before = order_facts(&app.pool, &order.order_id).await;
+    let payment_before = payment_state(&app.pool, &order.payment_id).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 640),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INSUFFICIENT_INVENTORY"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The listing sold out before this payment started.")
+    );
+
+    // The rollback: every fact is identical — no partial listing
+    // mutation, no order hold, no payment advance, no correlation, no
+    // outcome row; the checkout snapshot is untouched.
+    assert_eq!(listing_facts(&app.pool, &listing_a).await, listing_a_before);
+    assert_eq!(listing_facts(&app.pool, &listing_b).await, listing_b_before);
+    assert_eq!(order_facts(&app.pool, &order.order_id).await, order_before);
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await,
+        payment_before
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        0,
+        "no correlation"
+    );
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM payment_locks_binding_outcomes"
+        )
+        .await,
+        0,
+        "no outcome row: refusal auditing is removed"
+    );
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM payment_locks_checkout_snapshots"
+        )
+        .await,
+        1,
+        "the checkout snapshot is untouched"
+    );
+
+    // Restock line two: a fresh prepare succeeds, proving the refusal
+    // stranded nothing.
+    sqlx::query(
+        "UPDATE listings SET state = 'available', available_quantity = 1, reserved_quantity = 0, \
+         updated_at = now() WHERE aggregate_id = $1",
+    )
+    .bind(&listing_b)
+    .execute(&app.pool)
+    .await
+    .expect("line two restocks");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 641),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "prepare after restock: {body}");
+}
+
+// The pool-exhaustion P1 re-proven under the round-cap cut: twenty-five
+// concurrent REFUSING commands against a pool capped at TWENTY
+// connections all complete — no acquisition timeout, no starvation — and
+// every one rolls back whole: NO outcome rows are written (refusal
+// auditing is removed) and NO partial listing mutation survives, even
+// though hold acquisition updates line one's listing before line two
+// fails. Afterwards a fresh prepare succeeds.
 #[sqlx::test]
 async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
+    let seller_key = common::random_keypair();
+    let seller_pubky = seller_key.1.clone();
+    let resource = lock_resource_for_payment(&seller_pubky, 27_400, "USD");
+    let path = resource
+        .strip_prefix(&seller_pubky)
+        .expect("creator prefixes resource")
+        .to_string();
     let capped = sqlx::postgres::PgPoolOptions::new()
         .max_connections(20)
         .connect_with(pool.connect_options().as_ref().clone())
         .await
         .expect("capped pool connects");
-    let app = test_app_with_homeserver(capped, common::test_locks_homeserver()).await;
-    let seller = new_actor(&app).await;
+    let app = test_app_with_homeserver(
+        capped,
+        Arc::new(ScriptedLocksHomeserver {
+            documents: HashMap::from([(
+                (seller_pubky.clone(), path),
+                lock_document_for(&seller_pubky, 27_400, "USD"),
+            )]),
+        }),
+    )
+    .await;
+    let seller = TestActor {
+        token: common::authenticate(&app, &seller_key.0).await,
+        keypair: seller_key.0,
+        pubky: seller_pubky,
+    };
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let (order, listing_a, listing_b) = two_line_locks_order(
+        &app,
+        &seller,
+        &buyer,
+        &common::indexed_command_id(0x8004, 2),
+    )
+    .await;
+
+    // Line two is sold out: every prepare fails hold acquisition AFTER
+    // updating line one's listing row.
+    sqlx::query(
+        "UPDATE listings SET state = 'reserved', available_quantity = 0, reserved_quantity = 1, \
+         server_revision = server_revision + 1, updated_at = now() WHERE aggregate_id = $1",
+    )
+    .bind(&listing_b)
+    .execute(&app.pool)
+    .await
+    .expect("line two sells out");
 
     let mut tasks = Vec::new();
     for command_number in 600..625u64 {
         let router = app.router.clone();
         let token = buyer.token.clone();
-        let command = register_locks_command(
-            &order.payment_id,
-            1,
-            TEST_BUNDLE_ID,
-            &lock_resource_for(&seller.pubky),
-            command_number,
-        );
+        let command = common::prepare_locks_command(&order.payment_id, command_number);
         tasks.push(tokio::spawn(async move {
             send(router, "POST", "/v1/commands", Some(&token), &command).await
         }));
@@ -2564,22 +2512,49 @@ async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
     for task in tasks {
         let (status, body) = task.await.expect("command task joins");
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body["error"]["code"], json!("INVALID_STATE"), "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            json!("INSUFFICIENT_INVENTORY"),
+            "{body}"
+        );
     }
-    let (recorded,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM payment_locks_binding_outcomes \
-         WHERE payment_id = $1::uuid AND outcome = 'refused_no_prepare'",
-    )
-    .bind(&order.payment_id)
-    .fetch_one(&app.pool)
-    .await
-    .expect("outcomes counted");
-    assert_eq!(
-        recorded, 25,
-        "every refusing command recorded exactly one outcome, in-transaction"
-    );
 
-    // The lock winner proceeds: the payment is still usable afterwards.
+    // Every refusing command rolled back whole: no audit rows, no
+    // correlation, no payment advance, and line one's listing untouched.
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM payment_locks_binding_outcomes"
+        )
+        .await,
+        0,
+        "refusal auditing is removed: refusing commands write no rows"
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        0,
+        "no partial correlation"
+    );
+    assert_eq!(
+        listing_facts(&app.pool, &listing_a).await,
+        ("available".to_string(), 1, 0, 1),
+        "no partial listing mutation: line one was never debited"
+    );
+    let (state, adapter, revision) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "awaiting_entitlement");
+    assert_ne!(adapter, "locks");
+    assert_eq!(revision, 1, "no refusing command advanced the payment");
+
+    // Restock line two: a fresh prepare succeeds — the payment is still
+    // usable after the storm.
+    sqlx::query(
+        "UPDATE listings SET state = 'available', available_quantity = 1, reserved_quantity = 0, \
+         updated_at = now() WHERE aggregate_id = $1",
+    )
+    .bind(&listing_b)
+    .execute(&app.pool)
+    .await
+    .expect("line two restocks");
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -2587,82 +2562,4 @@ async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "prepare after the storm: {body}");
-}
-
-// The retention purge (migration 0030): outcome rows past their retention
-// are hard-deleted — directly, and through the worker's locks pass — while
-// rows inside the window survive.
-#[sqlx::test]
-async fn binding_outcomes_are_purged_with_their_retention(pool: PgPool) {
-    let (app, _fake) = test_app_with_locks(pool).await;
-    let holder = Uuid::new_v4();
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &common::prepare_locks_command(&order.payment_id, 710),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-
-    // Aged past the retention window, the row is purged…
-    sqlx::query(
-        "UPDATE payment_locks_binding_outcomes SET recorded_at = recorded_at - interval '91 days'",
-    )
-    .execute(&app.pool)
-    .await
-    .expect("row aged");
-    let purged =
-        marketplace_service::locks::purge_locks_binding_outcomes(&app.pool, app.clock.now(), 90)
-            .await
-            .expect("purge runs");
-    assert_eq!(purged, 1);
-    assert_eq!(
-        count(
-            &app.pool,
-            "SELECT COUNT(*) FROM payment_locks_binding_outcomes"
-        )
-        .await,
-        0
-    );
-
-    // …while a fresh row inside the window survives both the direct purge
-    // and the worker pass — until it too ages out.
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &register_locks_command(
-            &order.payment_id,
-            2,
-            TEST_BUNDLE_ID,
-            &lock_resource_for(&seller.pubky),
-            711,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let purged =
-        marketplace_service::locks::purge_locks_binding_outcomes(&app.pool, app.clock.now(), 90)
-            .await
-            .expect("purge runs");
-    assert_eq!(purged, 0, "a row inside the window survives");
-    let summary = run_once(&app.state, holder, app.clock.now())
-        .await
-        .expect("worker pass runs");
-    assert_eq!(summary.locks_outcomes_purged, 0);
-    sqlx::query(
-        "UPDATE payment_locks_binding_outcomes SET recorded_at = recorded_at - interval '91 days'",
-    )
-    .execute(&app.pool)
-    .await
-    .expect("row aged");
-    let summary = run_once(&app.state, holder, app.clock.now())
-        .await
-        .expect("worker pass runs");
-    assert_eq!(
-        summary.locks_outcomes_purged, 1,
-        "the worker's locks pass purges the aged row"
-    );
 }

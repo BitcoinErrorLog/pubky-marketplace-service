@@ -1,18 +1,22 @@
 //! Schema proof for the additive Locks binding-outcome audit migration
 //! (0028): the audit table exists with the static outcome vocabulary
-//! enforced by CHECK, so a refusal outcome outside the designed set is
-//! uncommittable.
+//! enforced by CHECK, so an outcome outside the designed set is
+//! uncommittable. Migration 0031 narrowed the vocabulary to the two
+//! success outcomes: refusal rows are never written, so every `refused_*`
+//! value is uncommittable.
 
 mod common;
 
 use sqlx::PgPool;
 
-/// The outcome vocabulary after 0030's additive extension (the
-/// already-registered, order-hold, and no-snapshot refusals), enumerated
-/// once so a schema drift fails loudly.
-const BINDING_OUTCOMES: [&str; 10] = [
-    "prepared",
-    "registered",
+/// The outcome vocabulary after 0031's round-cap cut (refusal auditing
+/// removed): only the two success outcomes, enumerated once so a schema
+/// drift fails loudly.
+const BINDING_OUTCOMES: [&str; 2] = ["prepared", "registered"];
+
+/// The refusal values the round cap removed from the vocabulary: each
+/// must now violate the CHECK.
+const REMOVED_REFUSAL_OUTCOMES: [&str; 8] = [
     "refused_identity",
     "refused_criterion",
     "refused_unavailable",
@@ -72,6 +76,18 @@ async fn migration_0028_adds_the_binding_outcome_audit(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap_or_else(|error| panic!("designed outcome {outcome} is committable: {error}"));
+    }
+
+    // Every refusal value the round cap removed violates the CHECK.
+    for outcome in REMOVED_REFUSAL_OUTCOMES {
+        sqlx::query(
+            "INSERT INTO payment_locks_binding_outcomes (id, payment_id, outcome, recorded_at) \
+             VALUES (gen_random_uuid(), gen_random_uuid(), $1, now())",
+        )
+        .bind(outcome)
+        .execute(&pool)
+        .await
+        .expect_err("a removed refusal outcome must violate the CHECK");
     }
 
     // Anything outside the vocabulary violates the CHECK.
