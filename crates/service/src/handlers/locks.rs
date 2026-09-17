@@ -55,14 +55,18 @@ use crate::model::PaymentRow;
 use crate::queries::PAYMENT_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
-/// The designed binding outcomes (migration 0028 enforces this vocabulary).
-/// Row outcomes are also stamped on the correlation's `binding_outcome`
-/// column in the same transaction; refusals are audit-only rows, written
-/// independently of the rolled-back command transaction so a retry stays
-/// possible. `refused_identity` covers any identity/availability failure of
-/// the seller's document at its content address (invalid resource, creator
-/// or path mismatch, strict-schema or Paykit-policy rejection, 404);
-/// `refused_unavailable` covers transient transport/5xx failure only.
+/// The designed binding outcomes (migrations 0028/0030 enforce this
+/// vocabulary). Row outcomes are also stamped on the correlation's
+/// `binding_outcome` column in the same transaction; refusals are
+/// audit-only rows, returned on the refusal itself and persisted by the
+/// executor IN the refusing command's transaction (a refusal is a business
+/// outcome, not an error — no second pool connection is ever acquired).
+/// Every outcome is keyed `(payment_id, command_id)` with ON CONFLICT DO
+/// NOTHING, so an exact retried command appends nothing. `refused_identity`
+/// covers any identity/availability failure of the seller's document at its
+/// content address (invalid resource, creator or path mismatch,
+/// strict-schema or Paykit-policy rejection, 404); `refused_unavailable`
+/// covers transient transport/5xx failure only.
 const OUTCOME_PREPARED: &str = "prepared";
 const OUTCOME_REGISTERED: &str = "registered";
 const OUTCOME_REFUSED_IDENTITY: &str = "refused_identity";
@@ -70,13 +74,16 @@ const OUTCOME_REFUSED_CRITERION: &str = "refused_criterion";
 const OUTCOME_REFUSED_UNAVAILABLE: &str = "refused_unavailable";
 const OUTCOME_REFUSED_EXPIRED: &str = "refused_expired";
 const OUTCOME_REFUSED_NO_PREPARE: &str = "refused_no_prepare";
+const OUTCOME_REFUSED_ALREADY_REGISTERED: &str = "refused_already_registered";
+const OUTCOME_REFUSED_ORDER_HOLD: &str = "refused_order_hold";
+const OUTCOME_REFUSED_NO_SNAPSHOT: &str = "refused_no_snapshot";
 
-/// Appends one binding-outcome audit row. Row outcomes are inserted inside
-/// the command transaction so they commit with the state change; refusals
-/// are inserted through the pool because the refusal rolls the command
-/// transaction back and the audit row must survive it.
+/// Appends one ROW outcome audit row inside the command transaction, so it
+/// commits with the state change. Refusals are never written here: they
+/// ride the returned [`CommandFailure`] and the executor persists them.
 async fn record_binding_outcome<'e, E>(
     executor: E,
+    command_id: Uuid,
     payment_id: Uuid,
     outcome: &'static str,
     now: DateTime<Utc>,
@@ -85,11 +92,12 @@ where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
     sqlx::query(
-        "INSERT INTO payment_locks_binding_outcomes (id, payment_id, outcome, recorded_at) \
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO payment_locks_binding_outcomes (id, payment_id, command_id, outcome, recorded_at) \
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (payment_id, command_id) DO NOTHING",
     )
     .bind(Uuid::new_v4())
     .bind(payment_id)
+    .bind(command_id)
     .bind(outcome)
     .bind(now)
     .execute(executor)
@@ -103,7 +111,6 @@ pub async fn register(
     command: &Command,
     payload: &RegisterLocksPayload,
     locks: Option<&LocksRuntime>,
-    pool: &sqlx::PgPool,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     // Fail closed: without configured keys the bundle id cannot be stored
@@ -158,17 +165,18 @@ pub async fn register(
             .fetch_optional(&mut **tx)
             .await?;
     let Some((correlation_id, creator, preparation_state, window_expires_at)) = prepared else {
-        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_NO_PREPARE, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "Prepare the seller-authorized Locks payment before registering a bundle.",
-        )));
+        )
+        .with_locks_refusal(payment.id, OUTCOME_REFUSED_NO_PREPARE)));
     };
     if preparation_state != "prepared" {
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The payment already has a registered Locks bundle.",
-        )));
+        )
+        .with_locks_refusal(payment.id, OUTCOME_REFUSED_ALREADY_REGISTERED)));
     }
     // Receiver-clock eligibility, under the payment/order locks: attachment
     // is allowed only while the prepared window is still open and the order
@@ -187,14 +195,15 @@ pub async fn register(
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The order no longer holds the prepared Locks payment window.",
-        )));
+        )
+        .with_locks_refusal(payment.id, OUTCOME_REFUSED_ORDER_HOLD)));
     }
     if now >= window_expires_at {
-        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_EXPIRED, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The Locks preparation has expired.",
-        )));
+        )
+        .with_locks_refusal(payment.id, OUTCOME_REFUSED_EXPIRED)));
     }
     let bundle_id_ciphertext = locks.keys.encrypt_bundle_id(payment.id, &payload.bundle_id);
     let bundle_lookup_token = locks.keys.lookup_token(&creator, &payload.bundle_id);
@@ -210,7 +219,14 @@ pub async fn register(
     .bind(now)
     .execute(&mut **tx)
     .await?;
-    record_binding_outcome(&mut **tx, payment.id, OUTCOME_REGISTERED, now).await?;
+    record_binding_outcome(
+        &mut **tx,
+        command.command_id,
+        payment.id,
+        OUTCOME_REGISTERED,
+        now,
+    )
+    .await?;
 
     // The adapter was pinned to 'locks' atomically with the preparation;
     // restating it here keeps attachment self-contained while the revision
@@ -266,7 +282,6 @@ pub async fn prepare(
     payload: &PrepareLocksPayload,
     locks: Option<&LocksRuntime>,
     homeserver: Option<&dyn HomeserverListingClient>,
-    pool: &sqlx::PgPool,
     payment_window_seconds: i64,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -315,11 +330,11 @@ pub async fn prepare(
     match existing.as_ref() {
         Some((state, Some(sealed_reference), expires_at)) if state == "prepared" => {
             if now >= *expires_at {
-                record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_EXPIRED, now).await?;
                 return Ok(Err(CommandFailure::new(
                     ErrorCode::InvalidState,
                     "The Locks preparation has expired.",
-                )));
+                )
+                .with_locks_refusal(payment.id, OUTCOME_REFUSED_EXPIRED)));
             }
             let reference = crate::seal::open(
                 locks.keys.encryption_bytes(),
@@ -341,7 +356,8 @@ pub async fn prepare(
             return Ok(Err(CommandFailure::new(
                 ErrorCode::InvalidState,
                 "The payment already has a Locks preparation.",
-            )));
+            )
+            .with_locks_refusal(payment.id, OUTCOME_REFUSED_ALREADY_REGISTERED)));
         }
         // Any other existing row (notably `registered`) is a stable
         // INVALID_STATE — never a fall-through to a uniqueness conflict.
@@ -349,7 +365,8 @@ pub async fn prepare(
             return Ok(Err(CommandFailure::new(
                 ErrorCode::InvalidState,
                 "The payment already has a Locks preparation.",
-            )));
+            )
+            .with_locks_refusal(payment.id, OUTCOME_REFUSED_ALREADY_REGISTERED)));
         }
         None => {}
     }
@@ -376,7 +393,8 @@ pub async fn prepare(
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "Only a pending order can prepare Locks.",
-        )));
+        )
+        .with_locks_refusal(payment.id, OUTCOME_REFUSED_ORDER_HOLD)));
     }
     // The seller-authoritative lock is the IMMUTABLE checkout-time snapshot
     // (DESIGN §§3.1–3.2): prepare reads only this private per-payment row,
@@ -394,11 +412,11 @@ pub async fn prepare(
     .await?;
     let Some((sealed_resource, criterion_id, snapshot_amount_minor, snapshot_asset)) = snapshot
     else {
-        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The order has no seller-authored Locks payment lock snapshot.",
-        )));
+        )
+        .with_locks_refusal(payment.id, OUTCOME_REFUSED_NO_SNAPSHOT)));
     };
     let Some(resource) =
         locks
@@ -414,18 +432,18 @@ pub async fn prepare(
         )));
     };
     let Some((creator, _)) = parse_lock_resource(&resource) else {
-        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The seller's Locks resource is invalid.",
-        )));
+        )
+        .with_locks_refusal(payment.id, OUTCOME_REFUSED_IDENTITY)));
     };
     if creator != payment.seller_pubky {
-        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The seller's Locks resource creator does not match the order.",
-        )));
+        )
+        .with_locks_refusal(payment.id, OUTCOME_REFUSED_IDENTITY)));
     }
     let content = match homeserver
         .fetch_content_lock(
@@ -438,36 +456,36 @@ pub async fn prepare(
     {
         HomeserverFetchOutcome::Found(value) => value,
         HomeserverFetchOutcome::NotFound => {
-            record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
             return Ok(Err(CommandFailure::new(
                 ErrorCode::InvalidState,
                 "The seller's Locks document is unavailable.",
-            )));
+            )
+            .with_locks_refusal(payment.id, OUTCOME_REFUSED_IDENTITY)));
         }
         HomeserverFetchOutcome::Unavailable => {
-            record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_UNAVAILABLE, now).await?;
             return Ok(Err(CommandFailure::new(
                 ErrorCode::UpstreamUnavailable,
                 "The seller's Locks document could not be reached.",
-            )));
+            )
+            .with_locks_refusal(payment.id, OUTCOME_REFUSED_UNAVAILABLE)));
         }
     };
     let content_lock = match crate::content_lock::validate_content_lock_value(&content, &resource) {
         Ok(content_lock) => content_lock,
         Err(_) => {
-            record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
             return Ok(Err(CommandFailure::new(
                 ErrorCode::InvalidState,
                 "The seller's Locks document does not match the payment.",
-            )));
+            )
+            .with_locks_refusal(payment.id, OUTCOME_REFUSED_IDENTITY)));
         }
     };
     if content_lock.validate_paykit_payment_v1_policy().is_err() {
-        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_IDENTITY, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The seller's Locks document does not match the payment.",
-        )));
+        )
+        .with_locks_refusal(payment.id, OUTCOME_REFUSED_IDENTITY)));
     }
     if !criterion_matches_payment(
         &content_lock,
@@ -475,16 +493,18 @@ pub async fn prepare(
         snapshot_amount_minor,
         &snapshot_asset,
     ) {
-        record_binding_outcome(pool, payment.id, OUTCOME_REFUSED_CRITERION, now).await?;
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The seller's Locks document does not match the payment.",
-        )));
+        )
+        .with_locks_refusal(payment.id, OUTCOME_REFUSED_CRITERION)));
     }
     if let Err(failure) =
         holds::acquire_payment_hold(tx, order, payment_window_seconds, now).await?
     {
-        return Ok(Err(failure));
+        return Ok(Err(
+            failure.with_locks_refusal(payment.id, OUTCOME_REFUSED_ORDER_HOLD)
+        ));
     }
     let client_reference = LocksKeys::mint_client_reference();
     let correlation_id = Uuid::new_v4();
@@ -504,7 +524,14 @@ pub async fn prepare(
     .bind(&criterion_id)
     .bind(locks.keys.encrypt_prepared_value(payment.id, b"locks-client-reference:", &client_reference))
     .bind(now).execute(&mut **tx).await?;
-    record_binding_outcome(&mut **tx, payment.id, OUTCOME_PREPARED, now).await?;
+    record_binding_outcome(
+        &mut **tx,
+        command.command_id,
+        payment.id,
+        OUTCOME_PREPARED,
+        now,
+    )
+    .await?;
     // The hold, the prepared row, and the adapter switch commit atomically
     // (DESIGN §3.2): from here only server-side verification can advance
     // this payment — the sandbox path is already closed, not only once a

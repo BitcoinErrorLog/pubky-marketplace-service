@@ -7,9 +7,10 @@ mod common;
 
 use sqlx::PgPool;
 
-/// The 0028 outcome vocabulary, enumerated once so a schema drift fails
-/// loudly.
-const BINDING_OUTCOMES: [&str; 7] = [
+/// The outcome vocabulary after 0030's additive extension (the
+/// already-registered, order-hold, and no-snapshot refusals), enumerated
+/// once so a schema drift fails loudly.
+const BINDING_OUTCOMES: [&str; 10] = [
     "prepared",
     "registered",
     "refused_identity",
@@ -17,6 +18,9 @@ const BINDING_OUTCOMES: [&str; 7] = [
     "refused_unavailable",
     "refused_expired",
     "refused_no_prepare",
+    "refused_already_registered",
+    "refused_order_hold",
+    "refused_no_snapshot",
 ];
 
 #[sqlx::test(migrations = "./migrations")]
@@ -36,6 +40,7 @@ async fn migration_0028_adds_the_binding_outcome_audit(pool: PgPool) {
     assert_eq!(
         columns,
         vec![
+            ("command_id".to_string(),),
             ("id".to_string(),),
             ("outcome".to_string(),),
             ("payment_id".to_string(),),

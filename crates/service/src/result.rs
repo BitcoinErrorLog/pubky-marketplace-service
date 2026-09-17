@@ -2,6 +2,18 @@ use marketplace_domain::{Command, ErrorCode, ValidationIssue};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+/// A designed Locks binding refusal for the executor to persist in the
+/// refusing command's OWN transaction. Set only on refusal paths that made
+/// no state changes: a refusal is a business outcome, not an error, so the
+/// executor commits the transaction — the audit row and the refusal
+/// response are atomic, and recording never acquires a second pool
+/// connection while the command transaction holds the payment lock.
+#[derive(Debug, Clone)]
+pub struct LocksRefusal {
+    pub payment_id: Uuid,
+    pub outcome: &'static str,
+}
+
 /// A rejected command. Field names and messages match the TypeScript
 /// prototype engine; wire casing is snake_case per ADR-0019 §3.
 #[derive(Debug, Clone)]
@@ -10,6 +22,7 @@ pub struct CommandFailure {
     pub message: String,
     pub current_revision: Option<i64>,
     pub issues: Option<Vec<ValidationIssue>>,
+    pub locks_refusal: Option<LocksRefusal>,
 }
 
 impl CommandFailure {
@@ -19,7 +32,18 @@ impl CommandFailure {
             message: message.to_string(),
             current_revision: None,
             issues: None,
+            locks_refusal: None,
         }
+    }
+
+    /// Attaches the designed Locks binding outcome the executor records
+    /// in-transaction when it refuses with this failure.
+    pub fn with_locks_refusal(mut self, payment_id: Uuid, outcome: &'static str) -> Self {
+        self.locks_refusal = Some(LocksRefusal {
+            payment_id,
+            outcome,
+        });
+        self
     }
 
     pub fn with_revision(code: ErrorCode, message: &str, current_revision: i64) -> Self {

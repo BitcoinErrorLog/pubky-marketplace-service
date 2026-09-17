@@ -169,7 +169,30 @@ pub async fn execute(
             Ok((StatusCode::OK, body))
         }
         Ok(Err(failure)) => {
-            tx.rollback().await?;
+            // A designed Locks refusal is a business outcome, not an
+            // error: its audit row commits in the SAME transaction (the
+            // refusing handler made no state change), so recording never
+            // acquires a second pool connection while this transaction
+            // holds the payment lock. The (payment, command) uniqueness
+            // key makes an exact retry append nothing.
+            if let Some(refusal) = &failure.locks_refusal {
+                sqlx::query(
+                    "INSERT INTO payment_locks_binding_outcomes \
+                     (id, payment_id, command_id, outcome, recorded_at) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (payment_id, command_id) DO NOTHING",
+                )
+                .bind(Uuid::new_v4())
+                .bind(refusal.payment_id)
+                .bind(command.command_id)
+                .bind(refusal.outcome)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
             log_command(
                 actor,
                 command.kind(),
@@ -353,7 +376,6 @@ async fn dispatch(
                 command,
                 payload,
                 state.locks.as_deref(),
-                &state.pool,
                 now,
             )
             .await
@@ -366,7 +388,6 @@ async fn dispatch(
                 payload,
                 state.locks.as_deref(),
                 state.homeserver.as_deref(),
-                &state.pool,
                 state.config.locks_payment_window_seconds,
                 now,
             )

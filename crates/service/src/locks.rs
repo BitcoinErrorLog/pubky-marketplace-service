@@ -189,6 +189,23 @@ fn parse_key(name: &str, hex_value: &str) -> anyhow::Result<[u8; KEY_LEN]> {
     seal::parse_key(name, hex_value)
 }
 
+/// The binding-outcome retention purge (migration 0030): audit rows older
+/// than the configured retention are hard-deleted. The rows carry only
+/// ids, the static outcome, and a timestamp — no correlation material — so
+/// retention is bounded purely by age.
+pub async fn purge_locks_binding_outcomes(
+    pool: &sqlx::PgPool,
+    now: chrono::DateTime<chrono::Utc>,
+    retention_days: i64,
+) -> Result<u64, sqlx::Error> {
+    let cutoff = now - chrono::Duration::days(retention_days);
+    let purged = sqlx::query("DELETE FROM payment_locks_binding_outcomes WHERE recorded_at < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(purged.rows_affected())
+}
+
 /// The Locks verification-task lifecycle statuses (Locks `docs/API.md` at
 /// pinned commit `ba49a777`; wire values are snake_case).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

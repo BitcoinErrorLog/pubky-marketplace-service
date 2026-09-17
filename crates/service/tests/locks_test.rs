@@ -722,9 +722,34 @@ async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
             .await
             .expect("correlation row exists");
     assert_eq!(column, "registered");
+
+    // refused_already_registered: a second registration for the same
+    // payment is a designed refusal, and it is recorded.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &register_locks_command(
+            &order.payment_id,
+            3,
+            OTHER_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            126,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The payment already has a registered Locks bundle.")
+    );
     assert_eq!(
         binding_outcomes(&app.pool, &order.payment_id).await,
-        vec!["prepared".to_string(), "registered".to_string()]
+        vec![
+            "prepared".to_string(),
+            "refused_already_registered".to_string(),
+            "registered".to_string(),
+        ]
     );
 
     // refused_no_prepare: registration without any preparation.
@@ -902,6 +927,96 @@ async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
     assert_eq!(
         binding_outcomes(&unavailable_app.pool, &unavailable_order.payment_id).await,
         vec!["refused_unavailable".to_string()]
+    );
+
+    // refused_order_hold: the prepared order is cancelled before
+    // attachment — registration finds the order no longer holding the
+    // prepared Locks window.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_at_listing_revision(&seller.pubky, "00000000-0000-4000-8000-000000004003", 3),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hold_order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id")
+        .to_string();
+    let hold_payment = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&hold_payment, 127),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::order_command(
+            "order.cancel_request",
+            &hold_order_id,
+            1,
+            json!({ "reason": "Changed my mind" }),
+            55,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cancellation: {body}");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &register_locks_command(
+            &hold_payment,
+            2,
+            TEST_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            128,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        json!("The order no longer holds the prepared Locks payment window.")
+    );
+    assert_eq!(
+        binding_outcomes(&app.pool, &hold_payment).await,
+        vec!["prepared".to_string(), "refused_order_hold".to_string()]
+    );
+
+    // refused_no_snapshot: a payment whose checkout predates the snapshot
+    // row (a legacy order) is refused statically at prepare.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_at_listing_revision(&seller.pubky, "00000000-0000-4000-8000-000000004004", 5),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let legacy_payment = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    sqlx::query("DELETE FROM payment_locks_checkout_snapshots WHERE payment_id = $1::uuid")
+        .bind(&legacy_payment)
+        .execute(&app.pool)
+        .await
+        .expect("snapshot row deleted");
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&legacy_payment, 129),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        binding_outcomes(&app.pool, &legacy_payment).await,
+        vec!["refused_no_snapshot".to_string()]
     );
 }
 
@@ -2327,7 +2442,7 @@ async fn prepare_refuses_a_payment_without_a_checkout_snapshot(pool: PgPool) {
     );
     assert_eq!(
         binding_outcomes(&app.pool, &order.payment_id).await,
-        vec!["refused_identity".to_string()]
+        vec!["refused_no_snapshot".to_string()]
     );
     assert_eq!(
         count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
@@ -2379,5 +2494,175 @@ async fn prepare_refuses_a_lock_document_with_a_swapped_creator(pool: PgPool) {
         count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
         0,
         "a creator mismatch never creates a correlation"
+    );
+}
+
+// Refusal idempotency (Sol Wave 1A review round 2, P2-3): a refused
+// command is never stored in command_results, so an exact retry
+// re-executes — and the (payment, command) outcome key makes the retried
+// refusal append NOTHING. Three identical submissions leave exactly one
+// audit row.
+#[sqlx::test]
+async fn an_identical_retried_refusal_appends_no_second_outcome_row(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    let command = register_locks_command(
+        &order.payment_id,
+        1,
+        TEST_BUNDLE_ID,
+        &lock_resource_for(&seller.pubky),
+        650,
+    );
+    for _ in 0..3 {
+        let (status, body) = execute(&app, &buyer.token, &command).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    }
+    assert_eq!(
+        binding_outcomes(&app.pool, &order.payment_id).await,
+        vec!["refused_no_prepare".to_string()],
+        "three identical refusals, one audit row"
+    );
+}
+
+// The pool-exhaustion P1 (Sol Wave 1A review round 2): refusal auditing
+// must never acquire a second pool connection while the command
+// transaction holds the payment lock. Twenty-five concurrent refusing
+// commands against a pool capped at TWENTY connections all complete — no
+// acquisition timeout, no starvation — each lock holder records its
+// refusal in its own transaction and releases; and the payment itself
+// still proceeds (a fresh prepare succeeds afterwards).
+#[sqlx::test]
+async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
+    let capped = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(20)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .expect("capped pool connects");
+    let app = test_app_with_homeserver(capped, common::test_locks_homeserver()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    let mut tasks = Vec::new();
+    for command_number in 600..625u64 {
+        let router = app.router.clone();
+        let token = buyer.token.clone();
+        let command = register_locks_command(
+            &order.payment_id,
+            1,
+            TEST_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            command_number,
+        );
+        tasks.push(tokio::spawn(async move {
+            send(router, "POST", "/v1/commands", Some(&token), &command).await
+        }));
+    }
+    for task in tasks {
+        let (status, body) = task.await.expect("command task joins");
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], json!("INVALID_STATE"), "{body}");
+    }
+    let (recorded,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM payment_locks_binding_outcomes \
+         WHERE payment_id = $1::uuid AND outcome = 'refused_no_prepare'",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("outcomes counted");
+    assert_eq!(
+        recorded, 25,
+        "every refusing command recorded exactly one outcome, in-transaction"
+    );
+
+    // The lock winner proceeds: the payment is still usable afterwards.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 700),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "prepare after the storm: {body}");
+}
+
+// The retention purge (migration 0030): outcome rows past their retention
+// are hard-deleted — directly, and through the worker's locks pass — while
+// rows inside the window survive.
+#[sqlx::test]
+async fn binding_outcomes_are_purged_with_their_retention(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 710),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Aged past the retention window, the row is purged…
+    sqlx::query(
+        "UPDATE payment_locks_binding_outcomes SET recorded_at = recorded_at - interval '91 days'",
+    )
+    .execute(&app.pool)
+    .await
+    .expect("row aged");
+    let purged =
+        marketplace_service::locks::purge_locks_binding_outcomes(&app.pool, app.clock.now(), 90)
+            .await
+            .expect("purge runs");
+    assert_eq!(purged, 1);
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM payment_locks_binding_outcomes"
+        )
+        .await,
+        0
+    );
+
+    // …while a fresh row inside the window survives both the direct purge
+    // and the worker pass — until it too ages out.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &register_locks_command(
+            &order.payment_id,
+            2,
+            TEST_BUNDLE_ID,
+            &lock_resource_for(&seller.pubky),
+            711,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let purged =
+        marketplace_service::locks::purge_locks_binding_outcomes(&app.pool, app.clock.now(), 90)
+            .await
+            .expect("purge runs");
+    assert_eq!(purged, 0, "a row inside the window survives");
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_outcomes_purged, 0);
+    sqlx::query(
+        "UPDATE payment_locks_binding_outcomes SET recorded_at = recorded_at - interval '91 days'",
+    )
+    .execute(&app.pool)
+    .await
+    .expect("row aged");
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(
+        summary.locks_outcomes_purged, 1,
+        "the worker's locks pass purges the aged row"
     );
 }
