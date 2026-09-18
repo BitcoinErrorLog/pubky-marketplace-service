@@ -298,6 +298,33 @@ pub fn refusal_kind_for_error(code: marketplace_domain::ErrorCode) -> RefusalKin
     }
 }
 
+pub const fn refusal_kind_for_review_reason(
+    reason: crate::contracts::ReviewReason,
+) -> RefusalKind {
+    use crate::contracts::ReviewReason;
+    match reason {
+        ReviewReason::ConfirmationObservationMismatch => {
+            RefusalKind::ManualResolveConfirmationObservationMismatch
+        }
+        ReviewReason::ConfirmationEffectsFailed => RefusalKind::ManualResolveConfirmationEffectsFailed,
+        ReviewReason::InvalidReason => RefusalKind::ManualResolveInvalidReason,
+        ReviewReason::InvalidIdempotencyKey => RefusalKind::ManualResolveInvalidIdempotencyKey,
+        ReviewReason::InvalidOutcome => RefusalKind::ManualResolveInvalidOutcome,
+        ReviewReason::InvalidRefundReference => RefusalKind::ManualResolveInvalidRefundReference,
+        ReviewReason::NotOrderSeller => RefusalKind::ManualResolveNotOrderSeller,
+        ReviewReason::OrderNotFound => RefusalKind::ManualResolveOrderNotFound,
+        ReviewReason::OrderNotAwaitingConfirmation => {
+            RefusalKind::ManualResolveOrderNotAwaitingConfirmation
+        }
+        ReviewReason::ResolutionNotApplicable => RefusalKind::ManualResolveNotApplicable,
+        ReviewReason::MissingPin => RefusalKind::ManualResolveMissingPin,
+        ReviewReason::Conflict => RefusalKind::ManualResolveConflict,
+        ReviewReason::AlreadyResolved => RefusalKind::ManualResolveAlreadyResolved,
+        ReviewReason::NotInManualReview => RefusalKind::ManualResolveNotInReview,
+        ReviewReason::StockUnavailable => RefusalKind::ManualResolveStockUnavailable,
+    }
+}
+
 #[derive(Clone)]
 pub struct AuditKeys {
     pub active_epoch: i16,

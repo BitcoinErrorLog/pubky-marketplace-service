@@ -536,11 +536,9 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 }
 
 /// The migration catalog is strictly increasing, unique per number, and
-/// contains the reserve-secrecy 0033 migration. Migration 0032 is reserved
-/// to its separate active stream and is intentionally absent in this
-/// worktree.
+/// contains both the refusal-audit 0032 and reserve-secrecy 0033 migrations.
 #[test]
-fn migration_catalog_preserves_reserved_0032_and_adds_0033() {
+fn migration_catalog_is_gapless_through_0033() {
     let mut numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -552,11 +550,8 @@ fn migration_catalog_preserves_reserved_0032_and_adds_0033() {
         .collect();
     numbers.sort_unstable();
     numbers.dedup();
-    let expected: Vec<u32> = (1..=31).chain([33]).collect();
-    assert_eq!(
-        numbers, expected,
-        "the catalog is 0001..=0031 plus 0033; 0032 is reserved"
-    );
+    let expected: Vec<u32> = (1..=33).collect();
+    assert_eq!(numbers, expected, "the catalog is 0001..=0033, gapless");
 }
 
 /// Every writer of `payments.state = 'manual_review'` across Bitcoin,
