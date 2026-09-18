@@ -42,63 +42,9 @@ pub async fn handle(
         )));
     }
 
-    let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
-    let current_revision = current.as_ref().map(|c| c.server_revision).unwrap_or(0);
-    if command.expected_revision != current_revision {
-        return Ok(Err(CommandFailure::with_revision(
-            ErrorCode::RevisionConflict,
-            "The listing revision is stale.",
-            current_revision,
-        )));
-    }
-    if let Some(current) = &current {
-        if payload.listing_revision <= current.listing_revision {
-            return Ok(Err(CommandFailure::with_revision(
-                ErrorCode::RevisionConflict,
-                "The public listing revision must advance.",
-                current_revision,
-            )));
-        }
-    }
-    let current_reserve = fetch_auction_reserve_for_update(tx, &command.aggregate_id).await?;
-    match (
-        current.as_ref(),
-        current_reserve.as_ref(),
-        payload.auction_reserve.as_ref(),
-    ) {
-        (None, None, Some(reserve)) => {
-            if payload.listing_revision != 1
-                || reserve.expected_record_revision != 0
-                || reserve.record_revision != 1
-            {
-                return Ok(Err(CommandFailure::with_revision(
-                    ErrorCode::RevisionConflict,
-                    "The reserve record revision is stale.",
-                    0,
-                )));
-            }
-        }
-        (None, None, None) => {}
-        (Some(listing), Some(stored), Some(reserve)) if listing.sale_format == "auction" => {
-            if reserve.expected_record_revision != stored.record_revision
-                || reserve.record_revision != stored.record_revision + 1
-            {
-                return Ok(Err(CommandFailure::with_revision(
-                    ErrorCode::RevisionConflict,
-                    "The reserve record revision is stale.",
-                    listing.server_revision,
-                )));
-            }
-        }
-        (Some(listing), None, None) if listing.sale_format == "fixed_price" => {}
-        _ => {
-            return Ok(Err(CommandFailure::new(
-                ErrorCode::InvariantViolation,
-                "The listing reserve authority is inconsistent.",
-            )))
-        }
-    }
-
+    // Resolve and validate public auction authority before taking either
+    // aggregate lock. A slow public homeserver must not stall bids or close
+    // while the seller registration command is waiting on the network.
     if payload.sale_format == SaleFormat::Auction {
         let Some(homeserver) = homeserver else {
             return Ok(Err(CommandFailure::new(
@@ -154,6 +100,73 @@ pub async fn handle(
                 ErrorCode::RevisionConflict,
                 "The public listing candidate does not match the registration command.",
             )));
+        }
+    }
+
+    let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
+    let current_revision = current.as_ref().map(|c| c.server_revision).unwrap_or(0);
+    if command.expected_revision != current_revision {
+        return Ok(Err(CommandFailure::with_revision(
+            ErrorCode::RevisionConflict,
+            "The listing revision is stale.",
+            current_revision,
+        )));
+    }
+    if let Some(current) = &current {
+        if payload.listing_revision <= current.listing_revision {
+            return Ok(Err(CommandFailure::with_revision(
+                ErrorCode::RevisionConflict,
+                "The public listing revision must advance.",
+                current_revision,
+            )));
+        }
+        let requested_sale_format = match payload.sale_format {
+            SaleFormat::FixedPrice => "fixed_price",
+            SaleFormat::Auction => "auction",
+        };
+        if current.sale_format != requested_sale_format {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidState,
+                "The listing sale format cannot change after registration.",
+            )));
+        }
+    }
+    let current_reserve = fetch_auction_reserve_for_update(tx, &command.aggregate_id).await?;
+    match (
+        current.as_ref(),
+        current_reserve.as_ref(),
+        payload.auction_reserve.as_ref(),
+    ) {
+        (None, None, Some(reserve)) => {
+            if payload.listing_revision != 1
+                || reserve.expected_record_revision != 0
+                || reserve.record_revision != 1
+            {
+                return Ok(Err(CommandFailure::with_revision(
+                    ErrorCode::RevisionConflict,
+                    "The reserve record revision is stale.",
+                    0,
+                )));
+            }
+        }
+        (None, None, None) => {}
+        (Some(listing), Some(stored), Some(reserve)) if listing.sale_format == "auction" => {
+            if reserve.expected_record_revision != stored.record_revision
+                || reserve.record_revision != stored.record_revision + 1
+            {
+                return Ok(Err(CommandFailure::with_revision(
+                    ErrorCode::RevisionConflict,
+                    "The reserve record revision is stale.",
+                    listing.server_revision,
+                )));
+            }
+        }
+        (Some(listing), None, None) if listing.sale_format == "fixed_price" => {}
+        _ => {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvariantViolation,
+                "The listing reserve authority is inconsistent.",
+            )))
         }
     }
 

@@ -302,6 +302,8 @@ fn nested_values_and_residual_sensitive_values_are_rejected() {
         json!({"nested": {"reservePrice": false}}),
         json!({"rows": [{"reserve_met": null}]}),
         json!([{"rows": [{"reserveMet": false}]}]),
+        json!({"reserve_record_revision": 1}),
+        json!({"rows": [{"last_reserve_command_id": null}]}),
         json!({"value": Uuid::new_v4().to_string()}),
         json!({"value": "2026-09-12T11:00:00Z"}),
         json!({"value": "a".repeat(52)}),
@@ -319,7 +321,9 @@ fn seller_contract_allows_only_labeled_top_level_seller_reserve_fields() {
             "response": {
                 "body": {
                     "reserve_price": null,
-                    "reserve_met": false
+                    "reserve_met": false,
+                    "reserve_record_revision": 1,
+                    "last_reserve_command_id": null
                 }
             }
         }
@@ -343,6 +347,16 @@ fn seller_contract_allows_only_labeled_top_level_seller_reserve_fields() {
         json!({
             "auction_non_seller_projection": {
                 "response": {"body": {"reserve_met": false}}
+            }
+        }),
+        json!({
+            "auction_non_seller_projection": {
+                "response": {"body": {"reserve_record_revision": 1}}
+            }
+        }),
+        json!({
+            "auction_seller_projection": {
+                "response": {"body": {"nested": {"last_reserve_command_id": null}}}
             }
         }),
     ] {

@@ -399,6 +399,52 @@ async fn auction_sync_is_reserve_blind_mutation_free_and_rejects_public_reserve_
     .expect("secret row");
     assert_eq!(after, before);
 
+    let listing_before_flip: Value =
+        sqlx::query_scalar("SELECT to_jsonb(l) FROM listings l WHERE aggregate_id = $1")
+            .bind(&aggregate_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("auction before public format flip");
+    let mut fixed_price_flip = public.clone();
+    fixed_price_flip["revision"] = json!(2);
+    fixed_price_flip["sale"] = json!({
+        "format": "fixed_price",
+        "unitPrice": {
+            "amountMinor": create["payload"]["unit_price"]["amount_minor"],
+            "currency": create["payload"]["unit_price"]["currency"],
+            "exponent": create["payload"]["unit_price"]["exponent"]
+        }
+    });
+    homeserver.put_record(&seller.pubky, "boots_01", fixed_price_flip);
+    for (token, command_number) in [(&buyer.token, 901), (&seller.token, 902)] {
+        let (status, refused) = execute(
+            &app,
+            token,
+            &sync_command(&seller.pubky, "boots_01", command_number),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(
+            refused["error"]["code"],
+            json!("SELLER_REGISTRATION_REQUIRED")
+        );
+    }
+    let listing_after_flip: Value =
+        sqlx::query_scalar("SELECT to_jsonb(l) FROM listings l WHERE aggregate_id = $1")
+            .bind(&aggregate_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("auction after refused public format flip");
+    let reserve_after_flip: Value = sqlx::query_scalar(
+        "SELECT to_jsonb(r) FROM listing_auction_reserves r WHERE listing_aggregate_id = $1",
+    )
+    .bind(&aggregate_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("reserve after refused public format flip");
+    assert_eq!(listing_after_flip, listing_before_flip);
+    assert_eq!(reserve_after_flip, before);
+
     let mut newer = public.clone();
     newer["revision"] = json!(2);
     homeserver.put_record(&seller.pubky, "boots_01", newer);

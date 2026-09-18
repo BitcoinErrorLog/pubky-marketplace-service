@@ -336,10 +336,16 @@ pub fn assert_reserve_contract_audience(value: &Value, allowed_seller_case: Opti
         match value {
             Value::Object(object) => {
                 for (key, value) in object {
-                    if crate::reserve_secrecy::FORBIDDEN_RESERVE_KEYS.contains(&key.as_str()) {
+                    if crate::reserve_secrecy::is_reserve_audience_key(key) {
                         assert!(
                             allowed_path.is_some_and(|allowed| path == allowed)
-                                && matches!(key.as_str(), "reserve_price" | "reserve_met"),
+                                && matches!(
+                                    key.as_str(),
+                                    "reserve_price"
+                                        | "reserve_met"
+                                        | "reserve_record_revision"
+                                        | "last_reserve_command_id"
+                                ),
                             "contract artifact contains forbidden reserve field '{key}'"
                         );
                     }
@@ -396,11 +402,16 @@ pub fn assert_no_sensitive_values_for_contract_with_seller(
                                 && allowed_delivery_path.is_some_and(|allowed| path == allowed),
                             "delivery_address is allowed only in the seller single-order contract case"
                         );
-                    } else if crate::reserve_secrecy::FORBIDDEN_RESERVE_KEYS.contains(&key.as_str())
-                    {
+                    } else if crate::reserve_secrecy::is_reserve_audience_key(key) {
                         assert!(
                             allowed_reserve_path.is_some_and(|allowed| path == allowed)
-                                && matches!(key.as_str(), "reserve_price" | "reserve_met"),
+                                && matches!(
+                                    key.as_str(),
+                                    "reserve_price"
+                                        | "reserve_met"
+                                        | "reserve_record_revision"
+                                        | "last_reserve_command_id"
+                                ),
                             "contract artifact contains forbidden reserve field '{key}'"
                         );
                     } else {
