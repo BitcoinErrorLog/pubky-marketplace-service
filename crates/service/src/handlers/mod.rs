@@ -23,7 +23,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::executor::insert_event;
-use crate::model::{ListingRow, OrderRow, ProjectionContext, ReviewRow};
+use crate::model::{AuctionReserveRow, ListingRow, OrderRow, ProjectionContext, ReviewRow};
 use crate::queries::ORDER_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -32,6 +32,10 @@ pub const LISTING_COLUMNS: &str = "aggregate_id, seller_pubky, listing_id, title
      available_quantity, reserved_quantity, sold_quantity, unit_price_amount_minor, \
      unit_price_currency, unit_price_exponent, shipping_minor, sale_format, auction, \
      fulfillment_methods, digital_lock_policy_uri, digital_lock_criterion_id, updated_at";
+
+pub const AUCTION_RESERVE_COLUMNS: &str = "listing_aggregate_id, listing_revision, \
+     record_revision, reserve_amount_minor, reserve_currency, reserve_exponent, \
+     last_command_id, updated_at";
 
 pub async fn fetch_listing(
     tx: &mut Transaction<'_, Postgres>,
@@ -51,6 +55,32 @@ pub async fn fetch_listing_for_update(
 ) -> Result<Option<ListingRow>, sqlx::Error> {
     sqlx::query_as(&format!(
         "SELECT {LISTING_COLUMNS} FROM listings WHERE aggregate_id = $1 FOR UPDATE"
+    ))
+    .bind(aggregate_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+pub async fn fetch_auction_reserve(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: &str,
+) -> Result<Option<AuctionReserveRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT {AUCTION_RESERVE_COLUMNS} FROM listing_auction_reserves \
+         WHERE listing_aggregate_id = $1"
+    ))
+    .bind(aggregate_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+pub async fn fetch_auction_reserve_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: &str,
+) -> Result<Option<AuctionReserveRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT {AUCTION_RESERVE_COLUMNS} FROM listing_auction_reserves \
+         WHERE listing_aggregate_id = $1 FOR UPDATE"
     ))
     .bind(aggregate_id)
     .fetch_optional(&mut **tx)
@@ -241,6 +271,8 @@ pub async fn insert_notification_intent(
     if let Some(amount) = amount {
         payload["amount"] = amount.clone();
     }
+    crate::reserve_secrecy::ensure_reserve_free(&payload)
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     sqlx::query("INSERT INTO outbox (event_id, kind, payload, created_at) VALUES ($1, $2, $3, $4)")
         .bind(event_id)
         .bind(format!("notification.{notification_type}"))

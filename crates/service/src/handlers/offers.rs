@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crate::clock::format_timestamp;
 use crate::executor::insert_event;
 use crate::handlers::{
-    fetch_listing, fetch_listing_for_update, insert_notification_intent, LISTING_COLUMNS,
+    fetch_auction_reserve, fetch_listing, fetch_listing_for_update, insert_notification_intent,
+    LISTING_COLUMNS,
 };
 use crate::homeserver::{
     award_terms_from_bytes, award_terms_from_bytes_for_variant, AwardListingSnapshot,
@@ -759,13 +760,17 @@ pub async fn accept(
     )
     .await?;
 
+    let reserve = fetch_auction_reserve(tx, &updated_listing.aggregate_id).await?;
+    let listing_projection = updated_listing
+        .projection_for_actor_with_auction(actor, reserve.as_ref(), None)
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     Ok(Ok(HandlerSuccess {
         revision: accepted.revision,
         event_ids: vec![offer_event_id, inventory_event_id],
         result: json!({
             "kind": "accepted_offer",
             "offer": accepted.view(now),
-            "listing": updated_listing.view(),
+            "listing": listing_projection,
             "reservation": reservation.view(),
         }),
     }))

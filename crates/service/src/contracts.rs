@@ -264,6 +264,9 @@ impl SnapshotNormalizer {
                 },
             ));
         }
+        if key == Some("listing_record_sha256") {
+            return Value::String("<listing-record-sha256>".to_string());
+        }
         if uuid::Uuid::parse_str(value).is_ok() {
             return Value::String(numbered(&mut self.uuids, value, "uuid"));
         }
@@ -310,20 +313,74 @@ fn is_pubky(value: &str) -> bool {
 }
 
 pub fn assert_no_sensitive_values(value: &Value) {
-    assert_no_sensitive_values_for_contract(value, None);
+    assert_no_sensitive_values_for_contract_with_seller(value, None, None);
+}
+
+/// Raw pre-normalization reserve audience guard for generated artifacts.
+/// Only the explicitly labeled seller case may carry the two seller fields,
+/// and only directly in its response body.
+pub fn assert_reserve_contract_audience(value: &Value, allowed_seller_case: Option<&str>) {
+    if let Some(case) = allowed_seller_case {
+        assert_eq!(
+            value
+                .get(case)
+                .and_then(|entry| entry.get("audience"))
+                .and_then(Value::as_str),
+            Some("seller"),
+            "reserve-bearing contract case must be labeled for the seller audience"
+        );
+    }
+    let allowed_path = allowed_seller_case
+        .map(|case| vec![case.to_string(), "response".to_string(), "body".to_string()]);
+    fn walk(value: &Value, path: &mut Vec<String>, allowed_path: Option<&[String]>) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if crate::reserve_secrecy::FORBIDDEN_RESERVE_KEYS.contains(&key.as_str()) {
+                        assert!(
+                            allowed_path.is_some_and(|allowed| path == allowed)
+                                && matches!(key.as_str(), "reserve_price" | "reserve_met"),
+                            "contract artifact contains forbidden reserve field '{key}'"
+                        );
+                    }
+                    path.push(key.clone());
+                    walk(value, path, allowed_path);
+                    path.pop();
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    walk(value, path, allowed_path);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(value, &mut Vec::new(), allowed_path.as_deref());
 }
 
 pub fn assert_no_sensitive_values_for_contract(
     value: &Value,
     allowed_single_order_case: Option<&str>,
 ) {
+    assert_no_sensitive_values_for_contract_with_seller(value, allowed_single_order_case, None);
+}
+
+pub fn assert_no_sensitive_values_for_contract_with_seller(
+    value: &Value,
+    allowed_single_order_case: Option<&str>,
+    allowed_seller_listing_case: Option<&str>,
+) {
     let allowed_delivery_path = allowed_single_order_case
+        .map(|case| vec![case.to_string(), "response".to_string(), "body".to_string()]);
+    let allowed_reserve_path = allowed_seller_listing_case
         .map(|case| vec![case.to_string(), "response".to_string(), "body".to_string()]);
     fn walk(
         value: &Value,
         key: Option<&str>,
         path: &mut Vec<String>,
         allowed_delivery_path: Option<&[String]>,
+        allowed_reserve_path: Option<&[String]>,
     ) {
         match value {
             Value::Object(object) => {
@@ -338,6 +395,13 @@ pub fn assert_no_sensitive_values_for_contract(
                             tagged
                                 && allowed_delivery_path.is_some_and(|allowed| path == allowed),
                             "delivery_address is allowed only in the seller single-order contract case"
+                        );
+                    } else if crate::reserve_secrecy::FORBIDDEN_RESERVE_KEYS.contains(&key.as_str())
+                    {
+                        assert!(
+                            allowed_reserve_path.is_some_and(|allowed| path == allowed)
+                                && matches!(key.as_str(), "reserve_price" | "reserve_met"),
+                            "contract artifact contains forbidden reserve field '{key}'"
                         );
                     } else {
                         assert!(
@@ -354,13 +418,25 @@ pub fn assert_no_sensitive_values_for_contract(
                         );
                     }
                     path.push(key.clone());
-                    walk(value, Some(key), path, allowed_delivery_path);
+                    walk(
+                        value,
+                        Some(key),
+                        path,
+                        allowed_delivery_path,
+                        allowed_reserve_path,
+                    );
                     path.pop();
                 }
             }
-            Value::Array(values) => values
-                .iter()
-                .for_each(|value| walk(value, key, path, allowed_delivery_path)),
+            Value::Array(values) => values.iter().for_each(|value| {
+                walk(
+                    value,
+                    key,
+                    path,
+                    allowed_delivery_path,
+                    allowed_reserve_path,
+                )
+            }),
             Value::String(value) => {
                 let lower = value.to_ascii_lowercase();
                 assert!(!lower.starts_with("bearer "), "residual bearer value");
@@ -382,6 +458,7 @@ pub fn assert_no_sensitive_values_for_contract(
         None,
         &mut Vec::new(),
         allowed_delivery_path.as_deref(),
+        allowed_reserve_path.as_deref(),
     );
 }
 

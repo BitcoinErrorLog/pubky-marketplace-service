@@ -219,7 +219,15 @@ async fn dispatch(
 ) -> Result<HandlerResult, sqlx::Error> {
     match &command.payload {
         CommandPayload::RegisterListing(payload) => {
-            crate::handlers::register_listing::handle(tx, actor, command, payload, now).await
+            crate::handlers::register_listing::handle(
+                tx,
+                actor,
+                command,
+                payload,
+                state.homeserver.as_deref(),
+                now,
+            )
+            .await
         }
         CommandPayload::SyncListing(payload) => {
             crate::handlers::sync_listing::handle(

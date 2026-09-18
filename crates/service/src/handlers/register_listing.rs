@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
-use marketplace_domain::commands::{Command, RegisterListingPayload, SaleFormat};
+use marketplace_domain::commands::{
+    validate_public_listing_payload, AuctionReserve, Command, RegisterListingPayload, SaleFormat,
+};
 use marketplace_domain::{ids, ErrorCode};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
@@ -7,8 +9,14 @@ use uuid::Uuid;
 
 use crate::clock::format_timestamp;
 use crate::executor::insert_event;
-use crate::handlers::{current_listing_revision, fetch_listing, fetch_listing_for_update};
-use crate::model::{money_json, ListingRow};
+use crate::handlers::{
+    current_listing_revision, fetch_auction_reserve, fetch_auction_reserve_for_update,
+    fetch_listing, fetch_listing_for_update,
+};
+use crate::homeserver::{
+    registration_payload_from_record, HomeserverFetchOutcome, HomeserverListingClient,
+};
+use crate::model::{money_json, AuctionReserveRow, AuctionState, ListingRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 pub async fn handle(
@@ -16,6 +24,7 @@ pub async fn handle(
     actor: &str,
     command: &Command,
     payload: &RegisterListingPayload,
+    homeserver: Option<&dyn HomeserverListingClient>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     if actor != payload.seller_pubky {
@@ -51,6 +60,108 @@ pub async fn handle(
             )));
         }
     }
+    let current_reserve = fetch_auction_reserve_for_update(tx, &command.aggregate_id).await?;
+    match (
+        current.as_ref(),
+        current_reserve.as_ref(),
+        payload.auction_reserve.as_ref(),
+    ) {
+        (None, None, Some(reserve)) => {
+            if payload.listing_revision != 1
+                || reserve.expected_record_revision != 0
+                || reserve.record_revision != 1
+            {
+                return Ok(Err(CommandFailure::with_revision(
+                    ErrorCode::RevisionConflict,
+                    "The reserve record revision is stale.",
+                    0,
+                )));
+            }
+        }
+        (None, None, None) => {}
+        (Some(listing), Some(stored), Some(reserve)) if listing.sale_format == "auction" => {
+            if reserve.expected_record_revision != stored.record_revision
+                || reserve.record_revision != stored.record_revision + 1
+            {
+                return Ok(Err(CommandFailure::with_revision(
+                    ErrorCode::RevisionConflict,
+                    "The reserve record revision is stale.",
+                    listing.server_revision,
+                )));
+            }
+        }
+        (Some(listing), None, None) if listing.sale_format == "fixed_price" => {}
+        _ => {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvariantViolation,
+                "The listing reserve authority is inconsistent.",
+            )))
+        }
+    }
+
+    if payload.sale_format == SaleFormat::Auction {
+        let Some(homeserver) = homeserver else {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::InvalidCommand,
+                "Listing registration is not enabled on this deployment.",
+            )));
+        };
+        let public_record = match homeserver
+            .fetch_listing(&payload.seller_pubky, &payload.listing_id)
+            .await
+        {
+            HomeserverFetchOutcome::Found(record) => record,
+            HomeserverFetchOutcome::NotFound => {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::NotFound,
+                    "The seller's homeserver has no such listing record.",
+                )))
+            }
+            HomeserverFetchOutcome::Unavailable => {
+                return Ok(Err(CommandFailure::new(
+                    ErrorCode::UpstreamUnavailable,
+                    "The seller's homeserver could not be reached. Try again shortly.",
+                )))
+            }
+        };
+        let public_candidate =
+            match registration_payload_from_record(
+                &payload.seller_pubky,
+                &payload.listing_id,
+                &public_record,
+            ) {
+                Ok(Some(candidate)) => match validate_public_listing_payload(candidate) {
+                    Ok(candidate) => candidate,
+                    Err(issues) => return Ok(Err(CommandFailure {
+                        issues: Some(issues),
+                        ..CommandFailure::new(
+                            ErrorCode::InvalidState,
+                            "The seller's listing record does not satisfy registration invariants.",
+                        )
+                    })),
+                },
+                _ => {
+                    return Ok(Err(CommandFailure::new(
+                        ErrorCode::InvalidState,
+                        "The seller's listing record could not be interpreted for registration.",
+                    )))
+                }
+            };
+        let mut public_command = payload.clone();
+        public_command.auction_reserve = None;
+        if public_candidate != public_command {
+            return Ok(Err(CommandFailure::new(
+                ErrorCode::RevisionConflict,
+                "The public listing candidate does not match the registration command.",
+            )));
+        }
+    }
+
+    if let Some(listing) = current.as_ref() {
+        if let Some(failure) = validate_edit(listing, current_reserve.as_ref(), payload, now)? {
+            return Ok(Err(failure));
+        }
+    }
 
     apply_registration(
         tx,
@@ -59,6 +170,7 @@ pub async fn handle(
         &command.aggregate_id,
         payload,
         current.as_ref(),
+        current_reserve.as_ref(),
         "listing.registered",
         now,
     )
@@ -80,6 +192,7 @@ pub(crate) async fn apply_registration(
     aggregate_id: &str,
     payload: &RegisterListingPayload,
     current: Option<&ListingRow>,
+    current_reserve: Option<&AuctionReserveRow>,
     event_kind: &str,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -199,6 +312,19 @@ pub(crate) async fn apply_registration(
         )));
     }
 
+    if let Some(reserve) = payload.auction_reserve.as_ref() {
+        persist_reserve(
+            tx,
+            aggregate_id,
+            payload.listing_revision,
+            command_id,
+            reserve,
+            current_reserve,
+            now,
+        )
+        .await?;
+    }
+
     let event_id = insert_event(
         tx,
         command_id,
@@ -213,11 +339,153 @@ pub(crate) async fn apply_registration(
     let listing = fetch_listing(tx, aggregate_id)
         .await?
         .expect("listing was just written in this transaction");
+    let reserve = fetch_auction_reserve(tx, aggregate_id).await?;
+    let projection = listing
+        .projection_for_actor_with_auction(actor, reserve.as_ref(), None)
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     Ok(Ok(HandlerSuccess {
         revision: new_revision,
         event_ids: vec![event_id],
-        result: json!({ "kind": "listing", "listing": listing.view() }),
+        result: json!({ "kind": "listing", "listing": projection }),
     }))
+}
+
+async fn persist_reserve(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: &str,
+    listing_revision: i64,
+    command_id: Uuid,
+    reserve: &AuctionReserve,
+    current: Option<&AuctionReserveRow>,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let reserve_price = reserve.reserve_price.as_ref();
+    if current.is_none() {
+        sqlx::query(
+            "INSERT INTO listing_auction_reserves \
+             (listing_aggregate_id, listing_revision, record_revision, reserve_amount_minor, \
+              reserve_currency, reserve_exponent, last_command_id, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(aggregate_id)
+        .bind(listing_revision)
+        .bind(reserve.record_revision)
+        .bind(reserve_price.map(|money| money.amount_minor))
+        .bind(reserve_price.map(|money| &money.currency))
+        .bind(reserve_price.map(|money| money.exponent))
+        .bind(command_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+    } else {
+        let updated = sqlx::query(
+            "UPDATE listing_auction_reserves SET listing_revision = $2, record_revision = $3, \
+             reserve_amount_minor = $4, reserve_currency = $5, reserve_exponent = $6, \
+             last_command_id = $7, updated_at = $8 \
+             WHERE listing_aggregate_id = $1 AND record_revision = $9",
+        )
+        .bind(aggregate_id)
+        .bind(listing_revision)
+        .bind(reserve.record_revision)
+        .bind(reserve_price.map(|money| money.amount_minor))
+        .bind(reserve_price.map(|money| &money.currency))
+        .bind(reserve_price.map(|money| money.exponent))
+        .bind(command_id)
+        .bind(now)
+        .bind(reserve.expected_record_revision)
+        .execute(&mut **tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(
+                "reserve compare-and-swap failed".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_edit(
+    current: &ListingRow,
+    current_reserve: Option<&AuctionReserveRow>,
+    payload: &RegisterListingPayload,
+    now: DateTime<Utc>,
+) -> Result<Option<CommandFailure>, sqlx::Error> {
+    if current.sale_format
+        != match payload.sale_format {
+            SaleFormat::FixedPrice => "fixed_price",
+            SaleFormat::Auction => "auction",
+        }
+    {
+        return Ok(Some(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The listing sale format cannot change after registration.",
+        )));
+    }
+    if current.sale_format != "auction" {
+        return Ok(None);
+    }
+    let Some(stored_reserve) = current_reserve else {
+        return Ok(Some(CommandFailure::new(
+            ErrorCode::InvariantViolation,
+            "The auction reserve authority is missing.",
+        )));
+    };
+    let Some(candidate_reserve) = payload.auction_reserve.as_ref() else {
+        return Ok(Some(CommandFailure::new(
+            ErrorCode::InvariantViolation,
+            "The auction reserve authority is missing.",
+        )));
+    };
+    let stored_auction = current
+        .auction
+        .as_ref()
+        .ok_or_else(|| sqlx::Error::Protocol("auction state is missing".to_string()))
+        .and_then(|value| {
+            AuctionState::from_value(value)
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+        })?;
+    let candidate_terms = payload
+        .auction_terms
+        .as_ref()
+        .expect("validated auction payload has terms");
+    let terms_changed = current.unit_price_amount_minor != payload.unit_price.amount_minor
+        || current.unit_price_currency != payload.unit_price.currency
+        || current.unit_price_exponent != payload.unit_price.exponent
+        || stored_auction.starts_at != candidate_terms.starts_at
+        || stored_auction.ends_at != candidate_terms.ends_at
+        || stored_auction.minimum_increment != candidate_terms.minimum_increment
+        || stored_auction.anti_sniping_window_seconds
+            != candidate_terms.anti_sniping_window_seconds
+        || stored_auction.anti_sniping_extension_seconds
+            != candidate_terms.anti_sniping_extension_seconds;
+    if terms_changed {
+        return Ok(Some(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "Auction terms cannot change after registration.",
+        )));
+    }
+    let stored_price = stored_reserve.reserve_price();
+    let candidate_price = candidate_reserve.reserve_price.as_ref();
+    if stored_price.as_ref() == candidate_price {
+        return Ok(None);
+    }
+    let allowed_decrease = match (stored_price.as_ref(), candidate_price) {
+        (Some(stored), Some(candidate)) => {
+            candidate.same_asset(stored)
+                && candidate.amount_minor < stored.amount_minor
+                && stored_auction.status == "scheduled"
+                && now < stored_auction.starts_at
+                && stored_auction.bid_count == 0
+        }
+        _ => false,
+    };
+    if !allowed_decrease {
+        return Ok(Some(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The auction reserve change is not permitted.",
+        )));
+    }
+    Ok(None)
 }
 
 fn auction_json(
@@ -239,12 +507,6 @@ fn auction_json(
         &payload.unit_price.currency,
         payload.unit_price.exponent,
     );
-    let reserve_met = existing("reserve_met").unwrap_or_else(|| {
-        json!(terms
-            .reserve_price
-            .as_ref()
-            .is_none_or(|reserve| payload.unit_price.amount_minor >= reserve.amount_minor))
-    });
     json!({
         "starts_at": format_timestamp(terms.starts_at),
         "ends_at": format_timestamp(terms.ends_at),
@@ -253,17 +515,11 @@ fn auction_json(
             &terms.minimum_increment.currency,
             terms.minimum_increment.exponent,
         ),
-        "reserve_price": terms.reserve_price.as_ref().map(|reserve| money_json(
-            reserve.amount_minor,
-            &reserve.currency,
-            reserve.exponent,
-        )),
         "anti_sniping_window_seconds": terms.anti_sniping_window_seconds,
         "anti_sniping_extension_seconds": terms.anti_sniping_extension_seconds,
         "status": status,
         "current_price": existing("current_price").unwrap_or(unit_price),
         "leader_pubky": existing("leader_pubky").unwrap_or(Value::Null),
         "bid_count": existing("bid_count").unwrap_or(json!(0)),
-        "reserve_met": reserve_met,
     })
 }

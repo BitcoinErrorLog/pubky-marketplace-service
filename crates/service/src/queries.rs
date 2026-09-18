@@ -35,11 +35,12 @@ use crate::auth::Actor;
 use crate::clock::format_timestamp;
 use crate::handlers::auction::personal_minimum_next_bid;
 use crate::handlers::{
-    drops::DROP_COLUMNS, offers::OFFER_COLUMNS, LISTING_COLUMNS, REVIEW_COLUMNS,
+    drops::DROP_COLUMNS, offers::OFFER_COLUMNS, AUCTION_RESERVE_COLUMNS, LISTING_COLUMNS,
+    REVIEW_COLUMNS,
 };
 use crate::model::{
-    AuctionState, DropRow, ListingRow, NotificationRow, OfferRow, OrderRow, PaymentRow, ReceiptRow,
-    ReviewRow,
+    AuctionReserveRow, AuctionState, DropRow, ListingRow, NotificationRow, OfferRow, OrderRow,
+    PaymentRow, ReceiptRow, ReviewRow,
 };
 use crate::AppState;
 
@@ -238,31 +239,49 @@ pub async fn get_listing(
                 Ok(own_bid) => own_bid,
                 Err(error) => return internal_error("listing viewer bid", &error),
             };
-            let mut view = listing.view();
-            if let (Some((maximum_minor, currency, exponent)), Some(auction_value)) =
-                (own_bid, listing.auction.as_ref())
-            {
-                if let Ok(auction) = AuctionState::from_value(auction_value) {
-                    let minimum_minor = personal_minimum_next_bid(
-                        auction.current_price.amount_minor,
-                        auction.minimum_increment.amount_minor,
-                        maximum_minor,
-                    );
-                    view["viewer_bid"] = json!({
-                        "maximum_amount": crate::model::money_json(
-                            maximum_minor,
-                            &currency,
-                            exponent,
-                        ),
-                        "minimum_next_bid": crate::model::money_json(
-                            minimum_minor,
-                            &currency,
-                            exponent,
-                        ),
-                    });
+            let viewer_bid = match (own_bid, listing.auction.as_ref()) {
+                (Some((maximum_minor, currency, exponent)), Some(auction_value)) => {
+                    match AuctionState::from_value(auction_value) {
+                        Ok(auction) => {
+                            let minimum_minor = personal_minimum_next_bid(
+                                auction.current_price.amount_minor,
+                                auction.minimum_increment.amount_minor,
+                                maximum_minor,
+                            );
+                            Some(json!({
+                                "maximum_amount": crate::model::money_json(
+                                    maximum_minor,
+                                    &currency,
+                                    exponent,
+                                ),
+                                "minimum_next_bid": crate::model::money_json(
+                                    minimum_minor,
+                                    &currency,
+                                    exponent,
+                                ),
+                            }))
+                        }
+                        Err(_) => return internal_projection_error("listing"),
+                    }
                 }
+                _ => None,
+            };
+            let reserve: Result<Option<AuctionReserveRow>, sqlx::Error> = sqlx::query_as(&format!(
+                "SELECT {AUCTION_RESERVE_COLUMNS} FROM listing_auction_reserves \
+                     WHERE listing_aggregate_id = $1"
+            ))
+            .bind(&aggregate_id)
+            .fetch_optional(&state.pool)
+            .await;
+            let reserve = match reserve {
+                Ok(reserve) => reserve,
+                Err(error) => return internal_error("listing reserve", &error),
+            };
+            match listing.projection_for_actor_with_auction(&actor.0, reserve.as_ref(), viewer_bid)
+            {
+                Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+                Err(_) => internal_projection_error("listing"),
             }
-            (StatusCode::OK, Json(view)).into_response()
         }
         Ok(None) => query_error(ErrorCode::NotFound, "The listing was not found."),
         Err(error) => internal_error("listing", &error),
@@ -315,20 +334,39 @@ pub async fn list_listing_bids(
                     },
                 )
                 .collect();
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "bids": bids,
-                    "auction": listing.auction.clone().unwrap_or(Value::Null),
-                    // Clients correct their countdown against the service
-                    // clock — the only clock auctions run on.
-                    "server_time": crate::clock::format_timestamp(state.clock.now()),
-                })),
-            )
-                .into_response()
+            let auction = match listing.auction.as_ref() {
+                Some(value) => match AuctionState::from_value(value) {
+                    Ok(auction) => auction.to_value(),
+                    Err(_) => return internal_projection_error("bid history"),
+                },
+                None => Value::Null,
+            };
+            let body = json!({
+                "bids": bids,
+                "auction": auction,
+                // Clients correct their countdown against the service
+                // clock — the only clock auctions run on.
+                "server_time": crate::clock::format_timestamp(state.clock.now()),
+            });
+            if crate::reserve_secrecy::ensure_reserve_free(&body).is_err() {
+                return internal_projection_error("bid history");
+            }
+            (StatusCode::OK, Json(body)).into_response()
         }
         Err(error) => internal_error("bid history", &error),
     }
+}
+
+fn internal_projection_error(context: &str) -> Response {
+    tracing::error!("{context} projection state is inconsistent");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "ok": false,
+            "error": { "code": "INTERNAL", "message": "The projection could not be read." },
+        })),
+    )
+        .into_response()
 }
 
 /// `GET /v1/offers`: offers where the caller is buyer or seller, never

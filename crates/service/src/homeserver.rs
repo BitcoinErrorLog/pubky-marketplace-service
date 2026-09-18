@@ -643,8 +643,6 @@ struct RecordSale {
     #[serde(default)]
     minimum_increment: Option<RecordMoney>,
     #[serde(default)]
-    reserve_price: Option<RecordMoney>,
-    #[serde(default)]
     anti_sniping_window_seconds: Option<i64>,
     #[serde(default)]
     anti_sniping_extension_seconds: Option<i64>,
@@ -668,6 +666,10 @@ struct RecordDigitalLock {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListingRecord {
+    record_type: String,
+    schema_version: i64,
+    owner_pubky: String,
+    listing_id: String,
     #[serde(default)]
     title: Option<String>,
     revision: i64,
@@ -734,9 +736,19 @@ pub fn registration_payload_from_record(
     listing_id: &str,
     record: &Value,
 ) -> Result<Option<RegisterListingPayload>, MalformedDigitalLock> {
+    if crate::reserve_secrecy::ensure_reserve_free(record).is_err() {
+        return Ok(None);
+    }
     let Ok(record) = serde_json::from_value::<ListingRecord>(record.clone()) else {
         return Ok(None);
     };
+    if record.record_type != "listing"
+        || record.schema_version != 1
+        || record.owner_pubky != seller_pubky
+        || record.listing_id != listing_id
+    {
+        return Ok(None);
+    }
     let sale_format = match record.sale.format.as_str() {
         "fixed_price" => SaleFormat::FixedPrice,
         "auction" => SaleFormat::Auction,
@@ -770,7 +782,6 @@ pub fn registration_payload_from_record(
             starts_at,
             ends_at,
             minimum_increment: minimum_increment.into_money(),
-            reserve_price: record.sale.reserve_price.map(RecordMoney::into_money),
             anti_sniping_window_seconds: window,
             anti_sniping_extension_seconds: extension,
         })
@@ -837,6 +848,7 @@ pub fn registration_payload_from_record(
         shipping_minor,
         sale_format,
         auction_terms,
+        auction_reserve: None,
         fulfillment_methods,
         digital_lock,
     }))
@@ -1027,6 +1039,8 @@ mod tests {
         json!({
             "recordType": "listing",
             "schemaVersion": 1,
+            "ownerPubky": "y".repeat(52),
+            "listingId": "l",
             "title": "Pokemon / Snorlax",
             "revision": 1,
             "location": { "countryCode": "US", "region": null },
@@ -1049,7 +1063,7 @@ mod tests {
     #[test]
     fn derives_the_registration_payload_like_the_client() {
         let seller = "y".repeat(52);
-        let payload = registration_payload_from_record(&seller, "listing_01", &record_json())
+        let payload = registration_payload_from_record(&seller, "l", &record_json())
             .expect("record parses")
             .expect("listing record");
         assert_eq!(payload.title, "Pokemon / Snorlax");
@@ -1082,7 +1096,6 @@ mod tests {
             "startsAt": "2026-08-19T22:00:00.000Z",
             "endsAt": "2026-08-19T22:10:00.000Z",
             "minimumIncrement": { "amountMinor": 500, "currency": "USD", "exponent": 2 },
-            "reservePrice": null,
             "antiSnipingWindowSeconds": 60,
             "antiSnipingExtensionSeconds": 120,
         });
@@ -1093,8 +1106,23 @@ mod tests {
         assert_eq!(payload.unit_price.amount_minor, 4_500);
         let terms = payload.auction_terms.expect("terms derived");
         assert_eq!(terms.minimum_increment.amount_minor, 500);
-        assert!(terms.reserve_price.is_none());
         assert_eq!(terms.anti_sniping_window_seconds, 60);
+
+        for forbidden in [
+            json!({"reservePrice": null}),
+            json!({"nested": {"reserve_price": null}}),
+            json!({"nested": [{"reserveMet": false}]}),
+            json!({"nested": [{"reserve_met": false}]}),
+        ] {
+            let mut bad = record.clone();
+            bad["future"] = forbidden;
+            assert!(
+                registration_payload_from_record(&"y".repeat(52), "l", &bad)
+                    .expect("guard returns a contract refusal")
+                    .is_none(),
+                "public reserve key must be rejected recursively"
+            );
+        }
     }
 
     #[test]

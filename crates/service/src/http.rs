@@ -183,7 +183,23 @@ async fn execute_command(
     Json(raw): Json<Value>,
 ) -> Response {
     match executor::execute(&state, &actor.0, &raw).await {
-        Ok((status, body)) => (status, Json(body)).into_response(),
+        Ok((status, body)) => {
+            if crate::reserve_secrecy::ensure_actor_reserve_audience(&body, &actor.0).is_err() {
+                tracing::error!("command result reserve audience guard rejected a response");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "ok": false,
+                        "error": {
+                            "code": "INTERNAL",
+                            "message": "The command could not be processed."
+                        },
+                    })),
+                )
+                    .into_response();
+            }
+            (status, Json(body)).into_response()
+        }
         Err(error) => {
             tracing::error!(error = %error, "command execution failed");
             (
