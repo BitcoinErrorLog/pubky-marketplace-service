@@ -4,13 +4,21 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Router;
 use chrono::Utc;
 use common::{
     execute, indexed_command_id, listing_aggregate, new_actor, random_keypair, register_command,
-    send, send_bytes, send_with_headers, test_app, test_app_with_homeserver, TestActor, TestApp,
+    send, send_bytes, send_with_headers, test_app, test_app_with_homeserver,
+    test_app_with_homeserver_client, TestActor, TestApp,
 };
 use marketplace_service::clock::Clock;
+use marketplace_service::homeserver::HttpHomeserverClient;
 use pubky_common::auth::AuthToken;
 use pubky_common::capabilities::Capability;
 use pubky_common::crypto::Keypair;
@@ -260,6 +268,110 @@ async fn changed_body_replay_is_quarantined_without_mutation(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn exhausted_rate_bucket_cannot_delay_or_suppress_changed_replay_quarantine(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    register(&app, &seller, 5).await;
+    let aggregate = listing_aggregate(&seller.pubky);
+    let key = Uuid::new_v4();
+    let original = adjust_request(&seller.pubky, 1, 1, key);
+
+    let (status, body) = adjust(&app, &seller.token, &original).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The default burst has 240 tokens. The accepted request consumed one;
+    // these distinct stale requests consume the remaining 239 without
+    // changing listing, event, or immutable-result facts.
+    for index in 0..239 {
+        let stale = adjust_request(
+            &seller.pubky,
+            1,
+            1,
+            Uuid::parse_str(&indexed_command_id(0x9020, index)).expect("fixture uuid"),
+        );
+        let (status, body) = adjust(&app, &seller.token, &stale).await;
+        assert_eq!(status, StatusCode::CONFLICT, "index {index}: {body}");
+        assert_eq!(body["error"]["code"], json!("revision_conflict"));
+    }
+    let tokens: f64 = sqlx::query_scalar(
+        "SELECT tokens FROM inventory_rate_limits WHERE endpoint_class = 'inventory.adjust'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("exhausted rate row");
+    assert!(tokens < 1.0, "rate bucket must be exhausted, got {tokens}");
+
+    let facts = listing_facts(&app.pool, &aggregate).await;
+    let events = inventory_event_count(&app.pool, &aggregate).await;
+    let results: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inventory_adjustment_results")
+        .fetch_one(&app.pool)
+        .await
+        .expect("result count");
+
+    // Holding the exhausted rate row makes any attempted rate accounting
+    // wait. A changed replay must classify and persist under its idempotency
+    // lock without depending on that operational bucket.
+    let mut rate_lock = app.pool.begin().await.expect("rate lock transaction");
+    sqlx::query(
+        "SELECT tokens FROM inventory_rate_limits \
+         WHERE endpoint_class = 'inventory.adjust' FOR UPDATE",
+    )
+    .fetch_one(&mut *rate_lock)
+    .await
+    .expect("rate row locks");
+
+    let mut changed = adjust_request(&seller.pubky, 1, 2, key);
+    changed["external_ref"] = json!({"channel": "shopify", "external_id": "changed-replay"});
+    let router = app.router.clone();
+    let token = seller.token.clone();
+    let changed_for_task = changed.clone();
+    let mut changed_task = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            "/v1/inventory/adjust",
+            Some(&token),
+            &changed_for_task,
+        )
+        .await
+    });
+    let completed = tokio::time::timeout(Duration::from_secs(2), &mut changed_task).await;
+    rate_lock.rollback().await.expect("release rate row");
+    let (status, body) = match completed {
+        Ok(joined) => joined.expect("changed replay task"),
+        Err(_) => {
+            let _ = tokio::time::timeout(Duration::from_secs(5), changed_task).await;
+            panic!("changed replay waited on exhausted rate accounting before quarantine");
+        }
+    };
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("idempotency_conflict"));
+    let (status, body) = adjust(&app, &seller.token, &changed).await;
+    assert_eq!(status, StatusCode::CONFLICT, "deduplicated replay: {body}");
+    assert_eq!(body["error"]["code"], json!("idempotency_conflict"));
+
+    let conflicts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inventory_adjustment_conflicts \
+         WHERE seller_pubky = $1 AND idempotency_key = $2",
+    )
+    .bind(&seller.pubky)
+    .bind(key)
+    .fetch_one(&app.pool)
+    .await
+    .expect("quarantine count");
+    assert_eq!(conflicts, 1, "same changed hash is deduplicated");
+    assert_eq!(listing_facts(&app.pool, &aggregate).await, facts);
+    assert_eq!(inventory_event_count(&app.pool, &aggregate).await, events);
+    let after_results: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM inventory_adjustment_results")
+            .fetch_one(&app.pool)
+            .await
+            .expect("result count");
+    assert_eq!(after_results, results);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn revision_negative_stock_and_spoof_refusals_mutate_nothing(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -332,6 +444,59 @@ fn homeserver_record(seller: &str, variants: Value) -> Value {
     })
 }
 
+#[derive(Clone)]
+struct DelayedListingServer {
+    record: Arc<Mutex<Value>>,
+    lookup_entered: Arc<tokio::sync::Barrier>,
+    release_lookup: Arc<tokio::sync::Notify>,
+    delay_next: Arc<AtomicBool>,
+}
+
+async fn serve_delayed_listing(
+    axum::extract::State(server): axum::extract::State<DelayedListingServer>,
+    axum::extract::Path(listing_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let seller = headers
+        .get("pubky-host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let record = server.record.lock().expect("listing record lock").clone();
+    if record["ownerPubky"] != json!(seller) || record["listingId"] != json!(listing_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if server.delay_next.swap(false, Ordering::SeqCst) {
+        server.lookup_entered.wait().await;
+        server.release_lookup.notified().await;
+    }
+    (StatusCode::OK, axum::Json(record)).into_response()
+}
+
+async fn spawn_delayed_listing_server(record: Value) -> (String, DelayedListingServer) {
+    let server = DelayedListingServer {
+        record: Arc::new(Mutex::new(record)),
+        lookup_entered: Arc::new(tokio::sync::Barrier::new(2)),
+        release_lookup: Arc::new(tokio::sync::Notify::new()),
+        delay_next: Arc::new(AtomicBool::new(true)),
+    };
+    let router = Router::new()
+        .route(
+            "/pub/pubky.app/marketplace/v1/listings/{listing_id}",
+            axum::routing::get(serve_delayed_listing),
+        )
+        .with_state(server.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("delayed homeserver binds");
+    let address = listener.local_addr().expect("delayed homeserver address");
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("delayed homeserver serves");
+    });
+    (format!("http://{address}"), server)
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn sole_enabled_variant_is_an_assertion_and_multi_variant_is_refused(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
@@ -384,6 +549,109 @@ async fn sole_enabled_variant_is_an_assertion_and_multi_variant_is_refused(pool:
     );
     assert_eq!(listing_facts(&app.pool, &aggregate).await, before);
     assert_eq!(inventory_event_count(&app.pool, &aggregate).await, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delayed_variant_lookup_holds_no_transaction_and_revision_binding_refuses_mismatch(
+    pool: PgPool,
+) {
+    let (keypair, seller_pubky) = random_keypair();
+    let record = homeserver_record(
+        &seller_pubky,
+        json!([{"id": "v1", "sku": "SKU-1", "quantity": 3, "enabled": true}]),
+    );
+    let (base_url, homeserver) = spawn_delayed_listing_server(record).await;
+    let client = Arc::new(HttpHomeserverClient::new(&base_url).expect("HTTP client builds"));
+    let app = test_app_with_homeserver_client(pool, client).await;
+    let (status, session) = post_capability_token(&app, &keypair, vec![Capability::root()]).await;
+    assert_eq!(status, StatusCode::CREATED, "session creation: {session}");
+    let token = session["token"].as_str().expect("bearer token").to_string();
+    let (status, second_session) =
+        post_capability_token(&app, &keypair, vec![Capability::root()]).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "second session creation: {second_session}"
+    );
+    let ordinary_token = second_session["token"]
+        .as_str()
+        .expect("second bearer token")
+        .to_string();
+    let seller = TestActor {
+        keypair,
+        pubky: seller_pubky,
+        token,
+    };
+    register(&app, &seller, 3).await;
+    let aggregate = listing_aggregate(&seller.pubky);
+
+    let mut delayed = adjust_request(&seller.pubky, 1, 1, Uuid::new_v4());
+    delayed["variant"] = json!({"id": "v1", "sku": "SKU-1"});
+    let router = app.router.clone();
+    let token = seller.token.clone();
+    let delayed_task = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            "/v1/inventory/adjust",
+            Some(&token),
+            &delayed,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), homeserver.lookup_entered.wait())
+        .await
+        .expect("real HTTP lookup reaches delayed response barrier");
+
+    // This ordinary adjustment uses a second genuine session for the same
+    // seller, so it has an independent rate row but needs the same listing
+    // row. It must finish while the real HttpHomeserverClient response is
+    // still delayed, proving the lookup holds no listing lock or transaction.
+    let ordinary = adjust_request(&seller.pubky, 1, 1, Uuid::new_v4());
+    let ordinary_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        adjust(&app, &ordinary_token, &ordinary),
+    )
+    .await;
+    homeserver.release_lookup.notify_one();
+    let (delayed_status, delayed_body) = tokio::time::timeout(Duration::from_secs(5), delayed_task)
+        .await
+        .expect("delayed variant request finishes")
+        .expect("delayed variant task");
+    let (status, body) =
+        ordinary_result.expect("ordinary adjustment blocked by delayed variant lookup");
+    assert_eq!(status, StatusCode::OK, "ordinary adjustment: {body}");
+    assert_eq!(delayed_status, StatusCode::CONFLICT, "{delayed_body}");
+    assert_eq!(
+        delayed_body["error"]["code"],
+        json!("revision_conflict"),
+        "lookup assertion matched listing revision, but ordinary mutation advanced server revision"
+    );
+    assert_eq!(listing_facts(&app.pool, &aggregate).await, (2, 4, 4, 0, 0));
+    assert_eq!(inventory_event_count(&app.pool, &aggregate).await, 1);
+
+    // The fetched listing-record revision is an assertion bound to the
+    // locked service listing_revision. A newer remote record is not CAS
+    // authority and must be refused without any mutation.
+    homeserver.record.lock().expect("listing record lock")["revision"] = json!(2);
+    let before = listing_facts(&app.pool, &aggregate).await;
+    let results: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inventory_adjustment_results")
+        .fetch_one(&app.pool)
+        .await
+        .expect("result count");
+    let mut mismatched = adjust_request(&seller.pubky, 2, 1, Uuid::new_v4());
+    mismatched["variant"] = json!({"id": "v1"});
+    let (status, body) = adjust(&app, &seller.token, &mismatched).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("variant_record_conflict"));
+    assert_eq!(listing_facts(&app.pool, &aggregate).await, before);
+    assert_eq!(inventory_event_count(&app.pool, &aggregate).await, 1);
+    let after_results: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM inventory_adjustment_results")
+            .fetch_one(&app.pool)
+            .await
+            .expect("result count");
+    assert_eq!(after_results, results);
 }
 
 #[sqlx::test(migrations = "./migrations")]

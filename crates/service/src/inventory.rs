@@ -235,6 +235,21 @@ struct LockedListing {
     sold: i64,
 }
 
+#[derive(Debug)]
+struct ValidatedVariantRecordBinding {
+    seller_pubky: String,
+    listing_id: String,
+    listing_revision: i64,
+    raw_sha256: [u8; 32],
+}
+
+#[derive(Debug)]
+enum StoredAdjustment {
+    Missing,
+    Exact(String),
+    Conflict,
+}
+
 impl StockView {
     fn new(total: i64, available: i64, reserved: i64, sold: i64) -> Self {
         Self {
@@ -437,6 +452,77 @@ async fn finish_without_mutation(tx: Transaction<'_, Postgres>, response: Respon
     }
 }
 
+async fn classify_stored_adjustment(
+    tx: &mut Transaction<'_, Postgres>,
+    session: &AuthSession,
+    request: &ValidatedAdjustRequest,
+    observed_at: DateTime<Utc>,
+) -> Result<StoredAdjustment, sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6341))")
+        .bind(format!("{}:{}", session.actor.0, request.idempotency_key))
+        .execute(&mut **tx)
+        .await?;
+
+    let stored: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT request_hash, result_json, aggregate_id \
+         FROM inventory_adjustment_results \
+         WHERE seller_pubky = $1 AND idempotency_key = $2",
+    )
+    .bind(&session.actor.0)
+    .bind(request.idempotency_key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((original_hash, result_json, original_aggregate)) = stored else {
+        return Ok(StoredAdjustment::Missing);
+    };
+    if original_hash == request.request_hash {
+        return Ok(StoredAdjustment::Exact(result_json));
+    }
+
+    sqlx::query(
+        "INSERT INTO inventory_adjustment_conflicts \
+             (seller_pubky, idempotency_key, aggregate_id, original_request_hash, \
+              conflicting_request_hash, observed_at) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (seller_pubky, idempotency_key, conflicting_request_hash) DO NOTHING",
+    )
+    .bind(&session.actor.0)
+    .bind(request.idempotency_key)
+    .bind(original_aggregate)
+    .bind(original_hash)
+    .bind(&request.request_hash)
+    .bind(observed_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(StoredAdjustment::Conflict)
+}
+
+async fn continue_or_finish_stored<'a>(
+    tx: Transaction<'a, Postgres>,
+    stored: StoredAdjustment,
+) -> Result<Transaction<'a, Postgres>, Response> {
+    match stored {
+        StoredAdjustment::Missing => Ok(tx),
+        StoredAdjustment::Exact(result_json) => {
+            let response: Value = match serde_json::from_str(&result_json) {
+                Ok(response) => response,
+                Err(_) => return Err(internal_error()),
+            };
+            Err(finish_without_mutation(tx, (StatusCode::OK, Json(response)).into_response()).await)
+        }
+        StoredAdjustment::Conflict => Err(finish_without_mutation(
+            tx,
+            inventory_error(
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+                "The idempotency key was already used with different input.",
+                None,
+            ),
+        )
+        .await),
+    }
+}
+
 pub async fn adjust_inventory(
     State(state): State<AppState>,
     Extension(session): Extension<AuthSession>,
@@ -463,82 +549,14 @@ pub async fn adjust_inventory(
         Err(_) => return internal_error(),
     };
 
-    if sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6341))")
-        .bind(format!("{}:{}", session.actor.0, request.idempotency_key))
-        .execute(&mut *tx)
-        .await
-        .is_err()
-    {
-        return internal_error();
-    }
-
-    let stored: Option<(String, String, String)> = match sqlx::query_as(
-        "SELECT request_hash, result_json, aggregate_id \
-         FROM inventory_adjustment_results \
-         WHERE seller_pubky = $1 AND idempotency_key = $2",
-    )
-    .bind(&session.actor.0)
-    .bind(request.idempotency_key)
-    .fetch_optional(&mut *tx)
-    .await
-    {
+    let stored = match classify_stored_adjustment(&mut tx, &session, &request, now).await {
         Ok(stored) => stored,
         Err(_) => return internal_error(),
     };
-    if let Some((original_hash, result_json, original_aggregate)) = stored {
-        if original_hash == request.request_hash {
-            let response: Value = match serde_json::from_str(&result_json) {
-                Ok(response) => response,
-                Err(_) => return internal_error(),
-            };
-            return finish_without_mutation(tx, (StatusCode::OK, Json(response)).into_response())
-                .await;
-        }
-        if consume_rate(&mut tx, &session, "inventory.adjust", now, config)
-            .await
-            .is_err()
-        {
-            return internal_error();
-        }
-        if sqlx::query(
-            "INSERT INTO inventory_adjustment_conflicts \
-                 (seller_pubky, idempotency_key, aggregate_id, original_request_hash, \
-                  conflicting_request_hash, observed_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (seller_pubky, idempotency_key, conflicting_request_hash) DO NOTHING",
-        )
-        .bind(&session.actor.0)
-        .bind(request.idempotency_key)
-        .bind(original_aggregate)
-        .bind(original_hash)
-        .bind(&request.request_hash)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .is_err()
-        {
-            return internal_error();
-        }
-        return finish_without_mutation(
-            tx,
-            inventory_error(
-                StatusCode::CONFLICT,
-                "idempotency_conflict",
-                "The idempotency key was already used with different input.",
-                None,
-            ),
-        )
-        .await;
-    }
-
-    let rate_allowed = match consume_rate(&mut tx, &session, "inventory.adjust", now, config).await
-    {
-        Ok(allowed) => allowed,
-        Err(_) => return internal_error(),
+    let mut tx = match continue_or_finish_stored(tx, stored).await {
+        Ok(tx) => tx,
+        Err(response) => return response,
     };
-    if !rate_allowed {
-        return finish_without_mutation(tx, rate_limited("inventory.adjust")).await;
-    }
 
     let expected_aggregate =
         marketplace_domain::ids::listing_aggregate_id(&session.actor.0, &request.wire.listing_id);
@@ -553,6 +571,52 @@ pub async fn adjust_inventory(
             ),
         )
         .await;
+    }
+
+    // The first short transaction preserves replay/conflict precedence under
+    // the idempotency advisory lock. For a new variant-addressed request it
+    // closes before remote I/O; after validation, the mutation transaction
+    // re-acquires the same lock and reclassifies to close the concurrency gap.
+    let variant_binding = if let Some(assertion) = &request.wire.variant {
+        if tx.commit().await.is_err() {
+            return internal_error();
+        }
+        let binding = match validate_variant_assertion(
+            &state,
+            &session.actor.0,
+            &request.wire.listing_id,
+            assertion,
+        )
+        .await
+        {
+            Ok(binding) => binding,
+            Err(response) => return response,
+        };
+        let mut mutation_tx = match state.pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => return internal_error(),
+        };
+        let stored =
+            match classify_stored_adjustment(&mut mutation_tx, &session, &request, now).await {
+                Ok(stored) => stored,
+                Err(_) => return internal_error(),
+            };
+        tx = match continue_or_finish_stored(mutation_tx, stored).await {
+            Ok(tx) => tx,
+            Err(response) => return response,
+        };
+        Some(binding)
+    } else {
+        None
+    };
+
+    let rate_allowed = match consume_rate(&mut tx, &session, "inventory.adjust", now, config).await
+    {
+        Ok(allowed) => allowed,
+        Err(_) => return internal_error(),
+    };
+    if !rate_allowed {
+        return finish_without_mutation(tx, rate_limited("inventory.adjust")).await;
     }
 
     let listing: Option<LockedListing> = match sqlx::query_as(
@@ -592,6 +656,28 @@ pub async fn adjust_inventory(
         )
         .await;
     }
+    if let Some(binding) = &variant_binding {
+        // The digest binds the exact bytes validated before this transaction.
+        // It is intentionally not compared with listings.content_hash, which
+        // is a media hash rather than a listing-record digest. The locked
+        // seller/id/revision tuple remains the service authority.
+        let _validated_raw_sha256 = binding.raw_sha256;
+        if binding.seller_pubky != listing.seller_pubky
+            || binding.listing_id != listing.listing_id
+            || binding.listing_revision != listing.listing_revision
+        {
+            return finish_without_mutation(
+                tx,
+                inventory_error(
+                    StatusCode::CONFLICT,
+                    "variant_record_conflict",
+                    "The seller listing record does not match the registered listing.",
+                    None,
+                ),
+            )
+            .await;
+        }
+    }
     if listing.server_revision != request.wire.expected_revision {
         return finish_without_mutation(
             tx,
@@ -603,12 +689,6 @@ pub async fn adjust_inventory(
             ),
         )
         .await;
-    }
-
-    if let Some(assertion) = &request.wire.variant {
-        if let Err(response) = verify_variant_assertion(&state, &listing, assertion).await {
-            return finish_without_mutation(tx, response).await;
-        }
     }
 
     if let Some(reference) = &request.wire.external_ref {
@@ -832,11 +912,12 @@ pub async fn adjust_inventory(
     }
 }
 
-async fn verify_variant_assertion(
+async fn validate_variant_assertion(
     state: &AppState,
-    listing: &LockedListing,
+    expected_seller_pubky: &str,
+    expected_listing_id: &str,
     assertion: &VariantAssertion,
-) -> Result<(), Response> {
+) -> Result<ValidatedVariantRecordBinding, Response> {
     let Some(homeserver) = state.homeserver.as_deref() else {
         return Err(inventory_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -846,7 +927,7 @@ async fn verify_variant_assertion(
         ));
     };
     let raw = match homeserver
-        .fetch_listing_raw(&listing.seller_pubky, &listing.listing_id)
+        .fetch_listing_raw(expected_seller_pubky, expected_listing_id)
         .await
     {
         HomeserverRawFetchOutcome::Found(raw) => raw,
@@ -869,9 +950,12 @@ async fn verify_variant_assertion(
             None,
         )
     })?;
-    if record.get("ownerPubky").and_then(Value::as_str) != Some(&listing.seller_pubky)
-        || record.get("listingId").and_then(Value::as_str) != Some(&listing.listing_id)
-        || record.get("revision").and_then(Value::as_i64) != Some(listing.listing_revision)
+    let record_seller = record.get("ownerPubky").and_then(Value::as_str);
+    let record_listing_id = record.get("listingId").and_then(Value::as_str);
+    let record_revision = record.get("revision").and_then(Value::as_i64);
+    if record_seller != Some(expected_seller_pubky)
+        || record_listing_id != Some(expected_listing_id)
+        || record_revision.is_none()
     {
         return Err(inventory_error(
             StatusCode::CONFLICT,
@@ -931,7 +1015,12 @@ async fn verify_variant_assertion(
             None,
         ));
     }
-    Ok(())
+    Ok(ValidatedVariantRecordBinding {
+        seller_pubky: record_seller.expect("checked above").to_string(),
+        listing_id: record_listing_id.expect("checked above").to_string(),
+        listing_revision: record_revision.expect("checked above"),
+        raw_sha256: Sha256::digest(&raw).into(),
+    })
 }
 
 pub async fn get_inventory_projection(
