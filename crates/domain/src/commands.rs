@@ -533,26 +533,6 @@ pub const LOCKS_CONTENT_LOCK_PREFIX: &str = "/pub/locks.app/";
 /// whitespace) stays part of the resource and fails validation.
 pub const PUBKY_RESOURCE_SCHEME: &str = "pubky://";
 
-/// Splits an addressed lock resource into `(creator, lock_id)` when it has
-/// the canonical form `<z-base-32 creator>/pub/locks.app/<lock_id>.json`
-/// with a 52-character canonical Crockford lock id. An optional leading
-/// [`PUBKY_RESOURCE_SCHEME`] prefix (the Shop client's addressing form) is
-/// stripped first; every other deviation stays rejected.
-pub fn parse_lock_resource(resource: &str) -> Option<(&str, &str)> {
-    let resource = resource
-        .strip_prefix(PUBKY_RESOURCE_SCHEME)
-        .unwrap_or(resource);
-    let (creator, path) = resource.split_at(resource.find(LOCKS_CONTENT_LOCK_PREFIX)?);
-    let lock_id = path
-        .strip_prefix(LOCKS_CONTENT_LOCK_PREFIX)?
-        .strip_suffix(".json")?;
-    if is_valid_pubky(creator) && crockford_id_regex_52().is_match(lock_id) {
-        Some((creator, lock_id))
-    } else {
-        None
-    }
-}
-
 /// Canonicalizes an addressed lock resource to the bare form
 /// `<creator>/pub/locks.app/<LOCK_ID>.json`: strips an optional leading
 /// [`PUBKY_RESOURCE_SCHEME`], requires the remainder to name a valid pubky
@@ -2504,11 +2484,6 @@ mod tests {
         let bare = bare_lock_resource();
         let addressed = format!("{PUBKY_RESOURCE_SCHEME}{bare}");
         assert_eq!(
-            parse_lock_resource(&bare),
-            Some(("y".repeat(52).as_str(), LOCK_ID))
-        );
-        assert_eq!(parse_lock_resource(&addressed), parse_lock_resource(&bare));
-        assert_eq!(
             canonical_lock_resource(&bare).as_deref(),
             Some(bare.as_str())
         );
@@ -2526,8 +2501,6 @@ mod tests {
             canonical_lock_resource(&lowercase).as_deref(),
             Some(bare.as_str())
         );
-        // The strict parser still requires the canonical uppercase id.
-        assert_eq!(parse_lock_resource(&lowercase), None);
     }
 
     #[test]
@@ -2557,11 +2530,6 @@ mod tests {
             bare.replace(&"y".repeat(52), &"l".repeat(52)),
         ];
         for resource in &rejections {
-            assert_eq!(
-                parse_lock_resource(resource),
-                None,
-                "parse must reject {resource:?}"
-            );
             assert_eq!(
                 canonical_lock_resource(resource),
                 None,
