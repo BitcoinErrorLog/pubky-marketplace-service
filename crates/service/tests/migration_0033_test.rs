@@ -49,7 +49,7 @@ async fn apply_0033(pool: &PgPool) {
         .expect("real 0033 migration applies");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
     let through_0033_without_0032 = Migrator {
         migrations: Cow::Owned(
