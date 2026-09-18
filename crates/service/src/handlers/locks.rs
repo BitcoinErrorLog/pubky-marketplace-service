@@ -44,7 +44,7 @@
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
-    parse_lock_resource, PrepareLocksPayload, RegisterLocksPayload,
+    canonical_lock_resource, PrepareLocksPayload, RegisterLocksPayload, LOCKS_CONTENT_LOCK_PREFIX,
 };
 use marketplace_domain::{ids, Command, ErrorCode};
 use serde_json::json;
@@ -472,7 +472,14 @@ pub async fn prepare(
             "The checkout Locks snapshot does not match the payment.",
         )));
     }
-    let Some((creator, _)) = parse_lock_resource(&resource) else {
+    let Some(canonical_resource) = canonical_lock_resource(&resource) else {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvalidState,
+            "The seller's Locks resource is invalid.",
+        )));
+    };
+    let Some((creator, content_path)) = canonical_resource.split_once(LOCKS_CONTENT_LOCK_PREFIX)
+    else {
         return Ok(Err(CommandFailure::new(
             ErrorCode::InvalidState,
             "The seller's Locks resource is invalid.",
@@ -487,9 +494,7 @@ pub async fn prepare(
     let content = match homeserver
         .fetch_content_lock(
             creator,
-            resource
-                .strip_prefix(creator)
-                .expect("creator prefixes canonical resource"),
+            &format!("{LOCKS_CONTENT_LOCK_PREFIX}{content_path}"),
         )
         .await
     {
