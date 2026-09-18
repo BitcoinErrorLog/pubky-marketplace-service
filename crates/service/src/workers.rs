@@ -373,9 +373,9 @@ pub struct AuctionCloseBatchSummary {
     pub failed: u64,
 }
 
-/// Canonical auction timestamps are fixed-width UTC strings, so lexical
-/// ordering safely over-selects due candidates without a fallible SQL cast.
-/// The locked Rust path remains authoritative for validity and due-ness.
+/// Canonical auction timestamps are fixed-width UTC strings. PostgreSQL's
+/// non-throwing input check validates their calendar values before a guarded
+/// cast; the locked Rust path remains authoritative for validity and due-ness.
 const AUCTION_INSTANT: &str = r"^[0-9]{4}-(0[1-9]|1[0-2])-([012][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{3}Z$";
 
 /// Authoritatively closes a bounded batch of active auctions whose end time
@@ -389,19 +389,28 @@ pub async fn close_due_auctions(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> anyhow::Result<AuctionCloseBatchSummary> {
-    let now_text = crate::clock::format_timestamp(now);
     let due: Vec<String> = sqlx::query_scalar(
-        "WITH valid_due AS ( \
-             SELECT aggregate_id, auction->>'ends_at' AS ends_at, 0 AS lane \
+        "WITH classified AS MATERIALIZED ( \
+             SELECT aggregate_id, \
+                 CASE \
+                     WHEN auction->>'ends_at' ~ $2 \
+                         AND pg_input_is_valid( \
+                             auction->>'ends_at', 'timestamp with time zone' \
+                         ) \
+                     THEN (auction->>'ends_at')::timestamptz \
+                     ELSE NULL \
+                 END AS ends_at \
              FROM listings \
              WHERE sale_format = 'auction' AND auction->>'status' = 'active' \
-             AND auction->>'ends_at' ~ $2 AND auction->>'ends_at' <= $1 \
-             ORDER BY auction->>'ends_at', aggregate_id LIMIT $3 \
+         ), valid_due AS ( \
+             SELECT aggregate_id, ends_at, 0 AS lane \
+             FROM classified \
+             WHERE ends_at IS NOT NULL AND ends_at <= $1 \
+             ORDER BY ends_at, aggregate_id LIMIT $3 \
          ), malformed AS ( \
-             SELECT aggregate_id, NULL::text AS ends_at, 1 AS lane \
-             FROM listings \
-             WHERE sale_format = 'auction' AND auction->>'status' = 'active' \
-             AND (auction->>'ends_at' IS NULL OR auction->>'ends_at' !~ $2) \
+             SELECT aggregate_id, NULL::timestamptz AS ends_at, 1 AS lane \
+             FROM classified \
+             WHERE ends_at IS NULL \
              ORDER BY aggregate_id LIMIT $3 \
          ) \
          SELECT aggregate_id FROM ( \
@@ -409,7 +418,7 @@ pub async fn close_due_auctions(
          ) candidates \
          ORDER BY lane, ends_at, aggregate_id",
     )
-    .bind(now_text)
+    .bind(now)
     .bind(AUCTION_INSTANT)
     .bind(AUCTION_CLOSE_BATCH_SIZE)
     .fetch_all(pool)

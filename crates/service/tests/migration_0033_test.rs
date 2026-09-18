@@ -429,6 +429,113 @@ async fn malformed_auction_documents_are_isolated_from_a_due_peer(pool: PgPool) 
 }
 
 #[sqlx::test(migrations = false)]
+async fn calendar_invalid_timestamps_cannot_starve_a_due_peer(pool: PgPool) {
+    common::install_log_capture();
+    migrate_through_0031(&pool).await;
+    let seller = "h".repeat(52);
+    let mut invalid_ids = Vec::new();
+    for index in 0..100 {
+        invalid_ids.push(
+            seed_production_shaped_legacy_auction(
+                &pool,
+                &seller,
+                &format!("calendar_invalid_{index:03}"),
+                "Calendar-invalid close fixture",
+            )
+            .await,
+        );
+    }
+    let valid = seed_production_shaped_legacy_auction(
+        &pool,
+        &"i".repeat(52),
+        "valid_due_after_calendar_invalid",
+        "Valid due peer after calendar-invalid fixtures",
+    )
+    .await;
+    apply_0033(&pool).await;
+
+    let invalid_timestamp = "2026-02-30T00:00:00.000Z";
+    sqlx::query(
+        "UPDATE listings
+         SET auction = jsonb_set(
+             jsonb_set(
+                 auction,
+                 '{ends_at}',
+                 to_jsonb($2::text)
+             ),
+             '{telemetry_secret}',
+             to_jsonb($3::text)
+         )
+         WHERE aggregate_id = ANY($1)",
+    )
+    .bind(&invalid_ids)
+    .bind(invalid_timestamp)
+    .bind("calendar-invalid-payload-do-not-log")
+    .execute(&pool)
+    .await
+    .expect("calendar-invalid timestamps seed");
+
+    let app = test_app(pool).await;
+    app.clock.advance_seconds(2_772_480);
+    let summary = marketplace_service::workers::close_due_auctions(&app.pool, app.clock.now())
+        .await
+        .expect("calendar-invalid rows cannot abort or starve the bounded batch");
+    assert_eq!(
+        summary,
+        AuctionCloseBatchSummary {
+            closed: 1,
+            failed: 100
+        }
+    );
+    assert!(summary.closed + summary.failed <= 200);
+
+    let invalid_active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM listings
+         WHERE aggregate_id = ANY($1) AND auction->>'status' = 'active'",
+    )
+    .bind(&invalid_ids)
+    .fetch_one(&app.pool)
+    .await
+    .expect("calendar-invalid states read");
+    assert_eq!(invalid_active, 100);
+    let valid_status: String =
+        sqlx::query_scalar("SELECT auction->>'status' FROM listings WHERE aggregate_id = $1")
+            .bind(&valid)
+            .fetch_one(&app.pool)
+            .await
+            .expect("valid due peer state reads");
+    assert_eq!(valid_status, "unsold");
+
+    let logs = common::captured_logs();
+    let invalid_failure_lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| {
+            invalid_ids
+                .iter()
+                .any(|aggregate_id| line.contains(aggregate_id))
+        })
+        .collect();
+    assert_eq!(invalid_failure_lines.len(), 100);
+    for line in invalid_failure_lines {
+        assert!(line.contains("auction_close_failed"), "{line}");
+        assert!(
+            line.contains("auction close failed; continuing batch"),
+            "{line}"
+        );
+    }
+    for forbidden in [
+        invalid_timestamp,
+        "calendar-invalid-payload-do-not-log",
+        "reserve_price",
+        "reservePrice",
+        "reserve_met",
+        "reserveMet",
+    ] {
+        assert!(!logs.contains(forbidden), "{logs}");
+    }
+}
+
+#[sqlx::test(migrations = false)]
 async fn due_auction_selection_is_bounded_and_drains_oldest_first(pool: PgPool) {
     migrate_through_0031(&pool).await;
     let seller = "g".repeat(52);
