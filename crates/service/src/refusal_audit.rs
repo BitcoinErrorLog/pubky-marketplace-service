@@ -4,11 +4,15 @@
 //! owned by a separate task and must never be awaited by a command handler.
 
 use std::fmt;
+use std::time::Duration;
 
 use base64::Engine;
+use chrono::{DateTime, Timelike, Utc};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use sqlx::PgPool;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const HKDF_SALT: &[u8] = b"marketplace/refusal-audit/hkdf-salt/v1";
@@ -69,6 +73,160 @@ pub enum RefusalKind {
     ManualResolveStockUnavailable = 34,
 }
 
+#[derive(Debug, Clone)]
+pub struct RefusalEnvelope {
+    pub occurred_at: DateTime<Utc>,
+    pub surface: SurfaceKind,
+    pub command_kind: i16,
+    pub refusal_kind: RefusalKind,
+    pub actor_epoch: i16,
+    pub actor_tag: [u8; 16],
+    pub sample_command_tag: Option<[u8; 16]>,
+    pub command_id_present: bool,
+}
+
+#[derive(Clone)]
+pub struct RefusalAuditRuntime {
+    sender: mpsc::Sender<RefusalEnvelope>,
+    keys: AuditKeys,
+}
+
+impl fmt::Debug for RefusalAuditRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RefusalAuditRuntime")
+            .field("active_epoch", &self.keys.active_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RefusalAuditRuntime {
+    pub fn spawn(pool: PgPool, keys: AuditKeys) -> Self {
+        let (sender, mut receiver) = mpsc::channel(QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            while let Some(envelope) = receiver.recv().await {
+                // The consumer alone owns the writer connection work. A
+                // failure is deliberately logged and discarded: delivery is
+                // observability, never part of a marketplace command result.
+                if let Err(error) = deliver(&pool, &envelope).await {
+                    tracing::warn!(error = %error, "refusal audit delivery failed");
+                }
+            }
+        });
+        Self { sender, keys }
+    }
+
+    pub fn envelope(
+        &self,
+        occurred_at: DateTime<Utc>,
+        surface: SurfaceKind,
+        command_kind: i16,
+        refusal_kind: RefusalKind,
+        actor: &str,
+        command_id: Option<Uuid>,
+    ) -> anyhow::Result<RefusalEnvelope> {
+        Ok(RefusalEnvelope {
+            occurred_at,
+            surface,
+            command_kind,
+            refusal_kind,
+            actor_epoch: self.keys.active_epoch,
+            actor_tag: self.keys.actor_tag(actor)?,
+            sample_command_tag: command_id
+                .map(|id| self.keys.sample_tag(surface, actor, id))
+                .transpose()?,
+            command_id_present: command_id.is_some(),
+        })
+    }
+
+    /// This never awaits queue capacity or does database work.
+    pub fn try_send(&self, envelope: RefusalEnvelope) {
+        if self.sender.try_send(envelope).is_err() {
+            tracing::warn!("refusal audit envelope dropped");
+        }
+    }
+}
+
+async fn deliver(pool: &PgPool, envelope: &RefusalEnvelope) -> Result<(), sqlx::Error> {
+    let bucket = envelope
+        .occurred_at
+        .with_minute(0)
+        .and_then(|value| value.with_second(0))
+        .and_then(|value| value.with_nanosecond(0))
+        .expect("valid timestamp hour");
+    tokio::time::timeout(Duration::from_millis(250), async {
+        let mut transaction = pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '200ms'; SET LOCAL lock_timeout = '50ms'")
+            .execute(&mut *transaction)
+            .await?;
+        let updated = sqlx::query(
+            "UPDATE command_refusal_audit_buckets SET \
+             occurrence_count = CASE WHEN occurrence_count = 9223372036854775807 THEN occurrence_count ELSE occurrence_count + 1 END, \
+             count_saturated = count_saturated OR occurrence_count = 9223372036854775807, \
+             last_occurred_at = GREATEST(last_occurred_at, $1) \
+             WHERE bucket_start = $2 AND surface_kind = $3 AND command_kind = $4 \
+             AND refusal_kind = $5 AND actor_key_epoch = $6 AND actor_tag = $7",
+        )
+        .bind(envelope.occurred_at)
+        .bind(bucket)
+        .bind(envelope.surface as i16)
+        .bind(envelope.command_kind)
+        .bind(envelope.refusal_kind as i16)
+        .bind(envelope.actor_epoch)
+        .bind(envelope.actor_tag.as_slice())
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() == 0 {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 32))")
+                .bind(bucket.to_rfc3339())
+                .execute(&mut *transaction)
+                .await?;
+            let second_update = sqlx::query(
+                "UPDATE command_refusal_audit_buckets SET occurrence_count = occurrence_count + 1, \
+                 last_occurred_at = GREATEST(last_occurred_at, $1) WHERE bucket_start = $2 \
+                 AND surface_kind = $3 AND command_kind = $4 AND refusal_kind = $5 \
+                 AND actor_key_epoch = $6 AND actor_tag = $7",
+            )
+            .bind(envelope.occurred_at).bind(bucket).bind(envelope.surface as i16)
+            .bind(envelope.command_kind).bind(envelope.refusal_kind as i16)
+            .bind(envelope.actor_epoch).bind(envelope.actor_tag.as_slice())
+            .execute(&mut *transaction).await?;
+            if second_update.rows_affected() == 0 {
+                sqlx::query(
+                    "INSERT INTO command_refusal_audit_bucket_limits (bucket_start, admitted_rows) VALUES ($1, 0) \
+                     ON CONFLICT (bucket_start) DO NOTHING",
+                ).bind(bucket).execute(&mut *transaction).await?;
+                let admitted: i32 = sqlx::query_scalar(
+                    "SELECT admitted_rows FROM command_refusal_audit_bucket_limits WHERE bucket_start = $1 FOR UPDATE",
+                ).bind(bucket).fetch_one(&mut *transaction).await?;
+                if admitted < MAX_ADMITTED_ROWS_PER_HOUR {
+                    sqlx::query(
+                        "INSERT INTO command_refusal_audit_buckets \
+                         (bucket_start,surface_kind,command_kind,refusal_kind,actor_key_epoch,actor_tag,occurrence_count,first_occurred_at,last_occurred_at,sample_command_tag,command_id_present) \
+                         VALUES ($1,$2,$3,$4,$5,$6,1,$7,$7,$8,$9)",
+                    ).bind(bucket).bind(envelope.surface as i16).bind(envelope.command_kind)
+                     .bind(envelope.refusal_kind as i16).bind(envelope.actor_epoch)
+                     .bind(envelope.actor_tag.as_slice()).bind(envelope.occurred_at)
+                     .bind(envelope.sample_command_tag.as_ref().map(|tag| tag.as_slice()))
+                     .bind(envelope.command_id_present).execute(&mut *transaction).await?;
+                    sqlx::query("UPDATE command_refusal_audit_bucket_limits SET admitted_rows = admitted_rows + 1 WHERE bucket_start = $1")
+                        .bind(bucket).execute(&mut *transaction).await?;
+                } else {
+                    sqlx::query(
+                        "UPDATE command_refusal_audit_bucket_limits SET \
+                         overflow_count = CASE WHEN overflow_count = 9223372036854775807 THEN overflow_count ELSE overflow_count + 1 END, \
+                         overflow_saturated = overflow_saturated OR overflow_count = 9223372036854775807 \
+                         WHERE bucket_start = $1",
+                    ).bind(bucket).execute(&mut *transaction).await?;
+                }
+            }
+        }
+        transaction.commit().await
+    })
+    .await
+    .map_err(|_| sqlx::Error::PoolTimedOut)?
+}
+
 impl RefusalKind {
     pub const fn name(self) -> &'static str {
         match self {
@@ -94,7 +252,9 @@ impl RefusalKind {
             Self::ManualResolveConfirmationObservationMismatch => {
                 "manual_resolve_confirmation_observation_mismatch"
             }
-            Self::ManualResolveConfirmationEffectsFailed => "manual_resolve_confirmation_effects_failed",
+            Self::ManualResolveConfirmationEffectsFailed => {
+                "manual_resolve_confirmation_effects_failed"
+            }
             Self::ManualResolveInvalidReason => "manual_resolve_invalid_reason",
             Self::ManualResolveInvalidIdempotencyKey => "manual_resolve_invalid_idempotency_key",
             Self::ManualResolveInvalidOutcome => "manual_resolve_invalid_outcome",
@@ -151,7 +311,10 @@ impl fmt::Debug for AuditKeys {
         formatter
             .debug_struct("AuditKeys")
             .field("active_epoch", &self.active_epoch)
-            .field("previous_epoch", &self.previous.as_ref().map(|value| value.0))
+            .field(
+                "previous_epoch",
+                &self.previous.as_ref().map(|value| value.0),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -197,7 +360,10 @@ impl AuditKeys {
         actor: &str,
         command_id: Uuid,
     ) -> anyhow::Result<[u8; 16]> {
-        tag(&self.active_sample, sample_input(surface, actor, command_id)?)
+        tag(
+            &self.active_sample,
+            sample_input(surface, actor, command_id)?,
+        )
     }
 
     pub fn previous_epoch(&self) -> Option<i16> {
@@ -212,9 +378,7 @@ fn parse_root(value: &str) -> anyhow::Result<[u8; 32]> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(value)
         .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_ROOT_B64 must be canonical base64"))?;
-    if decoded.len() != 32
-        || base64::engine::general_purpose::STANDARD.encode(&decoded) != value
-    {
+    if decoded.len() != 32 || base64::engine::general_purpose::STANDARD.encode(&decoded) != value {
         anyhow::bail!("REFUSAL_AUDIT_HMAC_ROOT_B64 must encode 32 bytes");
     }
     decoded
@@ -283,8 +447,7 @@ fn tag(key: &[u8; 32], input: Vec<u8>) -> anyhow::Result<[u8; 16]> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key)
         .map_err(|_| anyhow::anyhow!("audit HMAC initialization failed"))?;
     mac.update(&input);
-    mac.finalize()
-        .into_bytes()[..16]
+    mac.finalize().into_bytes()[..16]
         .try_into()
         .map_err(|_| anyhow::anyhow!("audit tag truncation failed"))
 }
@@ -298,12 +461,17 @@ mod tests {
         let root = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
         let first = AuditKeys::parse(&root, "1", None, None).unwrap();
         let second = AuditKeys::parse(&root, "2", None, None).unwrap();
-        let actor = "ybndrfg8ejkmcpqxot1uwisza345h769ybndrfg8ejkmcpqxot1";
+        let actor = pubky_common::crypto::Keypair::random().public_key().z32();
         let command = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
-        assert_ne!(first.actor_tag(actor).unwrap(), second.actor_tag(actor).unwrap());
         assert_ne!(
-            first.actor_tag(actor).unwrap(),
-            first.sample_tag(SurfaceKind::V1Command, actor, command).unwrap()
+            first.actor_tag(&actor).unwrap(),
+            second.actor_tag(&actor).unwrap()
+        );
+        assert_ne!(
+            first.actor_tag(&actor).unwrap(),
+            first
+                .sample_tag(SurfaceKind::V1Command, &actor, command)
+                .unwrap()
         );
     }
 

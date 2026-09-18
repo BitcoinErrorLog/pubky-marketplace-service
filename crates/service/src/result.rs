@@ -2,11 +2,14 @@ use marketplace_domain::{Command, ErrorCode, ValidationIssue};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::refusal_audit::{refusal_kind_for_error, RefusalKind};
+
 /// A rejected command. Field names and messages match the TypeScript
 /// prototype engine; wire casing is snake_case per ADR-0019 §3.
 #[derive(Debug, Clone)]
 pub struct CommandFailure {
     pub code: ErrorCode,
+    pub refusal_kind: RefusalKind,
     pub message: String,
     pub current_revision: Option<i64>,
     pub issues: Option<Vec<ValidationIssue>>,
@@ -16,6 +19,7 @@ impl CommandFailure {
     pub fn new(code: ErrorCode, message: &str) -> Self {
         Self {
             code,
+            refusal_kind: refusal_kind_for_error(code),
             message: message.to_string(),
             current_revision: None,
             issues: None,
@@ -32,6 +36,7 @@ impl CommandFailure {
     pub fn invalid_command(issues: Vec<ValidationIssue>) -> Self {
         Self {
             issues: Some(issues),
+            refusal_kind: RefusalKind::InvalidEnvelope,
             ..Self::new(
                 ErrorCode::InvalidCommand,
                 "The marketplace command is invalid.",

@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::logging::{log_command, log_invalid_command};
 use crate::model::redact_command_result;
+use crate::refusal_audit::{RefusalKind, SurfaceKind};
 use crate::result::{success_body, CommandFailure, HandlerResult};
 use crate::AppState;
 
@@ -34,7 +35,18 @@ pub async fn execute(
         Ok(command) => command,
         Err(issues) => {
             log_invalid_command(Some(actor), started.elapsed().as_millis() as u64);
-            return Ok(failure_response(&CommandFailure::invalid_command(issues)));
+            let failure = CommandFailure::invalid_command(issues);
+            let response = failure_response(&failure);
+            enqueue_refusal(
+                state,
+                actor,
+                state.clock.now(),
+                SurfaceKind::V1Command,
+                0,
+                RefusalKind::InvalidEnvelope,
+                None,
+            );
+            return Ok(response);
         }
     };
     let request_hash = command.request_hash();
@@ -169,7 +181,23 @@ pub async fn execute(
             Ok((StatusCode::OK, body))
         }
         Ok(Err(failure)) => {
+            let response = failure_response(&failure);
+            let descriptor = state.refusal_audit.as_ref().and_then(|audit| {
+                audit
+                    .envelope(
+                        now,
+                        SurfaceKind::V1Command,
+                        command_kind(&command.payload),
+                        failure.refusal_kind,
+                        actor,
+                        Some(command.command_id),
+                    )
+                    .ok()
+            });
             tx.rollback().await?;
+            if let (Some(audit), Some(descriptor)) = (&state.refusal_audit, descriptor) {
+                audit.try_send(descriptor);
+            }
             log_command(
                 actor,
                 command.kind(),
@@ -183,7 +211,7 @@ pub async fn execute(
                     .unwrap_or(command.expected_revision),
                 started.elapsed().as_millis() as u64,
             );
-            Ok(failure_response(&failure))
+            Ok(response)
         }
         Err(error) => {
             tx.rollback().await?;
@@ -207,6 +235,62 @@ pub async fn execute(
             }
             Err(error)
         }
+    }
+}
+
+fn enqueue_refusal(
+    state: &AppState,
+    actor: &str,
+    now: DateTime<Utc>,
+    surface: SurfaceKind,
+    command_kind: i16,
+    refusal_kind: RefusalKind,
+    command_id: Option<Uuid>,
+) {
+    if let Some(audit) = &state.refusal_audit {
+        if let Ok(descriptor) =
+            audit.envelope(now, surface, command_kind, refusal_kind, actor, command_id)
+        {
+            audit.try_send(descriptor);
+        }
+    }
+}
+
+fn command_kind(payload: &CommandPayload) -> i16 {
+    match payload {
+        CommandPayload::RegisterListing(_) => 1,
+        CommandPayload::SyncListing(_) => 2,
+        CommandPayload::SyncDrop(_) => 3,
+        CommandPayload::CancelDrop(_) => 4,
+        CommandPayload::ReleaseDropListings(_) => 5,
+        CommandPayload::ReserveInventory(_) => 6,
+        CommandPayload::CreateCheckout(_) => 7,
+        CommandPayload::CreateOffer(_) => 8,
+        CommandPayload::CounterOffer(_) => 9,
+        CommandPayload::AcceptOffer(_) => 10,
+        CommandPayload::OfferCheckout(_) => 11,
+        CommandPayload::RejectOffer(_) => 12,
+        CommandPayload::WithdrawOffer(_) => 13,
+        CommandPayload::PlaceBid(_) => 14,
+        CommandPayload::CloseAuction(_) => 15,
+        CommandPayload::AdvanceSandboxPayment(_) => 16,
+        CommandPayload::PrepareLocks(_) => 17,
+        CommandPayload::RegisterLocks(_) => 18,
+        CommandPayload::RequestCancellation(_) => 19,
+        CommandPayload::ApproveCancellation(_) => 20,
+        CommandPayload::ShipOrder(_) => 21,
+        CommandPayload::ConfirmDelivery(_) => 22,
+        CommandPayload::SetPickupDetails(_) => 23,
+        CommandPayload::ClearPickupDetails(_) => 24,
+        CommandPayload::MarkReadyForPickup(_) => 25,
+        CommandPayload::ConfirmPickup(_) => 26,
+        CommandPayload::RequestReturn(_) => 27,
+        CommandPayload::ApproveReturn(_) => 28,
+        CommandPayload::ReceiveReturn(_) => 29,
+        CommandPayload::RecordExternalRefund(_) => 30,
+        CommandPayload::CreateReview(_) => 31,
+        CommandPayload::UpdateReview(_) => 32,
+        CommandPayload::SetBandConsent(_) => 33,
     }
 }
 

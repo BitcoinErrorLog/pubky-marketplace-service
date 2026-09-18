@@ -142,8 +142,12 @@ impl Config {
                 .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_ROOT_B64 must be set"))?,
             &std::env::var("REFUSAL_AUDIT_HMAC_KEY_EPOCH")
                 .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_KEY_EPOCH must be set"))?,
-            std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64").ok().as_deref(),
-            std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH").ok().as_deref(),
+            std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64")
+                .ok()
+                .as_deref(),
+            std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH")
+                .ok()
+                .as_deref(),
         )?;
         let bind_addr = std::env::var("BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -237,13 +241,14 @@ impl Config {
 
     /// Configuration used by the integration test harness.
     pub fn for_tests() -> Self {
-        let test_root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
+        let test_root =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
         Self {
             bind_addr: "127.0.0.1:0".parse().expect("valid test bind address"),
             database_url: String::new(),
             refusal_audit_database_url: "postgres://writer@audit.test/refusal_audit".to_string(),
-            refusal_audit_retention_database_url:
-                "postgres://retention@audit.test/refusal_audit".to_string(),
+            refusal_audit_retention_database_url: "postgres://retention@audit.test/refusal_audit"
+                .to_string(),
             refusal_audit_keys: AuditKeys::parse(&test_root, "1", None, None)
                 .expect("test audit key parses"),
             allowed_origins: vec![HeaderValue::from_static("http://localhost:3000")],
@@ -298,7 +303,12 @@ fn reject_audit_url_reuse(first: &str, second: &str) -> anyhow::Result<()> {
     let second = Url::parse(second).map_err(|_| anyhow::anyhow!("database URL must be valid"))?;
     let normalized = |url: &Url| {
         (
-            if url.scheme() == "postgresql" { "postgres" } else { url.scheme() }.to_string(),
+            if url.scheme() == "postgresql" {
+                "postgres"
+            } else {
+                url.scheme()
+            }
+            .to_string(),
             url.username().to_string(),
             url.password().map(str::to_string),
             url.host_str().unwrap_or("localhost").to_string(),
@@ -388,7 +398,24 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let previous_database_url = std::env::var("DATABASE_URL").ok();
         let previous_fx_feed_url = std::env::var("FX_FEED_URL").ok();
+        let previous_writer_url = std::env::var("REFUSAL_AUDIT_DATABASE_URL").ok();
+        let previous_retention_url = std::env::var("REFUSAL_AUDIT_RETENTION_DATABASE_URL").ok();
+        let previous_root = std::env::var("REFUSAL_AUDIT_HMAC_ROOT_B64").ok();
+        let previous_epoch = std::env::var("REFUSAL_AUDIT_HMAC_KEY_EPOCH").ok();
         std::env::set_var("DATABASE_URL", "postgres://example.invalid/test");
+        std::env::set_var(
+            "REFUSAL_AUDIT_DATABASE_URL",
+            "postgres://writer@audit.example/refusal",
+        );
+        std::env::set_var(
+            "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
+            "postgres://retention@audit.example/refusal",
+        );
+        std::env::set_var(
+            "REFUSAL_AUDIT_HMAC_ROOT_B64",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]),
+        );
+        std::env::set_var("REFUSAL_AUDIT_HMAC_KEY_EPOCH", "1");
         std::env::set_var("FX_FEED_URL", "https://attacker.example/fx");
         let result = Config::from_env();
         match previous_database_url {
@@ -398,6 +425,20 @@ mod tests {
         match previous_fx_feed_url {
             Some(value) => std::env::set_var("FX_FEED_URL", value),
             None => std::env::remove_var("FX_FEED_URL"),
+        }
+        for (name, previous) in [
+            ("REFUSAL_AUDIT_DATABASE_URL", previous_writer_url),
+            (
+                "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
+                previous_retention_url,
+            ),
+            ("REFUSAL_AUDIT_HMAC_ROOT_B64", previous_root),
+            ("REFUSAL_AUDIT_HMAC_KEY_EPOCH", previous_epoch),
+        ] {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
         }
         let config = result.expect("from_env succeeds with DATABASE_URL set");
         assert_eq!(

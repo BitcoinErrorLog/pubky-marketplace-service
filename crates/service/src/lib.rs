@@ -45,6 +45,7 @@ use crate::locks::LocksRuntime;
 use crate::payment_availability::PaymentAvailabilityCache;
 use crate::payments::PaymentsRuntime;
 use crate::pickup::PickupKeys;
+use crate::refusal_audit::RefusalAuditRuntime;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -81,6 +82,12 @@ pub struct AppState {
     /// Per-endpoint cache of pinned-stack readiness identities for the
     /// resolve delivery arm (§B.8.8: 15 s TTL, per endpoint).
     pub resolve_pin_cache: resolve_delivery::ResolvePinCache,
+    /// Optional only in in-process legacy tests. Production always installs
+    /// this after constructing its separate lazy writer pool.
+    pub refusal_audit: Option<Arc<RefusalAuditRuntime>>,
+    /// The retention connection is distinct from both domain and writer
+    /// pools; its login is limited to the purge function.
+    pub refusal_audit_retention_pool: Option<PgPool>,
 }
 
 impl AppState {
@@ -105,6 +112,8 @@ impl AppState {
             payment_availability: PaymentAvailabilityCache::default(),
             pickup: None,
             resolve_pin_cache: resolve_delivery::ResolvePinCache::default(),
+            refusal_audit: None,
+            refusal_audit_retention_pool: None,
         }
     }
 
@@ -130,6 +139,16 @@ impl AppState {
 
     pub fn with_pickup(mut self, pickup: Option<Arc<PickupKeys>>) -> Self {
         self.pickup = pickup;
+        self
+    }
+
+    pub fn with_refusal_audit(mut self, refusal_audit: Arc<RefusalAuditRuntime>) -> Self {
+        self.refusal_audit = Some(refusal_audit);
+        self
+    }
+
+    pub fn with_refusal_audit_retention_pool(mut self, pool: PgPool) -> Self {
+        self.refusal_audit_retention_pool = Some(pool);
         self
     }
 }
