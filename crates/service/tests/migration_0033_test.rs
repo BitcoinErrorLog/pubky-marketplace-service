@@ -17,6 +17,17 @@ const CAPTURED_LISTING: &str = "7dd7e4279c2745df8b174656b9ee0670";
 const MIGRATION_COMMAND_ID: &str = "00000000-0000-0033-0000-000000000001";
 static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 
+#[derive(sqlx::FromRow)]
+struct LegacyAuthority {
+    listing_revision: i64,
+    record_revision: i64,
+    reserve_amount_minor: Option<i64>,
+    reserve_currency: Option<String>,
+    reserve_exponent: Option<i32>,
+    last_command_id: String,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 async fn migrate_through_0031(pool: &PgPool) {
     let migrator = Migrator {
         migrations: Cow::Owned(
@@ -71,7 +82,15 @@ async fn seed_production_shaped_legacy_auction(
                     'amount_minor', 100, 'currency', 'USD', 'exponent', 2
                 ),
                 'leader_pubky', NULL,
-                'bid_count', 0
+                'bid_count', 0,
+                'reserve_price', jsonb_build_object(
+                    'amount_minor', 900, 'currency', 'USD', 'exponent', 2
+                ),
+                'reservePrice', jsonb_build_object(
+                    'amount_minor', 901, 'currency', 'USD', 'exponent', 2
+                ),
+                'reserve_met', true,
+                'reserveMet', false
             ),
             ARRAY['shipping'], '2026-09-13T14:34:39.384Z'
          )",
@@ -137,6 +156,15 @@ async fn seed_listing(pool: &PgPool, aggregate_id: &str) {
     .expect("auction listing seeds");
 }
 
+async fn overwrite_auction(pool: &PgPool, aggregate_id: &str, auction: Value) {
+    sqlx::query("UPDATE listings SET auction = $2 WHERE aggregate_id = $1")
+        .bind(aggregate_id)
+        .bind(auction)
+        .execute(pool)
+        .await
+        .expect("test auction document updates");
+}
+
 #[sqlx::test(migrations = false)]
 async fn legacy_auction_migrates_to_no_reserve_then_bids_and_closes_sold(pool: PgPool) {
     migrate_through_0031(&pool).await;
@@ -149,27 +177,42 @@ async fn legacy_auction_migrates_to_no_reserve_then_bids_and_closes_sold(pool: P
     .await;
     apply_0033(&pool).await;
 
-    let authority: (i64, i64, Option<i64>, String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+    let authority: LegacyAuthority = sqlx::query_as(
         "SELECT listing_revision, record_revision, reserve_amount_minor,
-                    last_command_id::text, updated_at
+                    reserve_currency, reserve_exponent,
+                    last_command_id::text AS last_command_id, updated_at
              FROM listing_auction_reserves WHERE listing_aggregate_id = $1",
     )
     .bind(&aggregate_id)
     .fetch_one(&pool)
     .await
     .expect("migration created explicit authority");
-    assert_eq!(authority.0, 1);
-    assert_eq!(authority.1, 1);
+    assert_eq!(authority.listing_revision, 1);
+    assert_eq!(authority.record_revision, 1);
     assert_eq!(
-        authority.2, None,
+        authority.reserve_amount_minor, None,
         "legacy public JSON never supplies reserve"
     );
-    assert_eq!(authority.3, MIGRATION_COMMAND_ID);
+    assert_eq!(authority.reserve_currency, None);
+    assert_eq!(authority.reserve_exponent, None);
+    assert_eq!(authority.last_command_id, MIGRATION_COMMAND_ID);
     assert_eq!(
-        authority.4.to_rfc3339(),
+        authority.updated_at.to_rfc3339(),
         "2026-09-13T14:34:39.384+00:00",
         "migration provenance preserves the listing timestamp"
     );
+    let migrated_auction: Value =
+        sqlx::query_scalar("SELECT auction FROM listings WHERE aggregate_id = $1")
+            .bind(&aggregate_id)
+            .fetch_one(&pool)
+            .await
+            .expect("migrated public auction reads");
+    for legacy_key in ["reserve_price", "reservePrice", "reserve_met", "reserveMet"] {
+        assert!(
+            migrated_auction.get(legacy_key).is_none(),
+            "0033 must scrub the top-level legacy key {legacy_key}"
+        );
+    }
 
     let app = test_app(pool).await;
     app.clock.advance_seconds(2_572_480);
@@ -257,6 +300,194 @@ async fn failing_due_auction_is_isolated_and_reported_while_valid_peer_closes(po
     for forbidden in ["reserve_price", "reservePrice", "reserve_met", "reserveMet"] {
         assert!(!logs.contains(forbidden), "{logs}");
     }
+}
+
+#[sqlx::test(migrations = false)]
+async fn malformed_auction_documents_are_isolated_from_a_due_peer(pool: PgPool) {
+    common::install_log_capture();
+    migrate_through_0031(&pool).await;
+    let malformed_document = seed_production_shaped_legacy_auction(
+        &pool,
+        &"c".repeat(52),
+        "malformed_document",
+        "Malformed auction document fixture",
+    )
+    .await;
+    let malformed_end = seed_production_shaped_legacy_auction(
+        &pool,
+        &"d".repeat(52),
+        "malformed_end",
+        "Malformed end timestamp fixture",
+    )
+    .await;
+    let missing_end = seed_production_shaped_legacy_auction(
+        &pool,
+        &"e".repeat(52),
+        "missing_end",
+        "Missing end timestamp fixture",
+    )
+    .await;
+    let valid = seed_production_shaped_legacy_auction(
+        &pool,
+        &"f".repeat(52),
+        "valid_due",
+        "Valid due peer fixture",
+    )
+    .await;
+    apply_0033(&pool).await;
+
+    overwrite_auction(
+        &pool,
+        &malformed_document,
+        json!({
+            "status": "active",
+            "ends_at": "2026-09-20T14:34:39.384Z",
+            "reservePrice": {"amount_minor": 777, "private_marker": "do-not-log"}
+        }),
+    )
+    .await;
+    let malformed_end_value: Value =
+        sqlx::query_scalar("SELECT auction FROM listings WHERE aggregate_id = $1")
+            .bind(&malformed_end)
+            .fetch_one(&pool)
+            .await
+            .expect("malformed-end source reads");
+    let mut malformed_end_value = malformed_end_value;
+    malformed_end_value["ends_at"] = json!("not-a-timestamp-do-not-log");
+    overwrite_auction(&pool, &malformed_end, malformed_end_value).await;
+    let missing_end_value: Value =
+        sqlx::query_scalar("SELECT auction - 'ends_at' FROM listings WHERE aggregate_id = $1")
+            .bind(&missing_end)
+            .fetch_one(&pool)
+            .await
+            .expect("missing-end source reads");
+    overwrite_auction(&pool, &missing_end, missing_end_value).await;
+
+    let app = test_app(pool).await;
+    app.clock.advance_seconds(2_772_480);
+    let summary = marketplace_service::workers::close_due_auctions(&app.pool, app.clock.now())
+        .await
+        .expect("malformed rows do not abort the bounded batch");
+    assert_eq!(
+        summary,
+        AuctionCloseBatchSummary {
+            closed: 1,
+            failed: 3
+        }
+    );
+
+    let states: Vec<(String, String)> = sqlx::query_as(
+        "SELECT aggregate_id, auction->>'status' FROM listings
+         WHERE aggregate_id = ANY($1) ORDER BY aggregate_id",
+    )
+    .bind(vec![
+        malformed_document.clone(),
+        malformed_end.clone(),
+        missing_end.clone(),
+        valid.clone(),
+    ])
+    .fetch_all(&app.pool)
+    .await
+    .expect("malformed and valid states read");
+    assert_eq!(
+        states,
+        vec![
+            (malformed_document.clone(), "active".into()),
+            (malformed_end.clone(), "active".into()),
+            (missing_end.clone(), "active".into()),
+            (valid, "unsold".into()),
+        ]
+    );
+
+    let logs = common::captured_logs();
+    let failure_lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| {
+            [&malformed_document, &malformed_end, &missing_end]
+                .iter()
+                .any(|aggregate_id| line.contains(aggregate_id.as_str()))
+        })
+        .collect();
+    assert_eq!(failure_lines.len(), 3, "{failure_lines:?}");
+    for line in failure_lines {
+        assert!(line.contains("auction_close_failed"), "{line}");
+        assert!(
+            line.contains("auction close failed; continuing batch"),
+            "{line}"
+        );
+        for forbidden in [
+            "reserve_price",
+            "reservePrice",
+            "reserve_met",
+            "reserveMet",
+            "do-not-log",
+            "not-a-timestamp",
+        ] {
+            assert!(!line.contains(forbidden), "{line}");
+        }
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn due_auction_selection_is_bounded_and_drains_oldest_first(pool: PgPool) {
+    migrate_through_0031(&pool).await;
+    let seller = "g".repeat(52);
+    for index in 0..101 {
+        seed_production_shaped_legacy_auction(
+            &pool,
+            &seller,
+            &format!("bounded_{index:03}"),
+            "Bounded close fixture",
+        )
+        .await;
+    }
+    apply_0033(&pool).await;
+
+    let app = test_app(pool).await;
+    app.clock.advance_seconds(2_772_480);
+    let first = marketplace_service::workers::close_due_auctions(&app.pool, app.clock.now())
+        .await
+        .expect("first bounded close batch runs");
+    assert_eq!(
+        first,
+        AuctionCloseBatchSummary {
+            closed: 100,
+            failed: 0
+        }
+    );
+
+    let prefix = format!("listing:{seller}_bounded_%");
+    let first_states: (i64, i64) = sqlx::query_as(
+        "SELECT
+             COUNT(*) FILTER (WHERE auction->>'status' = 'unsold'),
+             COUNT(*) FILTER (WHERE auction->>'status' = 'active')
+         FROM listings WHERE aggregate_id LIKE $1",
+    )
+    .bind(&prefix)
+    .fetch_one(&app.pool)
+    .await
+    .expect("first bounded batch states read");
+    assert_eq!(first_states, (100, 1));
+    let last_status: String = sqlx::query_scalar(
+        "SELECT auction->>'status' FROM listings WHERE aggregate_id LIKE $1
+         ORDER BY aggregate_id DESC LIMIT 1",
+    )
+    .bind(&prefix)
+    .fetch_one(&app.pool)
+    .await
+    .expect("last ordered due auction reads");
+    assert_eq!(last_status, "active");
+
+    let second = marketplace_service::workers::close_due_auctions(&app.pool, app.clock.now())
+        .await
+        .expect("remaining due auction drains next pass");
+    assert_eq!(
+        second,
+        AuctionCloseBatchSummary {
+            closed: 1,
+            failed: 0
+        }
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]

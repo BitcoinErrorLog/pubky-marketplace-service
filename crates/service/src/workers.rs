@@ -97,6 +97,7 @@ pub const SYSTEM_ACTOR: &str = "system";
 pub const DELIVERY_SWEEP_MAX_BATCHES: u32 = 10;
 
 const OUTBOX_BATCH_SIZE: i64 = 100;
+const AUCTION_CLOSE_BATCH_SIZE: i64 = 100;
 const LOCKS_VERIFY_BATCH_SIZE: i64 = 25;
 const PAYKIT_VERIFY_BATCH_SIZE: i64 = 25;
 const FX_SAMPLE_INTERVAL_SECONDS: i64 = 60;
@@ -372,20 +373,45 @@ pub struct AuctionCloseBatchSummary {
     pub failed: u64,
 }
 
-/// Authoritatively closes active auctions whose end time has passed on
-/// server time, using the same close path as the seller command. Each auction
-/// gets its own transaction so one corrupt authority row cannot roll back the
-/// rest of the batch. Dynamic database errors are deliberately omitted from
-/// telemetry because they can include secret values or payload fragments.
+/// Canonical auction timestamps are fixed-width UTC strings, so lexical
+/// ordering safely over-selects due candidates without a fallible SQL cast.
+/// The locked Rust path remains authoritative for validity and due-ness.
+const AUCTION_INSTANT: &str = r"^[0-9]{4}-(0[1-9]|1[0-2])-([012][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{3}Z$";
+
+/// Authoritatively closes a bounded batch of active auctions whose end time
+/// has passed on server time, using the same close path as the seller command.
+/// Canonical due rows and malformed timestamp rows have independent limits:
+/// malformed rows stay observable but cannot consume the oldest-due budget.
+/// Each auction gets its own transaction so one corrupt row cannot roll back
+/// a peer. Dynamic errors are deliberately omitted from telemetry because
+/// they can include secret values or payload fragments.
 pub async fn close_due_auctions(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> anyhow::Result<AuctionCloseBatchSummary> {
+    let now_text = crate::clock::format_timestamp(now);
     let due: Vec<String> = sqlx::query_scalar(
-        "SELECT aggregate_id FROM listings \
-         WHERE sale_format = 'auction' AND auction->>'status' = 'active' \
-         ORDER BY aggregate_id",
+        "WITH valid_due AS ( \
+             SELECT aggregate_id, auction->>'ends_at' AS ends_at, 0 AS lane \
+             FROM listings \
+             WHERE sale_format = 'auction' AND auction->>'status' = 'active' \
+             AND auction->>'ends_at' ~ $2 AND auction->>'ends_at' <= $1 \
+             ORDER BY auction->>'ends_at', aggregate_id LIMIT $3 \
+         ), malformed AS ( \
+             SELECT aggregate_id, NULL::text AS ends_at, 1 AS lane \
+             FROM listings \
+             WHERE sale_format = 'auction' AND auction->>'status' = 'active' \
+             AND (auction->>'ends_at' IS NULL OR auction->>'ends_at' !~ $2) \
+             ORDER BY aggregate_id LIMIT $3 \
+         ) \
+         SELECT aggregate_id FROM ( \
+             SELECT * FROM valid_due UNION ALL SELECT * FROM malformed \
+         ) candidates \
+         ORDER BY lane, ends_at, aggregate_id",
     )
+    .bind(now_text)
+    .bind(AUCTION_INSTANT)
+    .bind(AUCTION_CLOSE_BATCH_SIZE)
     .fetch_all(pool)
     .await?;
 
