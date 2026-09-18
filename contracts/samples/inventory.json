@@ -1,0 +1,391 @@
+{
+  "cases": {
+    "adjust_replay": {
+      "request": {
+        "body": {
+          "aggregate_id": "listing:<pubky:seller>_boots_01",
+          "delta": 2,
+          "expected_revision": 1,
+          "external_ref": {
+            "channel": "shopify",
+            "external_id": "evt-contract-1"
+          },
+          "idempotency_key": "<uuid:1>",
+          "kind": "inventory.adjust",
+          "listing_id": "boots_01",
+          "schema_version": 1
+        },
+        "headers_present": [
+          "authorization",
+          "content-type"
+        ],
+        "method": "POST",
+        "path": "/v1/inventory/adjust"
+      },
+      "response": {
+        "body": {
+          "ok": true,
+          "result": {
+            "aggregate_id": "listing:<pubky:seller>_boots_01",
+            "event_id": "<uuid:2>",
+            "listing_id": "boots_01",
+            "server_revision": 2,
+            "stock": {
+              "authority": "listing_total",
+              "available": 5,
+              "reserved": 0,
+              "sold": 0,
+              "total": 5
+            }
+          },
+          "schema_version": 1
+        },
+        "status": 200
+      }
+    },
+    "adjust_success": {
+      "request": {
+        "body": {
+          "aggregate_id": "listing:<pubky:seller>_boots_01",
+          "delta": 2,
+          "expected_revision": 1,
+          "external_ref": {
+            "channel": "shopify",
+            "external_id": "evt-contract-1"
+          },
+          "idempotency_key": "<uuid:1>",
+          "kind": "inventory.adjust",
+          "listing_id": "boots_01",
+          "schema_version": 1
+        },
+        "headers_present": [
+          "authorization",
+          "content-type"
+        ],
+        "method": "POST",
+        "path": "/v1/inventory/adjust"
+      },
+      "response": {
+        "body": {
+          "ok": true,
+          "result": {
+            "aggregate_id": "listing:<pubky:seller>_boots_01",
+            "event_id": "<uuid:2>",
+            "listing_id": "boots_01",
+            "server_revision": 2,
+            "stock": {
+              "authority": "listing_total",
+              "available": 5,
+              "reserved": 0,
+              "sold": 0,
+              "total": 5
+            }
+          },
+          "schema_version": 1
+        },
+        "status": 200
+      }
+    },
+    "changed_replay_quarantined": {
+      "request": {
+        "body": {
+          "aggregate_id": "listing:<pubky:seller>_boots_01",
+          "delta": 3,
+          "expected_revision": 1,
+          "external_ref": {
+            "channel": "shopify",
+            "external_id": "evt-contract-1"
+          },
+          "idempotency_key": "<uuid:1>",
+          "kind": "inventory.adjust",
+          "listing_id": "boots_01",
+          "schema_version": 1
+        },
+        "headers_present": [
+          "authorization",
+          "content-type"
+        ],
+        "method": "POST",
+        "path": "/v1/inventory/adjust"
+      },
+      "response": {
+        "body": {
+          "error": {
+            "code": "idempotency_conflict",
+            "message": "The idempotency key was already used with different input."
+          },
+          "ok": false,
+          "schema_version": 1
+        },
+        "status": 409
+      }
+    },
+    "projection_after": {
+      "request": {
+        "body": null,
+        "headers_present": [
+          "authorization",
+          "content-type"
+        ],
+        "method": "GET",
+        "path": "/v1/inventory/listings/listing:<pubky:seller>_boots_01"
+      },
+      "response": {
+        "body": {
+          "aggregate_id": "listing:<pubky:seller>_boots_01",
+          "kind": "inventory_projection",
+          "listing_id": "boots_01",
+          "schema_version": 1,
+          "seller_pubky": "<pubky:seller>",
+          "server_revision": 2,
+          "stock": {
+            "authority": "listing_total",
+            "available": 5,
+            "reserved": 0,
+            "sold": 0,
+            "total": 5
+          }
+        },
+        "status": 200
+      }
+    },
+    "projection_before": {
+      "request": {
+        "body": null,
+        "headers_present": [
+          "authorization",
+          "content-type"
+        ],
+        "method": "GET",
+        "path": "/v1/inventory/listings/listing:<pubky:seller>_boots_01"
+      },
+      "response": {
+        "body": {
+          "aggregate_id": "listing:<pubky:seller>_boots_01",
+          "kind": "inventory_projection",
+          "listing_id": "boots_01",
+          "schema_version": 1,
+          "seller_pubky": "<pubky:seller>",
+          "server_revision": 1,
+          "stock": {
+            "authority": "listing_total",
+            "available": 3,
+            "reserved": 0,
+            "sold": 0,
+            "total": 3
+          }
+        },
+        "status": 200
+      }
+    }
+  },
+  "kind": "inventory_http_contract",
+  "projection_schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "definitions": {
+      "StockView": {
+        "properties": {
+          "authority": {
+            "pattern": "^listing_total$",
+            "type": "string"
+          },
+          "available": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "reserved": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sold": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "authority",
+          "available",
+          "reserved",
+          "sold",
+          "total"
+        ],
+        "type": "object"
+      }
+    },
+    "properties": {
+      "aggregate_id": {
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string"
+      },
+      "kind": {
+        "pattern": "^inventory_projection$",
+        "type": "string"
+      },
+      "listing_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9_.-]+$",
+        "type": "string"
+      },
+      "schema_version": {
+        "format": "uint8",
+        "maximum": 1.0,
+        "minimum": 1.0,
+        "type": "integer"
+      },
+      "seller_pubky": {
+        "maxLength": 52,
+        "minLength": 52,
+        "type": "string"
+      },
+      "server_revision": {
+        "format": "int64",
+        "minimum": 1.0,
+        "type": "integer"
+      },
+      "stock": {
+        "$ref": "#/definitions/StockView"
+      }
+    },
+    "required": [
+      "aggregate_id",
+      "kind",
+      "listing_id",
+      "schema_version",
+      "seller_pubky",
+      "server_revision",
+      "stock"
+    ],
+    "title": "InventoryProjection",
+    "type": "object"
+  },
+  "request_schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": false,
+    "definitions": {
+      "ExternalReference": {
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "maxLength": 32,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,31}$",
+            "type": "string"
+          },
+          "external_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel",
+          "external_id"
+        ],
+        "type": "object"
+      },
+      "VariantAssertion": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_.-]+$",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sku": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      }
+    },
+    "properties": {
+      "aggregate_id": {
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string"
+      },
+      "delta": {
+        "format": "int64",
+        "maximum": 1000000.0,
+        "minimum": -1000000.0,
+        "type": "integer"
+      },
+      "expected_revision": {
+        "format": "int64",
+        "minimum": 1.0,
+        "type": "integer"
+      },
+      "external_ref": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/ExternalReference"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "idempotency_key": {
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+        "type": "string"
+      },
+      "kind": {
+        "pattern": "^inventory\\.adjust$",
+        "type": "string"
+      },
+      "listing_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9_.-]+$",
+        "type": "string"
+      },
+      "schema_version": {
+        "format": "uint8",
+        "maximum": 1.0,
+        "minimum": 1.0,
+        "type": "integer"
+      },
+      "variant": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/VariantAssertion"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "aggregate_id",
+      "delta",
+      "expected_revision",
+      "idempotency_key",
+      "kind",
+      "listing_id",
+      "schema_version"
+    ],
+    "title": "InventoryAdjustRequest",
+    "type": "object"
+  },
+  "schema_version": 1
+}
