@@ -1,10 +1,11 @@
-//! Schema proof for the additive refusal-audit boundedness migration
+//! Schema proof for the historical outcome-table refusal-audit migration
 //! (0030) AS AMENDED by the round-cap cut (0031): the `command_id` column
 //! 0030 added remains (migrations are additive-only, so it is never
-//! dropped), but 0031 removed refusal auditing — the
+//! dropped), but 0031 removed refusal rows from this outcome table — the
 //! `(payment_id, command_id)` UNIQUE arbiter is gone, the outcome CHECK
 //! admits only the two success outcomes, and every `refused_*` value is
-//! uncommittable. The retention-registry enumeration of the audit table
+//! uncommittable. This is distinct from the later bounded refusal-audit
+//! buckets. The retention-registry enumeration of the outcome table
 //! stays: its full column set is ids, the static outcome, and a
 //! timestamp, so a new column (or a sensitive one) fails loudly.
 
@@ -26,7 +27,7 @@ async fn migration_0030_keys_binding_outcomes_per_command(pool: PgPool) {
     assert_eq!(nullable, "YES", "legacy rows predate the key");
 
     // The round-cap cut (0031) dropped the (payment, command) UNIQUE
-    // arbiter with the refusal auditing it served: success outcomes are
+    // arbiter with the outcome-table refusal auditing it served: success outcomes are
     // recorded inside the committing transaction, which the executor's
     // command_results dedup already serializes, so no audit arbiter
     // remains.
@@ -90,7 +91,7 @@ async fn migration_0030_keys_binding_outcomes_per_command(pool: PgPool) {
         .expect_err("a removed refusal outcome must violate the CHECK");
     }
 
-    // The audit table still carries no correlation material.
+    // The historical outcome table still carries no correlation material.
     let (sensitive,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM information_schema.columns \
          WHERE table_name = 'payment_locks_binding_outcomes' \
@@ -102,6 +103,6 @@ async fn migration_0030_keys_binding_outcomes_per_command(pool: PgPool) {
     .expect("column catalog is readable");
     assert_eq!(
         sensitive, 0,
-        "the audit table must never retain correlation material"
+        "the outcome table must never retain correlation material"
     );
 }

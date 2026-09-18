@@ -1,5 +1,8 @@
--- Refusal-audit boundedness, idempotency, and retention (Sol Wave 1A
--- review round 2, P2-3 + the pool-exhaustion P1).
+-- Historical Locks outcome-table refusal auditing (Sol Wave 1A review
+-- round 2, P2-3 + the pool-exhaustion P1). Migration 0031 subsequently
+-- removes these refusal outcomes. The separate refusal-audit bucket system
+-- introduced later is unrelated to this table and preserves these historical
+-- migration semantics.
 --
 -- Idempotency key: (payment_id, command_id). A refused command is never
 -- stored in command_results, so an exact retry re-executes; the UNIQUE

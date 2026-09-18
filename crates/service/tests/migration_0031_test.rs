@@ -1,5 +1,6 @@
-//! Schema proof for the round-cap cut migration (0031): refusal auditing
-//! is removed from the binding-outcome mechanism. The outcome CHECK
+//! Schema proof for the round-cap cut migration (0031): historical
+//! outcome-table refusal auditing is removed from the binding-outcome
+//! mechanism. The outcome CHECK
 //! admits ONLY the two success outcomes (`prepared`, `registered`) and
 //! rejects every `refused_*` value; the `(payment_id, command_id)` UNIQUE
 //! arbiter 0030 added is dropped; and the table COMMENT documents that
@@ -102,6 +103,6 @@ async fn migration_0031_removes_refusal_auditing(pool: PgPool) {
     let comment = comment.expect("the table carries a COMMENT");
     assert!(
         comment.contains("Refusal rows are never written"),
-        "the COMMENT documents the removed refusal auditing: {comment}"
+        "the COMMENT documents the removed outcome-table refusal auditing: {comment}"
     );
 }

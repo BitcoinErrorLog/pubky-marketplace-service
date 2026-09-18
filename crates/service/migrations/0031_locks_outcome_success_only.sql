@@ -1,5 +1,6 @@
--- Round-cap cut (Wave 1A review round 3, decision 2026-09-17): refusal
--- auditing is REMOVED from the binding-outcome mechanism. Committing a
+-- Round-cap cut (Wave 1A review round 3, decision 2026-09-17): historical
+-- outcome-table refusal auditing is REMOVED from the binding-outcome
+-- mechanism. Committing a
 -- refusing command's transaction could persist partial inventory
 -- mutations (hold acquisition updates earlier listing rows before a later
 -- order line fails), and the client-chosen command id made the audit key
@@ -7,9 +8,9 @@
 -- before the audit existed, and only the two success outcomes remain in
 -- the vocabulary. Migrations are additive-only: 0028/0030 objects stay;
 -- this migration narrows the CHECK and drops the (payment_id, command_id)
--- UNIQUE arbiter so no refusal row can ever be written again. Refusal
--- auditing returns as a designed item (server-derived identity, bounded
--- per payment, savepoint semantics) in a later wave.
+-- UNIQUE arbiter so no refusal row can ever be written there again. The
+-- later refusal-audit bucket system is separate: it records bounded,
+-- server-derived descriptors only after the domain transaction rolls back.
 
 ALTER TABLE payment_locks_binding_outcomes
     DROP CONSTRAINT payment_locks_binding_outcomes_outcome_check;
@@ -23,4 +24,4 @@ ALTER TABLE payment_locks_binding_outcomes
 DROP INDEX IF EXISTS payment_locks_binding_outcomes_payment_command_uq;
 
 COMMENT ON TABLE payment_locks_binding_outcomes IS
-    'Locks binding outcomes: prepared/registered only, written in the transaction that performs the state change. Refusal rows are never written — a refusing command rolls back whole (refusal auditing was removed at the round cap; see migration 0031).';
+    'Locks binding outcomes: prepared/registered only, written in the transaction that performs the state change. Refusal rows are never written here — a refusing command rolls back whole (historical outcome-table refusal auditing was removed at the round cap; see migration 0031).';
