@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,6 +19,7 @@ use common::{
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::homeserver::HttpHomeserverClient;
+use marketplace_service::inventory::MAX_CONFLICT_EVIDENCE_PER_IDEMPOTENCY_KEY;
 use pubky_common::auth::AuthToken;
 use pubky_common::capabilities::Capability;
 use pubky_common::crypto::Keypair;
@@ -268,6 +269,53 @@ async fn changed_body_replay_is_quarantined_without_mutation(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn changed_replay_conflict_evidence_is_capped_per_successful_key(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    register(&app, &seller, 5).await;
+    let aggregate = listing_aggregate(&seller.pubky);
+    let key = Uuid::new_v4();
+    let original = adjust_request(&seller.pubky, 1, 1, key);
+    let (status, body) = adjust(&app, &seller.token, &original).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let facts = listing_facts(&app.pool, &aggregate).await;
+
+    for index in 0..MAX_CONFLICT_EVIDENCE_PER_IDEMPOTENCY_KEY {
+        let changed = adjust_request(&seller.pubky, 1, index + 2, key);
+        let (status, body) = adjust(&app, &seller.token, &changed).await;
+        assert_eq!(status, StatusCode::CONFLICT, "index {index}: {body}");
+        assert_eq!(body["error"]["code"], json!("idempotency_conflict"));
+    }
+
+    let overflow = adjust_request(&seller.pubky, 1, 999, key);
+    for attempt in 0..2 {
+        let (status, body) = adjust(&app, &seller.token, &overflow).await;
+        assert_eq!(status, StatusCode::CONFLICT, "attempt {attempt}: {body}");
+        assert_eq!(body["error"]["code"], json!("idempotency_conflict"));
+    }
+    let conflicts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inventory_adjustment_conflicts \
+         WHERE seller_pubky = $1 AND idempotency_key = $2",
+    )
+    .bind(&seller.pubky)
+    .bind(key)
+    .fetch_one(&app.pool)
+    .await
+    .expect("bounded conflict count");
+    assert_eq!(
+        conflicts, MAX_CONFLICT_EVIDENCE_PER_IDEMPOTENCY_KEY,
+        "changed-hash evidence must remain bounded per successful key"
+    );
+    assert_eq!(listing_facts(&app.pool, &aggregate).await, facts);
+    assert_eq!(inventory_event_count(&app.pool, &aggregate).await, 1);
+    let results: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inventory_adjustment_results")
+        .fetch_one(&app.pool)
+        .await
+        .expect("result count");
+    assert_eq!(results, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn exhausted_rate_bucket_cannot_delay_or_suppress_changed_replay_quarantine(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -495,6 +543,164 @@ async fn spawn_delayed_listing_server(record: Value) -> (String, DelayedListingS
             .expect("delayed homeserver serves");
     });
     (format!("http://{address}"), server)
+}
+
+async fn serve_counting_unavailable_listing(
+    axum::extract::State(fetch_count): axum::extract::State<Arc<AtomicUsize>>,
+) -> StatusCode {
+    fetch_count.fetch_add(1, Ordering::SeqCst);
+    StatusCode::SERVICE_UNAVAILABLE
+}
+
+async fn spawn_counting_unavailable_listing_server() -> (String, Arc<AtomicUsize>) {
+    let fetch_count = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route(
+            "/pub/pubky.app/marketplace/v1/listings/{listing_id}",
+            axum::routing::get(serve_counting_unavailable_listing),
+        )
+        .with_state(fetch_count.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("counting homeserver binds");
+    let address = listener.local_addr().expect("counting homeserver address");
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("counting homeserver serves");
+    });
+    (format!("http://{address}"), fetch_count)
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn unavailable_variant_lookups_consume_rate_before_remote_io_and_stop_at_429(pool: PgPool) {
+    let (base_url, fetch_count) = spawn_counting_unavailable_listing_server().await;
+    let client = Arc::new(HttpHomeserverClient::new(&base_url).expect("HTTP client builds"));
+    let app = test_app_with_homeserver_client(pool, client).await;
+    let seller = new_actor(&app).await;
+    register(&app, &seller, 3).await;
+
+    for index in 0..240 {
+        let mut request = adjust_request(
+            &seller.pubky,
+            1,
+            1,
+            Uuid::parse_str(&indexed_command_id(0x9030, index)).expect("fixture uuid"),
+        );
+        request["variant"] = json!({"id": "v1"});
+        let (status, body) = adjust(&app, &seller.token, &request).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "index {index}: {body}"
+        );
+        assert_eq!(body["error"]["code"], json!("variant_lookup_unavailable"));
+    }
+    assert_eq!(fetch_count.load(Ordering::SeqCst), 240);
+    let tokens: f64 = sqlx::query_scalar(
+        "SELECT tokens FROM inventory_rate_limits WHERE endpoint_class = 'inventory.adjust'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("variant failures create a rate row");
+    assert_eq!(tokens, 0.0, "each failed remote lookup costs one token");
+
+    let mut next = adjust_request(&seller.pubky, 1, 1, Uuid::new_v4());
+    next["variant"] = json!({"id": "v1"});
+    let (status, body) = adjust(&app, &seller.token, &next).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], json!("rate_limited"));
+    assert_eq!(
+        fetch_count.load(Ordering::SeqCst),
+        240,
+        "quota refusal must happen before another homeserver fetch"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn variant_fetch_uses_prefetch_clock_for_rate_and_fresh_clock_for_mutation(pool: PgPool) {
+    let (keypair, seller_pubky) = random_keypair();
+    let record = homeserver_record(
+        &seller_pubky,
+        json!([{"id": "v1", "sku": "SKU-1", "quantity": 3, "enabled": true}]),
+    );
+    let (base_url, homeserver) = spawn_delayed_listing_server(record).await;
+    let client = Arc::new(HttpHomeserverClient::new(&base_url).expect("HTTP client builds"));
+    let app = test_app_with_homeserver_client(pool, client).await;
+    let (status, session) = post_capability_token(&app, &keypair, vec![Capability::root()]).await;
+    assert_eq!(status, StatusCode::CREATED, "session creation: {session}");
+    let seller = TestActor {
+        keypair,
+        pubky: seller_pubky,
+        token: session["token"].as_str().expect("bearer token").to_string(),
+    };
+    register(&app, &seller, 3).await;
+    let aggregate = listing_aggregate(&seller.pubky);
+    let before_fetch = app.clock.now();
+
+    let mut request = adjust_request(&seller.pubky, 1, 1, Uuid::new_v4());
+    request["variant"] = json!({"id": "v1", "sku": "SKU-1"});
+    request["external_ref"] = json!({"channel": "shopify", "external_id": "clock-proof"});
+    let router = app.router.clone();
+    let token = seller.token.clone();
+    let request_task = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            "/v1/inventory/adjust",
+            Some(&token),
+            &request,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), homeserver.lookup_entered.wait())
+        .await
+        .expect("real HTTP lookup reaches delayed response barrier");
+
+    let rate_updated_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT updated_at FROM inventory_rate_limits \
+         WHERE endpoint_class = 'inventory.adjust'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("rate token committed before remote response");
+    assert_eq!(rate_updated_at, before_fetch);
+
+    app.clock.advance_seconds(37);
+    let after_fetch = app.clock.now();
+    homeserver.release_lookup.notify_one();
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), request_task)
+        .await
+        .expect("variant request finishes")
+        .expect("variant task");
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (listing_updated_at, event_occurred_at, result_created_at, reference_created_at): (
+        chrono::DateTime<Utc>,
+        chrono::DateTime<Utc>,
+        chrono::DateTime<Utc>,
+        chrono::DateTime<Utc>,
+    ) = sqlx::query_as(
+        "SELECT l.updated_at, e.occurred_at, r.created_at, x.created_at \
+         FROM listings l \
+         JOIN inventory_adjustment_results r ON r.aggregate_id = l.aggregate_id \
+         JOIN events e ON e.id = r.event_id \
+         JOIN inventory_external_refs x ON x.event_id = e.id \
+         WHERE l.aggregate_id = $1",
+    )
+    .bind(&aggregate)
+    .fetch_one(&app.pool)
+    .await
+    .expect("post-fetch timestamps");
+    assert_eq!(
+        (
+            listing_updated_at,
+            event_occurred_at,
+            result_created_at,
+            reference_created_at,
+        ),
+        (after_fetch, after_fetch, after_fetch, after_fetch)
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]

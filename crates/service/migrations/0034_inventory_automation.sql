@@ -59,6 +59,31 @@ CREATE TABLE inventory_rate_limits (
     PRIMARY KEY (session_hash, endpoint_class)
 );
 
+-- Application writers take the same seller/key advisory lock before
+-- classifying a request. The trigger makes the 16-row cap authoritative for
+-- direct or future writers too, while returning NULL preserves the caller's
+-- typed idempotency-conflict response once durable evidence already exists.
+CREATE FUNCTION cap_inventory_adjustment_conflicts() RETURNS trigger AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(NEW.seller_pubky || ':' || NEW.idempotency_key::text, 6341)
+    );
+    IF (
+        SELECT COUNT(*)
+        FROM inventory_adjustment_conflicts
+        WHERE seller_pubky = NEW.seller_pubky
+          AND idempotency_key = NEW.idempotency_key
+    ) >= 16 THEN
+        RETURN NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER inventory_adjustment_conflicts_cap
+    BEFORE INSERT ON inventory_adjustment_conflicts
+    FOR EACH ROW EXECUTE FUNCTION cap_inventory_adjustment_conflicts();
+
 CREATE FUNCTION forbid_inventory_evidence_mutation() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION 'inventory evidence is immutable';

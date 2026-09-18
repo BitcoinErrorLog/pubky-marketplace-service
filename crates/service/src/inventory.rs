@@ -27,6 +27,9 @@ pub const MAX_INVENTORY_BODY_BYTES: usize = 4096;
 pub const DEFAULT_AUTHENTICATED_RATE_PER_MINUTE: u32 = 120;
 pub const DEFAULT_ANONYMOUS_RATE_PER_MINUTE: u32 = 20;
 pub const DEFAULT_RATE_BURST_MULTIPLIER: u32 = 2;
+/// At most this many distinct changed-body hashes are retained for one
+/// successful seller/idempotency-key pair.
+pub const MAX_CONFLICT_EVIDENCE_PER_IDEMPOTENCY_KEY: i64 = 16;
 
 const MAX_RATE_PER_MINUTE: u32 = 10_000;
 const MAX_BURST_MULTIPLIER: u32 = 10;
@@ -331,7 +334,7 @@ fn validate_request(bytes: &[u8]) -> Result<ValidatedAdjustRequest, ()> {
     {
         return Err(());
     }
-    let idempotency_key = Uuid::parse_str(&wire.idempotency_key).map_err(|_| ())?;
+    let idempotency_key = parse_strict_idempotency_uuid(&wire.idempotency_key)?;
     if let Some(variant) = &wire.variant {
         if variant.id.is_none() && variant.sku.is_none() {
             return Err(());
@@ -362,6 +365,21 @@ fn validate_request(bytes: &[u8]) -> Result<ValidatedAdjustRequest, ()> {
         idempotency_key,
         request_hash,
     })
+}
+
+fn parse_strict_idempotency_uuid(value: &str) -> Result<Uuid, ()> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36
+        || bytes.iter().enumerate().any(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte != b'-',
+            _ => !byte.is_ascii_hexdigit(),
+        })
+        || !matches!(bytes[14], b'1'..=b'8')
+        || !matches!(bytes[19], b'8' | b'9' | b'a' | b'A' | b'b' | b'B')
+    {
+        return Err(());
+    }
+    Uuid::parse_str(value).map_err(|_| ())
 }
 
 fn valid_bounded_id(value: &str, maximum: usize) -> bool {
@@ -479,11 +497,18 @@ async fn classify_stored_adjustment(
         return Ok(StoredAdjustment::Exact(result_json));
     }
 
+    // The unique index has seller/key as its leftmost prefix, so this bounded
+    // count remains indexable. Migration 0034 independently enforces the same
+    // cap for writers outside this application path.
     sqlx::query(
         "INSERT INTO inventory_adjustment_conflicts \
              (seller_pubky, idempotency_key, aggregate_id, original_request_hash, \
               conflicting_request_hash, observed_at) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+         SELECT $1, $2, $3, $4, $5, $6 \
+         WHERE ( \
+             SELECT COUNT(*) FROM inventory_adjustment_conflicts \
+             WHERE seller_pubky = $1 AND idempotency_key = $2 \
+         ) < $7 \
          ON CONFLICT (seller_pubky, idempotency_key, conflicting_request_hash) DO NOTHING",
     )
     .bind(&session.actor.0)
@@ -492,6 +517,7 @@ async fn classify_stored_adjustment(
     .bind(original_hash)
     .bind(&request.request_hash)
     .bind(observed_at)
+    .bind(MAX_CONFLICT_EVIDENCE_PER_IDEMPOTENCY_KEY)
     .execute(&mut **tx)
     .await?;
     Ok(StoredAdjustment::Conflict)
@@ -543,13 +569,14 @@ pub async fn adjust_inventory(
         Ok(config) => config,
         Err(_) => return internal_error(),
     };
-    let now = state.clock.now();
+    let preflight_now = state.clock.now();
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(_) => return internal_error(),
     };
 
-    let stored = match classify_stored_adjustment(&mut tx, &session, &request, now).await {
+    let stored = match classify_stored_adjustment(&mut tx, &session, &request, preflight_now).await
+    {
         Ok(stored) => stored,
         Err(_) => return internal_error(),
     };
@@ -577,46 +604,68 @@ pub async fn adjust_inventory(
     // the idempotency advisory lock. For a new variant-addressed request it
     // closes before remote I/O; after validation, the mutation transaction
     // re-acquires the same lock and reclassifies to close the concurrency gap.
-    let variant_binding = if let Some(assertion) = &request.wire.variant {
-        if tx.commit().await.is_err() {
-            return internal_error();
-        }
-        let binding = match validate_variant_assertion(
-            &state,
-            &session.actor.0,
-            &request.wire.listing_id,
-            assertion,
-        )
-        .await
-        {
-            Ok(binding) => binding,
-            Err(response) => return response,
-        };
-        let mut mutation_tx = match state.pool.begin().await {
-            Ok(tx) => tx,
-            Err(_) => return internal_error(),
-        };
-        let stored =
-            match classify_stored_adjustment(&mut mutation_tx, &session, &request, now).await {
+    let (variant_binding, rate_consumed, mutation_now) =
+        if let Some(assertion) = &request.wire.variant {
+            let rate_allowed =
+                match consume_rate(&mut tx, &session, "inventory.adjust", preflight_now, config)
+                    .await
+                {
+                    Ok(allowed) => allowed,
+                    Err(_) => return internal_error(),
+                };
+            if !rate_allowed {
+                return finish_without_mutation(tx, rate_limited("inventory.adjust")).await;
+            }
+            if tx.commit().await.is_err() {
+                return internal_error();
+            }
+            let binding = match validate_variant_assertion(
+                &state,
+                &session.actor.0,
+                &request.wire.listing_id,
+                assertion,
+            )
+            .await
+            {
+                Ok(binding) => binding,
+                Err(response) => return response,
+            };
+            // Remote lookup latency must not stale mutation, event, result, or
+            // external-reference timestamps.
+            let mutation_now = state.clock.now();
+            let mut mutation_tx = match state.pool.begin().await {
+                Ok(tx) => tx,
+                Err(_) => return internal_error(),
+            };
+            let stored = match classify_stored_adjustment(
+                &mut mutation_tx,
+                &session,
+                &request,
+                mutation_now,
+            )
+            .await
+            {
                 Ok(stored) => stored,
                 Err(_) => return internal_error(),
             };
-        tx = match continue_or_finish_stored(mutation_tx, stored).await {
-            Ok(tx) => tx,
-            Err(response) => return response,
+            tx = match continue_or_finish_stored(mutation_tx, stored).await {
+                Ok(tx) => tx,
+                Err(response) => return response,
+            };
+            (Some(binding), true, mutation_now)
+        } else {
+            (None, false, preflight_now)
         };
-        Some(binding)
-    } else {
-        None
-    };
 
-    let rate_allowed = match consume_rate(&mut tx, &session, "inventory.adjust", now, config).await
-    {
-        Ok(allowed) => allowed,
-        Err(_) => return internal_error(),
-    };
-    if !rate_allowed {
-        return finish_without_mutation(tx, rate_limited("inventory.adjust")).await;
+    if !rate_consumed {
+        let rate_allowed =
+            match consume_rate(&mut tx, &session, "inventory.adjust", mutation_now, config).await {
+                Ok(allowed) => allowed,
+                Err(_) => return internal_error(),
+            };
+        if !rate_allowed {
+            return finish_without_mutation(tx, rate_limited("inventory.adjust")).await;
+        }
     }
 
     let listing: Option<LockedListing> = match sqlx::query_as(
@@ -817,7 +866,7 @@ pub async fn adjust_inventory(
     .bind(new_available)
     .bind(new_revision)
     .bind(state_name)
-    .bind(now)
+    .bind(mutation_now)
     .bind(listing.server_revision)
     .fetch_optional(&mut *tx)
     .await
@@ -840,7 +889,7 @@ pub async fn adjust_inventory(
     .bind(&request.wire.aggregate_id)
     .bind(revision)
     .bind(&session.actor.0)
-    .bind(now)
+    .bind(mutation_now)
     .execute(&mut *tx)
     .await
     .is_err()
@@ -860,7 +909,7 @@ pub async fn adjust_inventory(
         .bind(&request.wire.aggregate_id)
         .bind(event_id)
         .bind(&request.request_hash)
-        .bind(now)
+        .bind(mutation_now)
         .execute(&mut *tx)
         .await
         .is_err()
@@ -895,7 +944,7 @@ pub async fn adjust_inventory(
     .bind(&request.wire.aggregate_id)
     .bind(event_id)
     .bind(&result_json)
-    .bind(now)
+    .bind(mutation_now)
     .execute(&mut *tx)
     .await
     .is_err()
@@ -1089,8 +1138,10 @@ pub async fn get_inventory_projection(
 
 /// Deterministic schema source consumed by the executable contract test.
 pub fn inventory_adjust_schema() -> Value {
-    serde_json::to_value(schema_for!(InventoryAdjustRequest))
-        .expect("inventory request schema serializes")
+    let mut schema = serde_json::to_value(schema_for!(InventoryAdjustRequest))
+        .expect("inventory request schema serializes");
+    schema["properties"]["delta"]["not"] = json!({"const": 0});
+    schema
 }
 
 pub fn inventory_projection_schema() -> Value {
@@ -1156,5 +1207,49 @@ mod tests {
             validate_request(&serde_json::to_vec(&changed).expect("changed request serializes"))
                 .expect("changed request validates");
         assert_ne!(a.request_hash, changed.request_hash);
+    }
+
+    fn request_bytes(idempotency_key: &str, delta: i64) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "kind": "inventory.adjust",
+            "aggregate_id": format!("listing:{}_boots_01", "y".repeat(52)),
+            "listing_id": "boots_01",
+            "expected_revision": 1,
+            "delta": delta,
+            "idempotency_key": idempotency_key,
+        }))
+        .expect("request serializes")
+    }
+
+    #[test]
+    fn runtime_rejects_nil_unsupported_version_variant_and_zero_delta() {
+        for (idempotency_key, delta) in [
+            ("00000000-0000-0000-8000-000000000001", 1),
+            ("00000000-0000-9000-8000-000000000001", 1),
+            ("00000000-0000-4000-7000-000000000001", 1),
+            ("00000000-0000-4000-8000-000000000001", 0),
+        ] {
+            assert!(
+                validate_request(&request_bytes(idempotency_key, delta)).is_err(),
+                "runtime accepted idempotency_key={idempotency_key}, delta={delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_schema_requires_rfc_variant_versions_one_through_eight_and_nonzero_delta() {
+        let schema = inventory_adjust_schema();
+        assert_eq!(
+            schema.pointer("/properties/idempotency_key/pattern"),
+            Some(&json!(
+                r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            ))
+        );
+        assert_eq!(
+            schema.pointer("/properties/delta/not/const"),
+            Some(&json!(0)),
+            "published schema must reject the zero delta that runtime rejects"
+        );
     }
 }

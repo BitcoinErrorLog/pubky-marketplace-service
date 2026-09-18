@@ -327,6 +327,9 @@
         "format": "int64",
         "maximum": 1000000.0,
         "minimum": -1000000.0,
+        "not": {
+          "const": 0
+        },
         "type": "integer"
       },
       "expected_revision": {

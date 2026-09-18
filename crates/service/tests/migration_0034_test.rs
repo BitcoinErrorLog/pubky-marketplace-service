@@ -6,6 +6,8 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use marketplace_service::inventory::MAX_CONFLICT_EVIDENCE_PER_IDEMPOTENCY_KEY;
+
 const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
 
 async fn seed_listing(pool: &PgPool, seller: &str, listing_id: &str) -> String {
@@ -169,6 +171,74 @@ async fn migration_0034_enforces_inventory_evidence_constraints(pool: PgPool) {
         .await
         .is_err(),
         "rate endpoint classes are closed"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn migration_0034_caps_conflicts_and_indexes_the_count_prefix(pool: PgPool) {
+    let seller = "y".repeat(52);
+    let aggregate = seed_listing(&pool, &seller, "bounded").await;
+    let key = Uuid::new_v4();
+    let original_hash = "a".repeat(64);
+
+    for index in 0..=MAX_CONFLICT_EVIDENCE_PER_IDEMPOTENCY_KEY {
+        let conflicting_hash = format!("{:064x}", index + 1);
+        sqlx::query(
+            "INSERT INTO inventory_adjustment_conflicts \
+                 (seller_pubky, idempotency_key, aggregate_id, original_request_hash, \
+                  conflicting_request_hash, observed_at) \
+             VALUES ($1, $2, $3, $4, $5, NOW())",
+        )
+        .bind(&seller)
+        .bind(key)
+        .bind(&aggregate)
+        .bind(&original_hash)
+        .bind(conflicting_hash)
+        .execute(&pool)
+        .await
+        .expect("direct conflict insert is accepted or capped");
+    }
+
+    let conflicts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inventory_adjustment_conflicts \
+         WHERE seller_pubky = $1 AND idempotency_key = $2",
+    )
+    .bind(&seller)
+    .bind(key)
+    .fetch_one(&pool)
+    .await
+    .expect("bounded direct conflict count");
+    assert_eq!(
+        conflicts, MAX_CONFLICT_EVIDENCE_PER_IDEMPOTENCY_KEY,
+        "the database boundary must cap distinct conflict hashes per successful key"
+    );
+
+    let cap_trigger_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM pg_trigger \
+             WHERE tgrelid = 'inventory_adjustment_conflicts'::regclass \
+               AND tgname = 'inventory_adjustment_conflicts_cap' \
+               AND NOT tgisinternal \
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("cap trigger catalog lookup");
+    assert!(cap_trigger_exists, "the database cap trigger must exist");
+
+    let index_definition: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes \
+         WHERE schemaname = current_schema() \
+           AND tablename = 'inventory_adjustment_conflicts' \
+           AND indexname = 'inventory_adjustment_conflict_unique'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("conflict unique index");
+    assert!(
+        index_definition.contains("(seller_pubky, idempotency_key, conflicting_request_hash)"),
+        "the unique index's leftmost seller/key prefix must support bounded counts: \
+         {index_definition}"
     );
 }
 
