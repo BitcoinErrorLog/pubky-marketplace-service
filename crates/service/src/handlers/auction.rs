@@ -701,7 +701,7 @@ pub fn parse_auction(listing: &ListingRow) -> Option<AuctionState> {
         return None;
     }
     let value = listing.auction.as_ref()?;
-    Some(AuctionState::from_value(value).expect("stored auction document is well-formed"))
+    AuctionState::from_value(value).ok()
 }
 
 async fn fetch_bids(

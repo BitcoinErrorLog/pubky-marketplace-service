@@ -2022,7 +2022,8 @@ async fn auction_winning_order(
     let closed = close_due_auctions(&app.pool, app.clock.now())
         .await
         .expect("close runs");
-    assert_eq!(closed, 1, "the auction closed");
+    assert_eq!(closed.closed, 1, "the auction closed");
+    assert_eq!(closed.failed, 0, "the auction close did not fail");
     let (order_id,): (String,) = sqlx::query_as(
         "SELECT id::text FROM orders WHERE auction_aggregate_id = $1 AND buyer_pubky = $2",
     )

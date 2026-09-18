@@ -366,39 +366,84 @@ pub async fn transition_due_drops(pool: &PgPool, now: DateTime<Utc>) -> anyhow::
     Ok(transitioned)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AuctionCloseBatchSummary {
+    pub closed: u64,
+    pub failed: u64,
+}
+
 /// Authoritatively closes active auctions whose end time has passed on
-/// server time, using the same close path as the seller command. Exactly one
-/// close result per auction: the status guard flips `active` exactly once
-/// and `orders_one_winner_per_auction` blocks a second winning order.
-pub async fn close_due_auctions(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
-    let mut tx = pool.begin().await?;
-    let due: Vec<ListingRow> = sqlx::query_as(&format!(
-        "SELECT {LISTING_COLUMNS} FROM listings \
+/// server time, using the same close path as the seller command. Each auction
+/// gets its own transaction so one corrupt authority row cannot roll back the
+/// rest of the batch. Dynamic database errors are deliberately omitted from
+/// telemetry because they can include secret values or payload fragments.
+pub async fn close_due_auctions(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> anyhow::Result<AuctionCloseBatchSummary> {
+    let due: Vec<String> = sqlx::query_scalar(
+        "SELECT aggregate_id FROM listings \
          WHERE sale_format = 'auction' AND auction->>'status' = 'active' \
-         AND (auction->>'ends_at')::timestamptz <= $1 \
-         FOR UPDATE SKIP LOCKED"
-    ))
-    .bind(now)
-    .fetch_all(&mut *tx)
+         ORDER BY aggregate_id",
+    )
+    .fetch_all(pool)
     .await?;
 
-    let mut closed = 0u64;
-    for listing in due {
-        let Some(auction) = parse_auction(&listing) else {
-            continue;
-        };
-        let seller = listing.seller_pubky.clone();
-        let outcome =
-            close_locked_auction(&mut tx, &listing, auction, &seller, Uuid::new_v4(), now).await?;
-        tracing::info!(
-            aggregate_id = %listing.aggregate_id,
-            outcome = if outcome.sold { "sold" } else { "unsold" },
-            "closed auction on server time"
-        );
-        closed += 1;
+    let mut summary = AuctionCloseBatchSummary::default();
+    for aggregate_id in due {
+        match close_one_due_auction(pool, &aggregate_id, now).await {
+            Ok(Some(sold)) => {
+                tracing::info!(
+                    aggregate_id = %aggregate_id,
+                    outcome = if sold { "sold" } else { "unsold" },
+                    "closed auction on server time"
+                );
+                summary.closed += 1;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::error!(
+                    aggregate_id = %aggregate_id,
+                    failure = "auction_close_failed",
+                    "auction close failed; continuing batch"
+                );
+                summary.failed += 1;
+            }
+        }
     }
+    Ok(summary)
+}
+
+async fn close_one_due_auction(
+    pool: &PgPool,
+    aggregate_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<bool>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let listing: Option<ListingRow> = sqlx::query_as(&format!(
+        "SELECT {LISTING_COLUMNS} FROM listings \
+         WHERE aggregate_id = $1 AND sale_format = 'auction' \
+         AND auction->>'status' = 'active' \
+         FOR UPDATE SKIP LOCKED"
+    ))
+    .bind(aggregate_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(listing) = listing else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let auction = parse_auction(&listing)
+        .ok_or_else(|| sqlx::Error::Protocol("stored auction state is invalid".to_string()))?;
+    if auction.ends_at > now {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    let seller = listing.seller_pubky.clone();
+    let outcome =
+        close_locked_auction(&mut tx, &listing, auction, &seller, Uuid::new_v4(), now).await?;
     tx.commit().await?;
-    Ok(closed)
+    Ok(Some(outcome.sold))
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -2832,6 +2877,7 @@ pub struct WorkerSummary {
     pub drops_transitioned: u64,
     pub offers_expired: u64,
     pub auctions_closed: u64,
+    pub auction_close_failures: u64,
     pub outbox_delivered: u64,
     pub locks_completions_applied: u64,
     pub locks_snapshots_purged: u64,
@@ -2983,7 +3029,9 @@ pub async fn run_once(
     if try_acquire_lease(&state.pool, TASK_AUCTION_CLOSE, holder, now, lease_seconds).await? {
         let result = close_due_auctions(&state.pool, now).await;
         release_lease(&state.pool, TASK_AUCTION_CLOSE, holder, now).await?;
-        summary.auctions_closed = result?;
+        let result = result?;
+        summary.auctions_closed = result.closed;
+        summary.auction_close_failures = result.failed;
     }
     if try_acquire_lease(&state.pool, TASK_OUTBOX, holder, now, lease_seconds).await? {
         let paykit = state
@@ -3423,6 +3471,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             drops_transitioned = summary.drops_transitioned,
                             offers_expired = summary.offers_expired,
                             auctions_closed = summary.auctions_closed,
+                            auction_close_failures = summary.auction_close_failures,
                             outbox_delivered = summary.outbox_delivered,
                             locks_completions_applied = summary.locks_completions_applied,
                             locks_snapshots_purged = summary.locks_snapshots_purged,

@@ -36,3 +36,43 @@ CREATE TABLE listing_auction_reserves (
 
 COMMENT ON TABLE listing_auction_reserves IS
     'Seller and trusted-service-only auction reserve authority; never serialized publicly.';
+
+-- Production before this migration has one reserve-free auction shape. Give
+-- every legacy auction an explicit no-reserve authority instead of treating
+-- absence as no reserve or trusting any value in public JSON. The fixed UUID
+-- is reserved migration provenance (not a seller command); listing_revision
+-- carries the listing side of the dual CAS and record_revision starts the
+-- private side at 1. Reusing the listing timestamp makes the backfill
+-- deterministic and does not manufacture a later seller write.
+INSERT INTO listing_auction_reserves (
+    listing_aggregate_id,
+    listing_revision,
+    record_revision,
+    reserve_amount_minor,
+    reserve_currency,
+    reserve_exponent,
+    last_command_id,
+    updated_at
+)
+SELECT
+    aggregate_id,
+    listing_revision,
+    1,
+    NULL,
+    NULL,
+    NULL,
+    '00000000-0000-0033-0000-000000000001'::uuid,
+    updated_at
+FROM listings
+WHERE sale_format = 'auction';
+
+-- Old service rows could contain these former public projection members.
+-- Scrub them without reading or copying their values; the authority row above
+-- remains explicit no-reserve regardless of their contents.
+UPDATE listings
+SET auction = auction
+    - 'reserve_price'
+    - 'reservePrice'
+    - 'reserve_met'
+    - 'reserveMet'
+WHERE sale_format = 'auction';
