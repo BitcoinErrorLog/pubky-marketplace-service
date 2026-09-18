@@ -628,11 +628,8 @@ mod tests {
         );
     }
 
-    // The same fetched document is identity-valid whether the advertised
-    // resource is spelled bare or with the Shop's `pubky://` prefix — and
-    // the content-address check still rejects a wrong lock id.
     #[test]
-    fn validation_rejects_a_wrong_path_under_the_pubky_scheme_spelling() {
+    fn validation_accepts_both_canonical_resource_spellings() {
         let document = fixture("typed-reserialisation.json");
         let bare = resource(POSITIVE_LOCK_ID);
         let addressed = format!("pubky://{bare}");
@@ -641,6 +638,11 @@ mod tests {
                 .expect("the same document is valid under both spellings");
             assert_eq!(lock.lock_id().as_deref(), Some(POSITIVE_LOCK_ID));
         }
+    }
+
+    #[test]
+    fn validation_rejects_a_wrong_path_under_the_pubky_scheme_spelling() {
+        let document = fixture("typed-reserialisation.json");
         const WRONG_LOCK_ID: &str = "RMFVM3N8PM1P6MZYCAKXRW3JXP6H3CDT1N4YPDS7NVJVQYYH4KAG";
         assert_eq!(
             validate_content_lock_value(&document, &format!("pubky://{}", resource(WRONG_LOCK_ID))),
