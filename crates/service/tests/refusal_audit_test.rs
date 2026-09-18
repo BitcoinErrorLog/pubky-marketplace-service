@@ -19,7 +19,33 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
+
+static WRITER_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
+
+type AttackBucketRow = (i16, i64, Vec<u8>, bool, Option<Vec<u8>>);
+
+struct ActualWriterFixture {
+    runtime: Arc<RefusalAuditRuntime>,
+    pool: PgPool,
+    keys: AuditKeys,
+    login_guard: Option<MutexGuard<'static, ()>>,
+}
+
+impl Drop for ActualWriterFixture {
+    fn drop(&mut self) {
+        let pool = self.pool.clone();
+        let login_guard = self
+            .login_guard
+            .take()
+            .expect("writer fixture guard is present");
+        tokio::spawn(async move {
+            pool.close().await;
+            drop(login_guard);
+        });
+    }
+}
 
 struct RefusalAuditLocksHomeserver {
     documents: HashMap<(String, String), serde_json::Value>,
@@ -116,13 +142,8 @@ async fn insert_bucket(
     .expect("insert audit fixture");
 }
 
-async fn actual_writer_runtime(pool: &PgPool) -> Arc<RefusalAuditRuntime> {
-    actual_writer_runtime_and_pool(pool).await.0
-}
-
-async fn actual_writer_runtime_and_pool(
-    pool: &PgPool,
-) -> (Arc<RefusalAuditRuntime>, PgPool, AuditKeys) {
+async fn actual_writer_fixture(pool: &PgPool) -> ActualWriterFixture {
+    let login_guard = WRITER_LOGIN_FIXTURE.lock().await;
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(pool)
         .await
@@ -135,9 +156,9 @@ async fn actual_writer_runtime_and_pool(
     .execute(pool)
     .await
     .expect("set isolated test login password");
+    let quoted_database = format!("\"{}\"", database.replace('"', "\"\""));
     sqlx::query(&format!(
-        "GRANT CONNECT ON DATABASE {} TO marketplace_refusal_audit_writer_login",
-        format!("\"{}\"", database.replace('"', "\"\""))
+        "GRANT CONNECT ON DATABASE {quoted_database} TO marketplace_refusal_audit_writer_login"
     ))
     .execute(pool)
     .await
@@ -162,7 +183,12 @@ async fn actual_writer_runtime_and_pool(
     ));
     for _ in 0..50 {
         if runtime.is_ready() {
-            return (runtime, writer_pool, keys);
+            return ActualWriterFixture {
+                runtime,
+                pool: writer_pool,
+                keys,
+                login_guard: Some(login_guard),
+            };
         }
         tokio::time::sleep(StdDuration::from_millis(10)).await;
     }
@@ -877,9 +903,9 @@ async fn refusal_audit_retention_actual_login_is_probed_before_purge(pool: PgPoo
     .execute(&pool)
     .await
     .expect("set retention test password");
+    let quoted_database = format!("\"{}\"", database.replace('"', "\"\""));
     sqlx::query(&format!(
-        "GRANT CONNECT ON DATABASE {} TO marketplace_refusal_audit_retention",
-        format!("\"{}\"", database.replace('"', "\"\""))
+        "GRANT CONNECT ON DATABASE {quoted_database} TO marketplace_refusal_audit_retention"
     ))
     .execute(&pool)
     .await
@@ -992,7 +1018,9 @@ async fn refusal_audit_rotation_verifies_old_epoch_until_destroyed(pool: PgPool)
 
 #[sqlx::test(migrations = "./migrations")]
 async fn refusal_audit_uses_separate_least_privilege_pool(pool: PgPool) {
-    let (runtime, writer_pool, _) = actual_writer_runtime_and_pool(&pool).await;
+    let writer = actual_writer_fixture(&pool).await;
+    let runtime = &writer.runtime;
+    let writer_pool = &writer.pool;
     assert_eq!(writer_pool.options().get_max_connections(), 2);
     assert_eq!(writer_pool.options().get_min_connections(), 0);
     assert_eq!(
@@ -1005,7 +1033,7 @@ async fn refusal_audit_uses_separate_least_privilege_pool(pool: PgPool) {
     );
     let writer_identity: (String, String) =
         sqlx::query_as("SELECT session_user::text, current_user::text")
-            .fetch_one(&writer_pool)
+            .fetch_one(writer_pool)
             .await
             .expect("writer identity");
     assert_eq!(writer_identity.0, "marketplace_refusal_audit_writer_login");
@@ -1032,7 +1060,7 @@ async fn refusal_audit_uses_separate_least_privilege_pool(pool: PgPool) {
             assert_eq!(runtime.metrics().delivered, 1);
             let catalog_mutation =
                 sqlx::query("UPDATE command_refusal_kinds SET name=name WHERE id=1")
-                    .execute(&writer_pool)
+                    .execute(writer_pool)
                     .await
                     .expect_err("writer cannot mutate catalogs");
             assert_eq!(
@@ -1042,7 +1070,7 @@ async fn refusal_audit_uses_separate_least_privilege_pool(pool: PgPool) {
                 Some(std::borrow::Cow::Borrowed("42501"))
             );
             let bucket_delete = sqlx::query("DELETE FROM command_refusal_audit_buckets")
-                .execute(&writer_pool)
+                .execute(writer_pool)
                 .await
                 .expect_err("writer cannot delete buckets");
             assert_eq!(
@@ -1128,7 +1156,9 @@ async fn refusal_audit_writer_failure_never_changes_command_outcome(pool: PgPool
 
 #[sqlx::test(migrations = "./migrations")]
 async fn refusal_audit_exhausted_writer_pool_never_starves_domain_pool(pool: PgPool) {
-    let (runtime, writer_pool, _) = actual_writer_runtime_and_pool(&pool).await;
+    let writer = actual_writer_fixture(&pool).await;
+    let runtime = &writer.runtime;
+    let writer_pool = &writer.pool;
     let held_one = writer_pool
         .acquire()
         .await
@@ -1147,7 +1177,7 @@ async fn refusal_audit_exhausted_writer_pool_never_starves_domain_pool(pool: PgP
     )
     .await;
     let router = marketplace_service::http::build_router(
-        app.state.clone().with_refusal_audit(runtime.clone()),
+        app.state.clone().with_refusal_audit(Arc::clone(runtime)),
     );
     let mut requests = tokio::task::JoinSet::new();
     for index in 0..25 {
@@ -1196,7 +1226,8 @@ async fn refusal_audit_ambiguous_commit_is_not_retried_and_discards_connection(p
     .execute(&pool)
     .await
     .expect("deferred commit fault");
-    let (runtime, _, _) = actual_writer_runtime_and_pool(&pool).await;
+    let writer = actual_writer_fixture(&pool).await;
+    let runtime = &writer.runtime;
     let actor = common::new_actor(&common::test_app(pool.clone()).await).await;
     runtime.try_send(
         runtime
@@ -1234,7 +1265,8 @@ async fn refusal_audit_ambiguous_commit_is_not_retried_and_discards_connection(p
 
 #[sqlx::test(migrations = "./migrations")]
 async fn refusal_audit_writer_panic_restarts_and_flushes_gap(pool: PgPool) {
-    let (runtime, _, _) = actual_writer_runtime_and_pool(&pool).await;
+    let writer = actual_writer_fixture(&pool).await;
+    let runtime = &writer.runtime;
     let actor = common::new_actor(&common::test_app(pool.clone()).await).await;
     let descriptor = || {
         runtime
@@ -1291,7 +1323,9 @@ async fn refusal_audit_writer_panic_restarts_and_flushes_gap(pool: PgPool) {
 async fn refusal_audit_identity_spoof_and_command_id_attacks_do_not_change_bucket_keys(
     pool: PgPool,
 ) {
-    let (runtime, _, keys) = actual_writer_runtime_and_pool(&pool).await;
+    let writer = actual_writer_fixture(&pool).await;
+    let runtime = &writer.runtime;
+    let keys = &writer.keys;
     let mut app = common::test_app(pool.clone()).await;
     app.state = app.state.clone().with_refusal_audit(runtime.clone());
     app.router = marketplace_service::http::build_router(app.state.clone());
@@ -1321,21 +1355,16 @@ async fn refusal_audit_identity_spoof_and_command_id_attacks_do_not_change_bucke
     let (_, body) = common::execute(&app, &bidder.token, &malformed).await;
     assert_eq!(body["error"]["code"], "INVALID_COMMAND");
 
-    for _ in 0..100 {
-        let delivered: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(sum(occurrence_count), 0)::bigint \
-             FROM command_refusal_audit_buckets",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("delivered count");
-        if delivered == 13 {
-            break;
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        while runtime.metrics().delivered != 13 {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
-    }
+    })
+    .await
+    .expect("all real writer deliveries committed");
+    assert_eq!(runtime.metrics().delivered, 13);
     let expected_actor_tag = keys.actor_tag(&bidder.pubky).expect("session actor tag");
-    let rows: Vec<(i16, i64, Vec<u8>, bool, Option<Vec<u8>>)> = sqlx::query_as(
+    let rows: Vec<AttackBucketRow> = sqlx::query_as(
         "SELECT refusal_kind, occurrence_count, actor_tag, command_id_present, sample_command_tag \
          FROM command_refusal_audit_buckets ORDER BY refusal_kind",
     )
@@ -1360,14 +1389,15 @@ async fn refusal_audit_identity_spoof_and_command_id_attacks_do_not_change_bucke
 
 #[sqlx::test(migrations = "./migrations")]
 async fn refusal_audit_concurrent_delivery_obeys_bounds(pool: PgPool) {
-    let runtime = actual_writer_runtime(&pool).await;
+    let writer = actual_writer_fixture(&pool).await;
+    let runtime = &writer.runtime;
     let app = common::test_app(pool.clone()).await;
     let mut actors = Vec::new();
     for _ in 0..20 {
         actors.push(common::new_actor(&app).await);
     }
     let router = marketplace_service::http::build_router(
-        app.state.clone().with_refusal_audit(runtime.clone()),
+        app.state.clone().with_refusal_audit(Arc::clone(runtime)),
     );
     let mut tasks = tokio::task::JoinSet::new();
     for actor in actors {
@@ -1414,13 +1444,14 @@ async fn refusal_audit_concurrent_delivery_obeys_bounds(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn refusal_audit_forbidden_plaintext_inverse_scan(pool: PgPool) {
-    let runtime = actual_writer_runtime(&pool).await;
+    let writer = actual_writer_fixture(&pool).await;
+    let runtime = &writer.runtime;
     let actor = pubky_common::crypto::Keypair::random().public_key().z32();
     let command_id = Uuid::new_v4();
     let app = common::test_app(pool.clone()).await;
     let authenticated = common::new_actor(&app).await;
     let router = marketplace_service::http::build_router(
-        app.state.clone().with_refusal_audit(runtime.clone()),
+        app.state.clone().with_refusal_audit(Arc::clone(runtime)),
     );
     let (status, _) = common::send(
         router,
@@ -1493,8 +1524,9 @@ async fn refusal_audit_manual_resolve_missing_pin_is_recorded_after_domain_relea
         .execute(&pool)
         .await
         .expect("remove pin fixture");
-    let runtime = actual_writer_runtime(&pool).await;
-    app.state = app.state.clone().with_refusal_audit(runtime.clone());
+    let writer = actual_writer_fixture(&pool).await;
+    let runtime = &writer.runtime;
+    app.state = app.state.clone().with_refusal_audit(Arc::clone(runtime));
     app.router = marketplace_service::http::build_router(app.state.clone());
 
     let (status, body) = resolve_call(
@@ -1587,8 +1619,9 @@ async fn refusal_audit_enqueue_happens_after_domain_rollback_release(pool: PgPoo
     .await
     .expect("second line sold out");
 
-    let runtime = actual_writer_runtime(&pool).await;
-    app.state = app.state.clone().with_refusal_audit(runtime.clone());
+    let writer = actual_writer_fixture(&pool).await;
+    let runtime = &writer.runtime;
+    app.state = app.state.clone().with_refusal_audit(Arc::clone(runtime));
     app.router = build_router(app.state.clone());
     let before: serde_json::Value = sqlx::query_scalar(
         "SELECT jsonb_build_object(\
@@ -1651,8 +1684,11 @@ async fn refusal_audit_enqueue_happens_after_domain_rollback_release(pool: PgPoo
 #[sqlx::test(migrations = "./migrations")]
 async fn refusal_audit_d26_2_precedence_and_personal_minimum_categories_are_exact(pool: PgPool) {
     let mut app = common::test_app(pool.clone()).await;
-    let runtime = actual_writer_runtime(&pool).await;
-    app.state = app.state.clone().with_refusal_audit(runtime);
+    let writer = actual_writer_fixture(&pool).await;
+    app.state = app
+        .state
+        .clone()
+        .with_refusal_audit(Arc::clone(&writer.runtime));
     app.router = marketplace_service::http::build_router(app.state.clone());
     let seller = common::new_actor(&app).await;
     let bidder = common::new_actor(&app).await;
