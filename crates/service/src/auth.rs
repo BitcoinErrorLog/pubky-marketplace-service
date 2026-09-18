@@ -28,6 +28,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use pubky_common::auth::AuthToken;
+use pubky_common::capabilities::{Action, Capabilities};
+use pubky_common::StoragePath;
 use rand::RngCore;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -48,9 +50,46 @@ const MIN_TOKEN_LENGTH: usize = 75;
 /// prunable.
 const LIBRARY_TIMESTAMP_WINDOW_SECONDS: i64 = 180;
 
+/// Canonical AuthToken directory grant required by every Phase 6 inventory
+/// command and projection. Both read and write actions are required by D6.6.
+pub const INVENTORY_SERVICE_SCOPE: &str = "/pub/pubky.app/marketplace-service/v1/";
+
 /// The authenticated actor, resolved from a session token by middleware.
 #[derive(Debug, Clone)]
 pub struct Actor(pub String);
+
+/// The verified persisted session facts available to route middleware and
+/// command/query boundaries. The token hash is opaque and must never be
+/// logged or serialized.
+#[derive(Debug, Clone)]
+pub struct AuthSession {
+    pub actor: Actor,
+    pub capabilities: String,
+    pub token_hash: Vec<u8>,
+}
+
+impl AuthSession {
+    pub fn covers_inventory_service(&self) -> bool {
+        capability_covers_inventory_service(&self.capabilities)
+    }
+}
+
+/// Semantic capability coverage: a directory grant strictly broader than
+/// the service scope (notably `/:rw`) covers it; exact string equality would
+/// incorrectly reject that grant. Read-only, write-only, malformed, empty,
+/// and unrelated grants fail closed.
+pub fn capability_covers_inventory_service(raw: &str) -> bool {
+    let Ok(capabilities) = raw.parse::<Capabilities>() else {
+        return false;
+    };
+    let required_path =
+        StoragePath::new(INVENTORY_SERVICE_SCOPE).expect("inventory service scope is canonical");
+    capabilities.iter().any(|capability| {
+        capability.scope_covers_path(&required_path)
+            && capability.actions().contains(&Action::Read)
+            && capability.actions().contains(&Action::Write)
+    })
+}
 
 /// The claims extracted from a cryptographically verified AuthToken.
 #[derive(Debug, PartialEq, Eq)]
@@ -99,7 +138,7 @@ pub fn verify_auth_token(
     }
     Ok(VerifiedAuthToken {
         pubky: token.public_key().z32(),
-        capabilities: token.capabilities().to_string(),
+        capabilities: token.capabilities().clone().normalize().to_string(),
         timestamp_micros,
     })
 }
@@ -189,8 +228,9 @@ pub async fn create_session(State(state): State<AppState>, body: Bytes) -> Respo
     )
     .bind(hash_token(&token))
     .bind(&verified.pubky)
-    // Intentionally empty: disclosure reduction; this column is not an ACL.
-    .bind("")
+    // Persist only the normalized verified grant, never the credential bytes.
+    // Inventory route middleware and the handler boundary both enforce it.
+    .bind(&verified.capabilities)
     .bind(now)
     .bind(expires_at)
     .execute(&mut *tx)
@@ -252,10 +292,12 @@ pub async fn require_session(
     };
 
     let now = state.clock.now();
-    let session: Option<(String, DateTime<Utc>)> = match sqlx::query_as(
-        "SELECT pubky, expires_at FROM auth_sessions WHERE token_hash = $1 AND expires_at > $2",
+    let token_hash = hash_token(&token);
+    let session: Option<(String, String, DateTime<Utc>)> = match sqlx::query_as(
+        "SELECT pubky, capabilities, expires_at FROM auth_sessions \
+         WHERE token_hash = $1 AND expires_at > $2",
     )
-    .bind(hash_token(&token))
+    .bind(&token_hash)
     .bind(now)
     .fetch_optional(&state.pool)
     .await
@@ -266,7 +308,7 @@ pub async fn require_session(
             return auth_error(StatusCode::INTERNAL_SERVER_ERROR, "Session lookup failed.");
         }
     };
-    let Some((pubky, _)) = session else {
+    let Some((pubky, capabilities, _)) = session else {
         tracing::warn!(
             route = logging::route_template(&request),
             status = StatusCode::UNAUTHORIZED.as_u16(),
@@ -279,7 +321,13 @@ pub async fn require_session(
         );
     };
 
-    request.extensions_mut().insert(Actor(pubky));
+    let actor = Actor(pubky);
+    request.extensions_mut().insert(actor.clone());
+    request.extensions_mut().insert(AuthSession {
+        actor,
+        capabilities,
+        token_hash,
+    });
     let Some(actor) = request.extensions().get::<Actor>().cloned() else {
         return auth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -289,6 +337,37 @@ pub async fn require_session(
     let mut response = next.run(request).await;
     response.extensions_mut().insert(actor);
     response
+}
+
+fn capability_error() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "schema_version": 1,
+            "ok": false,
+            "error": {
+                "code": "capability_required",
+                "message": "The session grant does not authorize inventory access."
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Inventory-only middleware. Generic legacy routes continue to receive the
+/// authenticated actor, while every new Phase 6 route must also pass this
+/// semantic capability gate.
+pub async fn require_inventory_capability(request: Request, next: Next) -> Response {
+    let Some(session) = request.extensions().get::<AuthSession>() else {
+        return auth_error(
+            StatusCode::UNAUTHORIZED,
+            "A session bearer token is required.",
+        );
+    };
+    if !session.covers_inventory_service() {
+        return capability_error();
+    }
+    next.run(request).await
 }
 
 #[cfg(test)]
