@@ -27,6 +27,132 @@ static ADMIN_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
 
 type AttackBucketRow = (i16, i64, Vec<u8>, bool, Option<Vec<u8>>);
 
+#[derive(Clone)]
+struct RefusalHttpCase {
+    kind: RefusalKind,
+    state: AppState,
+    token: String,
+    uri: String,
+    body: serde_json::Value,
+    idempotency_key: Option<String>,
+}
+
+async fn send_refusal_case(
+    case: &RefusalHttpCase,
+    runtime: Arc<RefusalAuditRuntime>,
+) -> (axum::http::StatusCode, Vec<u8>) {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(&case.uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", case.token));
+    if let Some(key) = &case.idempotency_key {
+        request = request.header("Idempotency-Key", key);
+    }
+    let response = build_router(case.state.clone().with_refusal_audit(runtime))
+        .oneshot(
+            request
+                .body(Body::from(
+                    serde_json::to_vec(&case.body).expect("case body serializes"),
+                ))
+                .expect("case request builds"),
+        )
+        .await
+        .expect("case request executes");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("case response body")
+        .to_bytes();
+    (status, bytes.to_vec())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refusal_offer_checkout_command(
+    offer_id: &str,
+    award_id: &str,
+    listing_aggregate_id: &str,
+    listing_revision: i64,
+    listing_record_sha256: &str,
+    variant_id: &str,
+    quantity: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "command_id": Uuid::new_v4(),
+        "aggregate_id": format!("offer:{offer_id}"),
+        "expected_revision": 2,
+        "issued_at": common::NOW,
+        "kind": "offer.checkout",
+        "payload": {
+            "offer_id": offer_id,
+            "award_id": award_id,
+            "listing_aggregate_id": listing_aggregate_id,
+            "listing_revision": listing_revision,
+            "listing_record_sha256": listing_record_sha256,
+            "variant_id": variant_id,
+            "quantity": quantity,
+            "delivery_address": {
+                "name": "Alice Buyer", "line1": "1 Market Street", "line2": "",
+                "city": "New York", "region": "NY", "postal_code": "10001",
+                "country_code": "US"
+            },
+            "guarantee_policy_version": 1
+        }
+    })
+}
+
+async fn accepted_refusal_offer(
+    app: &common::TestApp,
+    seller: &common::TestActor,
+    buyer: &common::TestActor,
+    index: u128,
+) -> (Uuid, Uuid, String, i64, String, String, i64) {
+    let mut register = common::register_command(&seller.pubky, 2);
+    register["command_id"] = serde_json::json!(Uuid::from_u128(0xb000 + index * 3));
+    common::execute(app, &seller.token, &register).await;
+    let offer_id = Uuid::from_u128(0xb001 + index * 3);
+    let mut create = common::create_offer_command(&seller.pubky, 1);
+    create["command_id"] = serde_json::json!(offer_id);
+    let (status, body) = common::execute(app, &buyer.token, &create).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let mut accept = common::offer_action(
+        "offer.accept",
+        1,
+        &Uuid::from_u128(0xb002 + index * 3).to_string(),
+    );
+    accept["aggregate_id"] = serde_json::json!(format!("offer:{offer_id}"));
+    accept["payload"]["offer_id"] = serde_json::json!(offer_id);
+    let (status, body) = common::execute(app, &seller.token, &accept).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    sqlx::query(
+        "UPDATE offers SET accepted_listing_record_sha256=$2, accepted_variant_id='boots_01' \
+         WHERE id=$1",
+    )
+    .bind(offer_id)
+    .bind("a".repeat(64))
+    .execute(&app.pool)
+    .await
+    .expect("normalize accepted refusal snapshot");
+    sqlx::query_as::<_, (Uuid, String, i64, String, String, i64)>(
+        "SELECT award_id, accepted_listing_aggregate_id, accepted_listing_revision, \
+         accepted_listing_record_sha256, accepted_variant_id, accepted_quantity \
+         FROM offers WHERE id=$1",
+    )
+    .bind(offer_id)
+    .fetch_one(&app.pool)
+    .await
+    .map(|row| (offer_id, row.0, row.1, row.2, row.3, row.4, row.5))
+    .expect("accepted refusal offer facts")
+}
+
 struct ActualWriterFixture {
     runtime: Arc<RefusalAuditRuntime>,
     pool: PgPool,
@@ -50,6 +176,7 @@ impl Drop for ActualWriterFixture {
 
 struct RefusalAuditLocksHomeserver {
     documents: HashMap<(String, String), serde_json::Value>,
+    unavailable_content: bool,
 }
 
 impl HomeserverListingClient for RefusalAuditLocksHomeserver {
@@ -58,7 +185,7 @@ impl HomeserverListingClient for RefusalAuditLocksHomeserver {
         _seller_pubky: &'a str,
         _listing_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        Box::pin(async { HomeserverFetchOutcome::NotFound })
+        Box::pin(async { HomeserverFetchOutcome::Unavailable })
     }
 
     fn fetch_drop<'a>(
@@ -75,6 +202,9 @@ impl HomeserverListingClient for RefusalAuditLocksHomeserver {
         content_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
         Box::pin(async move {
+            if self.unavailable_content {
+                return HomeserverFetchOutcome::Unavailable;
+            }
             match self
                 .documents
                 .get(&(creator_pubky.to_string(), content_path.to_string()))
@@ -99,6 +229,7 @@ async fn refusal_audit_locks_app(pool: PgPool, seller_pubky: &str) -> common::Te
             (seller_pubky.to_string(), path),
             common::lock_document_for(seller_pubky, 27_400, "USD"),
         )]),
+        unavailable_content: false,
     });
     let locks = Arc::new(LocksRuntime {
         keys: common::test_locks_keys(),
@@ -461,6 +592,106 @@ async fn refusal_audit_objects_have_hardened_owners_and_acls(pool: PgPool) {
     .await
     .expect("security definer inventory");
     assert_eq!(unsafe_definers, 0, "SECURITY DEFINER inventory is exact");
+}
+
+#[test]
+fn refusal_audit_command_failure_formation_is_compile_closed() {
+    let formation_sources = [
+        include_str!("../src/executor.rs"),
+        include_str!("../src/handlers/attestation.rs"),
+        include_str!("../src/handlers/auction.rs"),
+        include_str!("../src/handlers/cancellation.rs"),
+        include_str!("../src/handlers/checkout.rs"),
+        include_str!("../src/handlers/drops.rs"),
+        include_str!("../src/handlers/fulfillment.rs"),
+        include_str!("../src/handlers/holds.rs"),
+        include_str!("../src/handlers/locks.rs"),
+        include_str!("../src/handlers/mod.rs"),
+        include_str!("../src/handlers/offer_checkout.rs"),
+        include_str!("../src/handlers/offers.rs"),
+        include_str!("../src/handlers/payment.rs"),
+        include_str!("../src/handlers/pickup.rs"),
+        include_str!("../src/handlers/register_listing.rs"),
+        include_str!("../src/handlers/reserve_inventory.rs"),
+        include_str!("../src/handlers/returns.rs"),
+        include_str!("../src/handlers/reviews.rs"),
+        include_str!("../src/handlers/sync_listing.rs"),
+    ]
+    .join("\n");
+    for forbidden in [
+        "CommandFailure::new(",
+        "CommandFailure::with_revision(",
+        "Err(CommandFailure {",
+        "..CommandFailure::",
+        "refusal_kind_for_error",
+        "site_refusal_kind",
+        "failure.message().contains(",
+    ] {
+        assert!(
+            !formation_sources.contains(forbidden),
+            "generic or inferred refusal formation remains: {forbidden}"
+        );
+    }
+
+    let mut formed = std::collections::BTreeSet::from(["InvalidEnvelope".to_string()]);
+    for constructor in [
+        "CommandFailure::refused(",
+        "CommandFailure::refused_with_revision(",
+        "CommandFailure::refused_with_issues(",
+    ] {
+        for tail in formation_sources.split(constructor).skip(1) {
+            let tail = tail.trim_start();
+            let marker = "crate::refusal_audit::RefusalKind::";
+            assert!(
+                tail.starts_with(marker),
+                "{constructor} does not select a static site kind: {}",
+                &tail[..tail.len().min(192)]
+            );
+            let start = marker.len();
+            let variant = tail[start..]
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric())
+                .collect::<String>();
+            assert!(!variant.is_empty(), "empty static kind at {constructor}");
+            formed.insert(variant);
+        }
+    }
+    let audit_source = include_str!("../src/refusal_audit.rs");
+    let review_mapping = audit_source
+        .split_once("pub const fn refusal_kind_for_review_reason")
+        .expect("manual-resolution refusal mapping exists")
+        .1
+        .split_once("#[derive(Clone)]")
+        .expect("manual-resolution refusal mapping has a stable boundary")
+        .0;
+    for tail in review_mapping.split("RefusalKind::").skip(1) {
+        formed.insert(
+            tail.chars()
+                .take_while(|character| character.is_ascii_alphanumeric())
+                .collect(),
+        );
+    }
+    let expected = RefusalKind::ALL
+        .iter()
+        .map(|kind| {
+            kind.name()
+                .split('_')
+                .map(|part| {
+                    let mut characters = part.chars();
+                    characters
+                        .next()
+                        .into_iter()
+                        .flat_map(char::to_uppercase)
+                        .chain(characters)
+                        .collect::<String>()
+                })
+                .collect::<String>()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        formed, expected,
+        "formation sites and the static refusal catalog must have exact parity"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1894,122 +2125,595 @@ async fn refusal_audit_d26_2_precedence_and_personal_minimum_categories_are_exac
 
 #[sqlx::test(migrations = "./migrations")]
 async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPool) {
+    use common::paykit_review::{bound_order, into_manual_review_held, into_manual_review_late};
+
+    fn command_case(
+        kind: RefusalKind,
+        app: &common::TestApp,
+        actor: &common::TestActor,
+        body: serde_json::Value,
+    ) -> RefusalHttpCase {
+        RefusalHttpCase {
+            kind,
+            state: app.state.clone(),
+            token: actor.token.clone(),
+            uri: "/v1/commands".to_string(),
+            body,
+            idempotency_key: None,
+        }
+    }
+    fn resolve_case(
+        kind: RefusalKind,
+        app: &common::TestApp,
+        actor: &common::TestActor,
+        order_id: Uuid,
+        key: Option<Uuid>,
+        body: serde_json::Value,
+    ) -> RefusalHttpCase {
+        RefusalHttpCase {
+            kind,
+            state: app.state.clone(),
+            token: actor.token.clone(),
+            uri: format!("/v0/orders/{order_id}/bitcoin/resolve"),
+            body,
+            idempotency_key: key.map(|value| value.to_string()),
+        }
+    }
     async fn domain_snapshot(pool: &PgPool) -> serde_json::Value {
         sqlx::query_scalar(
             "SELECT jsonb_build_object(\
               'listings',(SELECT jsonb_agg(row_to_json(x) ORDER BY aggregate_id) FROM listings x),\
+              'drops',(SELECT jsonb_agg(row_to_json(x) ORDER BY aggregate_id) FROM drops x),\
+              'offers',(SELECT jsonb_agg(row_to_json(x) ORDER BY id) FROM offers x),\
+              'reservations',(SELECT jsonb_agg(row_to_json(x) ORDER BY id) FROM reservations x),\
+              'orders',(SELECT jsonb_agg(row_to_json(x) ORDER BY id) FROM orders x),\
+              'payments',(SELECT jsonb_agg(row_to_json(x) ORDER BY id) FROM payments x),\
               'bids',(SELECT jsonb_agg(row_to_json(x) ORDER BY id) FROM bids x),\
+              'correlations',(SELECT jsonb_agg(row_to_json(x) ORDER BY id) FROM payment_locks_correlations x),\
+              'outcomes',(SELECT jsonb_agg(row_to_json(x) ORDER BY id) FROM payment_locks_binding_outcomes x),\
+              'manual_resolutions',(SELECT jsonb_agg(row_to_json(x) ORDER BY order_id) FROM paykit_manual_resolutions x),\
               'events',(SELECT jsonb_agg(row_to_json(x) ORDER BY id) FROM events x),\
-              'results',(SELECT jsonb_agg(row_to_json(x) ORDER BY command_id) FROM command_results x))",
+              'results',(SELECT jsonb_agg(row_to_json(x) ORDER BY actor_pubky,command_id) FROM command_results x))",
         )
         .fetch_one(pool)
         .await
-        .expect("domain snapshot")
+        .expect("complete domain snapshot")
     }
 
-    let mut app = common::test_app(pool.clone()).await;
-    let seller = common::new_actor(&app).await;
-    let bidder = common::new_actor(&app).await;
-    common::execute(
-        &app,
-        &seller.token,
-        &common::register_auction_command(&seller.pubky),
+    let base = common::test_app(pool.clone()).await;
+    let seller = common::new_actor(&base).await;
+    let buyer = common::new_actor(&base).await;
+    let other = common::new_actor(&base).await;
+    let mut invalid_command = common::register_command(&seller.pubky, 1);
+    invalid_command["command_id"] = serde_json::json!(Uuid::from_u128(0xc000));
+    invalid_command["aggregate_id"] = serde_json::json!("listing:wrong");
+    let mut cases = vec![
+        command_case(
+            RefusalKind::InvalidEnvelope,
+            &base,
+            &buyer,
+            serde_json::json!({}),
+        ),
+        command_case(RefusalKind::InvalidCommand, &base, &seller, invalid_command),
+        command_case(
+            RefusalKind::NotFound,
+            &base,
+            &buyer,
+            common::reserve_command(&other.pubky, 91, 1, 0),
+        ),
+    ];
+
+    let mut normal = common::register_command(&seller.pubky, 1);
+    normal["command_id"] = serde_json::json!(Uuid::from_u128(0xc001));
+    let (status, body) = common::execute(&base, &seller.token, &normal).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    cases.push(command_case(
+        RefusalKind::Unauthorized,
+        &base,
+        &seller,
+        common::reserve_command(&seller.pubky, 92, 1, 1),
+    ));
+    cases.push(command_case(
+        RefusalKind::RevisionConflict,
+        &base,
+        &buyer,
+        common::reserve_command(&seller.pubky, 93, 1, 0),
+    ));
+    cases.push(command_case(
+        RefusalKind::InsufficientInventory,
+        &base,
+        &buyer,
+        common::reserve_command(&seller.pubky, 94, 2, 1),
+    ));
+    cases.push(command_case(
+        RefusalKind::InvalidState,
+        &base,
+        &seller,
+        common::close_auction_command(&seller.pubky, 1, 95),
+    ));
+    let mut changed = normal.clone();
+    changed["payload"]["quantity"] = serde_json::json!(2);
+    cases.push(command_case(
+        RefusalKind::IdempotencyConflict,
+        &base,
+        &seller,
+        changed,
+    ));
+
+    let invariant_seller = common::new_actor(&base).await;
+    let invariant_buyer = common::new_actor(&base).await;
+    let mut invariant_listing = common::register_command(&invariant_seller.pubky, 1);
+    invariant_listing["command_id"] = serde_json::json!(Uuid::from_u128(0xc010));
+    common::execute(&base, &invariant_seller.token, &invariant_listing).await;
+    let invariant_id = Uuid::from_u128(0xc011);
+    let invariant_checkout =
+        common::checkout_command_with_id(&invariant_seller.pubky, &invariant_id.to_string());
+    let (status, body) = common::execute(&base, &invariant_buyer.token, &invariant_checkout).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    sqlx::query(
+        "UPDATE command_results SET result='{}'::jsonb WHERE actor_pubky=$1 AND command_id=$2",
     )
-    .await;
-    let writer = actual_writer_fixture(&pool).await;
-    app.state = app
+    .bind(&invariant_buyer.pubky)
+    .bind(invariant_id)
+    .execute(&pool)
+    .await
+    .expect("malformed stored-result fixture");
+    cases.push(command_case(
+        RefusalKind::InvariantViolation,
+        &base,
+        &invariant_buyer,
+        invariant_checkout,
+    ));
+
+    let auction_seller = common::new_actor(&base).await;
+    let auction_bidder = common::new_actor(&base).await;
+    let mut auction = common::register_auction_command(&auction_seller.pubky);
+    auction["command_id"] = serde_json::json!(Uuid::from_u128(0xc020));
+    common::execute(&base, &auction_seller.token, &auction).await;
+    cases.push(command_case(
+        RefusalKind::BidListingNotFound,
+        &base,
+        &auction_bidder,
+        common::place_bid_command(&other.pubky, 101, 7_000, 1),
+    ));
+    cases.push(command_case(
+        RefusalKind::BidSellerForbidden,
+        &base,
+        &auction_seller,
+        common::place_bid_command(&auction_seller.pubky, 102, 7_000, 1),
+    ));
+    cases.push(command_case(
+        RefusalKind::BidNotAuction,
+        &base,
+        &buyer,
+        common::place_bid_command(&seller.pubky, 103, 7_000, 1),
+    ));
+    let mut wrong_asset = common::place_bid_command(&auction_seller.pubky, 104, 7_000, 1);
+    wrong_asset["payload"]["maximum_amount"]["currency"] = serde_json::json!("EUR");
+    cases.push(command_case(
+        RefusalKind::BidWrongAsset,
+        &base,
+        &auction_bidder,
+        wrong_asset,
+    ));
+    cases.push(command_case(
+        RefusalKind::BidTooLow,
+        &base,
+        &auction_bidder,
+        common::place_bid_command(&auction_seller.pubky, 105, 1, 1),
+    ));
+    cases.push(command_case(
+        RefusalKind::AuctionClosed,
+        &base,
+        &auction_seller,
+        common::close_auction_command(&auction_seller.pubky, 1, 106),
+    ));
+
+    let expired_app = common::test_app(pool.clone()).await;
+    let expired_seller = common::new_actor(&expired_app).await;
+    let expired_buyer = common::new_actor(&expired_app).await;
+    let mut expired_listing = common::register_command(&expired_seller.pubky, 1);
+    expired_listing["command_id"] = serde_json::json!(Uuid::from_u128(0xc030));
+    common::execute(&expired_app, &expired_seller.token, &expired_listing).await;
+    let expired_offer = Uuid::from_u128(0xc031);
+    let mut create_expired = common::create_offer_command(&expired_seller.pubky, 1);
+    create_expired["command_id"] = serde_json::json!(expired_offer);
+    common::execute(&expired_app, &expired_buyer.token, &create_expired).await;
+    expired_app.clock.advance_seconds(3_601);
+    let mut accept_expired =
+        common::offer_action("offer.accept", 1, &Uuid::from_u128(0xc032).to_string());
+    accept_expired["aggregate_id"] = serde_json::json!(format!("offer:{expired_offer}"));
+    accept_expired["payload"]["offer_id"] = serde_json::json!(expired_offer);
+    cases.push(command_case(
+        RefusalKind::OfferExpired,
+        &expired_app,
+        &expired_seller,
+        accept_expired,
+    ));
+
+    let upstream = refusal_audit_locks_app(pool.clone(), &seller.pubky).await;
+    cases.push(command_case(
+        RefusalKind::UpstreamUnavailable,
+        &upstream,
+        &seller,
+        common::sync_command(&seller.pubky, "missing-upstream", 107),
+    ));
+
+    let award_app = common::test_app(pool.clone()).await;
+    for (index, kind) in [
+        RefusalKind::AwardExpired,
+        RefusalKind::AwardAlreadyConverted,
+        RefusalKind::AwardQuantityMismatch,
+        RefusalKind::AwardVariantMismatch,
+        RefusalKind::AwardListingChanged,
+        RefusalKind::AwardHoldMissing,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let award_seller = common::new_actor(&award_app).await;
+        let award_buyer = common::new_actor(&award_app).await;
+        let (offer_id, award_id, listing, revision, hash, variant, quantity) =
+            accepted_refusal_offer(&award_app, &award_seller, &award_buyer, index as u128 + 1)
+                .await;
+        let mut command = refusal_offer_checkout_command(
+            &offer_id.to_string(),
+            &award_id.to_string(),
+            &listing,
+            revision,
+            &hash,
+            &variant,
+            quantity,
+        );
+        match kind {
+            RefusalKind::AwardExpired => {
+                sqlx::query(
+                    "UPDATE offers SET award_expires_at='2026-08-19T21:59:59Z' WHERE id=$1",
+                )
+                .bind(offer_id)
+                .execute(&pool)
+                .await
+                .expect("expired award fixture");
+            }
+            RefusalKind::AwardAlreadyConverted => {
+                let (status, body) =
+                    common::execute(&award_app, &award_buyer.token, &command).await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+                command["command_id"] = serde_json::json!(Uuid::new_v4());
+            }
+            RefusalKind::AwardQuantityMismatch => {
+                command["payload"]["quantity"] = serde_json::json!(quantity + 1)
+            }
+            RefusalKind::AwardVariantMismatch => {
+                command["payload"]["variant_id"] = serde_json::json!("wrong-variant")
+            }
+            RefusalKind::AwardListingChanged => {
+                command["payload"]["listing_record_sha256"] = serde_json::json!("f".repeat(64))
+            }
+            RefusalKind::AwardHoldMissing => {
+                sqlx::query("UPDATE reservations SET buyer_pubky=$2 WHERE offer_award_id=$1")
+                    .bind(award_id)
+                    .bind(&award_seller.pubky)
+                    .execute(&pool)
+                    .await
+                    .expect("missing award hold fixture");
+            }
+            _ => unreachable!(),
+        }
+        cases.push(command_case(kind, &award_app, &award_buyer, command));
+    }
+
+    let locks_seller_key = common::random_keypair();
+    let mut locks_app = refusal_audit_locks_app(pool.clone(), &locks_seller_key.1).await;
+    let locks_seller = common::TestActor {
+        token: common::authenticate(&locks_app, &locks_seller_key.0).await,
+        keypair: locks_seller_key.0,
+        pubky: locks_seller_key.1,
+    };
+    let locks_buyer = common::new_actor(&locks_app).await;
+    let locks_other = common::new_actor(&locks_app).await;
+    let resource = common::lock_resource_for_payment(&locks_seller.pubky, 27_400, "USD");
+    let mut locks_listing =
+        common::register_listing_command(&locks_seller.pubky, "locks_01", 1, 120);
+    locks_listing["payload"]["digital_lock"] =
+        serde_json::json!({"policyUri":resource,"criterionId":"paykit"});
+    common::execute(&locks_app, &locks_seller.token, &locks_listing).await;
+    let checkout_id = Uuid::from_u128(0xc040);
+    let mut locks_checkout =
+        common::checkout_command_with_id(&locks_seller.pubky, &checkout_id.to_string());
+    locks_checkout["payload"]["lines"][0]["listing_aggregate_id"] =
+        serde_json::json!(format!("listing:{}_locks_01", locks_seller.pubky));
+    let (status, body) = common::execute(&locks_app, &locks_buyer.token, &locks_checkout).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let locks_payment = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("locks payment");
+    cases.push(command_case(
+        RefusalKind::LocksIdentityMismatch,
+        &locks_app,
+        &locks_other,
+        common::prepare_locks_command(locks_payment, 121),
+    ));
+    let unavailable_homeserver = Arc::new(RefusalAuditLocksHomeserver {
+        documents: HashMap::new(),
+        unavailable_content: true,
+    });
+    locks_app.state = locks_app
         .state
         .clone()
-        .with_refusal_audit(Arc::clone(&writer.runtime));
-    app.router = build_router(app.state.clone());
+        .with_homeserver(Some(unavailable_homeserver));
+    cases.push(command_case(
+        RefusalKind::LocksUpstreamUnavailable,
+        &locks_app,
+        &locks_buyer,
+        common::prepare_locks_command(locks_payment, 122),
+    ));
+
+    let (manual_app, _stripe, paykit) = common::test_app_with_payments(pool.clone()).await;
+    let manual_seller = common::new_actor(&manual_app).await;
+    let manual_buyer = common::new_actor(&manual_app).await;
+    let manual_other = common::new_actor(&manual_app).await;
+    let missing_order = Uuid::from_u128(0xc050);
+    cases.extend([
+        resolve_case(
+            RefusalKind::ManualResolveInvalidIdempotencyKey,
+            &manual_app,
+            &manual_seller,
+            missing_order,
+            None,
+            serde_json::json!({"outcome":"paid"}),
+        ),
+        resolve_case(
+            RefusalKind::ManualResolveInvalidOutcome,
+            &manual_app,
+            &manual_seller,
+            missing_order,
+            Some(Uuid::new_v4()),
+            serde_json::json!({"outcome":"invalid"}),
+        ),
+        resolve_case(
+            RefusalKind::ManualResolveInvalidReason,
+            &manual_app,
+            &manual_seller,
+            missing_order,
+            Some(Uuid::new_v4()),
+            serde_json::json!({"outcome":"paid","reason":"x".repeat(501)}),
+        ),
+        resolve_case(
+            RefusalKind::ManualResolveInvalidRefundReference,
+            &manual_app,
+            &manual_seller,
+            missing_order,
+            Some(Uuid::new_v4()),
+            serde_json::json!({"outcome":"refunded"}),
+        ),
+        resolve_case(
+            RefusalKind::ManualResolveOrderNotFound,
+            &manual_app,
+            &manual_seller,
+            missing_order,
+            Some(Uuid::new_v4()),
+            serde_json::json!({"outcome":"paid"}),
+        ),
+    ]);
+    let (held_id, held_payment) =
+        into_manual_review_held(&manual_app, &paykit, &manual_seller, &manual_buyer).await;
+    let held_uuid = Uuid::parse_str(&held_id).expect("held order id");
+    cases.push(resolve_case(
+        RefusalKind::ManualResolveNotOrderSeller,
+        &manual_app,
+        &manual_other,
+        held_uuid,
+        Some(Uuid::new_v4()),
+        serde_json::json!({"outcome":"paid"}),
+    ));
+    let not_applicable_seller = common::new_actor(&manual_app).await;
+    let not_applicable_buyer = common::new_actor(&manual_app).await;
+    let not_applicable =
+        common::create_pending_order(&manual_app, &not_applicable_seller, &not_applicable_buyer)
+            .await;
+    cases.push(resolve_case(
+        RefusalKind::ManualResolveNotApplicable,
+        &manual_app,
+        &not_applicable_seller,
+        Uuid::parse_str(&not_applicable.order_id).expect("not-applicable order"),
+        Some(Uuid::new_v4()),
+        serde_json::json!({"outcome":"paid"}),
+    ));
+
+    let (missing_pin_id, _) =
+        into_manual_review_held(&manual_app, &paykit, &manual_seller, &manual_buyer).await;
+    let missing_pin_uuid = Uuid::parse_str(&missing_pin_id).expect("missing pin order");
+    sqlx::query("UPDATE orders SET paykit_stack_id=NULL WHERE id=$1")
+        .bind(missing_pin_uuid)
+        .execute(&pool)
+        .await
+        .expect("missing pin fixture");
+    cases.push(resolve_case(
+        RefusalKind::ManualResolveMissingPin,
+        &manual_app,
+        &manual_seller,
+        missing_pin_uuid,
+        Some(Uuid::new_v4()),
+        serde_json::json!({"outcome":"paid"}),
+    ));
+
+    let resolution_id = Uuid::from_u128(0xc051);
+    let event_id: Uuid = sqlx::query_scalar("SELECT id FROM events ORDER BY occurred_at LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("resolution event fixture");
+    sqlx::query("INSERT INTO paykit_manual_resolutions (order_id,payment_id,resolution_id,outcome,basis,resolved_at,resolved_by_pubky,request_hash,response,event_id,created_at) VALUES ($1,$2,$3,'paid','seller_attestation',clock_timestamp(),$4,'fixture-hash','{}',$5,clock_timestamp())")
+        .bind(held_uuid).bind(Uuid::parse_str(&held_payment).expect("held payment"))
+        .bind(resolution_id).bind(&manual_seller.pubky).bind(event_id)
+        .execute(&pool).await.expect("existing resolution fixture");
+    cases.push(resolve_case(
+        RefusalKind::ManualResolveConflict,
+        &manual_app,
+        &manual_seller,
+        held_uuid,
+        Some(resolution_id),
+        serde_json::json!({"outcome":"abandoned"}),
+    ));
+    cases.push(resolve_case(
+        RefusalKind::ManualResolveAlreadyResolved,
+        &manual_app,
+        &manual_seller,
+        held_uuid,
+        Some(Uuid::new_v4()),
+        serde_json::json!({"outcome":"paid"}),
+    ));
+
+    let (not_review_id, _, _) = bound_order(
+        &manual_app,
+        &paykit,
+        &manual_seller,
+        &manual_buyer,
+        "shared_manual",
+    )
+    .await;
+    cases.push(resolve_case(
+        RefusalKind::ManualResolveNotInReview,
+        &manual_app,
+        &manual_seller,
+        Uuid::parse_str(&not_review_id).expect("not-review order"),
+        Some(Uuid::new_v4()),
+        serde_json::json!({"outcome":"paid"}),
+    ));
+    let (stock_id, _) =
+        into_manual_review_late(&manual_app, &paykit, &manual_seller, &manual_buyer).await;
+    sqlx::query("UPDATE listings SET state='sold',available_quantity=0,reserved_quantity=0,sold_quantity=total_quantity WHERE seller_pubky=$1")
+        .bind(&manual_seller.pubky).execute(&pool).await.expect("sold-out stock fixture");
+    cases.push(resolve_case(
+        RefusalKind::ManualResolveStockUnavailable,
+        &manual_app,
+        &manual_seller,
+        Uuid::parse_str(&stock_id).expect("stock order"),
+        Some(Uuid::new_v4()),
+        serde_json::json!({"outcome":"paid"}),
+    ));
+
+    assert_eq!(
+        cases.len(),
+        RefusalKind::ALL.len(),
+        "one real fixture per static kind"
+    );
+    let case_kinds = cases
+        .iter()
+        .map(|case| case.kind as i16)
+        .collect::<std::collections::BTreeSet<_>>();
+    let catalog_kinds = RefusalKind::ALL
+        .iter()
+        .map(|kind| *kind as i16)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(case_kinds, catalog_kinds, "fixture/catalog parity is exact");
+
+    let writer = actual_writer_fixture(&pool).await;
     let before = domain_snapshot(&pool).await;
-    let request = |id: u128| {
-        let mut command = common::place_bid_command(&seller.pubky, 1, 7_000, 1);
-        command["command_id"] = serde_json::json!(Uuid::from_u128(id));
-        command["payload"]["maximum_amount"]["currency"] = serde_json::json!("EUR");
-        command
-    };
-
-    let golden = common::execute(&app, &bidder.token, &request(0xa001)).await;
-    assert_eq!(golden.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(golden.1["error"]["code"], "INVALID_COMMAND");
-    assert_eq!(domain_snapshot(&pool).await, before);
-    for _ in 0..50 {
-        if writer.runtime.metrics().delivered == 1 {
-            break;
+    let mut golden = Vec::with_capacity(cases.len());
+    for case in &cases {
+        let response = send_refusal_case(case, Arc::clone(&writer.runtime)).await;
+        if case.kind == RefusalKind::NotFound {
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.1).expect("not-found response is JSON");
+            assert_eq!(body["error"]["code"], "NOT_FOUND", "{body}");
         }
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        golden.push(response);
+        assert!(
+            domain_snapshot(&pool).await == before,
+            "healthy {:?} fixture changed domain facts",
+            case.kind
+        );
     }
-
-    sqlx::raw_sql(
-        "CREATE FUNCTION refusal_audit_timeout_fixture() RETURNS trigger \
-         LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$; \
-         CREATE TRIGGER refusal_audit_timeout_fixture \
-         BEFORE INSERT OR UPDATE ON command_refusal_audit_buckets \
-         FOR EACH ROW EXECUTE FUNCTION refusal_audit_timeout_fixture();",
-    )
-    .execute(&pool)
-    .await
-    .expect("timeout fixture");
-    let timed_out = tokio::time::timeout(
-        StdDuration::from_millis(250),
-        common::execute(&app, &bidder.token, &request(0xa002)),
-    )
-    .await
-    .expect("request never waits for timed-out writer");
-    assert_eq!(timed_out, golden);
-    assert_eq!(domain_snapshot(&pool).await, before);
-    for _ in 0..100 {
-        let metrics = writer.runtime.metrics();
-        if metrics.retries_statement_timeout + metrics.retries_db_error >= 3 {
-            break;
+    assert_eq!(
+        domain_snapshot(&pool).await,
+        before,
+        "healthy writer changes no domain facts"
+    );
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while writer.runtime.metrics().delivered != cases.len() as u64 {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
-    }
-    let timeout_metrics = writer.runtime.metrics();
-    assert!(
-        timeout_metrics.retries_statement_timeout + timeout_metrics.retries_db_error >= 3,
-        "PostgreSQL statement timeout exhausts all delivery attempts: {:?}",
-        timeout_metrics
-    );
-    sqlx::raw_sql(
-        "DROP TRIGGER refusal_audit_timeout_fixture ON command_refusal_audit_buckets; \
-         DROP FUNCTION refusal_audit_timeout_fixture();",
-    )
-    .execute(&pool)
+    })
     .await
-    .expect("remove timeout fixture");
+    .expect("all healthy catalog fixtures delivered");
+    let produced = sqlx::query_scalar::<_, i16>(
+        "SELECT DISTINCT refusal_kind FROM command_refusal_audit_buckets ORDER BY refusal_kind",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("produced refusal kinds");
     assert_eq!(
-        writer.runtime.metrics().delivered,
-        1,
-        "timed-out delivery cannot commit late"
+        produced,
+        RefusalKind::ALL
+            .iter()
+            .map(|kind| *kind as i16)
+            .collect::<Vec<_>>()
     );
+
+    sqlx::raw_sql("CREATE FUNCTION refusal_audit_timeout_fixture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$; CREATE TRIGGER refusal_audit_timeout_fixture BEFORE INSERT OR UPDATE ON command_refusal_audit_buckets FOR EACH ROW EXECUTE FUNCTION refusal_audit_timeout_fixture();")
+        .execute(&pool).await.expect("timeout writer fixture");
+    let timeout_drops_before = writer.runtime.metrics().dropped_after_retries;
+    for (case, expected) in cases.iter().zip(&golden) {
+        let actual = tokio::time::timeout(
+            StdDuration::from_millis(250),
+            send_refusal_case(case, Arc::clone(&writer.runtime)),
+        )
+        .await
+        .expect("request never waits for timed-out writer");
+        assert_eq!(
+            &actual, expected,
+            "timed-out writer changed {:?}",
+            case.kind
+        );
+    }
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM command_refusal_audit_buckets")
-            .fetch_one(&pool)
-            .await
-            .expect("post-timeout audit rows"),
-        1,
-        "only the healthy audit envelope committed"
+        domain_snapshot(&pool).await,
+        before,
+        "timed-out writer changes no domain facts"
     );
+    tokio::time::timeout(StdDuration::from_secs(45), async {
+        while writer.runtime.metrics().dropped_after_retries - timeout_drops_before
+            < cases.len() as u64
+        {
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every timed-out envelope exhausts three attempts");
+    sqlx::raw_sql("DROP TRIGGER refusal_audit_timeout_fixture ON command_refusal_audit_buckets; DROP FUNCTION refusal_audit_timeout_fixture();")
+        .execute(&pool).await.expect("remove timeout fixture");
 
     let held_one = writer.pool.acquire().await.expect("first held writer");
     let held_two = writer.pool.acquire().await.expect("second held writer");
-    let exhausted = tokio::time::timeout(
-        StdDuration::from_millis(250),
-        common::execute(&app, &bidder.token, &request(0xa003)),
-    )
-    .await
-    .expect("request never waits for exhausted writer");
-    assert_eq!(exhausted, golden);
-    assert_eq!(domain_snapshot(&pool).await, before);
-    for _ in 0..100 {
-        if writer.runtime.metrics().retries_acquire_timeout >= 3 {
-            break;
-        }
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    let exhausted_drops_before = writer.runtime.metrics().dropped_after_retries;
+    for (case, expected) in cases.iter().zip(&golden) {
+        let actual = tokio::time::timeout(
+            StdDuration::from_millis(250),
+            send_refusal_case(case, Arc::clone(&writer.runtime)),
+        )
+        .await
+        .expect("request never waits for exhausted writer");
+        assert_eq!(
+            &actual, expected,
+            "exhausted writer changed {:?}",
+            case.kind
+        );
     }
-    assert!(writer.runtime.metrics().retries_acquire_timeout >= 3);
+    assert_eq!(
+        domain_snapshot(&pool).await,
+        before,
+        "exhausted writer changes no domain facts"
+    );
+    tokio::time::timeout(StdDuration::from_secs(20), async {
+        while writer.runtime.metrics().dropped_after_retries - exhausted_drops_before
+            < cases.len() as u64
+        {
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every exhausted envelope exhausts three attempts");
     drop((held_one, held_two));
 
     let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8; 32]);
@@ -2018,17 +2722,23 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         AuditKeys::parse(&root, "1", None, None).expect("keys"),
     ));
     tokio::time::sleep(StdDuration::from_millis(20)).await;
-    let failed_router = build_router(app.state.clone().with_refusal_audit(failed_runtime));
-    let failed = common::send(
-        failed_router,
-        "POST",
-        "/v1/commands",
-        Some(&bidder.token),
-        &request(0xa004),
-    )
-    .await;
-    assert_eq!(failed, golden);
-    assert_eq!(domain_snapshot(&pool).await, before);
+    for (case, expected) in cases.iter().zip(&golden) {
+        let actual = send_refusal_case(case, Arc::clone(&failed_runtime)).await;
+        assert_eq!(
+            &actual, expected,
+            "authority-failed writer changed {:?}",
+            case.kind
+        );
+    }
+    assert_eq!(
+        domain_snapshot(&pool).await,
+        before,
+        "authority-failed writer changes no domain facts"
+    );
+    assert_eq!(
+        failed_runtime.metrics().dropped_writer_unverified,
+        cases.len() as u64
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
