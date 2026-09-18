@@ -298,15 +298,15 @@ pub fn refusal_kind_for_error(code: marketplace_domain::ErrorCode) -> RefusalKin
     }
 }
 
-pub const fn refusal_kind_for_review_reason(
-    reason: crate::contracts::ReviewReason,
-) -> RefusalKind {
+pub const fn refusal_kind_for_review_reason(reason: crate::contracts::ReviewReason) -> RefusalKind {
     use crate::contracts::ReviewReason;
     match reason {
         ReviewReason::ConfirmationObservationMismatch => {
             RefusalKind::ManualResolveConfirmationObservationMismatch
         }
-        ReviewReason::ConfirmationEffectsFailed => RefusalKind::ManualResolveConfirmationEffectsFailed,
+        ReviewReason::ConfirmationEffectsFailed => {
+            RefusalKind::ManualResolveConfirmationEffectsFailed
+        }
         ReviewReason::InvalidReason => RefusalKind::ManualResolveInvalidReason,
         ReviewReason::InvalidIdempotencyKey => RefusalKind::ManualResolveInvalidIdempotencyKey,
         ReviewReason::InvalidOutcome => RefusalKind::ManualResolveInvalidOutcome,
