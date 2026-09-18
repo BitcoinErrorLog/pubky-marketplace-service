@@ -33,6 +33,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
+hkdf = "0.12"
 
 [features]
 # Test-only fault hooks (e.g. the ambiguous bind-COMMIT injection in

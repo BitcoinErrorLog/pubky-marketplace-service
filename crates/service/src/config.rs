@@ -1,6 +1,9 @@
 use std::net::SocketAddr;
 
 use axum::http::HeaderValue;
+use url::Url;
+
+use crate::refusal_audit::AuditKeys;
 
 /// Default `DELIVERY_ASSUME_DAYS` when the env var is unset.
 pub const DEFAULT_DELIVERY_ASSUME_DAYS: i64 = 14;
@@ -10,10 +13,15 @@ pub const DEFAULT_AUTO_COMPLETE_DAYS: i64 = 14;
 /// (same shape as the paykit/outbox worker batches).
 pub const DEFAULT_DELIVERY_SWEEP_BATCH_SIZE: i64 = 100;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub database_url: String,
+    /// Separate least-privilege writer login; this must not be the domain URL.
+    pub refusal_audit_database_url: String,
+    /// Separate retention login; it can execute only the bounded purge function.
+    pub refusal_audit_retention_database_url: String,
+    pub refusal_audit_keys: AuditKeys,
     /// Exact origins allowed by CORS. Empty means no browser origin is
     /// allowed (non-browser clients are unaffected).
     pub allowed_origins: Vec<HeaderValue>,
@@ -120,6 +128,23 @@ impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?;
+        let refusal_audit_database_url = required_postgres_url("REFUSAL_AUDIT_DATABASE_URL")?;
+        let refusal_audit_retention_database_url =
+            required_postgres_url("REFUSAL_AUDIT_RETENTION_DATABASE_URL")?;
+        reject_audit_url_reuse(&database_url, &refusal_audit_database_url)?;
+        reject_audit_url_reuse(&database_url, &refusal_audit_retention_database_url)?;
+        reject_audit_url_reuse(
+            &refusal_audit_database_url,
+            &refusal_audit_retention_database_url,
+        )?;
+        let refusal_audit_keys = AuditKeys::parse(
+            &std::env::var("REFUSAL_AUDIT_HMAC_ROOT_B64")
+                .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_ROOT_B64 must be set"))?,
+            &std::env::var("REFUSAL_AUDIT_HMAC_KEY_EPOCH")
+                .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_KEY_EPOCH must be set"))?,
+            std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64").ok().as_deref(),
+            std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH").ok().as_deref(),
+        )?;
         let bind_addr = std::env::var("BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
             .parse()?;
@@ -183,6 +208,9 @@ impl Config {
         Ok(Self {
             bind_addr,
             database_url,
+            refusal_audit_database_url,
+            refusal_audit_retention_database_url,
+            refusal_audit_keys,
             allowed_origins,
             auth_token_window_seconds,
             session_ttl_seconds,
@@ -209,9 +237,15 @@ impl Config {
 
     /// Configuration used by the integration test harness.
     pub fn for_tests() -> Self {
+        let test_root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
         Self {
             bind_addr: "127.0.0.1:0".parse().expect("valid test bind address"),
             database_url: String::new(),
+            refusal_audit_database_url: "postgres://writer@audit.test/refusal_audit".to_string(),
+            refusal_audit_retention_database_url:
+                "postgres://retention@audit.test/refusal_audit".to_string(),
+            refusal_audit_keys: AuditKeys::parse(&test_root, "1", None, None)
+                .expect("test audit key parses"),
             allowed_origins: vec![HeaderValue::from_static("http://localhost:3000")],
             auth_token_window_seconds: 120,
             session_ttl_seconds: 86_400,
@@ -235,6 +269,52 @@ impl Config {
             fx_feed_url: crate::fx::FX_URL.to_string(),
         }
     }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("bind_addr", &self.bind_addr)
+            .field("database_url", &"<redacted>")
+            .field("refusal_audit_database_url", &"<redacted>")
+            .field("refusal_audit_retention_database_url", &"<redacted>")
+            .field("refusal_audit_keys", &self.refusal_audit_keys)
+            .finish_non_exhaustive()
+    }
+}
+
+fn required_postgres_url(name: &str) -> anyhow::Result<String> {
+    let value = std::env::var(name).map_err(|_| anyhow::anyhow!("{name} must be set"))?;
+    let url = Url::parse(&value).map_err(|_| anyhow::anyhow!("{name} must be a PostgreSQL URL"))?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
+        anyhow::bail!("{name} must be a PostgreSQL URL");
+    }
+    Ok(value)
+}
+
+fn reject_audit_url_reuse(first: &str, second: &str) -> anyhow::Result<()> {
+    let first = Url::parse(first).map_err(|_| anyhow::anyhow!("database URL must be valid"))?;
+    let second = Url::parse(second).map_err(|_| anyhow::anyhow!("database URL must be valid"))?;
+    let normalized = |url: &Url| {
+        (
+            if url.scheme() == "postgresql" { "postgres" } else { url.scheme() }.to_string(),
+            url.username().to_string(),
+            url.password().map(str::to_string),
+            url.host_str().unwrap_or("localhost").to_string(),
+            url.port_or_known_default().unwrap_or(5432),
+            url.path().trim_start_matches('/').to_string(),
+            url.query().map(str::to_string),
+        )
+    };
+    if normalized(&first) == normalized(&second)
+        || (!first.username().is_empty()
+            && !second.username().is_empty()
+            && first.username() == second.username())
+    {
+        anyhow::bail!("refusal-audit database URLs must use distinct principals");
+    }
+    Ok(())
 }
 
 fn env_i64(name: &str, default: i64) -> anyhow::Result<i64> {
