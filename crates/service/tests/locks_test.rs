@@ -94,7 +94,11 @@ struct SyncableLocksHomeserver {
 }
 
 impl SyncableLocksHomeserver {
-    fn put_record(&self, seller_pubky: &str, listing_id: &str, record: Value) {
+    fn put_record(&self, seller_pubky: &str, listing_id: &str, mut record: Value) {
+        record["recordType"] = json!("listing");
+        record["schemaVersion"] = json!(1);
+        record["ownerPubky"] = json!(seller_pubky);
+        record["listingId"] = json!(listing_id);
         self.records
             .lock()
             .expect("records lock")

@@ -111,27 +111,33 @@ pub async fn handle(
     };
 
     let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
-    if registration.sale_format == SaleFormat::Auction {
+    if let Some(current_auction) = current
+        .as_ref()
+        .filter(|listing| listing.sale_format == "auction")
+    {
         let reserve = fetch_auction_reserve_for_update(tx, &command.aggregate_id).await?;
-        let (Some(current), Some(reserve)) = (current.as_ref(), reserve.as_ref()) else {
+        let Some(reserve) = reserve.as_ref() else {
             return Ok(Err(seller_registration_required()));
         };
-        if current.sale_format != "auction" {
+        if registration.sale_format != SaleFormat::Auction {
             return Ok(Err(seller_registration_required()));
         }
-        if registration.listing_revision > current.listing_revision {
+        if registration.listing_revision > current_auction.listing_revision {
             return Ok(Err(seller_registration_required()));
         }
         let viewer_bid =
-            crate::handlers::auction::viewer_bid_projection(tx, current, actor).await?;
-        let projection = current
+            crate::handlers::auction::viewer_bid_projection(tx, current_auction, actor).await?;
+        let projection = current_auction
             .projection_for_actor_with_auction(actor, Some(reserve), viewer_bid)
             .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
         return Ok(Ok(HandlerSuccess {
-            revision: current.server_revision,
+            revision: current_auction.server_revision,
             event_ids: vec![],
             result: json!({ "kind": "listing", "listing": projection }),
         }));
+    }
+    if registration.sale_format == SaleFormat::Auction {
+        return Ok(Err(seller_registration_required()));
     }
     if let Some(current) = &current {
         // Convergent no-op: the aggregate already reflects this record

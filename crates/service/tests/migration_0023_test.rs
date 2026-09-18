@@ -536,10 +536,11 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 }
 
 /// The migration catalog is strictly increasing, unique per number, and
-/// ends at 0031. Migrations 0001–0026 are never rewritten; this asserts
-/// 0031 is the latest additive feature migration.
+/// contains the reserve-secrecy 0033 migration. Migration 0032 is reserved
+/// to its separate active stream and is intentionally absent in this
+/// worktree.
 #[test]
-fn migration_catalog_ends_unique_at_0031() {
+fn migration_catalog_preserves_reserved_0032_and_adds_0033() {
     let mut numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -551,8 +552,11 @@ fn migration_catalog_ends_unique_at_0031() {
         .collect();
     numbers.sort_unstable();
     numbers.dedup();
-    let expected: Vec<u32> = (1..=31).collect();
-    assert_eq!(numbers, expected, "the catalog is 0001..=0031, gapless");
+    let expected: Vec<u32> = (1..=31).chain([33]).collect();
+    assert_eq!(
+        numbers, expected,
+        "the catalog is 0001..=0031 plus 0033; 0032 is reserved"
+    );
 }
 
 /// Every writer of `payments.state = 'manual_review'` across Bitcoin,
