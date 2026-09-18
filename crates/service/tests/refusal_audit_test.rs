@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 static WRITER_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
+static ADMIN_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
 
 type AttackBucketRow = (i16, i64, Vec<u8>, bool, Option<Vec<u8>>);
 
@@ -398,13 +399,16 @@ async fn refusal_audit_objects_have_hardened_owners_and_acls(pool: PgPool) {
         "SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname IN (\
            'marketplace_refusal_audit_owner', 'marketplace_refusal_audit_writer', \
            'marketplace_refusal_audit_aggregate', 'marketplace_refusal_audit_raw', \
-           'marketplace_refusal_audit_retention', 'marketplace_refusal_audit_writer_login') \
+           'marketplace_refusal_audit_retention', 'marketplace_refusal_audit_writer_login', \
+           'marketplace_refusal_audit_admin_login') \
          AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls \
               OR rolinherit OR rolconnlimit <> CASE \
                 WHEN rolname = 'marketplace_refusal_audit_writer_login' THEN 2 \
-                WHEN rolname = 'marketplace_refusal_audit_retention' THEN 1 ELSE -1 END \
+                WHEN rolname IN ('marketplace_refusal_audit_retention', \
+                  'marketplace_refusal_audit_admin_login') THEN 1 ELSE -1 END \
               OR rolcanlogin <> (rolname IN (\
-                'marketplace_refusal_audit_writer_login', 'marketplace_refusal_audit_retention')))",
+                'marketplace_refusal_audit_writer_login', 'marketplace_refusal_audit_retention', \
+                'marketplace_refusal_audit_admin_login')))",
     )
     .fetch_one(&pool)
     .await
@@ -446,7 +450,9 @@ async fn refusal_audit_objects_have_hardened_owners_and_acls(pool: PgPool) {
          JOIN pg_catalog.pg_roles r ON r.oid = p.proowner \
          WHERE n.nspname = 'public' AND p.proname IN (\
            'operator_refusal_audit_summary', 'operator_refusal_audit_buckets', \
-           'purge_refusal_audit', 'record_refusal_audit_access') AND (NOT p.prosecdef \
+           'purge_refusal_audit', 'record_refusal_audit_access', \
+           'track_refusal_audit_epoch_inventory', \
+           'refusal_audit_previous_epoch_storage_safe') AND (NOT p.prosecdef \
              OR r.rolname <> 'marketplace_refusal_audit_owner' \
              OR p.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[] \
              OR has_function_privilege(0, p.oid, 'EXECUTE'))",
@@ -697,7 +703,7 @@ async fn refusal_audit_migration_0032_direct_rerun_is_idempotent(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("catalog counts");
-    assert_eq!(counts, (2, 35, 40));
+    assert_eq!(counts, (2, 35, 37));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1014,6 +1020,153 @@ async fn refusal_audit_rotation_verifies_old_epoch_until_destroyed(pool: PgPool)
         .await
         .expect("unsupported retained epoch fixture");
     assert!(keys.assert_database_epochs_supported(&pool).await.is_err());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn refusal_audit_admin_path_erases_actor_and_gates_key_destruction(pool: PgPool) {
+    use marketplace_service::refusal_audit_admin::{run, AdminConfig, AdminOperation};
+    use std::io::Cursor;
+
+    let _guard = ADMIN_LOGIN_FIXTURE.lock().await;
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("database name");
+    let password = format!("test-only-{}", Uuid::new_v4());
+    sqlx::query(&format!(
+        "ALTER ROLE marketplace_refusal_audit_admin_login PASSWORD '{}'",
+        password.replace('\'', "''")
+    ))
+    .execute(&pool)
+    .await
+    .expect("set admin test password");
+    let quoted_database = format!("\"{}\"", database.replace('"', "\"\""));
+    sqlx::query(&format!(
+        "GRANT CONNECT ON DATABASE {quoted_database} TO marketplace_refusal_audit_admin_login"
+    ))
+    .execute(&pool)
+    .await
+    .expect("grant admin database connect");
+    let url = format!(
+        "postgres://marketplace_refusal_audit_admin_login:{password}@localhost:5432/{database}"
+    );
+    let previous_root =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
+    let active_root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [8u8; 32]);
+    let keys = AuditKeys::parse(&active_root, "2", Some(&previous_root), Some("1"))
+        .expect("two epoch keys");
+    let actor = pubky_common::crypto::Keypair::random().public_key().z32();
+    let unrelated = pubky_common::crypto::Keypair::random().public_key().z32();
+    let bucket = hour(Utc::now()) - Duration::hours(1);
+    for (epoch, tag) in keys.erasure_candidates(&actor).expect("actor tags") {
+        sqlx::query(
+            "INSERT INTO command_refusal_audit_buckets(\
+             bucket_start,surface_kind,command_kind,refusal_kind,actor_key_epoch,actor_tag,\
+             occurrence_count,first_occurred_at,last_occurred_at,command_id_present) \
+             VALUES ($1,1,14,12,$2,$3,1,$1,$1,false)",
+        )
+        .bind(bucket)
+        .bind(epoch)
+        .bind(tag.as_slice())
+        .execute(&pool)
+        .await
+        .expect("actor bucket");
+    }
+    sqlx::query(
+        "INSERT INTO command_refusal_audit_buckets(\
+         bucket_start,surface_kind,command_kind,refusal_kind,actor_key_epoch,actor_tag,\
+         occurrence_count,first_occurred_at,last_occurred_at,command_id_present) \
+         VALUES ($1,1,14,12,2,$2,1,$1,$1,false)",
+    )
+    .bind(bucket)
+    .bind(
+        keys.actor_tag(&unrelated)
+            .expect("unrelated tag")
+            .as_slice(),
+    )
+    .execute(&pool)
+    .await
+    .expect("unrelated bucket");
+    let inventory_delete =
+        sqlx::query("DELETE FROM command_refusal_audit_epoch_inventory WHERE actor_key_epoch = 1")
+            .execute(&pool)
+            .await
+            .expect_err("epoch evidence is append-only");
+    assert_eq!(
+        inventory_delete
+            .as_database_error()
+            .and_then(|error| error.code()),
+        Some(std::borrow::Cow::Borrowed("P0001"))
+    );
+
+    run(
+        AdminConfig::new(url.clone(), keys.clone()).expect("admin config"),
+        AdminOperation::EraseActor,
+        Cursor::new(format!("{actor}\n")),
+    )
+    .await
+    .expect("controlled erasure");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM command_refusal_audit_buckets")
+            .fetch_one(&pool)
+            .await
+            .expect("remaining rows"),
+        1,
+        "only unrelated data survives"
+    );
+
+    let too_early = run(
+        AdminConfig::new(url.clone(), keys.clone()).expect("admin config"),
+        AdminOperation::DestroyPrevious,
+        Cursor::new(Vec::<u8>::new()),
+    )
+    .await
+    .expect_err("database-clock backup and replica expiry gate is enforced");
+    assert!(too_early
+        .to_string()
+        .contains("previous refusal-audit epoch is still retained"));
+    sqlx::query(
+        "UPDATE command_refusal_audit_epoch_inventory \
+         SET first_seen_at = clock_timestamp() - interval '32 days', \
+             last_seen_at = clock_timestamp() - interval '32 days', \
+             last_removed_at = clock_timestamp() - interval '31 days' \
+         WHERE actor_key_epoch = 1",
+    )
+    .execute(&pool)
+    .await
+    .expect("elapsed retention fixture");
+    run(
+        AdminConfig::new(url.clone(), keys.clone()).expect("admin config"),
+        AdminOperation::DestroyPrevious,
+        Cursor::new(Vec::<u8>::new()),
+    )
+    .await
+    .expect("database-derived destruction gate passes");
+
+    sqlx::query(
+        "GRANT INSERT ON command_refusal_audit_epoch_inventory \
+         TO marketplace_refusal_audit_admin_login",
+    )
+    .execute(&pool)
+    .await
+    .expect("excess authority fixture");
+    let excess = run(
+        AdminConfig::new(url, keys).expect("admin config"),
+        AdminOperation::EraseActor,
+        Cursor::new(format!("{actor}\n")),
+    )
+    .await;
+    sqlx::query(
+        "REVOKE INSERT ON command_refusal_audit_epoch_inventory \
+         FROM marketplace_refusal_audit_admin_login",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore admin authority");
+    assert!(excess
+        .expect_err("admin probe rejects excess membership")
+        .to_string()
+        .contains("authority verification failed"));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1737,6 +1890,145 @@ async fn refusal_audit_d26_2_precedence_and_personal_minimum_categories_are_exac
         tokio::time::sleep(StdDuration::from_millis(10)).await;
     }
     panic!("D26.2 refusal categories were not delivered");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPool) {
+    async fn domain_snapshot(pool: &PgPool) -> serde_json::Value {
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object(\
+              'listings',(SELECT jsonb_agg(row_to_json(x) ORDER BY aggregate_id) FROM listings x),\
+              'bids',(SELECT jsonb_agg(row_to_json(x) ORDER BY id) FROM bids x),\
+              'events',(SELECT jsonb_agg(row_to_json(x) ORDER BY id) FROM events x),\
+              'results',(SELECT jsonb_agg(row_to_json(x) ORDER BY command_id) FROM command_results x))",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("domain snapshot")
+    }
+
+    let mut app = common::test_app(pool.clone()).await;
+    let seller = common::new_actor(&app).await;
+    let bidder = common::new_actor(&app).await;
+    common::execute(
+        &app,
+        &seller.token,
+        &common::register_auction_command(&seller.pubky),
+    )
+    .await;
+    let writer = actual_writer_fixture(&pool).await;
+    app.state = app
+        .state
+        .clone()
+        .with_refusal_audit(Arc::clone(&writer.runtime));
+    app.router = build_router(app.state.clone());
+    let before = domain_snapshot(&pool).await;
+    let request = |id: u128| {
+        let mut command = common::place_bid_command(&seller.pubky, 1, 7_000, 1);
+        command["command_id"] = serde_json::json!(Uuid::from_u128(id));
+        command["payload"]["maximum_amount"]["currency"] = serde_json::json!("EUR");
+        command
+    };
+
+    let golden = common::execute(&app, &bidder.token, &request(0xa001)).await;
+    assert_eq!(golden.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(golden.1["error"]["code"], "INVALID_COMMAND");
+    assert_eq!(domain_snapshot(&pool).await, before);
+    for _ in 0..50 {
+        if writer.runtime.metrics().delivered == 1 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+
+    sqlx::raw_sql(
+        "CREATE FUNCTION refusal_audit_timeout_fixture() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$; \
+         CREATE TRIGGER refusal_audit_timeout_fixture \
+         BEFORE INSERT OR UPDATE ON command_refusal_audit_buckets \
+         FOR EACH ROW EXECUTE FUNCTION refusal_audit_timeout_fixture();",
+    )
+    .execute(&pool)
+    .await
+    .expect("timeout fixture");
+    let timed_out = tokio::time::timeout(
+        StdDuration::from_millis(250),
+        common::execute(&app, &bidder.token, &request(0xa002)),
+    )
+    .await
+    .expect("request never waits for timed-out writer");
+    assert_eq!(timed_out, golden);
+    assert_eq!(domain_snapshot(&pool).await, before);
+    for _ in 0..100 {
+        let metrics = writer.runtime.metrics();
+        if metrics.retries_statement_timeout + metrics.retries_db_error >= 3 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    let timeout_metrics = writer.runtime.metrics();
+    assert!(
+        timeout_metrics.retries_statement_timeout + timeout_metrics.retries_db_error >= 3,
+        "PostgreSQL statement timeout exhausts all delivery attempts: {:?}",
+        timeout_metrics
+    );
+    sqlx::raw_sql(
+        "DROP TRIGGER refusal_audit_timeout_fixture ON command_refusal_audit_buckets; \
+         DROP FUNCTION refusal_audit_timeout_fixture();",
+    )
+    .execute(&pool)
+    .await
+    .expect("remove timeout fixture");
+    assert_eq!(
+        writer.runtime.metrics().delivered,
+        1,
+        "timed-out delivery cannot commit late"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM command_refusal_audit_buckets")
+            .fetch_one(&pool)
+            .await
+            .expect("post-timeout audit rows"),
+        1,
+        "only the healthy audit envelope committed"
+    );
+
+    let held_one = writer.pool.acquire().await.expect("first held writer");
+    let held_two = writer.pool.acquire().await.expect("second held writer");
+    let exhausted = tokio::time::timeout(
+        StdDuration::from_millis(250),
+        common::execute(&app, &bidder.token, &request(0xa003)),
+    )
+    .await
+    .expect("request never waits for exhausted writer");
+    assert_eq!(exhausted, golden);
+    assert_eq!(domain_snapshot(&pool).await, before);
+    for _ in 0..100 {
+        if writer.runtime.metrics().retries_acquire_timeout >= 3 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    assert!(writer.runtime.metrics().retries_acquire_timeout >= 3);
+    drop((held_one, held_two));
+
+    let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8; 32]);
+    let failed_runtime = Arc::new(RefusalAuditRuntime::spawn(
+        pool.clone(),
+        AuditKeys::parse(&root, "1", None, None).expect("keys"),
+    ));
+    tokio::time::sleep(StdDuration::from_millis(20)).await;
+    let failed_router = build_router(app.state.clone().with_refusal_audit(failed_runtime));
+    let failed = common::send(
+        failed_router,
+        "POST",
+        "/v1/commands",
+        Some(&bidder.token),
+        &request(0xa004),
+    )
+    .await;
+    assert_eq!(failed, golden);
+    assert_eq!(domain_snapshot(&pool).await, before);
 }
 
 #[sqlx::test(migrations = "./migrations")]
