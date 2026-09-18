@@ -2299,6 +2299,89 @@ async fn prepare_seals_the_checkout_snapshot_not_a_post_checkout_lock_mutation(p
     assert_eq!(opened.as_deref(), Some(lock_a.as_str()));
 }
 
+// The Shop client (pubky-app fork) validates `digitalLock.policyUri` as
+// `pubky://<z32>/pub/locks.app/<LOCKID>.json`, so every Shop-authored
+// digital-lock listing record carries that addressed form (production
+// 2026-09-17). The service must accept it, persist only the canonical bare
+// form, and never treat the respelling of the SAME lock as a change.
+#[sqlx::test]
+async fn sync_accepts_the_pubky_scheme_policy_uri_and_persists_the_canonical_bare_form(
+    pool: PgPool,
+) {
+    let homeserver = Arc::new(SyncableLocksHomeserver::default());
+    let app = test_app_with_homeserver(pool, homeserver.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let bare = lock_resource_for(&seller.pubky);
+    let addressed = format!("pubky://{bare}");
+
+    // A listing record whose policyUri is the Shop's `pubky://` form syncs.
+    homeserver.put_record(
+        &seller.pubky,
+        "boots_01",
+        listing_record_with_lock(1, &addressed),
+    );
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::sync_command(&seller.pubky, "boots_01", 600),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "pubky:// sync: {body}");
+    assert_eq!(body["revision"], json!(1));
+    let (stored,): (Option<String>,) =
+        sqlx::query_as("SELECT digital_lock_policy_uri FROM listings WHERE aggregate_id = $1")
+            .bind(format!("listing:{}_boots_01", seller.pubky))
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing row exists");
+    assert_eq!(
+        stored.as_deref(),
+        Some(bare.as_str()),
+        "the stored policy uri is the canonical bare form"
+    );
+
+    // A second sync with the BARE spelling of the same URI is not a change:
+    // convergent no-op, same revision, no new event.
+    homeserver.put_record(
+        &seller.pubky,
+        "boots_01",
+        listing_record_with_lock(1, &bare),
+    );
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::sync_command(&seller.pubky, "boots_01", 601),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bare re-sync: {body}");
+    assert_eq!(body["revision"], json!(1));
+    assert_eq!(body["event_ids"], json!([]));
+
+    // Any other scheme is still rejected with the existing error.
+    homeserver.put_record(
+        &seller.pubky,
+        "boots_02",
+        listing_record_with_lock(1, &format!("https://{bare}")),
+    );
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::sync_command(&seller.pubky, "boots_02", 602),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "https:// stays rejected: {body}"
+    );
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The seller's listing record carries an invalid Locks payment lock.")
+    );
+}
+
 // Legacy orders — and carts whose checkout saw zero or multiple distinct
 // locks — carry no snapshot row: prepare refuses them statically rather
 // than falling back to the mutable listing rows.

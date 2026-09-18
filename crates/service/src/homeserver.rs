@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
-    parse_lock_resource, AuctionTerms, DigitalLockMetadata, RegisterListingPayload, SaleFormat,
+    canonical_lock_resource, AuctionTerms, DigitalLockMetadata, RegisterListingPayload, SaleFormat,
 };
 use marketplace_domain::money::Money;
 use marketplace_domain::ValidationIssue;
@@ -803,15 +803,19 @@ pub fn registration_payload_from_record(
     let digital_lock = match record.digital_lock {
         None => None,
         Some(lock) => {
-            if parse_lock_resource(&lock.policy_uri).is_some()
-                && marketplace_domain::commands::is_valid_entity_id(&lock.criterion_id)
-            {
-                Some(DigitalLockMetadata {
-                    policy_uri: lock.policy_uri,
-                    criterion_id: lock.criterion_id,
-                })
-            } else {
-                return Err(MalformedDigitalLock);
+            // The Shop client addresses the lock as `pubky://<creator>/…`;
+            // persist only the canonical bare form so stored rows, change
+            // detection, and checkout snapshots never see the scheme.
+            match canonical_lock_resource(&lock.policy_uri) {
+                Some(policy_uri)
+                    if marketplace_domain::commands::is_valid_entity_id(&lock.criterion_id) =>
+                {
+                    Some(DigitalLockMetadata {
+                        policy_uri,
+                        criterion_id: lock.criterion_id,
+                    })
+                }
+                _ => return Err(MalformedDigitalLock),
             }
         }
     };
