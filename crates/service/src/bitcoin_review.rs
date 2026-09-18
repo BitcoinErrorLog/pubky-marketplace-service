@@ -662,12 +662,15 @@ fn audited_resolve_refusal(
     message: &'static str,
 ) -> Response {
     let response = review_error(code, review_reason(reason), message);
-    if let Some(audit) = &state.refusal_audit {
+    if let (Some(audit), Some(refusal_kind)) = (
+        &state.refusal_audit,
+        crate::refusal_audit::refusal_kind_for_review_reason(reason),
+    ) {
         if let Ok(envelope) = audit.envelope(
             state.clock.now(),
             crate::refusal_audit::SurfaceKind::BitcoinManualResolve,
             crate::refusal_audit::CommandKind::ManualResolve,
-            crate::refusal_audit::refusal_kind_for_review_reason(reason),
+            refusal_kind,
             actor,
             resolution_id,
         ) {

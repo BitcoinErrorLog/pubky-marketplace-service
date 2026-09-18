@@ -63,12 +63,9 @@ INSERT INTO command_refusal_kinds (id, name) VALUES
   (13, 'upstream_unavailable'), (14, 'award_expired'), (15, 'award_already_converted'),
   (16, 'award_quantity_mismatch'), (17, 'award_variant_mismatch'),
   (18, 'award_listing_changed'), (19, 'award_hold_missing'),
-  (20, 'manual_resolve_confirmation_observation_mismatch'),
-  (21, 'manual_resolve_confirmation_effects_failed'),
   (22, 'manual_resolve_invalid_reason'), (23, 'manual_resolve_invalid_idempotency_key'),
   (24, 'manual_resolve_invalid_outcome'), (25, 'manual_resolve_invalid_refund_reference'),
   (26, 'manual_resolve_not_order_seller'), (27, 'manual_resolve_order_not_found'),
-  (28, 'manual_resolve_order_not_awaiting_confirmation'),
   (29, 'manual_resolve_not_applicable'), (30, 'manual_resolve_missing_pin'),
   (31, 'manual_resolve_conflict'), (32, 'manual_resolve_already_resolved'),
   (33, 'manual_resolve_not_in_review'), (34, 'manual_resolve_stock_unavailable'),
@@ -82,7 +79,7 @@ BEGIN
   IF (SELECT jsonb_object_agg(id::text, name ORDER BY id) FROM command_refusal_surface_kinds)
        <> '{"1":"v1_command","2":"bitcoin_manual_resolve"}'::jsonb
      OR (SELECT count(*) FROM command_refusal_command_kinds) <> 35
-     OR (SELECT count(*) FROM command_refusal_kinds) <> 40 THEN
+     OR (SELECT count(*) FROM command_refusal_kinds) <> 37 THEN
     RAISE EXCEPTION 'refusal audit catalog parity violation';
   END IF;
 END $catalog_parity$;
@@ -153,6 +150,19 @@ CREATE TABLE IF NOT EXISTS command_refusal_audit_loss_gap (
   pending_loss_count BIGINT NOT NULL CHECK (pending_loss_count >= 0),
   updated_at TIMESTAMPTZ NOT NULL
 );
+CREATE TABLE IF NOT EXISTS command_refusal_audit_epoch_inventory (
+  actor_key_epoch SMALLINT PRIMARY KEY CHECK (actor_key_epoch > 0),
+  first_seen_at TIMESTAMPTZ NOT NULL,
+  last_seen_at TIMESTAMPTZ NOT NULL,
+  last_removed_at TIMESTAMPTZ,
+  CHECK (last_seen_at >= first_seen_at),
+  CHECK (last_removed_at IS NULL OR last_removed_at >= first_seen_at)
+);
+DROP TRIGGER IF EXISTS command_refusal_audit_epoch_inventory_immutable
+  ON command_refusal_audit_epoch_inventory;
+CREATE TRIGGER command_refusal_audit_epoch_inventory_immutable
+BEFORE DELETE ON command_refusal_audit_epoch_inventory
+FOR EACH ROW EXECUTE FUNCTION public.forbid_refusal_audit_catalog_mutation();
 
 DO $roles$
 DECLARE
@@ -166,15 +176,18 @@ BEGIN
     'marketplace_refusal_audit_aggregate'::name,
     'marketplace_refusal_audit_raw'::name,
     'marketplace_refusal_audit_retention'::name,
-    'marketplace_refusal_audit_writer_login'::name
+    'marketplace_refusal_audit_writer_login'::name,
+    'marketplace_refusal_audit_admin_login'::name
   ] LOOP
     expected_login := role_name IN (
       'marketplace_refusal_audit_retention',
-      'marketplace_refusal_audit_writer_login'
+      'marketplace_refusal_audit_writer_login',
+      'marketplace_refusal_audit_admin_login'
     );
     expected_limit := CASE role_name
       WHEN 'marketplace_refusal_audit_retention' THEN 1
       WHEN 'marketplace_refusal_audit_writer_login' THEN 2
+      WHEN 'marketplace_refusal_audit_admin_login' THEN 1
       ELSE -1
     END;
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = role_name) THEN
@@ -213,6 +226,10 @@ BEGIN
   ) OR EXISTS (
     SELECT 1 FROM pg_catalog.pg_auth_members m
     JOIN pg_catalog.pg_roles member ON member.oid = m.member
+    WHERE member.rolname = 'marketplace_refusal_audit_admin_login'
+  ) OR EXISTS (
+    SELECT 1 FROM pg_catalog.pg_auth_members m
+    JOIN pg_catalog.pg_roles member ON member.oid = m.member
     WHERE member.rolname IN (
       'marketplace_refusal_audit_owner',
       'marketplace_refusal_audit_writer',
@@ -233,6 +250,55 @@ BEGIN
   EXECUTE pg_catalog.format('GRANT marketplace_refusal_audit_owner TO %I', migration_login);
 END $bootstrap$;
 GRANT CREATE ON SCHEMA public TO marketplace_refusal_audit_owner;
+
+CREATE OR REPLACE FUNCTION public.track_refusal_audit_epoch_inventory()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO public.command_refusal_audit_epoch_inventory(
+      actor_key_epoch, first_seen_at, last_seen_at, last_removed_at
+    ) VALUES (
+      NEW.actor_key_epoch, clock_timestamp(), clock_timestamp(), NULL
+    )
+    ON CONFLICT (actor_key_epoch) DO UPDATE
+      SET last_seen_at = clock_timestamp(), last_removed_at = NULL;
+    RETURN NEW;
+  END IF;
+  UPDATE public.command_refusal_audit_epoch_inventory
+     SET last_removed_at = clock_timestamp()
+   WHERE actor_key_epoch = OLD.actor_key_epoch
+     AND NOT EXISTS (
+       SELECT 1 FROM public.command_refusal_audit_buckets
+       WHERE actor_key_epoch = OLD.actor_key_epoch
+     );
+  RETURN OLD;
+END $$;
+DROP TRIGGER IF EXISTS command_refusal_audit_epoch_inventory_insert
+  ON command_refusal_audit_buckets;
+CREATE TRIGGER command_refusal_audit_epoch_inventory_insert
+AFTER INSERT ON command_refusal_audit_buckets
+FOR EACH ROW EXECUTE FUNCTION public.track_refusal_audit_epoch_inventory();
+DROP TRIGGER IF EXISTS command_refusal_audit_epoch_inventory_delete
+  ON command_refusal_audit_buckets;
+CREATE TRIGGER command_refusal_audit_epoch_inventory_delete
+AFTER DELETE ON command_refusal_audit_buckets
+FOR EACH ROW EXECUTE FUNCTION public.track_refusal_audit_epoch_inventory();
+
+CREATE OR REPLACE FUNCTION public.refusal_audit_previous_epoch_storage_safe(
+  requested_epoch smallint
+) RETURNS boolean LANGUAGE sql VOLATILE SECURITY DEFINER AS $$
+  SELECT requested_epoch > 0
+     AND NOT EXISTS (
+       SELECT 1 FROM public.command_refusal_audit_buckets
+       WHERE actor_key_epoch = requested_epoch
+     )
+     AND COALESCE((
+       SELECT last_removed_at IS NOT NULL
+          AND last_removed_at <= clock_timestamp() - interval '30 days'
+       FROM public.command_refusal_audit_epoch_inventory
+       WHERE actor_key_epoch = requested_epoch
+     ), true)
+$$;
 
 CREATE OR REPLACE FUNCTION public.purge_refusal_audit(reference_time timestamptz, batch_size integer)
 RETURNS integer LANGUAGE plpgsql SECURITY DEFINER AS $$
@@ -539,6 +605,10 @@ ALTER FUNCTION public.purge_refusal_audit(timestamptz,integer) SET search_path =
 ALTER FUNCTION public.record_refusal_audit_access(smallint,smallint,integer) OWNER TO marketplace_refusal_audit_owner;
 ALTER FUNCTION public.record_refusal_audit_access(smallint,smallint,integer) SET search_path = pg_catalog;
 ALTER FUNCTION public.forbid_refusal_audit_catalog_mutation() OWNER TO marketplace_refusal_audit_owner;
+ALTER FUNCTION public.track_refusal_audit_epoch_inventory() OWNER TO marketplace_refusal_audit_owner;
+ALTER FUNCTION public.track_refusal_audit_epoch_inventory() SET search_path = pg_catalog;
+ALTER FUNCTION public.refusal_audit_previous_epoch_storage_safe(smallint) OWNER TO marketplace_refusal_audit_owner;
+ALTER FUNCTION public.refusal_audit_previous_epoch_storage_safe(smallint) SET search_path = pg_catalog;
 
 ALTER TABLE command_refusal_surface_kinds OWNER TO marketplace_refusal_audit_owner;
 ALTER TABLE command_refusal_command_kinds OWNER TO marketplace_refusal_audit_owner;
@@ -548,23 +618,28 @@ ALTER TABLE command_refusal_audit_bucket_limits OWNER TO marketplace_refusal_aud
 ALTER TABLE command_refusal_audit_access_buckets OWNER TO marketplace_refusal_audit_owner;
 ALTER TABLE command_refusal_audit_access_limits OWNER TO marketplace_refusal_audit_owner;
 ALTER TABLE command_refusal_audit_loss_gap OWNER TO marketplace_refusal_audit_owner;
+ALTER TABLE command_refusal_audit_epoch_inventory OWNER TO marketplace_refusal_audit_owner;
 
 REVOKE ALL ON command_refusal_surface_kinds, command_refusal_command_kinds,
   command_refusal_kinds, command_refusal_audit_buckets,
   command_refusal_audit_bucket_limits, command_refusal_audit_access_buckets,
-  command_refusal_audit_access_limits, command_refusal_audit_loss_gap FROM PUBLIC;
+  command_refusal_audit_access_limits, command_refusal_audit_loss_gap,
+  command_refusal_audit_epoch_inventory FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.operator_refusal_audit_summary(timestamptz,timestamptz,smallint,smallint,smallint,integer,jsonb) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.operator_refusal_audit_buckets(timestamptz,timestamptz,smallint,smallint,smallint,integer,jsonb) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.purge_refusal_audit(timestamptz,integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.record_refusal_audit_access(smallint,smallint,integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.forbid_refusal_audit_catalog_mutation() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.track_refusal_audit_epoch_inventory() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.refusal_audit_previous_epoch_storage_safe(smallint) FROM PUBLIC;
 REVOKE ALL ON command_refusal_surface_kinds, command_refusal_command_kinds,
   command_refusal_kinds, command_refusal_audit_buckets,
   command_refusal_audit_bucket_limits, command_refusal_audit_access_buckets,
-  command_refusal_audit_access_limits, command_refusal_audit_loss_gap
+  command_refusal_audit_access_limits, command_refusal_audit_loss_gap,
+  command_refusal_audit_epoch_inventory
   FROM marketplace_refusal_audit_writer, marketplace_refusal_audit_writer_login,
        marketplace_refusal_audit_retention, marketplace_refusal_audit_aggregate,
-       marketplace_refusal_audit_raw;
+       marketplace_refusal_audit_raw, marketplace_refusal_audit_admin_login;
 REVOKE ALL ON FUNCTION public.operator_refusal_audit_summary(timestamptz,timestamptz,smallint,smallint,smallint,integer,jsonb)
   FROM marketplace_refusal_audit_writer, marketplace_refusal_audit_writer_login,
        marketplace_refusal_audit_retention, marketplace_refusal_audit_aggregate,
@@ -585,6 +660,14 @@ REVOKE ALL ON FUNCTION public.forbid_refusal_audit_catalog_mutation()
   FROM marketplace_refusal_audit_writer, marketplace_refusal_audit_writer_login,
        marketplace_refusal_audit_retention, marketplace_refusal_audit_aggregate,
        marketplace_refusal_audit_raw;
+REVOKE ALL ON FUNCTION public.track_refusal_audit_epoch_inventory()
+  FROM marketplace_refusal_audit_writer, marketplace_refusal_audit_writer_login,
+       marketplace_refusal_audit_retention, marketplace_refusal_audit_aggregate,
+       marketplace_refusal_audit_raw, marketplace_refusal_audit_admin_login;
+REVOKE ALL ON FUNCTION public.refusal_audit_previous_epoch_storage_safe(smallint)
+  FROM marketplace_refusal_audit_writer, marketplace_refusal_audit_writer_login,
+       marketplace_refusal_audit_retention, marketplace_refusal_audit_aggregate,
+       marketplace_refusal_audit_raw, marketplace_refusal_audit_admin_login;
 GRANT SELECT ON command_refusal_surface_kinds, command_refusal_command_kinds, command_refusal_kinds TO marketplace_refusal_audit_writer;
 GRANT SELECT, INSERT, UPDATE ON command_refusal_audit_buckets, command_refusal_audit_bucket_limits TO marketplace_refusal_audit_writer;
 GRANT SELECT, INSERT, UPDATE ON command_refusal_audit_loss_gap TO marketplace_refusal_audit_writer;
@@ -598,7 +681,10 @@ GRANT SELECT, INSERT, UPDATE ON command_refusal_audit_loss_gap TO marketplace_re
 GRANT EXECUTE ON FUNCTION public.operator_refusal_audit_summary(timestamptz,timestamptz,smallint,smallint,smallint,integer,jsonb) TO marketplace_refusal_audit_aggregate, marketplace_refusal_audit_raw;
 GRANT EXECUTE ON FUNCTION public.operator_refusal_audit_buckets(timestamptz,timestamptz,smallint,smallint,smallint,integer,jsonb) TO marketplace_refusal_audit_raw;
 GRANT EXECUTE ON FUNCTION public.purge_refusal_audit(timestamptz,integer) TO marketplace_refusal_audit_retention;
-GRANT SELECT, INSERT, UPDATE, DELETE ON command_refusal_audit_buckets, command_refusal_audit_bucket_limits, command_refusal_audit_access_buckets, command_refusal_audit_access_limits, command_refusal_audit_loss_gap TO marketplace_refusal_audit_owner;
+GRANT SELECT, DELETE ON command_refusal_audit_buckets TO marketplace_refusal_audit_admin_login;
+GRANT SELECT ON command_refusal_audit_epoch_inventory TO marketplace_refusal_audit_admin_login;
+GRANT EXECUTE ON FUNCTION public.refusal_audit_previous_epoch_storage_safe(smallint) TO marketplace_refusal_audit_admin_login;
+GRANT SELECT, INSERT, UPDATE, DELETE ON command_refusal_audit_buckets, command_refusal_audit_bucket_limits, command_refusal_audit_access_buckets, command_refusal_audit_access_limits, command_refusal_audit_loss_gap, command_refusal_audit_epoch_inventory TO marketplace_refusal_audit_owner;
 REVOKE CREATE ON SCHEMA public FROM marketplace_refusal_audit_owner;
 DO $bootstrap$
 DECLARE migration_login name := current_user;

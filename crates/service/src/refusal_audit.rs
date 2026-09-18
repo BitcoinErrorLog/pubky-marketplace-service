@@ -379,15 +379,12 @@ pub enum RefusalKind {
     AwardVariantMismatch = 17,
     AwardListingChanged = 18,
     AwardHoldMissing = 19,
-    ManualResolveConfirmationObservationMismatch = 20,
-    ManualResolveConfirmationEffectsFailed = 21,
     ManualResolveInvalidReason = 22,
     ManualResolveInvalidIdempotencyKey = 23,
     ManualResolveInvalidOutcome = 24,
     ManualResolveInvalidRefundReference = 25,
     ManualResolveNotOrderSeller = 26,
     ManualResolveOrderNotFound = 27,
-    ManualResolveOrderNotAwaitingConfirmation = 28,
     ManualResolveNotApplicable = 29,
     ManualResolveMissingPin = 30,
     ManualResolveConflict = 31,
@@ -1085,7 +1082,7 @@ async fn flush_loss_gap(pool: &PgPool, metrics: &RefusalAuditMetrics) {
 }
 
 impl RefusalKind {
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 37] = [
         Self::InvalidEnvelope,
         Self::InvalidCommand,
         Self::Unauthorized,
@@ -1105,15 +1102,12 @@ impl RefusalKind {
         Self::AwardVariantMismatch,
         Self::AwardListingChanged,
         Self::AwardHoldMissing,
-        Self::ManualResolveConfirmationObservationMismatch,
-        Self::ManualResolveConfirmationEffectsFailed,
         Self::ManualResolveInvalidReason,
         Self::ManualResolveInvalidIdempotencyKey,
         Self::ManualResolveInvalidOutcome,
         Self::ManualResolveInvalidRefundReference,
         Self::ManualResolveNotOrderSeller,
         Self::ManualResolveOrderNotFound,
-        Self::ManualResolveOrderNotAwaitingConfirmation,
         Self::ManualResolveNotApplicable,
         Self::ManualResolveMissingPin,
         Self::ManualResolveConflict,
@@ -1149,21 +1143,12 @@ impl RefusalKind {
             Self::AwardVariantMismatch => "award_variant_mismatch",
             Self::AwardListingChanged => "award_listing_changed",
             Self::AwardHoldMissing => "award_hold_missing",
-            Self::ManualResolveConfirmationObservationMismatch => {
-                "manual_resolve_confirmation_observation_mismatch"
-            }
-            Self::ManualResolveConfirmationEffectsFailed => {
-                "manual_resolve_confirmation_effects_failed"
-            }
             Self::ManualResolveInvalidReason => "manual_resolve_invalid_reason",
             Self::ManualResolveInvalidIdempotencyKey => "manual_resolve_invalid_idempotency_key",
             Self::ManualResolveInvalidOutcome => "manual_resolve_invalid_outcome",
             Self::ManualResolveInvalidRefundReference => "manual_resolve_invalid_refund_reference",
             Self::ManualResolveNotOrderSeller => "manual_resolve_not_order_seller",
             Self::ManualResolveOrderNotFound => "manual_resolve_order_not_found",
-            Self::ManualResolveOrderNotAwaitingConfirmation => {
-                "manual_resolve_order_not_awaiting_confirmation"
-            }
             Self::ManualResolveNotApplicable => "manual_resolve_not_applicable",
             Self::ManualResolveMissingPin => "manual_resolve_missing_pin",
             Self::ManualResolveConflict => "manual_resolve_conflict",
@@ -1204,30 +1189,30 @@ pub fn refusal_kind_for_error(code: marketplace_domain::ErrorCode) -> RefusalKin
     }
 }
 
-pub const fn refusal_kind_for_review_reason(reason: crate::contracts::ReviewReason) -> RefusalKind {
+pub const fn refusal_kind_for_review_reason(
+    reason: crate::contracts::ReviewReason,
+) -> Option<RefusalKind> {
     use crate::contracts::ReviewReason;
     match reason {
-        ReviewReason::ConfirmationObservationMismatch => {
-            RefusalKind::ManualResolveConfirmationObservationMismatch
+        ReviewReason::ConfirmationObservationMismatch
+        | ReviewReason::ConfirmationEffectsFailed
+        | ReviewReason::OrderNotAwaitingConfirmation => None,
+        ReviewReason::InvalidReason => Some(RefusalKind::ManualResolveInvalidReason),
+        ReviewReason::InvalidIdempotencyKey => {
+            Some(RefusalKind::ManualResolveInvalidIdempotencyKey)
         }
-        ReviewReason::ConfirmationEffectsFailed => {
-            RefusalKind::ManualResolveConfirmationEffectsFailed
+        ReviewReason::InvalidOutcome => Some(RefusalKind::ManualResolveInvalidOutcome),
+        ReviewReason::InvalidRefundReference => {
+            Some(RefusalKind::ManualResolveInvalidRefundReference)
         }
-        ReviewReason::InvalidReason => RefusalKind::ManualResolveInvalidReason,
-        ReviewReason::InvalidIdempotencyKey => RefusalKind::ManualResolveInvalidIdempotencyKey,
-        ReviewReason::InvalidOutcome => RefusalKind::ManualResolveInvalidOutcome,
-        ReviewReason::InvalidRefundReference => RefusalKind::ManualResolveInvalidRefundReference,
-        ReviewReason::NotOrderSeller => RefusalKind::ManualResolveNotOrderSeller,
-        ReviewReason::OrderNotFound => RefusalKind::ManualResolveOrderNotFound,
-        ReviewReason::OrderNotAwaitingConfirmation => {
-            RefusalKind::ManualResolveOrderNotAwaitingConfirmation
-        }
-        ReviewReason::ResolutionNotApplicable => RefusalKind::ManualResolveNotApplicable,
-        ReviewReason::MissingPin => RefusalKind::ManualResolveMissingPin,
-        ReviewReason::Conflict => RefusalKind::ManualResolveConflict,
-        ReviewReason::AlreadyResolved => RefusalKind::ManualResolveAlreadyResolved,
-        ReviewReason::NotInManualReview => RefusalKind::ManualResolveNotInReview,
-        ReviewReason::StockUnavailable => RefusalKind::ManualResolveStockUnavailable,
+        ReviewReason::NotOrderSeller => Some(RefusalKind::ManualResolveNotOrderSeller),
+        ReviewReason::OrderNotFound => Some(RefusalKind::ManualResolveOrderNotFound),
+        ReviewReason::ResolutionNotApplicable => Some(RefusalKind::ManualResolveNotApplicable),
+        ReviewReason::MissingPin => Some(RefusalKind::ManualResolveMissingPin),
+        ReviewReason::Conflict => Some(RefusalKind::ManualResolveConflict),
+        ReviewReason::AlreadyResolved => Some(RefusalKind::ManualResolveAlreadyResolved),
+        ReviewReason::NotInManualReview => Some(RefusalKind::ManualResolveNotInReview),
+        ReviewReason::StockUnavailable => Some(RefusalKind::ManualResolveStockUnavailable),
     }
 }
 

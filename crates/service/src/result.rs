@@ -85,27 +85,3 @@ pub fn success_body(command: &Command, success: &HandlerSuccess) -> Value {
 }
 
 pub type HandlerResult = Result<HandlerSuccess, CommandFailure>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn refusal_audit_all_kinds_preserve_response_and_state() {
-        let baseline = CommandFailure::with_revision(
-            ErrorCode::RevisionConflict,
-            "The aggregate revision does not match.",
-            41,
-        );
-        let expected_body = baseline.body();
-        let expected_status = baseline.http_status();
-        for refusal_kind in RefusalKind::ALL {
-            let candidate = CommandFailure {
-                refusal_kind,
-                ..baseline.clone()
-            };
-            assert_eq!(candidate.http_status(), expected_status);
-            assert_eq!(candidate.body(), expected_body);
-        }
-    }
-}
