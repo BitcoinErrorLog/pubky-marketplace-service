@@ -25,6 +25,7 @@ pub mod payment_methods;
 pub mod payments;
 pub mod pickup;
 pub mod queries;
+pub mod reserve_secrecy;
 pub mod resolve_delivery;
 pub mod result;
 pub mod seal;

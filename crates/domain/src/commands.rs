@@ -232,10 +232,26 @@ pub struct AuctionTerms {
     pub starts_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
     pub minimum_increment: Money,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reserve_price: Option<Money>,
     pub anti_sniping_window_seconds: i64,
     pub anti_sniping_extension_seconds: i64,
+}
+
+/// Seller-private reserve authority paired with the public listing revision.
+/// The container is required for auctions even when `reserve_price` is null.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuctionReserve {
+    pub expected_record_revision: i64,
+    pub record_revision: i64,
+    #[serde(deserialize_with = "deserialize_required_nullable_money")]
+    pub reserve_price: Option<Money>,
+}
+
+fn deserialize_required_nullable_money<'de, D>(deserializer: D) -> Result<Option<Money>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Money>::deserialize(deserializer)
 }
 
 fn default_title() -> String {
@@ -263,6 +279,8 @@ pub struct RegisterListingPayload {
     pub sale_format: SaleFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auction_terms: Option<AuctionTerms>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auction_reserve: Option<AuctionReserve>,
     /// The fulfillment methods the owner-signed listing record publishes
     /// (`fulfillmentMethods`, local pickup design §A1). Public catalog data
     /// echoed at `listing.register`/`listing.sync`; defaults to shipping
@@ -1025,7 +1043,22 @@ fn validate_sync_drop(payload: SyncDropPayload) -> Result<CommandPayload, Vec<Va
 /// `listing.sync` handler derives one from the fetched homeserver record and
 /// must hold it to exactly the invariants `listing.register` enforces.
 pub fn validate_register_listing_payload(
+    payload: RegisterListingPayload,
+) -> Result<RegisterListingPayload, Vec<ValidationIssue>> {
+    validate_listing_payload(payload, true)
+}
+
+/// Validates a payload derived from the public homeserver record. Auction
+/// reserve authority is deliberately absent from this reserve-blind shape.
+pub fn validate_public_listing_payload(
+    payload: RegisterListingPayload,
+) -> Result<RegisterListingPayload, Vec<ValidationIssue>> {
+    validate_listing_payload(payload, false)
+}
+
+fn validate_listing_payload(
     mut payload: RegisterListingPayload,
+    require_auction_reserve: bool,
 ) -> Result<RegisterListingPayload, Vec<ValidationIssue>> {
     let mut issues = Vec::new();
     if !is_valid_pubky(&payload.seller_pubky) {
@@ -1074,6 +1107,15 @@ pub fn validate_register_listing_payload(
             "Auction format and terms must be configured together",
         ));
     }
+    let has_auction_reserve = payload.auction_reserve.is_some();
+    if (!is_auction && has_auction_reserve)
+        || (require_auction_reserve && is_auction && !has_auction_reserve)
+    {
+        issues.push(issue(
+            "payload.auction_reserve",
+            "Auction format and reserve authority must be configured together",
+        ));
+    }
     if let Some(terms) = &payload.auction_terms {
         if terms.ends_at <= terms.starts_at {
             issues.push(issue(
@@ -1086,21 +1128,11 @@ pub fn validate_register_listing_payload(
             &terms.minimum_increment,
             &mut issues,
         );
-        if let Some(reserve) = &terms.reserve_price {
-            validate_positive_money("payload.auction_terms.reserve_price", reserve, &mut issues);
-        }
-        for (path, amount) in [
-            ("minimum_increment", Some(&terms.minimum_increment)),
-            ("reserve_price", terms.reserve_price.as_ref()),
-        ] {
-            if let Some(amount) = amount {
-                if !amount.same_asset(&payload.unit_price) {
-                    issues.push(issue(
-                        &format!("payload.auction_terms.{path}"),
-                        "Auction amounts must use the listing asset and exponent",
-                    ));
-                }
-            }
+        if !terms.minimum_increment.same_asset(&payload.unit_price) {
+            issues.push(issue(
+                "payload.auction_terms.minimum_increment",
+                "Auction amounts must use the listing asset and exponent",
+            ));
         }
         if !(0..=3_600).contains(&terms.anti_sniping_window_seconds) {
             issues.push(issue(
@@ -1113,6 +1145,38 @@ pub fn validate_register_listing_payload(
                 "payload.auction_terms.anti_sniping_extension_seconds",
                 "Expected an extension between 0 and 3600 seconds",
             ));
+        }
+    }
+    if let Some(reserve) = &payload.auction_reserve {
+        if !(0..=MAX_SAFE_INTEGER).contains(&reserve.expected_record_revision) {
+            issues.push(issue(
+                "payload.auction_reserve.expected_record_revision",
+                "Expected a non-negative reserve record revision",
+            ));
+        }
+        if !(1..=MAX_SAFE_INTEGER).contains(&reserve.record_revision) {
+            issues.push(issue(
+                "payload.auction_reserve.record_revision",
+                "Expected a positive reserve record revision",
+            ));
+        }
+        if let Some(reserve_price) = &reserve.reserve_price {
+            validate_positive_money(
+                "payload.auction_reserve.reserve_price",
+                reserve_price,
+                &mut issues,
+            );
+            if !reserve_price.same_asset(&payload.unit_price) {
+                issues.push(issue(
+                    "payload.auction_reserve.reserve_price",
+                    "Auction amounts must use the listing asset and exponent",
+                ));
+            } else if reserve_price.amount_minor < payload.unit_price.amount_minor {
+                issues.push(issue(
+                    "payload.auction_reserve.reserve_price.amount_minor",
+                    "Auction reserve must not be below the opening price",
+                ));
+            }
         }
     }
 
@@ -2466,6 +2530,32 @@ mod tests {
         });
         let issues = parse_command(&raw).expect_err("terms without auction format invalid");
         assert!(issues.iter().any(|i| i.path == "payload.auction_terms"));
+    }
+
+    #[test]
+    fn auction_reserve_requires_an_explicit_nullable_price_member() {
+        let mut raw = register_command_json();
+        raw["payload"]["sale_format"] = json!("auction");
+        raw["payload"]["auction_terms"] = json!({
+            "starts_at": "2026-08-19T22:00:00.000Z",
+            "ends_at": "2026-08-19T22:10:00.000Z",
+            "minimum_increment": { "amount_minor": 500, "currency": "USD", "exponent": 2 },
+            "anti_sniping_window_seconds": 60,
+            "anti_sniping_extension_seconds": 120,
+        });
+        raw["payload"]["auction_reserve"] = json!({
+            "expected_record_revision": 0,
+            "record_revision": 1,
+            "reserve_price": null,
+        });
+        parse_command(&raw).expect("explicit null means no reserve");
+
+        raw["payload"]["auction_reserve"]
+            .as_object_mut()
+            .expect("reserve object")
+            .remove("reserve_price");
+        let issues = parse_command(&raw).expect_err("missing reserve price must be rejected");
+        assert!(issues.iter().any(|issue| issue.path == "payload"));
     }
 
     /// A Locks lock id from the pinned upstream positive vector

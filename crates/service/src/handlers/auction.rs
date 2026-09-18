@@ -18,10 +18,13 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::executor::insert_event;
-use crate::handlers::{fetch_listing_for_update, insert_notification_intent, LISTING_COLUMNS};
+use crate::handlers::{
+    fetch_auction_reserve_for_update, fetch_listing_for_update, insert_notification_intent,
+    LISTING_COLUMNS,
+};
 use crate::model::{
-    money_json, AuctionState, BidRow, ListingRow, OrderRow, PaymentRow, ProjectionContext,
-    ReservationRow,
+    money_json, AuctionReserveRow, AuctionState, BidRow, ListingRow, OrderRow, PaymentRow,
+    ProjectionContext, ReservationRow,
 };
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -74,6 +77,12 @@ pub async fn place_bid(
                 "This listing is not an auction.",
             )));
         }
+    };
+    let Some(reserve) = fetch_auction_reserve_for_update(tx, &command.aggregate_id).await? else {
+        return Ok(Err(CommandFailure::new(
+            ErrorCode::InvariantViolation,
+            "The auction reserve authority is missing.",
+        )));
     };
     if auction.status != "active" {
         return Ok(Err(CommandFailure::new(
@@ -179,10 +188,6 @@ pub async fn place_bid(
     updated_auction.current_price = updated_auction.current_price.with_amount(visible_amount);
     updated_auction.leader_pubky = Some(leader.bidder_pubky.clone());
     updated_auction.bid_count += 1;
-    updated_auction.reserve_met = updated_auction
-        .reserve_price
-        .as_ref()
-        .is_none_or(|reserve| visible_amount >= reserve.amount_minor);
 
     let updated_listing: ListingRow = sqlx::query_as(&format!(
         "UPDATE listings SET server_revision = server_revision + 1, auction = $2, \
@@ -226,12 +231,21 @@ pub async fn place_bid(
         }
     }
 
+    let viewer_bid = viewer_bid_json(
+        &updated_auction,
+        bid.maximum_amount_minor,
+        &bid.currency,
+        bid.exponent,
+    );
+    let listing_projection = updated_listing
+        .projection_for_actor_with_auction(actor, Some(&reserve), Some(viewer_bid))
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     Ok(Ok(HandlerSuccess {
         revision: updated_listing.server_revision,
         event_ids: vec![event_id],
         result: json!({
             "kind": "bid",
-            "listing": updated_listing.view(),
+            "listing": listing_projection,
             "bid": bid.view(),
         }),
     }))
@@ -282,7 +296,7 @@ pub async fn close(
     Ok(Ok(HandlerSuccess {
         revision: outcome.listing.server_revision,
         event_ids: outcome.event_ids.clone(),
-        result: outcome.result_json(),
+        result: outcome.result_json(actor)?,
     }))
 }
 
@@ -290,6 +304,7 @@ pub struct AuctionCloseOutcome {
     pub sold: bool,
     pub winner_pubky: Option<String>,
     pub listing: ListingRow,
+    pub reserve: AuctionReserveRow,
     pub reservation: Option<ReservationRow>,
     pub order: Option<OrderRow>,
     pub payment: Option<PaymentRow>,
@@ -297,16 +312,20 @@ pub struct AuctionCloseOutcome {
 }
 
 impl AuctionCloseOutcome {
-    pub fn result_json(&self) -> Value {
+    pub fn result_json(&self, actor: &str) -> Result<Value, sqlx::Error> {
         // The order and payment use the redacted projections: no delivery
         // address (always null here — the winner has not supplied one) and
         // no Locks bundle id, which stays out of command results exactly as
         // out of read projections (ADR-0019 §8).
-        json!({
+        let listing = self
+            .listing
+            .projection_for_actor_with_auction(actor, Some(&self.reserve), None)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        Ok(json!({
             "kind": "auction_result",
             "outcome": if self.sold { "sold" } else { "unsold" },
             "winner_pubky": self.winner_pubky,
-            "listing": self.listing.view(),
+            "listing": listing,
             "reservation": self.reservation.as_ref().map(ReservationRow::view),
             "order": self.order.as_ref().map(|order| {
                 order.project(ProjectionContext::CommandResult {
@@ -314,7 +333,7 @@ impl AuctionCloseOutcome {
                 })
             }),
             "payment": self.payment.as_ref().map(PaymentRow::projection),
-        })
+        }))
     }
 }
 
@@ -330,7 +349,11 @@ pub async fn close_locked_auction(
     command_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<AuctionCloseOutcome, sqlx::Error> {
-    let winner = auction.leader_pubky.clone().filter(|_| auction.reserve_met);
+    let reserve = fetch_auction_reserve_for_update(tx, &listing.aggregate_id)
+        .await?
+        .ok_or_else(|| sqlx::Error::Protocol("auction reserve authority is missing".to_string()))?;
+    let reserve_satisfied = reserve_satisfied(listing, &auction, &reserve)?;
+    let winner = auction.leader_pubky.clone().filter(|_| reserve_satisfied);
     let sold = winner.is_some();
     let auction_status = if sold { "sold" } else { "unsold" };
     debug_assert!(can_transition(&auction_machine(), "active", auction_status));
@@ -587,6 +610,7 @@ pub async fn close_locked_auction(
         sold,
         winner_pubky: winner,
         listing: updated_listing,
+        reserve,
         reservation,
         order,
         payment,
@@ -594,12 +618,90 @@ pub async fn close_locked_auction(
     })
 }
 
+fn reserve_satisfied(
+    listing: &ListingRow,
+    auction: &AuctionState,
+    reserve: &AuctionReserveRow,
+) -> Result<bool, sqlx::Error> {
+    if reserve.listing_aggregate_id != listing.aggregate_id
+        || reserve.listing_revision != listing.listing_revision
+    {
+        return Err(sqlx::Error::Protocol(
+            "auction reserve revision is inconsistent".to_string(),
+        ));
+    }
+    if auction.current_price.currency != listing.unit_price_currency
+        || auction.current_price.exponent != listing.unit_price_exponent
+        || auction.minimum_increment.currency != listing.unit_price_currency
+        || auction.minimum_increment.exponent != listing.unit_price_exponent
+    {
+        return Err(sqlx::Error::Protocol(
+            "auction current-price asset is inconsistent".to_string(),
+        ));
+    }
+    let Some(reserve_price) = reserve.reserve_price() else {
+        return Ok(true);
+    };
+    if reserve_price.currency != listing.unit_price_currency
+        || reserve_price.exponent != listing.unit_price_exponent
+    {
+        return Err(sqlx::Error::Protocol(
+            "auction reserve asset is inconsistent".to_string(),
+        ));
+    }
+    Ok(auction.current_price.amount_minor >= reserve_price.amount_minor)
+}
+
+fn viewer_bid_json(
+    auction: &AuctionState,
+    maximum_minor: i64,
+    currency: &str,
+    exponent: i32,
+) -> Value {
+    let minimum_minor = personal_minimum_next_bid(
+        auction.current_price.amount_minor,
+        auction.minimum_increment.amount_minor,
+        maximum_minor,
+    );
+    json!({
+        "maximum_amount": money_json(maximum_minor, currency, exponent),
+        "minimum_next_bid": money_json(minimum_minor, currency, exponent),
+    })
+}
+
+pub async fn viewer_bid_projection(
+    tx: &mut Transaction<'_, Postgres>,
+    listing: &ListingRow,
+    actor: &str,
+) -> Result<Option<Value>, sqlx::Error> {
+    let own_bid: Option<(i64, String, i32)> = sqlx::query_as(
+        "SELECT maximum_amount_minor, currency, exponent FROM bids \
+         WHERE listing_aggregate_id = $1 AND bidder_pubky = $2 \
+         ORDER BY maximum_amount_minor DESC LIMIT 1",
+    )
+    .bind(&listing.aggregate_id)
+    .bind(actor)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((maximum_minor, currency, exponent)) = own_bid else {
+        return Ok(None);
+    };
+    let auction = parse_auction(listing)
+        .ok_or_else(|| sqlx::Error::Protocol("auction state is missing".to_string()))?;
+    Ok(Some(viewer_bid_json(
+        &auction,
+        maximum_minor,
+        &currency,
+        exponent,
+    )))
+}
+
 pub fn parse_auction(listing: &ListingRow) -> Option<AuctionState> {
     if listing.sale_format != "auction" {
         return None;
     }
     let value = listing.auction.as_ref()?;
-    Some(AuctionState::from_value(value).expect("stored auction document is well-formed"))
+    AuctionState::from_value(value).ok()
 }
 
 async fn fetch_bids(

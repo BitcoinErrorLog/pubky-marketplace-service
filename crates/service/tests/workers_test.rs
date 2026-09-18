@@ -290,12 +290,14 @@ async fn worker_delivers_offer_and_auction_notifications(pool: PgPool) {
     let app = test_app(pool).await;
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
+    let auction_seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let other_buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
     execute(
         &app,
-        &seller.token,
-        &register_auction_command(&seller.pubky),
+        &auction_seller.token,
+        &register_auction_command(&auction_seller.pubky),
     )
     .await;
     let mut offer = create_offer_command(&seller.pubky, 1);
@@ -305,13 +307,13 @@ async fn worker_delivers_offer_and_auction_notifications(pool: PgPool) {
     execute(
         &app,
         &buyer.token,
-        &place_bid_command(&seller.pubky, 10, 10_000, 1),
+        &place_bid_command(&auction_seller.pubky, 10, 10_000, 1),
     )
     .await;
     let (status, _) = execute(
         &app,
         &other_buyer.token,
-        &place_bid_command(&seller.pubky, 11, 12_000, 2),
+        &place_bid_command(&auction_seller.pubky, 11, 12_000, 2),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

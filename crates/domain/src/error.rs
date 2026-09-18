@@ -15,6 +15,7 @@ pub enum ErrorCode {
     InvalidState,
     AuctionClosed,
     BidTooLow,
+    SellerRegistrationRequired,
     /// An upstream dependency (the seller's homeserver) could not be
     /// reached or answered unusably. Retriable: the command may succeed
     /// once the upstream recovers, so it maps to 503 rather than a 4xx.
@@ -42,7 +43,8 @@ impl ErrorCode {
             | ErrorCode::OfferExpired
             | ErrorCode::InvalidState
             | ErrorCode::AuctionClosed
-            | ErrorCode::BidTooLow => 409,
+            | ErrorCode::BidTooLow
+            | ErrorCode::SellerRegistrationRequired => 409,
             ErrorCode::AwardExpired
             | ErrorCode::AwardAlreadyConverted
             | ErrorCode::AwardQuantityMismatch

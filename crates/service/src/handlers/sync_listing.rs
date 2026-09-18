@@ -16,14 +16,14 @@
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
-    validate_register_listing_payload, Command, SyncListingPayload,
+    validate_public_listing_payload, Command, SaleFormat, SyncListingPayload,
 };
 use marketplace_domain::{ids, ErrorCode};
 use serde_json::json;
 use sqlx::{Postgres, Transaction};
 
-use crate::handlers::fetch_listing_for_update;
 use crate::handlers::register_listing::apply_registration;
+use crate::handlers::{fetch_auction_reserve_for_update, fetch_listing_for_update};
 use crate::homeserver::{
     registration_payload_from_record, HomeserverFetchOutcome, HomeserverListingClient,
     MalformedDigitalLock,
@@ -97,7 +97,7 @@ pub async fn handle(
     // The derived payload must satisfy exactly the invariants
     // `listing.register` enforces; a record that fails them cannot back a
     // registered aggregate.
-    let registration = match validate_register_listing_payload(registration) {
+    let registration = match validate_public_listing_payload(registration) {
         Ok(registration) => registration,
         Err(issues) => {
             return Ok(Err(CommandFailure {
@@ -111,6 +111,34 @@ pub async fn handle(
     };
 
     let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
+    if let Some(current_auction) = current
+        .as_ref()
+        .filter(|listing| listing.sale_format == "auction")
+    {
+        let reserve = fetch_auction_reserve_for_update(tx, &command.aggregate_id).await?;
+        let Some(reserve) = reserve.as_ref() else {
+            return Ok(Err(seller_registration_required()));
+        };
+        if registration.sale_format != SaleFormat::Auction {
+            return Ok(Err(seller_registration_required()));
+        }
+        if registration.listing_revision > current_auction.listing_revision {
+            return Ok(Err(seller_registration_required()));
+        }
+        let viewer_bid =
+            crate::handlers::auction::viewer_bid_projection(tx, current_auction, actor).await?;
+        let projection = current_auction
+            .projection_for_actor_with_auction(actor, Some(reserve), viewer_bid)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        return Ok(Ok(HandlerSuccess {
+            revision: current_auction.server_revision,
+            event_ids: vec![],
+            result: json!({ "kind": "listing", "listing": projection }),
+        }));
+    }
+    if registration.sale_format == SaleFormat::Auction {
+        return Ok(Err(seller_registration_required()));
+    }
     if let Some(current) = &current {
         // Convergent no-op: the aggregate already reflects this record
         // revision (or a newer one) — with narrow healing exceptions. When
@@ -185,13 +213,23 @@ pub async fn handle(
                 return Ok(Ok(HandlerSuccess {
                     revision: healed.server_revision,
                     event_ids: vec![event_id],
-                    result: json!({ "kind": "listing", "listing": healed.view() }),
+                    result: json!({
+                        "kind": "listing",
+                        "listing": healed
+                            .projection_for_actor_with_auction(actor, None, None)
+                            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
+                    }),
                 }));
             }
             return Ok(Ok(HandlerSuccess {
                 revision: current.server_revision,
                 event_ids: vec![],
-                result: json!({ "kind": "listing", "listing": current.view() }),
+                result: json!({
+                    "kind": "listing",
+                    "listing": current
+                        .projection_for_actor_with_auction(actor, None, None)
+                        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
+                }),
             }));
         }
     }
@@ -203,8 +241,16 @@ pub async fn handle(
         &command.aggregate_id,
         &registration,
         current.as_ref(),
+        None,
         "listing.synced",
         now,
     )
     .await
+}
+
+fn seller_registration_required() -> CommandFailure {
+    CommandFailure::new(
+        ErrorCode::SellerRegistrationRequired,
+        "The seller must register this auction with its private reserve authority.",
+    )
 }

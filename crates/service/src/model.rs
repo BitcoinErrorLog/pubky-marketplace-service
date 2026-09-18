@@ -38,14 +38,12 @@ pub struct AuctionState {
     #[serde(with = "ts_millis")]
     pub ends_at: DateTime<Utc>,
     pub minimum_increment: Money,
-    pub reserve_price: Option<Money>,
     pub anti_sniping_window_seconds: i64,
     pub anti_sniping_extension_seconds: i64,
     pub status: String,
     pub current_price: Money,
     pub leader_pubky: Option<String>,
     pub bid_count: i64,
-    pub reserve_met: bool,
 }
 
 impl AuctionState {
@@ -91,6 +89,60 @@ pub struct ListingRow {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct AuctionReserveRow {
+    pub listing_aggregate_id: String,
+    pub listing_revision: i64,
+    pub record_revision: i64,
+    pub reserve_amount_minor: Option<i64>,
+    pub reserve_currency: Option<String>,
+    pub reserve_exponent: Option<i32>,
+    pub last_command_id: Uuid,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl AuctionReserveRow {
+    pub fn reserve_price(&self) -> Option<Money> {
+        match (
+            self.reserve_amount_minor,
+            self.reserve_currency.as_ref(),
+            self.reserve_exponent,
+        ) {
+            (Some(amount_minor), Some(currency), Some(exponent)) => Some(Money {
+                amount_minor,
+                currency: currency.clone(),
+                exponent,
+            }),
+            (None, None, None) => None,
+            _ => unreachable!("database reserve Money presence constraint was bypassed"),
+        }
+    }
+
+    fn reserve_met(&self, auction: &AuctionState) -> Result<bool, ListingProjectionError> {
+        let Some(_leader) = auction.leader_pubky.as_ref() else {
+            return Ok(false);
+        };
+        let Some(reserve) = self.reserve_price() else {
+            return Ok(true);
+        };
+        if !reserve.same_asset(&auction.current_price) {
+            return Err(ListingProjectionError);
+        }
+        Ok(auction.current_price.amount_minor >= reserve.amount_minor)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ListingProjectionError;
+
+impl std::fmt::Display for ListingProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stored auction projection state is inconsistent")
+    }
+}
+
+impl std::error::Error for ListingProjectionError {}
+
 impl ListingRow {
     pub fn unit_price_json(&self) -> Value {
         money_json(
@@ -100,8 +152,14 @@ impl ListingRow {
         )
     }
 
-    pub fn view(&self) -> Value {
-        json!({
+    pub fn public_projection(&self) -> Result<Value, ListingProjectionError> {
+        let auction = match self.auction.as_ref() {
+            Some(value) => AuctionState::from_value(value)
+                .map_err(|_| ListingProjectionError)?
+                .to_value(),
+            None => Value::Null,
+        };
+        let projection = json!({
             "aggregate_id": self.aggregate_id,
             "seller_pubky": self.seller_pubky,
             "listing_id": self.listing_id,
@@ -121,10 +179,61 @@ impl ListingRow {
                 self.unit_price_exponent,
             ),
             "sale_format": self.sale_format,
-            "auction": self.auction.clone().unwrap_or(Value::Null),
+            "auction": auction,
             "fulfillment_methods": self.fulfillment_methods,
             "updated_at": format_timestamp(self.updated_at),
-        })
+        });
+        crate::reserve_secrecy::ensure_reserve_free(&projection)
+            .map_err(|_| ListingProjectionError)?;
+        Ok(projection)
+    }
+
+    /// The sole actor-aware listing serializer. `viewer_bid` must already be
+    /// scoped to `actor` by the caller. Seller reserve fields are added only
+    /// after the reserve-free base projection has passed the raw guard.
+    pub fn projection_for_actor_with_auction(
+        &self,
+        actor: &str,
+        reserve: Option<&AuctionReserveRow>,
+        viewer_bid: Option<Value>,
+    ) -> Result<Value, ListingProjectionError> {
+        let mut projection = self.public_projection()?;
+        if let Some(viewer_bid) = viewer_bid {
+            projection["viewer_bid"] = viewer_bid;
+        }
+        if self.sale_format == "auction" && actor == self.seller_pubky {
+            let reserve = reserve.ok_or(ListingProjectionError)?;
+            if reserve.listing_aggregate_id != self.aggregate_id
+                || reserve.listing_revision != self.listing_revision
+            {
+                return Err(ListingProjectionError);
+            }
+            let auction = self
+                .auction
+                .as_ref()
+                .ok_or(ListingProjectionError)
+                .and_then(|value| {
+                    AuctionState::from_value(value).map_err(|_| ListingProjectionError)
+                })?;
+            if auction.current_price.currency != self.unit_price_currency
+                || auction.current_price.exponent != self.unit_price_exponent
+                || auction.minimum_increment.currency != self.unit_price_currency
+                || auction.minimum_increment.exponent != self.unit_price_exponent
+            {
+                return Err(ListingProjectionError);
+            }
+            projection["reserve_price"] = reserve
+                .reserve_price()
+                .map(|money| money_json(money.amount_minor, &money.currency, money.exponent))
+                .unwrap_or(Value::Null);
+            projection["reserve_met"] = Value::Bool(reserve.reserve_met(&auction)?);
+            projection["reserve_record_revision"] = json!(reserve.record_revision);
+            projection["last_reserve_command_id"] = json!(reserve.last_command_id);
+        } else {
+            crate::reserve_secrecy::ensure_reserve_free(&projection)
+                .map_err(|_| ListingProjectionError)?;
+        }
+        Ok(projection)
     }
 }
 

@@ -6,7 +6,9 @@ use serde_json::json;
 use sqlx::{Postgres, Transaction};
 
 use crate::executor::insert_event;
-use crate::handlers::{current_listing_revision, fetch_listing, LISTING_COLUMNS};
+use crate::handlers::{
+    current_listing_revision, fetch_auction_reserve, fetch_listing, LISTING_COLUMNS,
+};
 use crate::model::{ListingRow, ReservationRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -147,13 +149,17 @@ pub async fn handle(
         now,
     )
     .await?;
+    let reserve = fetch_auction_reserve(tx, &listing.aggregate_id).await?;
+    let listing_projection = listing
+        .projection_for_actor_with_auction(actor, reserve.as_ref(), None)
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
 
     Ok(Ok(HandlerSuccess {
         revision: listing.server_revision,
         event_ids: vec![event_id],
         result: json!({
             "kind": "reservation",
-            "listing": listing.view(),
+            "listing": listing_projection,
             "reservation": reservation.view(),
         }),
     }))

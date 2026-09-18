@@ -34,9 +34,9 @@ async fn delivered_notifications(app: &TestApp) -> Vec<(String, String, serde_js
     .collect()
 }
 
-// TS case: "applies deterministic proxy bidding and reserve status"
+// Proxy bidding never exposes reserve-derived status to either bidder.
 #[sqlx::test]
-async fn applies_deterministic_proxy_bidding_and_reserve_status(pool: PgPool) {
+async fn applies_deterministic_proxy_bidding_without_reserve_status(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -59,7 +59,8 @@ async fn applies_deterministic_proxy_bidding_and_reserve_status(pool: PgPool) {
     assert_eq!(first["result"]["kind"], json!("bid"));
     assert_eq!(auction["current_price"]["amount_minor"], json!(4_500));
     assert_eq!(auction["leader_pubky"], json!(buyer.pubky));
-    assert_eq!(auction["reserve_met"], json!(false));
+    assert!(auction.get("reserve_met").is_none());
+    assert!(auction.get("reserve_price").is_none());
     assert_eq!(auction["bid_count"], json!(1));
 
     let (status, second) = execute(
@@ -73,7 +74,8 @@ async fn applies_deterministic_proxy_bidding_and_reserve_status(pool: PgPool) {
     let auction = &second["result"]["listing"]["auction"];
     assert_eq!(auction["current_price"]["amount_minor"], json!(8_500));
     assert_eq!(auction["leader_pubky"], json!(buyer.pubky));
-    assert_eq!(auction["reserve_met"], json!(true));
+    assert!(auction.get("reserve_met").is_none());
+    assert!(auction.get("reserve_price").is_none());
     assert_eq!(auction["bid_count"], json!(2));
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM bids").await, 2);
 }

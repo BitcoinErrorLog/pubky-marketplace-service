@@ -82,6 +82,7 @@ pub(crate) fn error_code_name(code: Option<ErrorCode>) -> &'static str {
         Some(ErrorCode::InvalidState) => "INVALID_STATE",
         Some(ErrorCode::AuctionClosed) => "AUCTION_CLOSED",
         Some(ErrorCode::BidTooLow) => "BID_TOO_LOW",
+        Some(ErrorCode::SellerRegistrationRequired) => "SELLER_REGISTRATION_REQUIRED",
         Some(ErrorCode::UpstreamUnavailable) => "UPSTREAM_UNAVAILABLE",
         Some(ErrorCode::AwardExpired) => "AWARD_EXPIRED",
         Some(ErrorCode::AwardAlreadyConverted) => "AWARD_ALREADY_CONVERTED",

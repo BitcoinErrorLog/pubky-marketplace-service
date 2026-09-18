@@ -278,7 +278,10 @@ async fn hundred_concurrent_proxy_bids_produce_one_deterministic_leader_and_one_
         (104_500..=105_000).contains(&visible),
         "visible price is runner-up bound: {visible}"
     );
-    assert_eq!(auction["reserve_met"], json!(true));
+    assert!(
+        auction.get("reserve_met").is_none() && auction.get("reserve_price").is_none(),
+        "stored auction state is reserve-blind"
+    );
 
     // Two concurrent closes: exactly one close result, exactly one winning
     // order (the second closer sees the auction already terminal).
