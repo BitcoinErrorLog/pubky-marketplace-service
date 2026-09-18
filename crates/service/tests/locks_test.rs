@@ -2382,6 +2382,41 @@ async fn sync_accepts_the_pubky_scheme_policy_uri_and_persists_the_canonical_bar
     );
 }
 
+#[sqlx::test]
+async fn sync_canonicalizes_a_lowercase_z32_lock_id(pool: PgPool) {
+    let homeserver = Arc::new(SyncableLocksHomeserver::default());
+    let app = test_app_with_homeserver(pool, homeserver.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let bare = lock_resource_for(&seller.pubky);
+    let lowercase = bare.to_ascii_lowercase();
+
+    homeserver.put_record(
+        &seller.pubky,
+        "boots_01",
+        listing_record_with_lock(1, &lowercase),
+    );
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::sync_command(&seller.pubky, "boots_01", 603),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "lowercase lock id sync: {body}");
+    let (stored,): (Option<String>,) =
+        sqlx::query_as("SELECT digital_lock_policy_uri FROM listings WHERE aggregate_id = $1")
+            .bind(format!("listing:{}_boots_01", seller.pubky))
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing row exists");
+    assert_eq!(
+        stored.as_deref(),
+        Some(bare.as_str()),
+        "listing sync persists the canonical uppercase Crockford lock id"
+    );
+}
+
 // Legacy orders — and carts whose checkout saw zero or multiple distinct
 // locks — carry no snapshot row: prepare refuses them statically rather
 // than falling back to the mutable listing rows.
