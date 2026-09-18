@@ -526,10 +526,22 @@ pub struct PrepareLocksPayload {
 /// The Locks content-lock path prefix inside a pubky lock resource.
 pub const LOCKS_CONTENT_LOCK_PREFIX: &str = "/pub/locks.app/";
 
+/// The exact `pubky://` URL scheme the Shop client prefixes to a Locks
+/// policy URI (`digitalLock.policyUri`). Only this exact, case-sensitive
+/// prefix is ever stripped during canonicalization; anything else
+/// (`http(s)://`, a bare `pubky:`, a mixed-case scheme, embedded
+/// whitespace) stays part of the resource and fails validation.
+pub const PUBKY_RESOURCE_SCHEME: &str = "pubky://";
+
 /// Splits an addressed lock resource into `(creator, lock_id)` when it has
 /// the canonical form `<z-base-32 creator>/pub/locks.app/<lock_id>.json`
-/// with a 52-character canonical Crockford lock id.
+/// with a 52-character canonical Crockford lock id. An optional leading
+/// [`PUBKY_RESOURCE_SCHEME`] prefix (the Shop client's addressing form) is
+/// stripped first; every other deviation stays rejected.
 pub fn parse_lock_resource(resource: &str) -> Option<(&str, &str)> {
+    let resource = resource
+        .strip_prefix(PUBKY_RESOURCE_SCHEME)
+        .unwrap_or(resource);
     let (creator, path) = resource.split_at(resource.find(LOCKS_CONTENT_LOCK_PREFIX)?);
     let lock_id = path
         .strip_prefix(LOCKS_CONTENT_LOCK_PREFIX)?
@@ -539,6 +551,32 @@ pub fn parse_lock_resource(resource: &str) -> Option<(&str, &str)> {
     } else {
         None
     }
+}
+
+/// Canonicalizes an addressed lock resource to the bare form
+/// `<creator>/pub/locks.app/<LOCK_ID>.json`: strips an optional leading
+/// [`PUBKY_RESOURCE_SCHEME`], requires the remainder to name a valid pubky
+/// creator and a 52-character Crockford lock id that decodes to exactly 32
+/// bytes, and renders the id in canonical UPPERCASE Crockford (a lowercase
+/// id is accepted and uppercased). Anything else returns `None`.
+pub fn canonical_lock_resource(resource: &str) -> Option<String> {
+    let resource = resource
+        .strip_prefix(PUBKY_RESOURCE_SCHEME)
+        .unwrap_or(resource);
+    let (creator, path) = resource.split_at(resource.find(LOCKS_CONTENT_LOCK_PREFIX)?);
+    let lock_id = path
+        .strip_prefix(LOCKS_CONTENT_LOCK_PREFIX)?
+        .strip_suffix(".json")?
+        .to_ascii_uppercase();
+    if !(is_valid_pubky(creator) && crockford_id_regex_52().is_match(&lock_id)) {
+        return None;
+    }
+    let decoded = base32::decode(base32::Alphabet::Crockford, &lock_id)
+        .filter(|decoded| decoded.len() == 32)?;
+    Some(format!(
+        "{creator}{LOCKS_CONTENT_LOCK_PREFIX}{}.json",
+        base32::encode(base32::Alphabet::Crockford, &decoded)
+    ))
 }
 
 /// Payload shared by the order commands that carry only the order id
@@ -1124,12 +1162,18 @@ pub fn validate_register_listing_payload(
             "Auction listings are shipping-only",
         ));
     }
-    if let Some(lock) = &payload.digital_lock {
-        if parse_lock_resource(&lock.policy_uri).is_none() {
-            issues.push(issue(
+    if let Some(lock) = &mut payload.digital_lock {
+        // Persist only the canonical bare form: a Shop-authored
+        // `pubky://<creator>/pub/locks.app/<id>.json` policy URI and its
+        // bare spelling are the SAME lock, so validation normalizes the
+        // payload before it is bound to SQL and change detection always
+        // compares canonical against canonical.
+        match canonical_lock_resource(&lock.policy_uri) {
+            Some(canonical) => lock.policy_uri = canonical,
+            None => issues.push(issue(
                 "payload.digital_lock.policyUri",
                 "Expected a canonical Locks public resource",
-            ));
+            )),
         }
         if !entity_id_regex().is_match(&lock.criterion_id) {
             issues.push(issue(
@@ -2442,5 +2486,109 @@ mod tests {
         });
         let issues = parse_command(&raw).expect_err("terms without auction format invalid");
         assert!(issues.iter().any(|i| i.path == "payload.auction_terms"));
+    }
+
+    /// A Locks lock id from the pinned upstream positive vector
+    /// (`pubky/locks@ba49a777`), known to decode to exactly 32 bytes.
+    const LOCK_ID: &str = "5Z4FC0QEAFTTTE1DFH7DNZW2HVVPTDNJY5MERMD3Y0CQKH1P2SM0";
+
+    fn bare_lock_resource() -> String {
+        format!(
+            "{}{LOCKS_CONTENT_LOCK_PREFIX}{LOCK_ID}.json",
+            "y".repeat(52)
+        )
+    }
+
+    #[test]
+    fn lock_resource_bare_and_pubky_scheme_forms_parse_identically() {
+        let bare = bare_lock_resource();
+        let addressed = format!("{PUBKY_RESOURCE_SCHEME}{bare}");
+        assert_eq!(
+            parse_lock_resource(&bare),
+            Some(("y".repeat(52).as_str(), LOCK_ID))
+        );
+        assert_eq!(parse_lock_resource(&addressed), parse_lock_resource(&bare));
+        assert_eq!(
+            canonical_lock_resource(&bare).as_deref(),
+            Some(bare.as_str())
+        );
+        assert_eq!(
+            canonical_lock_resource(&addressed),
+            canonical_lock_resource(&bare)
+        );
+    }
+
+    #[test]
+    fn canonical_lock_resource_uppercases_a_lowercase_lock_id() {
+        let bare = bare_lock_resource();
+        let lowercase = bare.replace(LOCK_ID, &LOCK_ID.to_ascii_lowercase());
+        assert_eq!(
+            canonical_lock_resource(&lowercase).as_deref(),
+            Some(bare.as_str())
+        );
+        // The strict parser still requires the canonical uppercase id.
+        assert_eq!(parse_lock_resource(&lowercase), None);
+    }
+
+    #[test]
+    fn lock_resource_rejects_every_non_canonical_form() {
+        let bare = bare_lock_resource();
+        let rejections = [
+            format!("https://{bare}"),
+            format!("http://{bare}"),
+            // `pubky:` without the slashes is not the scheme prefix.
+            format!("pubky:{bare}"),
+            // `pubky:///` leaves a leading slash on the creator.
+            format!("{PUBKY_RESOURCE_SCHEME}/{bare}"),
+            // The scheme match is case-sensitive.
+            format!("PUBKY://{bare}"),
+            format!("Pubky://{bare}"),
+            // Embedded whitespace anywhere invalidates the resource.
+            bare.replacen(LOCKS_CONTENT_LOCK_PREFIX, " /pub/locks.app/", 1),
+            format!("{bare} "),
+            // A path other than `/pub/locks.app/`.
+            bare.replace(LOCKS_CONTENT_LOCK_PREFIX, "/pub/other.app/"),
+            // An id that is not 52 Crockford characters.
+            bare.replace(LOCK_ID, &LOCK_ID[..51]),
+            bare.replace(LOCK_ID, &format!("{LOCK_ID}0")),
+            bare.replace(LOCK_ID, &LOCK_ID.replace('Z', "L")),
+            // A creator that is not a valid pubky.
+            bare.replace(&"y".repeat(52), "not-a-pubky"),
+            bare.replace(&"y".repeat(52), &"l".repeat(52)),
+        ];
+        for resource in &rejections {
+            assert_eq!(
+                parse_lock_resource(resource),
+                None,
+                "parse must reject {resource:?}"
+            );
+            assert_eq!(
+                canonical_lock_resource(resource),
+                None,
+                "canonicalize must reject {resource:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn register_validation_persists_the_canonical_bare_policy_uri() {
+        let bare = bare_lock_resource();
+        let mut raw = register_command_json();
+        raw["payload"]["digital_lock"] = json!({
+            "policyUri": format!("{PUBKY_RESOURCE_SCHEME}{bare}"),
+            "criterionId": "paykit",
+        });
+        let command = parse_command(&raw).expect("pubky:// policy uri is valid");
+        let CommandPayload::RegisterListing(payload) = command.payload else {
+            panic!("expected register payload");
+        };
+        assert_eq!(
+            payload
+                .digital_lock
+                .as_ref()
+                .map(|lock| lock.policy_uri.as_str()),
+            Some(bare.as_str()),
+            "the payload bound to SQL carries the canonical bare form"
+        );
     }
 }

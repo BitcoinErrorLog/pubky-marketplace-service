@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 
 use base32::Alphabet;
 use chrono::{DateTime, FixedOffset};
+use marketplace_domain::commands::PUBKY_RESOURCE_SCHEME;
 use pubky_common::crypto::PublicKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -417,13 +418,17 @@ pub struct LockResourceParts {
 /// Mirrors `pubky/locks@ba49a777:locks-core/src/ids.rs:461-484`
 /// (`PubkyLockResource::from_str`), `:379-396`
 /// (`ContentLockPath::from_str`), and `:486-508` (`parse_crockford_id`):
-/// `pubky://` URLs are rejected, the lock id must be 52 Crockford
-/// characters decoding to 32 bytes (normalized to canonical uppercase),
-/// and the creator must be a valid Pubky key.
+/// the lock id must be 52 Crockford characters decoding to 32 bytes
+/// (normalized to canonical uppercase), and the creator must be a valid
+/// Pubky key. The service additionally accepts the Shop client's
+/// `pubky://` addressing of a Locks policy URI: the exact
+/// [`PUBKY_RESOURCE_SCHEME`] prefix is canonicalized away first, and the
+/// locks-core-mirroring checks below then apply — strict and unchanged —
+/// to the bare remainder.
 pub fn parse_lock_resource_typed(resource: &str) -> Option<LockResourceParts> {
-    if resource.starts_with("pubky://") {
-        return None;
-    }
+    let resource = resource
+        .strip_prefix(PUBKY_RESOURCE_SCHEME)
+        .unwrap_or(resource);
     let path_start = resource.find("/pub/locks.app/")?;
     let (creator, path) = resource.split_at(path_start);
     let creator = PubkyIdentity::parse(creator)?;
@@ -600,6 +605,41 @@ mod tests {
             validate_content_lock_value(&document, &resource(&raw_lock_id)),
             Err(ContentLockIdentityRejection::PathMismatch),
             "the raw-canonical content address is NOT the typed identity"
+        );
+    }
+
+    // The Shop client addresses the lock as
+    // `pubky://<creator>/pub/locks.app/<id>.json`: the service strips the
+    // exact scheme prefix and the strict mirrored checks then see the bare
+    // form, so both spellings parse to the same typed parts.
+    #[test]
+    fn the_typed_parse_accepts_the_shop_pubky_scheme_form() {
+        let bare = resource(POSITIVE_LOCK_ID);
+        let addressed = format!("pubky://{bare}");
+        let bare_parts = parse_lock_resource_typed(&bare).expect("bare form parses");
+        let addressed_parts = parse_lock_resource_typed(&addressed).expect("pubky:// form parses");
+        assert_eq!(addressed_parts, bare_parts);
+        assert_eq!(addressed_parts.lock_id, POSITIVE_LOCK_ID);
+    }
+
+    // The same fetched document is identity-valid whether the advertised
+    // resource is spelled bare or with the Shop's `pubky://` prefix — and
+    // the content-address check still rejects a wrong lock id.
+    #[test]
+    fn validation_accepts_both_resource_spellings_and_still_rejects_a_wrong_id() {
+        let document = fixture("typed-reserialisation.json");
+        let bare = resource(POSITIVE_LOCK_ID);
+        let addressed = format!("pubky://{bare}");
+        for expected in [&bare, &addressed] {
+            let lock = validate_content_lock_value(&document, expected)
+                .expect("the same document is valid under both spellings");
+            assert_eq!(lock.lock_id().as_deref(), Some(POSITIVE_LOCK_ID));
+        }
+        const WRONG_LOCK_ID: &str = "RMFVM3N8PM1P6MZYCAKXRW3JXP6H3CDT1N4YPDS7NVJVQYYH4KAG";
+        assert_eq!(
+            validate_content_lock_value(&document, &format!("pubky://{}", resource(WRONG_LOCK_ID))),
+            Err(ContentLockIdentityRejection::PathMismatch),
+            "a wrong id is still a path mismatch under the pubky:// spelling"
         );
     }
 }

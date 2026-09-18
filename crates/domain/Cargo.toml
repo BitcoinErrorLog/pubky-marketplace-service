@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Canonical domain contracts for the Pubky Marketplace Transaction Service"
 
 [dependencies]
+base32.workspace = true
 chrono.workspace = true
 regex.workspace = true
 serde.workspace = true
