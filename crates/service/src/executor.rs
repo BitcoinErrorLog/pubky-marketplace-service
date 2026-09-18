@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::logging::{log_command, log_invalid_command};
 use crate::model::redact_command_result;
-use crate::refusal_audit::{RefusalKind, SurfaceKind};
+use crate::refusal_audit::{CommandKind, RefusalKind, SurfaceKind};
 use crate::result::{success_body, CommandFailure, HandlerResult};
 use crate::AppState;
 
@@ -42,7 +42,7 @@ pub async fn execute(
                 actor,
                 state.clock.now(),
                 SurfaceKind::V1Command,
-                0,
+                CommandKind::InvalidEnvelope,
                 RefusalKind::InvalidEnvelope,
                 None,
             );
@@ -84,10 +84,21 @@ pub async fn execute(
             );
             if command.kind() == "checkout.create" {
                 let Some(stored_result) = redact_command_result(stored_result) else {
-                    return Ok(failure_response(&CommandFailure::new(
+                    let failure = CommandFailure::new(
                         ErrorCode::InvariantViolation,
                         "The stored command result could not be processed.",
-                    )));
+                    );
+                    let response = failure_response(&failure);
+                    enqueue_refusal(
+                        state,
+                        actor,
+                        state.clock.now(),
+                        SurfaceKind::V1Command,
+                        command_kind(&command.payload),
+                        site_refusal_kind(&command.payload, &failure),
+                        Some(command.command_id),
+                    );
+                    return Ok(response);
                 };
                 return Ok((StatusCode::OK, stored_result));
             }
@@ -96,18 +107,40 @@ pub async fn execute(
                 // is opened only for the same authenticated actor (the
                 // command_results lookup above is actor-scoped).
                 let Some(locks) = state.locks.as_deref() else {
-                    return Ok(failure_response(&CommandFailure::new(
+                    let failure = CommandFailure::new(
                         ErrorCode::InvariantViolation,
                         "The stored command result could not be processed.",
-                    )));
+                    );
+                    let response = failure_response(&failure);
+                    enqueue_refusal(
+                        state,
+                        actor,
+                        state.clock.now(),
+                        SurfaceKind::V1Command,
+                        command_kind(&command.payload),
+                        site_refusal_kind(&command.payload, &failure),
+                        Some(command.command_id),
+                    );
+                    return Ok(response);
                 };
                 let Some(stored_result) =
                     unseal_prepare_locks_result(locks, &command, actor, &stored_result)
                 else {
-                    return Ok(failure_response(&CommandFailure::new(
+                    let failure = CommandFailure::new(
                         ErrorCode::InvariantViolation,
                         "The stored command result could not be processed.",
-                    )));
+                    );
+                    let response = failure_response(&failure);
+                    enqueue_refusal(
+                        state,
+                        actor,
+                        state.clock.now(),
+                        SurfaceKind::V1Command,
+                        command_kind(&command.payload),
+                        site_refusal_kind(&command.payload, &failure),
+                        Some(command.command_id),
+                    );
+                    return Ok(response);
                 };
                 return Ok((StatusCode::OK, stored_result));
             }
@@ -128,7 +161,17 @@ pub async fn execute(
             command.expected_revision,
             started.elapsed().as_millis() as u64,
         );
-        return Ok(failure_response(&failure));
+        let response = failure_response(&failure);
+        enqueue_refusal(
+            state,
+            actor,
+            state.clock.now(),
+            SurfaceKind::V1Command,
+            command_kind(&command.payload),
+            site_refusal_kind(&command.payload, &failure),
+            Some(command.command_id),
+        );
+        return Ok(response);
     }
 
     let now = state.clock.now();
@@ -146,10 +189,28 @@ pub async fn execute(
                     .as_deref()
                     .and_then(|locks| seal_prepare_locks_result(locks, &command, actor, &body));
                 let Some(stored_body) = protected else {
-                    return Ok(failure_response(&CommandFailure::new(
+                    let failure = CommandFailure::new(
                         ErrorCode::InvariantViolation,
                         "The command result could not be protected.",
-                    )));
+                    );
+                    let response = failure_response(&failure);
+                    let descriptor = state.refusal_audit.as_ref().and_then(|audit| {
+                        audit
+                            .envelope(
+                                now,
+                                SurfaceKind::V1Command,
+                                command_kind(&command.payload),
+                                site_refusal_kind(&command.payload, &failure),
+                                actor,
+                                Some(command.command_id),
+                            )
+                            .ok()
+                    });
+                    tx.rollback().await?;
+                    if let (Some(audit), Some(descriptor)) = (&state.refusal_audit, descriptor) {
+                        audit.try_send(descriptor);
+                    }
+                    return Ok(response);
                 };
                 stored_body
             } else {
@@ -188,7 +249,7 @@ pub async fn execute(
                         now,
                         SurfaceKind::V1Command,
                         command_kind(&command.payload),
-                        failure.refusal_kind,
+                        site_refusal_kind(&command.payload, &failure),
                         actor,
                         Some(command.command_id),
                     )
@@ -231,7 +292,17 @@ pub async fn execute(
                     command.expected_revision,
                     started.elapsed().as_millis() as u64,
                 );
-                return Ok(failure_response(&failure));
+                let response = failure_response(&failure);
+                enqueue_refusal(
+                    state,
+                    actor,
+                    now,
+                    SurfaceKind::V1Command,
+                    command_kind(&command.payload),
+                    site_refusal_kind(&command.payload, &failure),
+                    Some(command.command_id),
+                );
+                return Ok(response);
             }
             Err(error)
         }
@@ -243,7 +314,7 @@ fn enqueue_refusal(
     actor: &str,
     now: DateTime<Utc>,
     surface: SurfaceKind,
-    command_kind: i16,
+    command_kind: CommandKind,
     refusal_kind: RefusalKind,
     command_id: Option<Uuid>,
 ) {
@@ -256,41 +327,59 @@ fn enqueue_refusal(
     }
 }
 
-fn command_kind(payload: &CommandPayload) -> i16 {
+fn command_kind(payload: &CommandPayload) -> CommandKind {
     match payload {
-        CommandPayload::RegisterListing(_) => 1,
-        CommandPayload::SyncListing(_) => 2,
-        CommandPayload::SyncDrop(_) => 3,
-        CommandPayload::CancelDrop(_) => 4,
-        CommandPayload::ReleaseDropListings(_) => 5,
-        CommandPayload::ReserveInventory(_) => 6,
-        CommandPayload::CreateCheckout(_) => 7,
-        CommandPayload::CreateOffer(_) => 8,
-        CommandPayload::CounterOffer(_) => 9,
-        CommandPayload::AcceptOffer(_) => 10,
-        CommandPayload::OfferCheckout(_) => 11,
-        CommandPayload::RejectOffer(_) => 12,
-        CommandPayload::WithdrawOffer(_) => 13,
-        CommandPayload::PlaceBid(_) => 14,
-        CommandPayload::CloseAuction(_) => 15,
-        CommandPayload::AdvanceSandboxPayment(_) => 16,
-        CommandPayload::PrepareLocks(_) => 17,
-        CommandPayload::RegisterLocks(_) => 18,
-        CommandPayload::RequestCancellation(_) => 19,
-        CommandPayload::ApproveCancellation(_) => 20,
-        CommandPayload::ShipOrder(_) => 21,
-        CommandPayload::ConfirmDelivery(_) => 22,
-        CommandPayload::SetPickupDetails(_) => 23,
-        CommandPayload::ClearPickupDetails(_) => 24,
-        CommandPayload::MarkReadyForPickup(_) => 25,
-        CommandPayload::ConfirmPickup(_) => 26,
-        CommandPayload::RequestReturn(_) => 27,
-        CommandPayload::ApproveReturn(_) => 28,
-        CommandPayload::ReceiveReturn(_) => 29,
-        CommandPayload::RecordExternalRefund(_) => 30,
-        CommandPayload::CreateReview(_) => 31,
-        CommandPayload::UpdateReview(_) => 32,
-        CommandPayload::SetBandConsent(_) => 33,
+        CommandPayload::RegisterListing(_) => CommandKind::RegisterListing,
+        CommandPayload::SyncListing(_) => CommandKind::SyncListing,
+        CommandPayload::SyncDrop(_) => CommandKind::SyncDrop,
+        CommandPayload::CancelDrop(_) => CommandKind::CancelDrop,
+        CommandPayload::ReleaseDropListings(_) => CommandKind::ReleaseDropListings,
+        CommandPayload::ReserveInventory(_) => CommandKind::ReserveInventory,
+        CommandPayload::CreateCheckout(_) => CommandKind::CreateCheckout,
+        CommandPayload::CreateOffer(_) => CommandKind::CreateOffer,
+        CommandPayload::CounterOffer(_) => CommandKind::CounterOffer,
+        CommandPayload::AcceptOffer(_) => CommandKind::AcceptOffer,
+        CommandPayload::OfferCheckout(_) => CommandKind::OfferCheckout,
+        CommandPayload::RejectOffer(_) => CommandKind::RejectOffer,
+        CommandPayload::WithdrawOffer(_) => CommandKind::WithdrawOffer,
+        CommandPayload::PlaceBid(_) => CommandKind::PlaceBid,
+        CommandPayload::CloseAuction(_) => CommandKind::CloseAuction,
+        CommandPayload::AdvanceSandboxPayment(_) => CommandKind::AdvanceSandboxPayment,
+        CommandPayload::PrepareLocks(_) => CommandKind::PrepareLocks,
+        CommandPayload::RegisterLocks(_) => CommandKind::RegisterLocks,
+        CommandPayload::RequestCancellation(_) => CommandKind::RequestCancellation,
+        CommandPayload::ApproveCancellation(_) => CommandKind::ApproveCancellation,
+        CommandPayload::ShipOrder(_) => CommandKind::ShipOrder,
+        CommandPayload::ConfirmDelivery(_) => CommandKind::ConfirmDelivery,
+        CommandPayload::SetPickupDetails(_) => CommandKind::SetPickupDetails,
+        CommandPayload::ClearPickupDetails(_) => CommandKind::ClearPickupDetails,
+        CommandPayload::MarkReadyForPickup(_) => CommandKind::MarkReadyForPickup,
+        CommandPayload::ConfirmPickup(_) => CommandKind::ConfirmPickup,
+        CommandPayload::RequestReturn(_) => CommandKind::RequestReturn,
+        CommandPayload::ApproveReturn(_) => CommandKind::ApproveReturn,
+        CommandPayload::ReceiveReturn(_) => CommandKind::ReceiveReturn,
+        CommandPayload::RecordExternalRefund(_) => CommandKind::RecordExternalRefund,
+        CommandPayload::CreateReview(_) => CommandKind::CreateReview,
+        CommandPayload::UpdateReview(_) => CommandKind::UpdateReview,
+        CommandPayload::SetBandConsent(_) => CommandKind::SetBandConsent,
+    }
+}
+
+fn site_refusal_kind(payload: &CommandPayload, failure: &CommandFailure) -> RefusalKind {
+    match (payload, failure.code) {
+        (CommandPayload::PlaceBid(_), ErrorCode::InvalidCommand) => RefusalKind::BidWrongAsset,
+        (CommandPayload::PlaceBid(_), ErrorCode::Unauthorized) => RefusalKind::BidSellerForbidden,
+        (CommandPayload::PlaceBid(_), ErrorCode::InvalidState) => RefusalKind::BidNotAuction,
+        (CommandPayload::PlaceBid(_), ErrorCode::NotFound) => RefusalKind::BidListingNotFound,
+        (
+            CommandPayload::PrepareLocks(_) | CommandPayload::RegisterLocks(_),
+            ErrorCode::UpstreamUnavailable,
+        ) => RefusalKind::LocksUpstreamUnavailable,
+        (
+            CommandPayload::PrepareLocks(_) | CommandPayload::RegisterLocks(_),
+            ErrorCode::Unauthorized,
+        ) => RefusalKind::LocksIdentityMismatch,
+        _ => failure.refusal_kind,
     }
 }
 

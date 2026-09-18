@@ -26,6 +26,7 @@ schemars.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tower-http.workspace = true

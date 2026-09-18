@@ -164,6 +164,15 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
+    if let Some(audit) = &state.refusal_audit {
+        if !audit.is_ready() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "status": "unavailable" })),
+            )
+                .into_response();
+        }
+    }
     match sqlx::query("SELECT 1").execute(&state.pool).await {
         Ok(_) => (StatusCode::OK, Json(json!({ "status": "ready" }))).into_response(),
         Err(error) => {

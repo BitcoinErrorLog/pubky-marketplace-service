@@ -3150,14 +3150,22 @@ pub async fn run_once(
         )
         .await?
         {
-            let cutoff = now - chrono::Duration::days(crate::refusal_audit::RETENTION_DAYS);
-            let result: Result<(i32,), sqlx::Error> =
-                sqlx::query_as("SELECT public.purge_refusal_audit(date_trunc('hour', $1), 500)")
-                    .bind(cutoff)
-                    .fetch_one(retention_pool)
-                    .await;
+            let result = crate::refusal_audit::purge_once(retention_pool, now).await;
             release_lease(&state.pool, TASK_REFUSAL_AUDIT_RETENTION, holder, now).await?;
-            summary.refusal_audit_rows_purged = result?.0 as u64;
+            match result {
+                Ok(purged) => {
+                    summary.refusal_audit_rows_purged = purged as u64;
+                    if let Some(audit) = &state.refusal_audit {
+                        audit.record_purge_success(purged as u64);
+                    }
+                }
+                Err(_) => {
+                    if let Some(audit) = &state.refusal_audit {
+                        audit.record_purge_failure();
+                    }
+                    tracing::warn!("refusal audit retention pass failed; domain work continues");
+                }
+            }
         }
     }
     // The shared_manual seller-confirmation window (§B.8.8): elapsed

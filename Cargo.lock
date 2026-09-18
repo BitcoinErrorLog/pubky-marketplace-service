@@ -1297,6 +1297,7 @@ dependencies = [
  "serde_json_canonicalizer",
  "sha2 0.10.9",
  "sqlx",
+ "subtle",
  "tokio",
  "tower",
  "tower-http",

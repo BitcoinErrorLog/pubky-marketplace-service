@@ -16,7 +16,7 @@ pub struct CommandFailure {
 }
 
 impl CommandFailure {
-    pub fn new(code: ErrorCode, message: &str) -> Self {
+    pub(crate) fn new(code: ErrorCode, message: &str) -> Self {
         Self {
             code,
             refusal_kind: refusal_kind_for_error(code),
@@ -26,14 +26,14 @@ impl CommandFailure {
         }
     }
 
-    pub fn with_revision(code: ErrorCode, message: &str, current_revision: i64) -> Self {
+    pub(crate) fn with_revision(code: ErrorCode, message: &str, current_revision: i64) -> Self {
         Self {
             current_revision: Some(current_revision),
             ..Self::new(code, message)
         }
     }
 
-    pub fn invalid_command(issues: Vec<ValidationIssue>) -> Self {
+    pub(crate) fn invalid_command(issues: Vec<ValidationIssue>) -> Self {
         Self {
             issues: Some(issues),
             refusal_kind: RefusalKind::InvalidEnvelope,
@@ -85,3 +85,27 @@ pub fn success_body(command: &Command, success: &HandlerSuccess) -> Value {
 }
 
 pub type HandlerResult = Result<HandlerSuccess, CommandFailure>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_audit_all_kinds_preserve_response_and_state() {
+        let baseline = CommandFailure::with_revision(
+            ErrorCode::RevisionConflict,
+            "The aggregate revision does not match.",
+            41,
+        );
+        let expected_body = baseline.body();
+        let expected_status = baseline.http_status();
+        for refusal_kind in RefusalKind::ALL {
+            let candidate = CommandFailure {
+                refusal_kind,
+                ..baseline.clone()
+            };
+            assert_eq!(candidate.http_status(), expected_status);
+            assert_eq!(candidate.body(), expected_body);
+        }
+    }
+}

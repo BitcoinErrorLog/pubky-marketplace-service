@@ -128,27 +128,30 @@ impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?;
-        let refusal_audit_database_url = required_postgres_url("REFUSAL_AUDIT_DATABASE_URL")?;
-        let refusal_audit_retention_database_url =
-            required_postgres_url("REFUSAL_AUDIT_RETENTION_DATABASE_URL")?;
+        let refusal_audit_database_url = required_postgres_url(
+            "REFUSAL_AUDIT_DATABASE_URL",
+            crate::refusal_audit::WRITER_LOGIN,
+        )?;
+        let refusal_audit_retention_database_url = required_postgres_url(
+            "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
+            crate::refusal_audit::RETENTION_LOGIN,
+        )?;
         reject_audit_url_reuse(&database_url, &refusal_audit_database_url)?;
         reject_audit_url_reuse(&database_url, &refusal_audit_retention_database_url)?;
         reject_audit_url_reuse(
             &refusal_audit_database_url,
             &refusal_audit_retention_database_url,
         )?;
-        let refusal_audit_keys = AuditKeys::parse(
-            &std::env::var("REFUSAL_AUDIT_HMAC_ROOT_B64")
-                .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_ROOT_B64 must be set"))?,
-            &std::env::var("REFUSAL_AUDIT_HMAC_KEY_EPOCH")
-                .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_KEY_EPOCH must be set"))?,
-            std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64")
-                .ok()
-                .as_deref(),
-            std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH")
-                .ok()
-                .as_deref(),
-        )?;
+        let refusal_audit_keys = refusal_audit_keys_from_env()?;
+        for name in [
+            "REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED",
+            "REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED",
+            "REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED",
+        ] {
+            if !env_bool(name, false)? {
+                anyhow::bail!("{name} must be true before refusal-audit production readiness");
+            }
+        }
         let bind_addr = std::env::var("BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
             .parse()?;
@@ -289,13 +292,21 @@ impl std::fmt::Debug for Config {
     }
 }
 
-fn required_postgres_url(name: &str) -> anyhow::Result<String> {
+fn required_postgres_url(name: &str, expected_login: &str) -> anyhow::Result<String> {
     let value = std::env::var(name).map_err(|_| anyhow::anyhow!("{name} must be set"))?;
-    let url = Url::parse(&value).map_err(|_| anyhow::anyhow!("{name} must be a PostgreSQL URL"))?;
+    validate_postgres_url(name, &value, expected_login)?;
+    Ok(value)
+}
+
+fn validate_postgres_url(name: &str, value: &str, expected_login: &str) -> anyhow::Result<()> {
+    let url = Url::parse(value).map_err(|_| anyhow::anyhow!("{name} must be a PostgreSQL URL"))?;
     if !matches!(url.scheme(), "postgres" | "postgresql") {
         anyhow::bail!("{name} must be a PostgreSQL URL");
     }
-    Ok(value)
+    if url.username() != expected_login {
+        anyhow::bail!("{name} must name its designated refusal-audit login");
+    }
+    Ok(())
 }
 
 fn reject_audit_url_reuse(first: &str, second: &str) -> anyhow::Result<()> {
@@ -325,6 +336,21 @@ fn reject_audit_url_reuse(first: &str, second: &str) -> anyhow::Result<()> {
         anyhow::bail!("refusal-audit database URLs must use distinct principals");
     }
     Ok(())
+}
+
+fn refusal_audit_keys_from_env() -> anyhow::Result<AuditKeys> {
+    AuditKeys::parse(
+        &std::env::var("REFUSAL_AUDIT_HMAC_ROOT_B64")
+            .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_ROOT_B64 must be set"))?,
+        &std::env::var("REFUSAL_AUDIT_HMAC_KEY_EPOCH")
+            .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_KEY_EPOCH must be set"))?,
+        std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64")
+            .ok()
+            .as_deref(),
+        std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH")
+            .ok()
+            .as_deref(),
+    )
 }
 
 fn env_i64(name: &str, default: i64) -> anyhow::Result<i64> {
@@ -388,7 +414,10 @@ fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_days, Config, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS};
+    use super::{
+        parse_days, refusal_audit_keys_from_env, reject_audit_url_reuse, required_postgres_url,
+        validate_postgres_url, Config, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS,
+    };
 
     /// Serializes the environment-mutating test (env is process-global).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -401,21 +430,27 @@ mod tests {
         let previous_writer_url = std::env::var("REFUSAL_AUDIT_DATABASE_URL").ok();
         let previous_retention_url = std::env::var("REFUSAL_AUDIT_RETENTION_DATABASE_URL").ok();
         let previous_root = std::env::var("REFUSAL_AUDIT_HMAC_ROOT_B64").ok();
-        let previous_epoch = std::env::var("REFUSAL_AUDIT_HMAC_KEY_EPOCH").ok();
+        let previous_epoch = std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH").ok();
+        let previous_backup = std::env::var("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED").ok();
+        let previous_replica = std::env::var("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED").ok();
+        let previous_risk = std::env::var("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED").ok();
         std::env::set_var("DATABASE_URL", "postgres://example.invalid/test");
         std::env::set_var(
             "REFUSAL_AUDIT_DATABASE_URL",
-            "postgres://writer@audit.example/refusal",
+            "postgres://marketplace_refusal_audit_writer_login@audit.example/refusal",
         );
         std::env::set_var(
             "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
-            "postgres://retention@audit.example/refusal",
+            "postgres://marketplace_refusal_audit_retention@audit.example/refusal",
         );
         std::env::set_var(
             "REFUSAL_AUDIT_HMAC_ROOT_B64",
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]),
         );
         std::env::set_var("REFUSAL_AUDIT_HMAC_KEY_EPOCH", "1");
+        std::env::set_var("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", "true");
+        std::env::set_var("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", "true");
+        std::env::set_var("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", "true");
         std::env::set_var("FX_FEED_URL", "https://attacker.example/fx");
         let result = Config::from_env();
         match previous_database_url {
@@ -434,6 +469,9 @@ mod tests {
             ),
             ("REFUSAL_AUDIT_HMAC_ROOT_B64", previous_root),
             ("REFUSAL_AUDIT_HMAC_KEY_EPOCH", previous_epoch),
+            ("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", previous_backup),
+            ("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", previous_replica),
+            ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", previous_risk),
         ] {
             match previous {
                 Some(value) => std::env::set_var(name, value),
@@ -485,6 +523,97 @@ mod tests {
                 error.to_string().contains("must be at least 1"),
                 "unexpected: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn refusal_audit_writer_url_is_mandatory_distinct_and_valid() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let expected = crate::refusal_audit::WRITER_LOGIN;
+        let test_name = "REFUSAL_AUDIT_TEST_DATABASE_URL";
+        std::env::remove_var(test_name);
+        assert!(required_postgres_url(test_name, expected).is_err());
+        std::env::set_var(
+            test_name,
+            "postgres://marketplace_refusal_audit_writer_login@audit.test/refusal",
+        );
+        assert!(required_postgres_url(test_name, expected).is_ok());
+        std::env::remove_var(test_name);
+        assert!(validate_postgres_url(
+            "REFUSAL_AUDIT_DATABASE_URL",
+            "postgres://marketplace_refusal_audit_writer_login@audit.test/refusal",
+            expected,
+        )
+        .is_ok());
+        for value in [
+            "not a url",
+            "https://marketplace_refusal_audit_writer_login@audit.test/refusal",
+            "postgres://postgres@audit.test/refusal",
+            "postgres://writer@audit.test/refusal",
+        ] {
+            assert!(
+                validate_postgres_url("REFUSAL_AUDIT_DATABASE_URL", value, expected).is_err(),
+                "{value} must be rejected"
+            );
+        }
+        for (first, second) in [
+            (
+                "postgres://domain@db.test/service",
+                "postgres://domain@db.test/service",
+            ),
+            (
+                "postgresql://domain@db.test/service",
+                "postgres://domain@db.test:5432/service",
+            ),
+            (
+                "postgres://domain@db.test/service",
+                "postgres://domain@alias.test/audit",
+            ),
+        ] {
+            assert!(
+                reject_audit_url_reuse(first, second).is_err(),
+                "{first} and {second} must be rejected offline"
+            );
+        }
+        assert!(reject_audit_url_reuse(
+            "postgres://domain@db.test/service",
+            "postgres://marketplace_refusal_audit_writer_login@db.test/service"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn refusal_audit_hmac_config_is_mandatory_and_strict() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        const NAMES: [&str; 4] = [
+            "REFUSAL_AUDIT_HMAC_ROOT_B64",
+            "REFUSAL_AUDIT_HMAC_KEY_EPOCH",
+            "REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64",
+            "REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH",
+        ];
+        let previous = NAMES.map(|name| std::env::var(name).ok());
+        let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7_u8; 32]);
+        let other = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [8_u8; 32]);
+        for name in NAMES {
+            std::env::remove_var(name);
+        }
+        assert!(refusal_audit_keys_from_env().is_err());
+        std::env::set_var(NAMES[0], &root);
+        assert!(refusal_audit_keys_from_env().is_err());
+        std::env::set_var(NAMES[1], "01");
+        assert!(refusal_audit_keys_from_env().is_err());
+        std::env::set_var(NAMES[1], "2");
+        std::env::set_var(NAMES[2], &other);
+        assert!(refusal_audit_keys_from_env().is_err());
+        std::env::set_var(NAMES[3], "1");
+        let keys = refusal_audit_keys_from_env().expect("valid two-epoch configuration");
+        assert_eq!(keys.active_epoch, 2);
+        assert_eq!(keys.previous_epoch(), Some(1));
+        for (name, value) in NAMES.into_iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
         }
     }
 }
