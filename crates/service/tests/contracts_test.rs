@@ -11,8 +11,9 @@ use common::{
     test_app_with_payments, TestActor, TestApp,
 };
 use marketplace_service::contracts::{
-    assert_no_sensitive_values, assert_no_sensitive_values_for_contract, endpoint_contracts,
-    normalized_snapshot, ReviewReason,
+    assert_no_sensitive_values, assert_no_sensitive_values_for_contract,
+    assert_no_sensitive_values_for_contract_with_seller, assert_reserve_contract_audience,
+    endpoint_contracts, normalized_snapshot, ReviewReason,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -35,10 +36,15 @@ fn snapshot_path(name: &str) -> PathBuf {
 }
 
 fn rendered_snapshot(name: &str, value: &Value) -> Vec<u8> {
+    assert_reserve_contract_audience(
+        value,
+        (name == "projections").then_some("auction_seller_projection"),
+    );
     let normalized = normalized_snapshot(value);
-    assert_no_sensitive_values_for_contract(
+    assert_no_sensitive_values_for_contract_with_seller(
         &normalized,
         (name == "projections").then_some("seller_paid_shipping_address"),
+        (name == "projections").then_some("auction_seller_projection"),
     );
     let mut rendered = serde_json::to_vec_pretty(&normalized).expect("snapshot serializes");
     rendered.push(b'\n');
@@ -292,6 +298,10 @@ fn reason_catalog_is_central_and_complete() {
 fn nested_values_and_residual_sensitive_values_are_rejected() {
     for value in [
         json!({"paykit_observation": {"nested": {"token": "secret"}}}),
+        json!({"reserve_price": null}),
+        json!({"nested": {"reservePrice": false}}),
+        json!({"rows": [{"reserve_met": null}]}),
+        json!([{"rows": [{"reserveMet": false}]}]),
         json!({"value": Uuid::new_v4().to_string()}),
         json!({"value": "2026-09-12T11:00:00Z"}),
         json!({"value": "a".repeat(52)}),
@@ -299,6 +309,54 @@ fn nested_values_and_residual_sensitive_values_are_rejected() {
     ] {
         let result = std::panic::catch_unwind(|| assert_no_sensitive_values(&value));
         assert!(result.is_err(), "sensitive nested value must fail closed");
+    }
+}
+
+#[test]
+fn seller_contract_allows_only_labeled_top_level_seller_reserve_fields() {
+    let seller = json!({
+        "auction_seller_projection": {
+            "response": {
+                "body": {
+                    "reserve_price": null,
+                    "reserve_met": false
+                }
+            }
+        }
+    });
+    assert_no_sensitive_values_for_contract_with_seller(
+        &seller,
+        None,
+        Some("auction_seller_projection"),
+    );
+    for bad in [
+        json!({
+            "auction_seller_projection": {
+                "response": {"body": {"nested": {"reserve_price": null}}}
+            }
+        }),
+        json!({
+            "auction_seller_projection": {
+                "response": {"body": {"reservePrice": null}}
+            }
+        }),
+        json!({
+            "auction_non_seller_projection": {
+                "response": {"body": {"reserve_met": false}}
+            }
+        }),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_no_sensitive_values_for_contract_with_seller(
+                    &bad,
+                    None,
+                    Some("auction_seller_projection"),
+                )
+            })
+            .is_err(),
+            "reserve contract guard must reject bad nesting/audience"
+        );
     }
 }
 
@@ -422,6 +480,16 @@ fn content_hash_longer_than_a_pubky_is_unchanged() {
     let raw = json!({"content_hash": content_hash});
 
     assert_eq!(normalized_snapshot(&raw), raw);
+}
+
+#[test]
+fn listing_record_hash_is_normalized_for_repeatable_route_contracts() {
+    let raw = json!({"listing_record_sha256": "a".repeat(64)});
+
+    assert_eq!(
+        normalized_snapshot(&raw)["listing_record_sha256"],
+        json!("<listing-record-sha256>")
+    );
 }
 
 #[test]
@@ -1041,20 +1109,33 @@ fn insert_listing_projection(
     aggregate_id: &str,
     status: StatusCode,
     response: Value,
+    audience: &str,
+    actor_pubky: &str,
 ) {
+    if audience == "seller" {
+        assert_eq!(
+            response["seller_pubky"],
+            json!(actor_pubky),
+            "seller contract reserve fields require an actor match"
+        );
+    } else {
+        assert_ne!(
+            response["seller_pubky"],
+            json!(actor_pubky),
+            "non-seller contract case must use a distinct actor"
+        );
+    }
+    let mut record = request_record(
+        "GET",
+        format!("/v1/listings/{aggregate_id}"),
+        &["authorization"],
+        Value::Null,
+        status,
+        response,
+    );
+    record["audience"] = json!(audience);
     assert!(
-        map.insert(
-            key.to_string(),
-            request_record(
-                "GET",
-                format!("/v1/listings/{aggregate_id}"),
-                &["authorization"],
-                Value::Null,
-                status,
-                response,
-            ),
-        )
-        .is_none(),
+        map.insert(key.to_string(), record).is_none(),
         "duplicate listing projection case {key}"
     );
 }
@@ -1210,10 +1291,12 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
     .await;
     insert_listing_projection(
         &mut map,
-        "auction_seller_no_viewer_bid",
+        "auction_seller_projection",
         &aggregate_id,
         status,
         response,
+        "seller",
+        &seller.pubky,
     );
     let (status, response) = send(
         app.router.clone(),
@@ -1225,10 +1308,12 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
     .await;
     insert_listing_projection(
         &mut map,
-        "auction_bidder_viewer_bid",
+        "auction_non_seller_bidder_projection",
         &aggregate_id,
         status,
         response,
+        "non_seller",
+        &bidder.pubky,
     );
 
     let seller = new_actor(&app).await;
@@ -1323,8 +1408,8 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
             "buyer_manual_review_held",
             "seller_manual_review_late",
             "buyer_manual_review_late",
-            "auction_seller_no_viewer_bid",
-            "auction_bidder_viewer_bid",
+            "auction_seller_projection",
+            "auction_non_seller_bidder_projection",
             "accepted_offer_with_award",
             "seller_paid_shipping_address",
             "buyer_paid_shipping_address",

@@ -1970,9 +1970,13 @@ fn register_sat_auction_command(
             starts_at + chrono::Duration::seconds(600),
         ),
         "minimum_increment": { "amount_minor": 5_000, "currency": "SAT", "exponent": 0 },
-        "reserve_price": { "amount_minor": 45_000, "currency": "SAT", "exponent": 0 },
         "anti_sniping_window_seconds": 60,
         "anti_sniping_extension_seconds": 120,
+    });
+    command["payload"]["auction_reserve"] = json!({
+        "expected_record_revision": 0,
+        "record_revision": 1,
+        "reserve_price": { "amount_minor": 45_000, "currency": "SAT", "exponent": 0 },
     });
     command
 }

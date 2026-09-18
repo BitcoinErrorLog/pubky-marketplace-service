@@ -81,7 +81,21 @@ pub async fn test_app_full(
 ) -> TestApp {
     let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
-    let state = AppState::new(pool.clone(), clock.clone(), config).with_attestor(attestor);
+    let state = AppState::new(pool.clone(), clock.clone(), config)
+        .with_attestor(attestor)
+        .with_homeserver(Some(Arc::new(CommandMirrorHomeserver)));
+    TestApp {
+        router: build_router(state.clone()),
+        pool,
+        clock,
+        state,
+    }
+}
+
+pub async fn test_app_without_homeserver(pool: PgPool) -> TestApp {
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests());
     TestApp {
         router: build_router(state.clone()),
         pool,
@@ -410,6 +424,92 @@ impl HomeserverListingClient for TestLocksHomeserver {
 
 type HomeserverRecordMap = Arc<Mutex<HashMap<(String, String), Value>>>;
 
+fn command_mirror_records() -> &'static Mutex<HashMap<(String, String), Value>> {
+    static RECORDS: std::sync::OnceLock<Mutex<HashMap<(String, String), Value>>> =
+        std::sync::OnceLock::new();
+    RECORDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct CommandMirrorHomeserver;
+
+impl HomeserverListingClient for CommandMirrorHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            command_mirror_records()
+                .lock()
+                .expect("command mirror records lock")
+                .get(&(seller_pubky.to_string(), listing_id.to_string()))
+                .cloned()
+                .map(marketplace_service::homeserver::HomeserverFetchOutcome::Found)
+                .unwrap_or(marketplace_service::homeserver::HomeserverFetchOutcome::NotFound)
+        })
+    }
+
+    fn fetch_listing_raw<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverRawFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let record = command_mirror_records()
+                .lock()
+                .expect("command mirror records lock")
+                .get(&(seller_pubky.to_string(), listing_id.to_string()))
+                .cloned();
+            match record {
+                Some(record) => marketplace_service::homeserver::HomeserverRawFetchOutcome::Found(
+                    serde_json::to_vec(&record).expect("command mirror record serializes"),
+                ),
+                None => marketplace_service::homeserver::HomeserverRawFetchOutcome::NotFound,
+            }
+        })
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _drop_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { marketplace_service::homeserver::HomeserverFetchOutcome::NotFound })
+    }
+
+    fn fetch_content_lock<'a>(
+        &'a self,
+        _creator_pubky: &'a str,
+        _content_path: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { marketplace_service::homeserver::HomeserverFetchOutcome::NotFound })
+    }
+}
+
 /// A minimal local homeserver double: a real axum listener serving canonical
 /// camelCase listing and drop records at the production paths, keyed by the
 /// `pubky-host` header and record id — exactly how the real homeserver
@@ -423,7 +523,11 @@ pub struct FakeHomeserver {
 }
 
 impl FakeHomeserver {
-    pub fn put_record(&self, seller_pubky: &str, listing_id: &str, record: Value) {
+    pub fn put_record(&self, seller_pubky: &str, listing_id: &str, mut record: Value) {
+        record["recordType"] = json!("listing");
+        record["schemaVersion"] = json!(1);
+        record["ownerPubky"] = json!(seller_pubky);
+        record["listingId"] = json!(listing_id);
         self.records
             .lock()
             .expect("fake homeserver records lock")
@@ -895,6 +999,7 @@ pub async fn new_actor(app: &TestApp) -> TestActor {
 }
 
 pub async fn execute(app: &TestApp, token: &str, body: &Value) -> (StatusCode, Value) {
+    mirror_listing_registration(body);
     send(
         app.router.clone(),
         "POST",
@@ -903,6 +1008,90 @@ pub async fn execute(app: &TestApp, token: &str, body: &Value) -> (StatusCode, V
         body,
     )
     .await
+}
+
+fn mirror_listing_registration(command: &Value) {
+    if command["kind"] != json!("listing.register") {
+        return;
+    }
+    let payload = &command["payload"];
+    let Some(seller_pubky) = payload["seller_pubky"].as_str() else {
+        return;
+    };
+    let Some(listing_id) = payload["listing_id"].as_str() else {
+        return;
+    };
+    let is_auction = payload["sale_format"] == json!("auction");
+    let shipping_options = if is_auction {
+        json!([{
+            "pricing": "flat",
+            "price": {
+                "amountMinor": payload["shipping_minor"],
+                "currency": payload["unit_price"]["currency"],
+                "exponent": payload["unit_price"]["exponent"]
+            }
+        }])
+    } else {
+        // Fixed-price registration does not use the homeserver authority
+        // added for secret-reserve tests. Keep its established offer fixture
+        // behavior (free shipping) while auctions mirror the strict command.
+        json!([{"pricing": "free"}])
+    };
+    let sale = if is_auction {
+        let terms = &payload["auction_terms"];
+        json!({
+            "format": "auction",
+            "startingPrice": {
+                "amountMinor": payload["unit_price"]["amount_minor"],
+                "currency": payload["unit_price"]["currency"],
+                "exponent": payload["unit_price"]["exponent"]
+            },
+            "startsAt": terms["starts_at"],
+            "endsAt": terms["ends_at"],
+            "minimumIncrement": {
+                "amountMinor": terms["minimum_increment"]["amount_minor"],
+                "currency": terms["minimum_increment"]["currency"],
+                "exponent": terms["minimum_increment"]["exponent"]
+            },
+            "antiSnipingWindowSeconds": terms["anti_sniping_window_seconds"],
+            "antiSnipingExtensionSeconds": terms["anti_sniping_extension_seconds"]
+        })
+    } else {
+        json!({
+            "format": "fixed_price",
+            "unitPrice": {
+                "amountMinor": payload["unit_price"]["amount_minor"],
+                "currency": payload["unit_price"]["currency"],
+                "exponent": payload["unit_price"]["exponent"]
+            }
+        })
+    };
+    let record = json!({
+        "recordType": "listing",
+        "schemaVersion": 1,
+        "ownerPubky": seller_pubky,
+        "listingId": listing_id,
+        "title": payload["title"].as_str().unwrap_or("Marketplace item"),
+        "revision": payload["listing_revision"],
+        "media": [{"contentHash": payload["content_hash"]}],
+        "variants": [{
+            "id": "variant_1",
+            "enabled": true,
+            "quantity": payload["quantity"],
+            "sku": null,
+            "options": []
+        }],
+        "shippingOptions": shipping_options,
+        "fulfillmentMethods": payload["fulfillment_methods"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| vec![json!("shipping")]),
+        "sale": sale
+    });
+    command_mirror_records()
+        .lock()
+        .expect("command mirror records lock")
+        .insert((seller_pubky.to_string(), listing_id.to_string()), record);
 }
 
 pub fn listing_aggregate(seller_pubky: &str) -> String {
@@ -966,9 +1155,13 @@ pub fn register_auction_command(seller_pubky: &str) -> Value {
         "starts_at": "2026-08-19T22:00:00.000Z",
         "ends_at": "2026-08-19T22:10:00.000Z",
         "minimum_increment": { "amount_minor": 500, "currency": "USD", "exponent": 2 },
-        "reserve_price": { "amount_minor": 6_000, "currency": "USD", "exponent": 2 },
         "anti_sniping_window_seconds": 60,
         "anti_sniping_extension_seconds": 120,
+    });
+    command["payload"]["auction_reserve"] = json!({
+        "expected_record_revision": 0,
+        "record_revision": 1,
+        "reserve_price": { "amount_minor": 6_000, "currency": "USD", "exponent": 2 },
     });
     command
 }
@@ -2295,7 +2488,8 @@ pub async fn test_app_with_payments_full(
     let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
     let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
-        .with_payments(Some(runtime));
+        .with_payments(Some(runtime))
+        .with_homeserver(Some(Arc::new(CommandMirrorHomeserver)));
     (
         TestApp {
             router: build_router(state.clone()),
@@ -2337,7 +2531,9 @@ pub async fn test_app_with_payments_and_fx(
     let clock = Arc::new(AdjustableClock::new(now));
     let mut config = Config::for_tests();
     config.fx_feed_url = fx.base_url.clone();
-    let state = AppState::new(pool.clone(), clock.clone(), config).with_payments(Some(runtime));
+    let state = AppState::new(pool.clone(), clock.clone(), config)
+        .with_payments(Some(runtime))
+        .with_homeserver(Some(Arc::new(CommandMirrorHomeserver)));
     (
         TestApp {
             router: build_router(state.clone()),
@@ -2371,7 +2567,8 @@ pub async fn test_app_with_paykit_base(pool: PgPool, paykit_base_url: &str) -> T
     let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
     let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
-        .with_payments(Some(runtime));
+        .with_payments(Some(runtime))
+        .with_homeserver(Some(Arc::new(CommandMirrorHomeserver)));
     TestApp {
         router: build_router(state.clone()),
         pool,

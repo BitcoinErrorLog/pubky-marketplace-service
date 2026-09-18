@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use common::{
-    execute, new_actor, register_command, send, sync_command, test_app, test_app_with_homeserver,
-    test_app_with_homeserver_client, TestApp,
+    execute, new_actor, register_command, send, sync_command, test_app_with_homeserver,
+    test_app_with_homeserver_client, test_app_without_homeserver, TestApp,
 };
 use marketplace_service::homeserver::HttpHomeserverClient;
 use std::sync::Arc;
@@ -292,7 +292,7 @@ async fn an_unreachable_homeserver_is_a_distinct_retriable_failure(pool: PgPool)
 
 #[sqlx::test(migrations = "./migrations")]
 async fn sync_is_refused_where_no_homeserver_is_configured(pool: PgPool) {
-    let app = test_app(pool).await;
+    let app = test_app_without_homeserver(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
 
