@@ -75,31 +75,30 @@ pub async fn handle(
                 )))
             }
         };
-        let public_candidate =
-            match registration_payload_from_record(
-                &payload.seller_pubky,
-                &payload.listing_id,
-                &public_record,
-            ) {
-                Ok(Some(candidate)) => match validate_public_listing_payload(candidate) {
-                    Ok(candidate) => candidate,
-                    Err(issues) => {
-                        return Ok(Err(CommandFailure::refused_with_issues(
-                            crate::refusal_audit::RefusalKind::InvalidState,
-                            ErrorCode::InvalidState,
-                            "The seller's listing record does not satisfy registration invariants.",
-                            issues,
-                        )))
-                    }
-                },
-                _ => {
-                    return Ok(Err(CommandFailure::refused(
+        let public_candidate = match registration_payload_from_record(
+            &payload.seller_pubky,
+            &payload.listing_id,
+            &public_record,
+        ) {
+            Ok(Some(candidate)) => match validate_public_listing_payload(candidate) {
+                Ok(candidate) => candidate,
+                Err(issues) => {
+                    return Ok(Err(CommandFailure::refused_with_issues(
                         crate::refusal_audit::RefusalKind::InvalidState,
                         ErrorCode::InvalidState,
-                        "The seller's listing record could not be interpreted for registration.",
+                        "The seller's listing record does not satisfy registration invariants.",
+                        issues,
                     )))
                 }
-            };
+            },
+            _ => {
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvalidState,
+                    ErrorCode::InvalidState,
+                    "The seller's listing record could not be interpreted for registration.",
+                )))
+            }
+        };
         let mut public_command = payload.clone();
         public_command.auction_reserve = None;
         if public_candidate != public_command {
