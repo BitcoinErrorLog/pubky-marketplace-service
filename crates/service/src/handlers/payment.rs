@@ -43,13 +43,15 @@ pub async fn advance(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(payment) = payment else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The sandbox payment was not found.",
         )));
     };
     if payment.buyer_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the buyer may advance a sandbox payment.",
         )));
@@ -58,19 +60,22 @@ pub async fn advance(
     // server-side verification (ADR-0019 §7): no client claim — including
     // this explicitly sandbox-only command — may advance it.
     if payment.adapter != "sandbox" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "A Locks-correlated payment advances only by server-side verification.",
         )));
     }
     if command.aggregate_id != ids::payment_aggregate_id(payment.id) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The payment aggregate id is invalid.",
         )));
     }
     if command.expected_revision != payment.revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The payment revision is stale.",
             payment.revision,
@@ -85,20 +90,23 @@ pub async fn advance(
         _ => [].as_slice(),
     };
     if !allowed.contains(&target) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The sandbox payment transition is invalid.",
         )));
     }
     debug_assert!(can_transition(&payment_machine(), &payment.state, target));
     if payload.target == SandboxPaymentTarget::Confirmed && payload.confirmations < 1 {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Confirmed payment requires at least one confirmation.",
         )));
     }
     let Some(order) = fetch_order_for_update(tx, payment.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "Payment order is missing.",
         )));
@@ -208,7 +216,8 @@ pub(crate) async fn confirm_order(
     now: DateTime<Utc>,
 ) -> Result<Result<(OrderRow, ReceiptRow, Uuid), CommandFailure>, sqlx::Error> {
     if !can_transition(&order_machine(), &order.state, "paid") {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order can no longer be paid.",
         )));
@@ -220,7 +229,8 @@ pub(crate) async fn confirm_order(
     // to tolerate. Auction orders hold through their winning reservation,
     // checked below.
     if order.auction_aggregate_id.is_none() && !order.stock_held {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "The reserved inventory for this order is no longer held.",
         )));
@@ -240,7 +250,8 @@ pub(crate) async fn confirm_order(
         .execute(&mut **tx)
         .await?;
         if converted.rows_affected() == 0 {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "The reserved inventory for this order is no longer held.",
             )));
@@ -285,13 +296,15 @@ pub(crate) async fn confirm_order(
             .as_i64()
             .expect("order line carries its quantity");
         let Some(listing) = fetch_listing_for_update(tx, aggregate_id).await? else {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvariantViolation,
                 ErrorCode::InvariantViolation,
                 "An order line's listing is missing.",
             )));
         };
         if listing.reserved_quantity < quantity {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "The reserved inventory for this order is no longer held.",
             )));

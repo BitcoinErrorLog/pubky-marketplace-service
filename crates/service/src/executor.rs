@@ -29,13 +29,13 @@ pub async fn execute(
     let started = Instant::now();
     if let Err(issues) = validate_actor(actor) {
         log_invalid_command(None, started.elapsed().as_millis() as u64);
-        return Ok(failure_response(&CommandFailure::invalid_command(issues)));
+        return Ok(failure_response(&CommandFailure::invalid_envelope(issues)));
     }
     let command = match parse_command(raw) {
         Ok(command) => command,
         Err(issues) => {
             log_invalid_command(Some(actor), started.elapsed().as_millis() as u64);
-            let failure = CommandFailure::invalid_command(issues);
+            let failure = CommandFailure::invalid_envelope(issues);
             let response = failure_response(&failure);
             enqueue_refusal(
                 state,
@@ -84,7 +84,8 @@ pub async fn execute(
             );
             if command.kind() == "checkout.create" {
                 let Some(stored_result) = redact_command_result(stored_result) else {
-                    let failure = CommandFailure::new(
+                    let failure = CommandFailure::refused(
+                        crate::refusal_audit::RefusalKind::InvariantViolation,
                         ErrorCode::InvariantViolation,
                         "The stored command result could not be processed.",
                     );
@@ -95,7 +96,7 @@ pub async fn execute(
                         state.clock.now(),
                         SurfaceKind::V1Command,
                         command_kind(&command.payload),
-                        site_refusal_kind(&command.payload, &failure),
+                        failure.refusal_kind(),
                         Some(command.command_id),
                     );
                     return Ok(response);
@@ -107,7 +108,8 @@ pub async fn execute(
                 // is opened only for the same authenticated actor (the
                 // command_results lookup above is actor-scoped).
                 let Some(locks) = state.locks.as_deref() else {
-                    let failure = CommandFailure::new(
+                    let failure = CommandFailure::refused(
+                        crate::refusal_audit::RefusalKind::InvariantViolation,
                         ErrorCode::InvariantViolation,
                         "The stored command result could not be processed.",
                     );
@@ -118,7 +120,7 @@ pub async fn execute(
                         state.clock.now(),
                         SurfaceKind::V1Command,
                         command_kind(&command.payload),
-                        site_refusal_kind(&command.payload, &failure),
+                        failure.refusal_kind(),
                         Some(command.command_id),
                     );
                     return Ok(response);
@@ -126,7 +128,8 @@ pub async fn execute(
                 let Some(stored_result) =
                     unseal_prepare_locks_result(locks, &command, actor, &stored_result)
                 else {
-                    let failure = CommandFailure::new(
+                    let failure = CommandFailure::refused(
+                        crate::refusal_audit::RefusalKind::InvariantViolation,
                         ErrorCode::InvariantViolation,
                         "The stored command result could not be processed.",
                     );
@@ -137,7 +140,7 @@ pub async fn execute(
                         state.clock.now(),
                         SurfaceKind::V1Command,
                         command_kind(&command.payload),
-                        site_refusal_kind(&command.payload, &failure),
+                        failure.refusal_kind(),
                         Some(command.command_id),
                     );
                     return Ok(response);
@@ -146,7 +149,8 @@ pub async fn execute(
             }
             return Ok((StatusCode::OK, stored_result));
         }
-        let failure = CommandFailure::new(
+        let failure = CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::IdempotencyConflict,
             ErrorCode::IdempotencyConflict,
             "The command id was already used with different input.",
         );
@@ -156,8 +160,8 @@ pub async fn execute(
             &command.command_id.to_string(),
             &command.aggregate_id,
             "conflict",
-            Some(failure.code),
-            Some(&failure.message),
+            Some(failure.code()),
+            Some(failure.message()),
             command.expected_revision,
             started.elapsed().as_millis() as u64,
         );
@@ -168,7 +172,7 @@ pub async fn execute(
             state.clock.now(),
             SurfaceKind::V1Command,
             command_kind(&command.payload),
-            site_refusal_kind(&command.payload, &failure),
+            failure.refusal_kind(),
             Some(command.command_id),
         );
         return Ok(response);
@@ -189,7 +193,8 @@ pub async fn execute(
                     .as_deref()
                     .and_then(|locks| seal_prepare_locks_result(locks, &command, actor, &body));
                 let Some(stored_body) = protected else {
-                    let failure = CommandFailure::new(
+                    let failure = CommandFailure::refused(
+                        crate::refusal_audit::RefusalKind::InvariantViolation,
                         ErrorCode::InvariantViolation,
                         "The command result could not be protected.",
                     );
@@ -200,7 +205,7 @@ pub async fn execute(
                                 now,
                                 SurfaceKind::V1Command,
                                 command_kind(&command.payload),
-                                site_refusal_kind(&command.payload, &failure),
+                                failure.refusal_kind(),
                                 actor,
                                 Some(command.command_id),
                             )
@@ -249,7 +254,7 @@ pub async fn execute(
                         now,
                         SurfaceKind::V1Command,
                         command_kind(&command.payload),
-                        site_refusal_kind(&command.payload, &failure),
+                        failure.refusal_kind(),
                         actor,
                         Some(command.command_id),
                     )
@@ -265,10 +270,10 @@ pub async fn execute(
                 &command.command_id.to_string(),
                 &command.aggregate_id,
                 "refused",
-                Some(failure.code),
-                Some(&failure.message),
+                Some(failure.code()),
+                Some(failure.message()),
                 failure
-                    .current_revision
+                    .current_revision()
                     .unwrap_or(command.expected_revision),
                 started.elapsed().as_millis() as u64,
             );
@@ -277,7 +282,8 @@ pub async fn execute(
         Err(error) => {
             tx.rollback().await?;
             if is_unique_violation(&error) {
-                let failure = CommandFailure::new(
+                let failure = CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvariantViolation,
                     ErrorCode::InvariantViolation,
                     "A uniqueness constraint rejected the command.",
                 );
@@ -287,8 +293,8 @@ pub async fn execute(
                     &command.command_id.to_string(),
                     &command.aggregate_id,
                     "conflict",
-                    Some(failure.code),
-                    Some(&failure.message),
+                    Some(failure.code()),
+                    Some(failure.message()),
                     command.expected_revision,
                     started.elapsed().as_millis() as u64,
                 );
@@ -299,7 +305,7 @@ pub async fn execute(
                     now,
                     SurfaceKind::V1Command,
                     command_kind(&command.payload),
-                    site_refusal_kind(&command.payload, &failure),
+                    failure.refusal_kind(),
                     Some(command.command_id),
                 );
                 return Ok(response);
@@ -362,24 +368,6 @@ fn command_kind(payload: &CommandPayload) -> CommandKind {
         CommandPayload::CreateReview(_) => CommandKind::CreateReview,
         CommandPayload::UpdateReview(_) => CommandKind::UpdateReview,
         CommandPayload::SetBandConsent(_) => CommandKind::SetBandConsent,
-    }
-}
-
-fn site_refusal_kind(payload: &CommandPayload, failure: &CommandFailure) -> RefusalKind {
-    match (payload, failure.code) {
-        (CommandPayload::PlaceBid(_), ErrorCode::InvalidCommand) => RefusalKind::BidWrongAsset,
-        (CommandPayload::PlaceBid(_), ErrorCode::Unauthorized) => RefusalKind::BidSellerForbidden,
-        (CommandPayload::PlaceBid(_), ErrorCode::InvalidState) => RefusalKind::BidNotAuction,
-        (CommandPayload::PlaceBid(_), ErrorCode::NotFound) => RefusalKind::BidListingNotFound,
-        (
-            CommandPayload::PrepareLocks(_) | CommandPayload::RegisterLocks(_),
-            ErrorCode::UpstreamUnavailable,
-        ) => RefusalKind::LocksUpstreamUnavailable,
-        (
-            CommandPayload::PrepareLocks(_) | CommandPayload::RegisterLocks(_),
-            ErrorCode::Unauthorized,
-        ) => RefusalKind::LocksIdentityMismatch,
-        _ => failure.refusal_kind,
     }
 }
 
@@ -511,7 +499,8 @@ async fn dispatch(
             // deployment the buyer must never be able to drive a payment to
             // `paid` by command (ADR-0019 §7).
             if !state.config.sandbox_payments_enabled {
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvalidCommand,
                     ErrorCode::InvalidCommand,
                     "Sandbox payment commands are disabled on this deployment.",
                 )));

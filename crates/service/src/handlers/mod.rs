@@ -130,19 +130,22 @@ pub fn guard_order_action(
     order: &OrderRow,
 ) -> Option<CommandFailure> {
     if actor != order.buyer_pubky && actor != order.seller_pubky {
-        return Some(CommandFailure::new(
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only order participants may act on it.",
         ));
     }
     if command.aggregate_id != ids::order_aggregate_id(order.id) {
-        return Some(CommandFailure::new(
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The order aggregate id is invalid.",
         ));
     }
     if command.expected_revision != order.revision {
-        return Some(CommandFailure::with_revision(
+        return Some(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The order revision is stale.",
             order.revision,

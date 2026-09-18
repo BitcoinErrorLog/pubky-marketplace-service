@@ -54,7 +54,11 @@ fn details_aggregate_id(listing_aggregate_id: &str) -> String {
 }
 
 fn unavailable() -> CommandFailure {
-    CommandFailure::new(ErrorCode::InvalidState, PICKUP_UNAVAILABLE)
+    CommandFailure::refused(
+        crate::refusal_audit::RefusalKind::InvalidState,
+        ErrorCode::InvalidState,
+        PICKUP_UNAVAILABLE,
+    )
 }
 
 /// Fetches and locks the listing the command targets, enforcing seller
@@ -71,13 +75,15 @@ async fn guard_details_command(
         return Ok(Err(unavailable()));
     }
     let Some(listing) = fetch_listing_for_update(tx, &command.aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The listing was not found.",
         )));
     };
     if listing.seller_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the listing seller may manage its pickup details.",
         )));
@@ -112,7 +118,8 @@ async fn lock_counter_cas(
     .fetch_one(&mut **tx)
     .await?;
     if counter.last_version != expected_version {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The pickup details version is stale.",
             counter.last_version,
@@ -253,7 +260,8 @@ pub async fn set(
         .iter()
         .any(|method| method == "pickup")
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The listing does not publish pickup.",
         )));

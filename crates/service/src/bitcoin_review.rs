@@ -465,9 +465,9 @@ pub async fn confirm_bitcoin_payment(
             Ok(Err(failure)) => {
                 let _ = tx.rollback().await;
                 return review_error(
-                    failure.code,
+                    failure.code(),
                     review_reason(ReviewReason::ConfirmationEffectsFailed),
-                    &failure.message,
+                    failure.message(),
                 );
             }
             Err(error) => return internal("confirmation effects", &error),
@@ -1191,14 +1191,14 @@ async fn apply_paid_effects(
     {
         Ok((order, _receipt, _event)) => Ok(order),
         Err(failure) => {
-            if failure.code == ErrorCode::InsufficientInventory
-                || failure.code == ErrorCode::InvalidState
+            if failure.code() == ErrorCode::InsufficientInventory
+                || failure.code() == ErrorCode::InvalidState
             {
                 Err(ResolutionFailure::StockUnavailable)
             } else {
                 Err(ResolutionFailure::Internal(
                     "confirmation effects".into(),
-                    failure.message,
+                    failure.message().to_string(),
                 ))
             }
         }
@@ -1463,20 +1463,23 @@ async fn cancel_held_order(
             .await
             .map_err(|e| ResolutionFailure::Internal("reservation release".into(), e.to_string()))?
             .map_err(|failure| {
-                ResolutionFailure::Internal("reservation release".into(), failure.message)
+                ResolutionFailure::Internal(
+                    "reservation release".into(),
+                    failure.message().to_string(),
+                )
             })?;
     } else if order.stock_held {
         crate::handlers::cancellation::credit_order_drop(tx, order, now)
             .await
             .map_err(|e| ResolutionFailure::Internal("drop credit".into(), e.to_string()))?
             .map_err(|failure| {
-                ResolutionFailure::Internal("drop credit".into(), failure.message)
+                ResolutionFailure::Internal("drop credit".into(), failure.message().to_string())
             })?;
         release_lines(tx, order, HeldQuantity::Reserved, now)
             .await
             .map_err(|e| ResolutionFailure::Internal("hold release".into(), e.to_string()))?
             .map_err(|failure| {
-                ResolutionFailure::Internal("hold release".into(), failure.message)
+                ResolutionFailure::Internal("hold release".into(), failure.message().to_string())
             })?;
     }
     let updated: OrderRow = sqlx::query_as(&format!(

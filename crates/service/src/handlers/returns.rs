@@ -31,7 +31,8 @@ pub async fn request(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -40,7 +41,8 @@ pub async fn request(
         return Ok(Err(failure));
     }
     if order.buyer_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the buyer may request a return.",
         )));
@@ -48,7 +50,8 @@ pub async fn request(
     if !matches!(order.state.as_str(), "delivered" | "completed")
         || payload.requested_amount_minor > order.total_minor
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order is not eligible for this return amount.",
         )));
@@ -159,7 +162,8 @@ async fn advance_return(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -168,7 +172,8 @@ async fn advance_return(
         return Ok(Err(failure));
     }
     if order.seller_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             if step.to_return_state == "approved" {
                 "Only the seller may approve this return."
@@ -182,7 +187,8 @@ async fn advance_return(
         .clone()
         .filter(|_| order.state == step.from_order_state)
     else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             step.invalid_message,
         )));
@@ -236,7 +242,8 @@ pub async fn record_external_refund(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -245,7 +252,8 @@ pub async fn record_external_refund(
         return Ok(Err(failure));
     }
     if order.seller_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the seller may record a refund.",
         )));
@@ -254,7 +262,8 @@ pub async fn record_external_refund(
         || payload.amount_minor > order.total_minor
         || order.external_refund.is_some()
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The external refund cannot be recorded.",
         )));

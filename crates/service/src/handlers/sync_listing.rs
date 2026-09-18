@@ -41,7 +41,8 @@ pub async fn handle(
     // Fail closed: without a configured homeserver there is no canonical
     // record to derive registration from.
     let Some(homeserver) = homeserver else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Listing sync is not enabled on this deployment.",
         )));
@@ -50,7 +51,8 @@ pub async fn handle(
     let expected_aggregate_id =
         ids::listing_aggregate_id(&payload.seller_pubky, &payload.listing_id);
     if command.aggregate_id != expected_aggregate_id {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The listing aggregate id does not match its seller and listing.",
         )));
@@ -62,13 +64,15 @@ pub async fn handle(
     {
         HomeserverFetchOutcome::Found(record) => record,
         HomeserverFetchOutcome::NotFound => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::NotFound,
                 ErrorCode::NotFound,
                 "The seller's homeserver has no such listing record.",
             )));
         }
         HomeserverFetchOutcome::Unavailable => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::UpstreamUnavailable,
                 ErrorCode::UpstreamUnavailable,
                 "The seller's homeserver could not be reached. Try again shortly.",
             )));
@@ -80,7 +84,8 @@ pub async fn handle(
         {
             Ok(Some(registration)) => registration,
             Ok(None) => {
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvalidState,
                     ErrorCode::InvalidState,
                     "The seller's listing record could not be interpreted for registration.",
                 )))
@@ -88,7 +93,8 @@ pub async fn handle(
             // A present-but-invalid digitalLock refuses the sync rather than
             // healing the listing to no lock.
             Err(MalformedDigitalLock) => {
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvalidState,
                     ErrorCode::InvalidState,
                     "The seller's listing record carries an invalid Locks payment lock.",
                 )))
@@ -100,13 +106,12 @@ pub async fn handle(
     let registration = match validate_public_listing_payload(registration) {
         Ok(registration) => registration,
         Err(issues) => {
-            return Ok(Err(CommandFailure {
-                issues: Some(issues),
-                ..CommandFailure::new(
-                    ErrorCode::InvalidState,
-                    "The seller's listing record does not satisfy registration invariants.",
-                )
-            }));
+            return Ok(Err(CommandFailure::refused_with_issues(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "The seller's listing record does not satisfy registration invariants.",
+                issues,
+            )));
         }
     };
 

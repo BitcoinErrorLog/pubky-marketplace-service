@@ -1274,7 +1274,7 @@ async fn apply_completed_lifecycle(
                     tracing::warn!(
                         payment_id = %payment.id,
                         correlation_id = %row.id,
-                        code = ?failure.code,
+                        code = ?failure.code(),
                         "verified locks completion could not confirm the order; routing to manual review"
                     );
                     apply_manual_review(pool, row, "awaiting_entitlement", now).await
@@ -1717,7 +1717,7 @@ async fn apply_confirmed_paykit_payment(
             tx.rollback().await?;
             tracing::warn!(
                 order_id = %row.id,
-                code = ?failure.code,
+                code = ?failure.code(),
                 "confirmed paykit payment could not confirm the order; routing to manual review"
             );
             let mut tx = pool.begin().await?;

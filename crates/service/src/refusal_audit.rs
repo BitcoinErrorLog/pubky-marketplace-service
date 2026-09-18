@@ -1165,30 +1165,6 @@ impl RefusalKind {
     }
 }
 
-pub fn refusal_kind_for_error(code: marketplace_domain::ErrorCode) -> RefusalKind {
-    use marketplace_domain::ErrorCode;
-    match code {
-        ErrorCode::InvalidCommand => RefusalKind::InvalidCommand,
-        ErrorCode::Unauthorized => RefusalKind::Unauthorized,
-        ErrorCode::NotFound => RefusalKind::NotFound,
-        ErrorCode::RevisionConflict => RefusalKind::RevisionConflict,
-        ErrorCode::IdempotencyConflict => RefusalKind::IdempotencyConflict,
-        ErrorCode::InsufficientInventory => RefusalKind::InsufficientInventory,
-        ErrorCode::InvariantViolation => RefusalKind::InvariantViolation,
-        ErrorCode::OfferExpired => RefusalKind::OfferExpired,
-        ErrorCode::InvalidState => RefusalKind::InvalidState,
-        ErrorCode::AuctionClosed => RefusalKind::AuctionClosed,
-        ErrorCode::BidTooLow => RefusalKind::BidTooLow,
-        ErrorCode::UpstreamUnavailable => RefusalKind::UpstreamUnavailable,
-        ErrorCode::AwardExpired => RefusalKind::AwardExpired,
-        ErrorCode::AwardAlreadyConverted => RefusalKind::AwardAlreadyConverted,
-        ErrorCode::AwardQuantityMismatch => RefusalKind::AwardQuantityMismatch,
-        ErrorCode::AwardVariantMismatch => RefusalKind::AwardVariantMismatch,
-        ErrorCode::AwardListingChanged => RefusalKind::AwardListingChanged,
-        ErrorCode::AwardHoldMissing => RefusalKind::AwardHoldMissing,
-    }
-}
-
 pub const fn refusal_kind_for_review_reason(
     reason: crate::contracts::ReviewReason,
 ) -> Option<RefusalKind> {

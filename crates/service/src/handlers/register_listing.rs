@@ -28,7 +28,8 @@ pub async fn handle(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     if actor != payload.seller_pubky {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the listing seller may register inventory.",
         )));
@@ -36,7 +37,8 @@ pub async fn handle(
     let expected_aggregate_id =
         ids::listing_aggregate_id(&payload.seller_pubky, &payload.listing_id);
     if command.aggregate_id != expected_aggregate_id {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The listing aggregate id does not match its seller and listing.",
         )));
@@ -106,7 +108,8 @@ pub async fn handle(
     let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
     let current_revision = current.as_ref().map(|c| c.server_revision).unwrap_or(0);
     if command.expected_revision != current_revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The listing revision is stale.",
             current_revision,
@@ -114,7 +117,8 @@ pub async fn handle(
     }
     if let Some(current) = &current {
         if payload.listing_revision <= current.listing_revision {
-            return Ok(Err(CommandFailure::with_revision(
+            return Ok(Err(CommandFailure::refused_with_revision(
+                crate::refusal_audit::RefusalKind::RevisionConflict,
                 ErrorCode::RevisionConflict,
                 "The public listing revision must advance.",
                 current_revision,
@@ -214,7 +218,8 @@ pub(crate) async fn apply_registration(
     let sold = current.as_ref().map(|c| c.sold_quantity).unwrap_or(0);
     let committed = reserved + sold;
     if payload.quantity < committed {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "Listing quantity cannot fall below committed inventory.",
             current_revision,
@@ -318,7 +323,8 @@ pub(crate) async fn apply_registration(
     };
     if !written {
         let latest = current_listing_revision(tx, aggregate_id).await?;
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The listing revision is stale.",
             latest,

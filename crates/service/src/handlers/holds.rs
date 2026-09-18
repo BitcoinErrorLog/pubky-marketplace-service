@@ -80,7 +80,8 @@ pub(crate) async fn release_lines(
             .as_i64()
             .expect("order line carries its quantity");
         let Some(listing) = fetch_listing_for_update(tx, aggregate_id).await? else {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvariantViolation,
                 ErrorCode::InvariantViolation,
                 "An order line's listing is missing.",
             )));
@@ -101,7 +102,8 @@ pub(crate) async fn release_lines(
         .execute(&mut **tx)
         .await?;
         if updated.rows_affected() != 1 {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvariantViolation,
                 ErrorCode::InvariantViolation,
                 "The inventory held by this order is no longer accounted to its listing.",
             )));
@@ -134,7 +136,8 @@ pub async fn acquire_payment_hold(
         return Ok(Ok(order));
     }
     if order.state != "pending_payment" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "Only an order pending payment can start a payment.",
         )));
@@ -167,13 +170,15 @@ pub async fn acquire_payment_hold(
             .as_i64()
             .expect("order line carries its quantity");
         let Some(listing) = fetch_listing_for_update(tx, aggregate_id).await? else {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvariantViolation,
                 ErrorCode::InvariantViolation,
                 "An order line's listing is missing.",
             )));
         };
         if listing.available_quantity < quantity {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InsufficientInventory,
                 ErrorCode::InsufficientInventory,
                 SOLD_OUT_BEFORE_PAYMENT,
             )));
@@ -203,7 +208,8 @@ pub async fn acquire_payment_hold(
         .execute(&mut **tx)
         .await?;
         if updated.rows_affected() != 1 {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InsufficientInventory,
                 ErrorCode::InsufficientInventory,
                 SOLD_OUT_BEFORE_PAYMENT,
             )));

@@ -107,7 +107,8 @@ pub async fn sync(
     // Fail closed: without a configured homeserver there is no canonical
     // record to derive the drop from.
     let Some(homeserver) = homeserver else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Drop sync is not enabled on this deployment.",
         )));
@@ -115,7 +116,8 @@ pub async fn sync(
 
     let expected_aggregate_id = ids::drop_aggregate_id(&payload.seller_pubky, &payload.drop_id);
     if command.aggregate_id != expected_aggregate_id {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The drop aggregate id does not match its seller and drop.",
         )));
@@ -127,13 +129,15 @@ pub async fn sync(
     {
         HomeserverFetchOutcome::Found(record) => record,
         HomeserverFetchOutcome::NotFound => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::NotFound,
                 ErrorCode::NotFound,
                 "The seller's homeserver has no such drop record.",
             )));
         }
         HomeserverFetchOutcome::Unavailable => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::UpstreamUnavailable,
                 ErrorCode::UpstreamUnavailable,
                 "The seller's homeserver could not be reached. Try again shortly.",
             )));
@@ -143,13 +147,12 @@ pub async fn sync(
     let record = match validated_drop_record(&payload.seller_pubky, &payload.drop_id, &record) {
         Ok(record) => record,
         Err(issues) => {
-            return Ok(Err(CommandFailure {
-                issues: Some(issues),
-                ..CommandFailure::new(
-                    ErrorCode::InvalidState,
-                    "The seller's drop record does not satisfy drop invariants.",
-                )
-            }));
+            return Ok(Err(CommandFailure::refused_with_issues(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "The seller's drop record does not satisfy drop invariants.",
+                issues,
+            )));
         }
     };
 
@@ -173,21 +176,18 @@ pub async fn sync(
             missing_count = missing.len(),
             "drop.sync refused: unregistered listings"
         );
-        return Ok(Err(CommandFailure {
-            issues: Some(
-                missing
-                    .iter()
-                    .map(|listing_id| marketplace_domain::ValidationIssue {
-                        path: "payload.listing_ids".to_string(),
-                        message: format!("Unregistered listing: {listing_id}"),
-                    })
-                    .collect(),
-            ),
-            ..CommandFailure::new(
-                ErrorCode::InvalidCommand,
-                "The drop references unregistered listings.",
-            )
-        }));
+        return Ok(Err(CommandFailure::refused_with_issues(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
+            ErrorCode::InvalidCommand,
+            "The drop references unregistered listings.",
+            missing
+                .iter()
+                .map(|listing_id| marketplace_domain::ValidationIssue {
+                    path: "payload.listing_ids".to_string(),
+                    message: format!("Unregistered listing: {listing_id}"),
+                })
+                .collect(),
+        )));
     }
 
     let current = fetch_drop_for_update(tx, &command.aggregate_id).await?;
@@ -281,7 +281,8 @@ async fn apply_resync(
         state => state,
     };
     if effective != "announced" {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The drop's terms are locked at launch.",
             current.revision,
@@ -371,19 +372,22 @@ pub async fn cancel(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(drop) = fetch_drop_for_update(tx, &command.aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The drop was not found.",
         )));
     };
     if drop.seller_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the seller may cancel a drop.",
         )));
     }
     if command.expected_revision != drop.revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The drop revision is stale.",
             drop.revision,
@@ -397,7 +401,8 @@ pub async fn cancel(
         state => state,
     };
     if !is_active_state(effective) {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "This drop can no longer be cancelled.",
             drop.revision,
@@ -464,19 +469,22 @@ pub async fn release_listings(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(drop) = fetch_drop_for_update(tx, &command.aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The drop was not found.",
         )));
     };
     if drop.seller_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the seller may release a drop's listings.",
         )));
     }
     if command.expected_revision != drop.revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The drop revision is stale.",
             drop.revision,
@@ -484,7 +492,8 @@ pub async fn release_listings(
     }
     let drop = apply_time_transitions(tx, drop, command.command_id, now).await?;
     if is_active_state(&drop.state) {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             DROP_RELEASE_BEFORE_END,
             drop.revision,
@@ -623,14 +632,16 @@ pub async fn enforce_drop_gate(
     let drop = apply_time_transitions(tx, drop, command_id, now).await?;
     match drop.state.as_str() {
         "announced" => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 DROP_NOT_STARTED,
             )));
         }
         "live" => {}
         _ => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 DROP_ENDED,
             )));
@@ -641,7 +652,8 @@ pub async fn enforce_drop_gate(
     // so the reads below are race-free; the CHECK constraints remain as the
     // database backstop should any future path skip the lock.
     if drop.remaining_quantity < units {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InsufficientInventory,
             ErrorCode::InsufficientInventory,
             DROP_SOLD_OUT,
         )));
@@ -655,7 +667,8 @@ pub async fn enforce_drop_gate(
     .fetch_optional(&mut **tx)
     .await?;
     if held.map(|(quantity,)| quantity).unwrap_or(0) + units > drop.per_buyer_limit {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             DROP_PER_BUYER_LIMIT,
         )));
@@ -707,7 +720,8 @@ pub async fn record_paid_unit(
     now: DateTime<Utc>,
 ) -> Result<Result<i64, CommandFailure>, sqlx::Error> {
     let Some(drop) = fetch_drop_for_update(tx, drop_aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "The order's drop is missing.",
         )));

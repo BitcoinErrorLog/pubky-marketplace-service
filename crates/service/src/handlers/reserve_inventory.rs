@@ -20,26 +20,30 @@ pub async fn handle(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(listing) = fetch_listing(tx, &command.aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The listing is not registered.",
         )));
     };
     if listing.seller_pubky == actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "A seller cannot reserve their own listing.",
         )));
     }
     if command.expected_revision != listing.server_revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The listing revision is stale.",
             listing.server_revision,
         )));
     }
     if listing.available_quantity < payload.quantity {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InsufficientInventory,
             ErrorCode::InsufficientInventory,
             "The requested quantity is unavailable.",
             listing.server_revision,
@@ -56,7 +60,8 @@ pub async fn handle(
         // A reserve against a drop-bound listing holds exactly one unit,
         // the same v1 shape rule checkout enforces per line.
         if payload.quantity != 1 {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
                 "A drop-bound listing can be reserved one unit at a time.",
             )));
@@ -82,7 +87,8 @@ pub async fn handle(
         "available"
     };
     if !can_transition(&listing_machine(), &listing.state, new_state) {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "The listing cannot enter the reserved state.",
             listing.server_revision,
@@ -107,7 +113,8 @@ pub async fn handle(
     .await?;
     let Some(listing) = updated else {
         let latest = current_listing_revision(tx, &command.aggregate_id).await?;
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The listing revision is stale.",
             latest,

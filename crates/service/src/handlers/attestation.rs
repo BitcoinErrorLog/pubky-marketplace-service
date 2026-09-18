@@ -31,7 +31,8 @@ pub async fn set_band_consent(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     if command.aggregate_id != ids::seller_settings_aggregate_id(actor) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Band consent may only be set on the actor's own settings aggregate.",
         )));
@@ -44,7 +45,8 @@ pub async fn set_band_consent(
     .await?;
     let current_revision = current.map(|(revision,)| revision).unwrap_or(0);
     if command.expected_revision != current_revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The band consent revision is stale.",
             current_revision,
