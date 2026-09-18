@@ -82,7 +82,8 @@ pub async fn place_bid(
         }
     };
     let Some(reserve) = fetch_auction_reserve_for_update(tx, &command.aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "The auction reserve authority is missing.",
         )));

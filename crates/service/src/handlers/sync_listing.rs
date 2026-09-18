@@ -254,7 +254,8 @@ pub async fn handle(
 }
 
 fn seller_registration_required() -> CommandFailure {
-    CommandFailure::new(
+    CommandFailure::refused(
+        crate::refusal_audit::RefusalKind::InvalidState,
         ErrorCode::SellerRegistrationRequired,
         "The seller must register this auction with its private reserve authority.",
     )
