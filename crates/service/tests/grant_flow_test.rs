@@ -454,6 +454,8 @@ async fn result_expiry_revokes_both_undelivered_and_delivered_sessions(pool: sql
     let (app, authority) = test_app_with_grant(pool.clone()).await;
     let result_key = SigningKey::from_bytes(&[51u8; 32]);
     let result_cpk = encode_pubky(&result_key.verifying_key().to_bytes());
+    let delivered_result_key = SigningKey::from_bytes(&[58u8; 32]);
+    let delivered_result_cpk = encode_pubky(&delivered_result_key.verifying_key().to_bytes());
     let undelivered = authority
         .seed_completed_flow(
             &pool,
@@ -472,7 +474,7 @@ async fn result_expiry_revokes_both_undelivered_and_delivered_sessions(pool: sql
             &pool,
             SeedCompletedFlow {
                 expected_pubky: &"o".repeat(52),
-                result_cpk: &result_cpk,
+                result_cpk: &delivered_result_cpk,
                 delivery_id: [55u8; 32],
                 bearer: [56u8; 32],
                 result_token: [57u8; 32],
