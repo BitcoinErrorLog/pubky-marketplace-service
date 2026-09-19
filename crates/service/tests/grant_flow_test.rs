@@ -284,8 +284,7 @@ async fn nonce(
         "request_id":Uuid::new_v4().to_string(),
     });
     let (body, signature) = authority.sign_service_body(&request);
-    let (status, headers, response) =
-        send_signed(app.router.clone(), &path, body, signature).await;
+    let (status, headers, response) = send_signed(app.router.clone(), &path, body, signature).await;
     assert_eq!(status, StatusCode::CREATED, "{response}");
     assert_no_store(&headers);
     response
@@ -338,8 +337,13 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
         response["result_token"],
         URL_SAFE_NO_PAD.encode(result_token)
     );
-    let (status, _, _) =
-        send_signed(app.router.clone(), &ticket_path, ticket_body, ticket_signature).await;
+    let (status, _, _) = send_signed(
+        app.router.clone(),
+        &ticket_path,
+        ticket_body,
+        ticket_signature,
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     let claim_nonce = nonce(&app, &authority, flow_id, "claim").await;
@@ -360,13 +364,8 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
     let mut wrong_claim = claim.clone();
     wrong_claim["result_token"] = Value::String(URL_SAFE_NO_PAD.encode([99u8; 32]));
     let (wrong_body, wrong_signature) = authority.sign_service_body(&wrong_claim);
-    let (status, _, wrong_response) = send_signed(
-        app.router.clone(),
-        &claim_path,
-        wrong_body,
-        wrong_signature,
-    )
-    .await;
+    let (status, _, wrong_response) =
+        send_signed(app.router.clone(), &claim_path, wrong_body, wrong_signature).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(wrong_response["error"], "result_denied");
     assert_eq!(wrong_response.as_object().unwrap().len(), 1);
@@ -381,8 +380,7 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["token"], URL_SAFE_NO_PAD.encode(bearer));
-    let (status, _, _) =
-        send_signed(app.router, &claim_path, claim_body, claim_signature).await;
+    let (status, _, _) = send_signed(app.router, &claim_path, claim_body, claim_signature).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let row: (bool, bool, bool) = sqlx::query_as(
         "SELECT result_claimed_at IS NOT NULL, result_token_hash IS NULL, \
@@ -495,10 +493,8 @@ async fn result_expiry_revokes_both_undelivered_and_delivered_sessions(pool: sql
 #[test]
 #[ignore = "#48 must reach staging and provide the redacted real Bitkit rc55 artifact"]
 fn real_rc55_bitkit_artifact_is_pinned_before_enablement() {
-    let fixture = std::fs::read_to_string(
-        "tests/fixtures/grant/bitkit-rc55-staging.json",
-    )
-    .expect("capture the real staging artifact before removing #[ignore]");
+    let fixture = std::fs::read_to_string("tests/fixtures/grant/bitkit-rc55-staging.json")
+        .expect("capture the real staging artifact before removing #[ignore]");
     let value: Value = serde_json::from_str(&fixture).expect("artifact JSON");
     assert_eq!(value["intent"], "signin_grant");
     assert!(value["authorization_url_redacted"]

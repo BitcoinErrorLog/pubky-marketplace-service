@@ -176,10 +176,7 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/auth/sessions",
             post(auth::create_session).get(auth::list_sessions),
         )
-        .route(
-            "/v1/auth/grant-flows",
-            post(crate::grant::create_flow),
-        )
+        .route("/v1/auth/grant-flows", post(crate::grant::create_flow))
         .route(
             "/v1/auth/grant-flows/{flow_id}",
             get(crate::grant::get_status),

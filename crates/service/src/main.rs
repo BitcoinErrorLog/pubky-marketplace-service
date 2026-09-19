@@ -30,8 +30,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let grant =
-        marketplace_service::grant::GrantRuntime::from_env(config.session_ttl_seconds)?;
+    let grant = marketplace_service::grant::GrantRuntime::from_env(config.session_ttl_seconds)?;
     marketplace_service::inventory::validate_rate_config_from_env()?;
     // Fail closed before serving: a partial Locks configuration (URL without
     // keys, or keys without URL) refuses to start rather than running with
