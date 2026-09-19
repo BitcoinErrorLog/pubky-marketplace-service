@@ -35,6 +35,7 @@ tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
 hkdf = "0.12"
+pubky = { version = "=0.11.0", features = ["json"] }
 
 [features]
 # Test-only fault hooks (e.g. the ambiguous bind-COMMIT injection in

@@ -15,6 +15,7 @@ pub mod contracts;
 pub mod executor;
 pub mod expiry;
 pub mod fx;
+pub mod grant;
 pub mod handlers;
 pub mod homeserver;
 pub mod http;
@@ -91,6 +92,9 @@ pub struct AppState {
     /// The retention connection is distinct from both domain and writer
     /// pools; its login is limited to the purge function.
     pub refusal_audit_retention_pool: Option<PgPool>,
+    /// Durable Pubky grant-flow runtime. `None` keeps the rollout surface
+    /// disabled; no legacy or in-memory fallback is used.
+    pub grant: Option<Arc<grant::GrantRuntime>>,
 }
 
 impl AppState {
@@ -117,6 +121,7 @@ impl AppState {
             resolve_pin_cache: resolve_delivery::ResolvePinCache::default(),
             refusal_audit: None,
             refusal_audit_retention_pool: None,
+            grant: None,
         }
     }
 
@@ -152,6 +157,11 @@ impl AppState {
 
     pub fn with_refusal_audit_retention_pool(mut self, pool: PgPool) -> Self {
         self.refusal_audit_retention_pool = Some(pool);
+        self
+    }
+
+    pub fn with_grant(mut self, grant: Option<Arc<grant::GrantRuntime>>) -> Self {
+        self.grant = grant;
         self
     }
 }
