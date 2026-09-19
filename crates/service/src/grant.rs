@@ -6,11 +6,12 @@
 //! proof, and (for claim) a one-use result token.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -65,6 +66,10 @@ pub struct GrantConfig {
     pub worker_batch_size: i64,
     pub reaper_batch_size: i64,
     pub terminal_retention_seconds: i64,
+    pub create_per_ip_per_minute: i64,
+    pub create_per_pubky_per_minute: i64,
+    pub status_per_flow_per_minute: i64,
+    pub result_per_principal_per_minute: i64,
     pub assertion_issuer: String,
     pub session_ttl_seconds: i64,
 }
@@ -371,6 +376,30 @@ impl GrantRuntime {
                 600,
                 i64::MAX,
             )?,
+            create_per_ip_per_minute: env_bounded_i64(
+                "MARKETPLACE_GRANT_CREATE_PER_IP_PER_MINUTE",
+                10,
+                1,
+                10_000,
+            )?,
+            create_per_pubky_per_minute: env_bounded_i64(
+                "MARKETPLACE_GRANT_CREATE_PER_PUBKY_PER_MINUTE",
+                5,
+                1,
+                10_000,
+            )?,
+            status_per_flow_per_minute: env_bounded_i64(
+                "MARKETPLACE_GRANT_STATUS_PER_FLOW_PER_MINUTE",
+                60,
+                1,
+                100_000,
+            )?,
+            result_per_principal_per_minute: env_bounded_i64(
+                "MARKETPLACE_GRANT_RESULT_PER_PRINCIPAL_PER_MINUTE",
+                30,
+                1,
+                10_000,
+            )?,
             assertion_issuer: std::env::var("SHOP_GRANT_ASSERTION_ISSUER")
                 .unwrap_or_else(|_| "https://shop.pubky.app".to_string()),
             session_ttl_seconds,
@@ -500,6 +529,10 @@ pub mod test_support {
                     worker_batch_size: 25,
                     reaper_batch_size: 100,
                     terminal_retention_seconds: 86_400,
+                    create_per_ip_per_minute: 10,
+                    create_per_pubky_per_minute: 5,
+                    status_per_flow_per_minute: 60,
+                    result_per_principal_per_minute: 30,
                     assertion_issuer: "https://shop.test".to_string(),
                     session_ttl_seconds,
                 },
@@ -937,6 +970,48 @@ fn error_response(status: StatusCode, code: &'static str) -> Response {
     no_store((status, Json(json!({ "error": code }))).into_response())
 }
 
+async fn admit_rate(
+    state: &AppState,
+    endpoint_class: &str,
+    bucket: &str,
+    limit: i64,
+) -> anyhow::Result<bool> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marketplace/grant-rate-limit/v1");
+    hasher.update(endpoint_class.as_bytes());
+    hasher.update([0]);
+    hasher.update(bucket.as_bytes());
+    let bucket_hash = hasher.finalize();
+    let now = state.clock.now();
+    let window_floor = now - Duration::seconds(60);
+    let count: i32 = sqlx::query_scalar(
+        "INSERT INTO grant_rate_limits \
+         (bucket_hash, endpoint_class, window_started_at, request_count) \
+         VALUES ($1,$2,$3,1) \
+         ON CONFLICT (bucket_hash, endpoint_class) DO UPDATE SET \
+           window_started_at = CASE \
+             WHEN grant_rate_limits.window_started_at <= $4 THEN EXCLUDED.window_started_at \
+             ELSE grant_rate_limits.window_started_at END, \
+           request_count = CASE \
+             WHEN grant_rate_limits.window_started_at <= $4 THEN 1 \
+             ELSE grant_rate_limits.request_count + 1 END \
+         RETURNING request_count",
+    )
+    .bind(bucket_hash.as_slice())
+    .bind(endpoint_class)
+    .bind(now)
+    .bind(window_floor)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(i64::from(count) <= limit)
+}
+
+fn request_ip(connect: Option<ConnectInfo<SocketAddr>>) -> String {
+    connect
+        .map(|ConnectInfo(address)| address.ip().to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateGrantFlowRequest {
@@ -971,6 +1046,7 @@ fn authorization_cpk(url: &Url) -> anyhow::Result<String> {
 
 pub async fn create_flow(
     State(state): State<AppState>,
+    connect: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -980,6 +1056,18 @@ pub async fn create_flow(
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
         }
     };
+    match admit_rate(
+        &state,
+        "create_ip",
+        &request_ip(connect),
+        runtime.config.create_per_ip_per_minute,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
+    }
     let request: CreateGrantFlowRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_request"),
@@ -1012,6 +1100,18 @@ pub async fn create_flow(
     };
     if !marketplace_domain::pubky::is_valid_pubky(&expected_pubky) {
         return error_response(StatusCode::UNAUTHORIZED, "invalid_assertion");
+    }
+    match admit_rate(
+        &state,
+        "create_pubky",
+        &expected_pubky,
+        runtime.config.create_per_pubky_per_minute,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
     }
 
     let live: i64 = match sqlx::query_scalar(
@@ -1136,9 +1236,26 @@ struct StatusRow {
     expires_at: DateTime<Utc>,
 }
 
-pub async fn get_status(State(state): State<AppState>, Path(flow_id): Path<Uuid>) -> Response {
-    if grant_runtime(&state).is_none() {
+pub async fn get_status(
+    State(state): State<AppState>,
+    connect: Option<ConnectInfo<SocketAddr>>,
+    Path(flow_id): Path<Uuid>,
+) -> Response {
+    let Some(runtime) = grant_runtime(&state) else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
+    };
+    let bucket = format!("{}:{flow_id}", request_ip(connect));
+    match admit_rate(
+        &state,
+        "status_flow",
+        &bucket,
+        runtime.config.status_per_flow_per_minute,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
     }
     let row: Option<StatusRow> = match sqlx::query_as(
         "SELECT flow_id, status, terminal_code, expires_at FROM grant_flows WHERE flow_id = $1",
@@ -1208,6 +1325,25 @@ fn verify_service_request<'a>(
     Ok((principal, value))
 }
 
+async fn admit_result_rates(
+    state: &AppState,
+    runtime: &GrantRuntime,
+    principal: &str,
+    flow_id: Uuid,
+) -> anyhow::Result<bool> {
+    if !admit_rate(
+        state,
+        "result_principal",
+        principal,
+        runtime.config.result_per_principal_per_minute,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    admit_rate(state, "result_flow", &flow_id.to_string(), 10).await
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NonceRequest {
@@ -1236,6 +1372,11 @@ pub async fn issue_result_nonce(
             return error_response(StatusCode::UNAUTHORIZED, "invalid_service_signature");
         }
     };
+    match admit_result_rates(&state, runtime, principal, flow_id).await {
+        Ok(true) => {}
+        Ok(false) => return error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
+    }
     let request: NonceRequest = match serde_json::from_value(value) {
         Ok(request) => request,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_request"),
@@ -1513,6 +1654,11 @@ pub async fn result_ticket(
             return error_response(StatusCode::UNAUTHORIZED, "invalid_service_signature");
         }
     };
+    match admit_result_rates(&state, runtime, principal, flow_id).await {
+        Ok(true) => {}
+        Ok(false) => return error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
+    }
     let request: TicketRequest = match serde_json::from_value(value) {
         Ok(request) => request,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_request"),
@@ -1636,6 +1782,11 @@ pub async fn claim_result(
             return error_response(StatusCode::UNAUTHORIZED, "invalid_service_signature");
         }
     };
+    match admit_result_rates(&state, runtime, principal, flow_id).await {
+        Ok(true) => {}
+        Ok(false) => return error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
+    }
     let request: ClaimRequest = match serde_json::from_value(value) {
         Ok(request) => request,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_request"),
@@ -1774,6 +1925,11 @@ pub async fn cancel_flow(
             return error_response(StatusCode::UNAUTHORIZED, "invalid_service_signature");
         }
     };
+    match admit_result_rates(&state, runtime, principal, flow_id).await {
+        Ok(true) => {}
+        Ok(false) => return error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
+    }
     let request: CancelRequest = match serde_json::from_value(value) {
         Ok(request) => request,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_request"),
@@ -2159,6 +2315,10 @@ pub async fn reap_once(state: &AppState) -> anyhow::Result<u64> {
 
     sqlx::query("DELETE FROM grant_result_nonces WHERE expires_at <= $1")
         .bind(now)
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("DELETE FROM grant_rate_limits WHERE window_started_at <= $1")
+        .bind(now - Duration::seconds(120))
         .execute(&state.pool)
         .await?;
     let purged = sqlx::query(

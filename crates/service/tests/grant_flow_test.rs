@@ -203,6 +203,44 @@ async fn flow_id_status_never_returns_result_authority(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn status_rate_limit_is_shared_in_postgres(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool).await;
+    let result_key = SigningKey::from_bytes(&[30u8; 32]);
+    let flow_id = authority
+        .seed_completed_flow(
+            &app.pool,
+            SeedCompletedFlow {
+                expected_pubky: &"y".repeat(52),
+                result_cpk: &encode_pubky(&result_key.verifying_key().to_bytes()),
+                delivery_id: [31u8; 32],
+                bearer: [32u8; 32],
+                result_token: [33u8; 32],
+                now: app.clock.now(),
+            },
+        )
+        .await;
+    let uri = format!("/v1/auth/grant-flows/{flow_id}");
+    for _ in 0..60 {
+        assert_eq!(
+            send(app.router.clone(), "GET", &uri, None, &Value::Null)
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let (status, body) = send(app.router, "GET", &uri, None, &Value::Null).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"], "rate_limited");
+    let count: i32 = sqlx::query_scalar(
+        "SELECT request_count FROM grant_rate_limits WHERE endpoint_class = 'status_flow'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 61);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn wrong_verified_signer_is_visible_409_mints_no_bearer_and_cannot_replay(
     pool: sqlx::PgPool,
 ) {
