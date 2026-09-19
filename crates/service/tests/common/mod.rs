@@ -30,6 +30,7 @@ use marketplace_service::clock::{AdjustableClock, Clock};
 use marketplace_service::config::Config;
 use marketplace_service::homeserver::{HomeserverListingClient, HttpHomeserverClient};
 use marketplace_service::http::build_router;
+use marketplace_service::grant::test_support::GrantTestAuthority;
 use marketplace_service::locks::{
     LocksKeys, LocksLifecycleClient, LocksLookupOutcome, LocksRuntime,
 };
@@ -72,6 +73,24 @@ pub fn test_attestor() -> Arc<Attestor> {
 
 pub async fn test_app_with_attestor(pool: PgPool) -> TestApp {
     test_app_full(pool, Config::for_tests(), Some(test_attestor())).await
+}
+
+pub async fn test_app_with_grant(pool: PgPool) -> (TestApp, GrantTestAuthority) {
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let authority = GrantTestAuthority::generate(Config::for_tests().session_ttl_seconds);
+    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
+        .with_homeserver(Some(Arc::new(CommandMirrorHomeserver)))
+        .with_grant(Some(authority.runtime.clone()));
+    (
+        TestApp {
+            router: build_router(state.clone()),
+            pool,
+            clock,
+            state,
+        },
+        authority,
+    )
 }
 
 pub async fn test_app_full(

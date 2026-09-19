@@ -473,6 +473,207 @@ impl GrantRuntime {
     }
 }
 
+#[cfg(any(test, feature = "test-faults"))]
+pub mod test_support {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    pub struct GrantTestAuthority {
+        pub runtime: Arc<GrantRuntime>,
+        assertion_key: SigningKey,
+        request_key: SigningKey,
+    }
+
+    impl GrantTestAuthority {
+        pub fn generate(session_ttl_seconds: i64) -> Self {
+            let mut assertion_seed = [0u8; 32];
+            let mut request_seed = [0u8; 32];
+            let mut encryption_key = [0u8; 32];
+            let mut hash_root = [0u8; 32];
+            let mut bff_state_key = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut assertion_seed);
+            rand::rngs::OsRng.fill_bytes(&mut request_seed);
+            rand::rngs::OsRng.fill_bytes(&mut encryption_key);
+            rand::rngs::OsRng.fill_bytes(&mut hash_root);
+            // Generated in-process to exercise the fifth-input inventory.
+            // It belongs to Shop BFF and is deliberately not installed in
+            // marketplace-service.
+            rand::rngs::OsRng.fill_bytes(&mut bff_state_key);
+            let assertion_key = SigningKey::from_bytes(&assertion_seed);
+            let request_key = SigningKey::from_bytes(&request_seed);
+            let runtime = GrantRuntime {
+                config: GrantConfig {
+                    client_id: "marketplace.localhost".to_string(),
+                    relay_url: Url::parse("http://127.0.0.1:1/inbox")
+                        .expect("test relay URL"),
+                    flow_ttl_seconds: 300,
+                    verify_lease_seconds: 30,
+                    relay_poll_milliseconds: 1000,
+                    max_live_flows: 1000,
+                    worker_batch_size: 25,
+                    reaper_batch_size: 100,
+                    terminal_retention_seconds: 86_400,
+                    assertion_issuer: "https://shop.test".to_string(),
+                    session_ttl_seconds,
+                },
+                encryption_keys: SecretKeyRing {
+                    active: KeySlot {
+                        epoch: 1,
+                        key: encryption_key,
+                    },
+                    previous: None,
+                },
+                result_hash_keys: SecretKeyRing {
+                    active: KeySlot {
+                        epoch: 1,
+                        key: hash_root,
+                    },
+                    previous: None,
+                },
+                assertion_keys: VerifyKeyRing {
+                    active: VerifySlot {
+                        epoch: 1,
+                        kid: "shop-test-0001".to_string(),
+                        key: assertion_key.verifying_key(),
+                    },
+                    previous: None,
+                },
+                request_keys: VerifyKeyRing {
+                    active: VerifySlot {
+                        epoch: 1,
+                        kid: "bff-test-0001".to_string(),
+                        key: request_key.verifying_key(),
+                    },
+                    previous: None,
+                },
+                client: PubkyHttpClient::new().expect("test Pubky client"),
+                notify: Arc::new(Notify::new()),
+            };
+            bff_state_key.fill(0);
+            Self {
+                runtime: Arc::new(runtime),
+                assertion_key,
+                request_key,
+            }
+        }
+
+        pub fn sign_bootstrap_assertion(
+            &self,
+            sub: &str,
+            result_delivery_id: &[u8; 32],
+            result_cpk: &str,
+            now: DateTime<Utc>,
+            jti: Uuid,
+        ) -> String {
+            self.sign_assertion(json!({
+                "aud": ASSERTION_AUDIENCE,
+                "exp": now.timestamp() + 60,
+                "iat": now.timestamp(),
+                "iss": self.runtime.config.assertion_issuer,
+                "jti": jti.to_string(),
+                "purpose": ASSERTION_BOOTSTRAP_PURPOSE,
+                "result_cpk": result_cpk,
+                "result_delivery_id": URL_SAFE_NO_PAD.encode(result_delivery_id),
+                "sub": sub,
+            }))
+        }
+
+        fn sign_assertion(&self, claims: Value) -> String {
+            let header = json!({"alg":"EdDSA","kid":"shop-test-0001","typ":"JWT"});
+            let header = URL_SAFE_NO_PAD.encode(canonical_json(&header).expect("header JCS"));
+            let claims = URL_SAFE_NO_PAD.encode(canonical_json(&claims).expect("claims JCS"));
+            let signing_input = format!("{header}.{claims}");
+            let signature = self.assertion_key.sign(signing_input.as_bytes());
+            format!(
+                "{signing_input}.{}",
+                URL_SAFE_NO_PAD.encode(signature.to_bytes())
+            )
+        }
+
+        pub fn sign_service_body(&self, value: &Value) -> (Vec<u8>, String) {
+            let body = canonical_json(value).expect("service body JCS");
+            let signature = self.request_key.sign(&body);
+            (body, URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+        }
+
+        pub async fn seed_completed_flow(
+            &self,
+            pool: &sqlx::PgPool,
+            expected_pubky: &str,
+            result_cpk: &str,
+            delivery_id: [u8; 32],
+            bearer: [u8; 32],
+            result_token: [u8; 32],
+            now: DateTime<Utc>,
+        ) -> Uuid {
+            let flow_id = Uuid::new_v4();
+            let key_epoch = self.runtime.active_key_epoch();
+            let hash_epoch = self.runtime.active_hash_epoch();
+            let delivery_hash = self
+                .runtime
+                .result_hash(flow_id, hash_epoch, &delivery_id, false)
+                .expect("delivery hash");
+            let token_hash = self
+                .runtime
+                .result_hash(flow_id, hash_epoch, &result_token, true)
+                .expect("token hash");
+            let expires_at = now + Duration::seconds(300);
+            let session_expires_at = now + Duration::seconds(86_400);
+            let result_expires_at = now + Duration::seconds(60);
+            let payload = SealedResult {
+                version: GRANT_STATE_VERSION,
+                bearer,
+                result_token,
+                session_expires_at,
+            };
+            let aad = result_aad(flow_id, result_cpk, key_epoch).expect("result AAD");
+            let sealed = seal::seal(
+                self.runtime.encryption_key(key_epoch).expect("test key"),
+                &aad,
+                &canonical_json(&payload).expect("result JSON"),
+            );
+            let session_id: i64 = sqlx::query_scalar(
+                "INSERT INTO auth_sessions (token_hash,pubky,capabilities,created_at,expires_at) \
+                 VALUES ($1,$2,'',$3,$4) RETURNING session_id",
+            )
+            .bind(auth::hash_token(&bearer))
+            .bind(expected_pubky)
+            .bind(now)
+            .bind(session_expires_at)
+            .fetch_one(pool)
+            .await
+            .expect("seed auth session");
+            sqlx::query(
+                "INSERT INTO grant_flows (flow_id,expected_pubky,assertion_jti,client_id,cpk,\
+                 capabilities,relay_url,key_epoch,result_hash_epoch,status,approved_pubky,\
+                 result_delivery_id_hash,result_cpk,result_token_hash,result_token_expires_at,\
+                 result_payload_sealed,result_auth_session_id,created_at,expires_at,terminal_at) \
+                 VALUES ($1,$2,$3,$4,$5,'',$6,$7,$8,'complete',$2,$9,$10,$11,$12,$13,$14,$15,$16,$15)",
+            )
+            .bind(flow_id)
+            .bind(expected_pubky)
+            .bind(Uuid::new_v4())
+            .bind(&self.runtime.config.client_id)
+            .bind(PublicKey::try_from_z32(result_cpk).expect("result key").z32())
+            .bind(self.runtime.config.relay_url.as_str())
+            .bind(key_epoch)
+            .bind(hash_epoch)
+            .bind(delivery_hash.as_slice())
+            .bind(result_cpk)
+            .bind(token_hash.as_slice())
+            .bind(result_expires_at)
+            .bind(sealed)
+            .bind(session_id)
+            .bind(now)
+            .bind(expires_at)
+            .execute(pool)
+            .await
+            .expect("seed completed flow");
+            flow_id
+        }
+    }
+}
+
 fn append_len_prefixed(output: &mut Vec<u8>, value: &str) -> anyhow::Result<()> {
     let length: u16 = value
         .len()
@@ -729,11 +930,15 @@ fn authorization_cpk(url: &Url) -> anyhow::Result<String> {
 pub async fn create_flow(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<CreateGrantFlowRequest>,
+    body: Bytes,
 ) -> Response {
     let runtime = match grant_runtime(&state) {
         Ok(runtime) => runtime,
         Err(response) => return response,
+    };
+    let request: CreateGrantFlowRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_request"),
     };
     let now = state.clock.now();
     let actor = match auth::actor_from_authorization(&state.pool, &headers, now).await {

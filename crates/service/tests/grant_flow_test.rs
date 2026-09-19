@@ -1,0 +1,412 @@
+mod common;
+
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use chrono::{DateTime, Duration, Utc};
+use ed25519_dalek::{Signer, SigningKey};
+use http_body_util::BodyExt;
+use marketplace_domain::pubky::encode_pubky;
+use marketplace_service::grant;
+use pubky_common::crypto::Keypair;
+use rand::RngCore;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tower::ServiceExt;
+use uuid::Uuid;
+
+use common::{send, test_app_with_grant, NOW};
+
+async fn send_signed(
+    router: axum::Router,
+    uri: &str,
+    body: Vec<u8>,
+    signature: String,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("x-marketplace-signature", signature)
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("JSON response")
+    };
+    (status, headers, body)
+}
+
+fn assert_no_store(headers: &axum::http::HeaderMap) {
+    assert!(headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("no-store")));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn migration_0035_preserves_bearer_key_and_adds_session_identity(pool: sqlx::PgPool) {
+    let token_hash = vec![7u8; 32];
+    let now: DateTime<Utc> = NOW.parse().unwrap();
+    let session_id: i64 = sqlx::query_scalar(
+        "INSERT INTO auth_sessions (token_hash,pubky,capabilities,created_at,expires_at) \
+         VALUES ($1,$2,'',$3,$4) RETURNING session_id",
+    )
+    .bind(&token_hash)
+    .bind("y".repeat(52))
+    .bind(now)
+    .bind(now + Duration::hours(1))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(session_id > 0);
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT token_hash FROM auth_sessions WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, token_hash);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn client_asserted_identity_and_ambiguous_principal_create_nothing(pool: sqlx::PgPool) {
+    let (app, _) = test_app_with_grant(pool.clone()).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/auth/grant-flows",
+        None,
+        &json!({"assertion":"opaque","expected_pubky":"y".repeat(52)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_request");
+
+    let (status, body) = send(
+        app.router,
+        "POST",
+        "/v1/auth/grant-flows",
+        None,
+        &json!({"assertion":"opaque","delivery_assertion":"opaque"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "ambiguous_principal");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM grant_flows")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn bootstrap_identity_is_assertion_derived_and_jti_is_single_use(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool.clone()).await;
+    let now = app.clock.now();
+    let signer = Keypair::random();
+    let expected_pubky = signer.public_key().z32();
+    let result_key = SigningKey::from_bytes(&[19u8; 32]);
+    let result_cpk = encode_pubky(&result_key.verifying_key().to_bytes());
+    let assertion = authority.sign_bootstrap_assertion(
+        &expected_pubky,
+        &[23u8; 32],
+        &result_cpk,
+        now,
+        Uuid::new_v4(),
+    );
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/auth/grant-flows",
+        None,
+        &json!({"assertion":assertion}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let flow_id = body["flow_id"].as_str().unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT expected_pubky FROM grant_flows WHERE flow_id = $1"
+        )
+        .bind(Uuid::parse_str(flow_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        expected_pubky
+    );
+
+    let (status, _) = send(
+        app.router,
+        "POST",
+        "/v1/auth/grant-flows",
+        None,
+        &json!({"assertion":assertion}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM grant_flows")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn flow_id_status_never_returns_result_authority(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool).await;
+    let result_key = SigningKey::from_bytes(&[31u8; 32]);
+    let pubky = "y".repeat(52);
+    let flow_id = authority
+        .seed_completed_flow(
+            &app.pool,
+            &pubky,
+            &encode_pubky(&result_key.verifying_key().to_bytes()),
+            [5u8; 32],
+            [6u8; 32],
+            [7u8; 32],
+            app.clock.now(),
+        )
+        .await;
+    let (status, body) = send(
+        app.router,
+        "GET",
+        &format!("/v1/auth/grant-flows/{flow_id}"),
+        None,
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "complete");
+    let text = body.to_string();
+    for forbidden in ["token", "bearer", "payload", "delivery", "cpk"] {
+        assert!(!text.contains(forbidden), "{forbidden} leaked in {text}");
+    }
+}
+
+fn proof(
+    key: &SigningKey,
+    flow_id: Uuid,
+    path: &str,
+    purpose: &str,
+    delivery_id: &[u8; 32],
+    nonce_id: &str,
+    nonce: &str,
+    issued_at: i64,
+) -> Value {
+    let delivery = URL_SAFE_NO_PAD.encode(delivery_id);
+    let signed = json!({
+        "domain":"marketplace/grant-result-pop/v1",
+        "flow_id":flow_id.to_string(),
+        "issued_at":issued_at,
+        "method":"POST",
+        "nonce":nonce,
+        "nonce_id":nonce_id,
+        "path":path,
+        "purpose":purpose,
+        "result_delivery_id":delivery,
+    });
+    let bytes = serde_json_canonicalizer::to_string(&signed).unwrap();
+    json!({
+        "issued_at":issued_at,
+        "nonce":nonce,
+        "nonce_id":nonce_id,
+        "signature":URL_SAFE_NO_PAD.encode(key.sign(bytes.as_bytes()).to_bytes()),
+    })
+}
+
+async fn nonce(
+    app: &common::TestApp,
+    authority: &marketplace_service::grant::test_support::GrantTestAuthority,
+    flow_id: Uuid,
+    purpose: &str,
+) -> Value {
+    let path = format!("/v1/auth/grant-flows/{flow_id}/result-nonces");
+    let request = json!({
+        "method":"POST",
+        "path":path,
+        "purpose":purpose,
+        "request_id":Uuid::new_v4().to_string(),
+    });
+    let (body, signature) = authority.sign_service_body(&request);
+    let (status, headers, response) =
+        send_signed(app.router.clone(), &path, body, signature).await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert_no_store(&headers);
+    response
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool.clone()).await;
+    let result_key = SigningKey::from_bytes(&[41u8; 32]);
+    let delivery_id = [42u8; 32];
+    let bearer = [43u8; 32];
+    let result_token = [44u8; 32];
+    let pubky = "y".repeat(52);
+    let flow_id = authority
+        .seed_completed_flow(
+            &pool,
+            &pubky,
+            &encode_pubky(&result_key.verifying_key().to_bytes()),
+            delivery_id,
+            bearer,
+            result_token,
+            app.clock.now(),
+        )
+        .await;
+
+    let ticket_nonce = nonce(&app, &authority, flow_id, "ticket").await;
+    let ticket_path = format!("/v1/auth/grant-flows/{flow_id}/result-ticket");
+    let ticket = json!({
+        "method":"POST",
+        "path":ticket_path,
+        "proof":proof(
+            &result_key, flow_id, &ticket_path, "ticket", &delivery_id,
+            ticket_nonce["nonce_id"].as_str().unwrap(),
+            ticket_nonce["nonce"].as_str().unwrap(),
+            app.clock.now().timestamp(),
+        ),
+        "request_id":Uuid::new_v4().to_string(),
+        "result_delivery_id":URL_SAFE_NO_PAD.encode(delivery_id),
+    });
+    let (ticket_body, ticket_signature) = authority.sign_service_body(&ticket);
+    let (status, _, response) = send_signed(
+        app.router.clone(),
+        &ticket_path,
+        ticket_body.clone(),
+        ticket_signature.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["result_token"],
+        URL_SAFE_NO_PAD.encode(result_token)
+    );
+    let (status, _, _) =
+        send_signed(app.router.clone(), &ticket_path, ticket_body, ticket_signature).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let claim_nonce = nonce(&app, &authority, flow_id, "claim").await;
+    let claim_path = format!("/v1/auth/grant-flows/{flow_id}/claim");
+    let claim = json!({
+        "method":"POST",
+        "path":claim_path,
+        "proof":proof(
+            &result_key, flow_id, &claim_path, "claim", &delivery_id,
+            claim_nonce["nonce_id"].as_str().unwrap(),
+            claim_nonce["nonce"].as_str().unwrap(),
+            app.clock.now().timestamp(),
+        ),
+        "request_id":Uuid::new_v4().to_string(),
+        "result_delivery_id":URL_SAFE_NO_PAD.encode(delivery_id),
+        "result_token":URL_SAFE_NO_PAD.encode(result_token),
+    });
+    let (claim_body, claim_signature) = authority.sign_service_body(&claim);
+    let (status, _, response) = send_signed(
+        app.router.clone(),
+        &claim_path,
+        claim_body.clone(),
+        claim_signature.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["token"], URL_SAFE_NO_PAD.encode(bearer));
+    let (status, _, _) =
+        send_signed(app.router, &claim_path, claim_body, claim_signature).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let row: (bool, bool, bool) = sqlx::query_as(
+        "SELECT result_claimed_at IS NOT NULL, result_token_hash IS NULL, \
+         result_payload_sealed IS NULL FROM grant_flows WHERE flow_id = $1",
+    )
+    .bind(flow_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row, (true, true, true));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn reaper_terminalizes_expiry_and_stale_lease_without_replay(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool.clone()).await;
+    let now = app.clock.now();
+    for (status, lease_until) in [
+        ("awaiting", None),
+        ("verifying", Some(now - Duration::seconds(1))),
+    ] {
+        sqlx::query(
+            "INSERT INTO grant_flows (flow_id,expected_pubky,assertion_jti,client_id,cpk,\
+             capabilities,relay_url,grant_state_sealed,key_epoch,result_hash_epoch,status,\
+             version,lease_owner,lease_until,result_delivery_id_hash,result_cpk,created_at,expires_at) \
+             VALUES ($1,$2,$3,$4,$5,'',$6,$7,1,1,$8,1,$9,$10,$11,$12,$13,$14)",
+        )
+        .bind(Uuid::new_v4())
+        .bind("y".repeat(52))
+        .bind(Uuid::new_v4())
+        .bind(format!("{}-{status}", authority.runtime.config.client_id))
+        .bind(if status == "awaiting" { "y".repeat(52) } else { "o".repeat(52) })
+        .bind(authority.runtime.config.relay_url.as_str())
+        .bind(vec![9u8; 80])
+        .bind(status)
+        .bind(Uuid::new_v4())
+        .bind(lease_until)
+        .bind(vec![8u8; 32])
+        .bind("y".repeat(52))
+        .bind(now - Duration::minutes(10))
+        .bind(now - Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    assert_eq!(grant::reap_once(&app.state).await.unwrap(), 2);
+    let rows: Vec<(String, String, bool)> = sqlx::query_as(
+        "SELECT status, terminal_code, grant_state_sealed IS NULL \
+         FROM grant_flows ORDER BY status",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(rows.contains(&("expired".into(), "flow_expired".into(), true)));
+    assert!(rows.contains(&("failed".into(), "lease_lost".into(), true)));
+}
+
+#[test]
+#[ignore = "#48 must reach staging and provide the redacted real Bitkit rc55 artifact"]
+fn real_rc55_bitkit_artifact_is_pinned_before_enablement() {
+    let fixture = std::fs::read_to_string(
+        "tests/fixtures/grant/bitkit-rc55-staging.json",
+    )
+    .expect("capture the real staging artifact before removing #[ignore]");
+    let value: Value = serde_json::from_str(&fixture).expect("artifact JSON");
+    assert_eq!(value["intent"], "signin_grant");
+    assert!(value["authorization_url_redacted"]
+        .as_str()
+        .is_some_and(|url| url.contains("secret=%3Credacted%3E")));
+    for forbidden in ["grant", "pop_private_key", "bearer", "relay_secret"] {
+        assert!(value.get(forbidden).is_none());
+    }
+}
+
+#[test]
+fn no_plaintext_secret_sentinels_are_hashed_as_their_stored_forms() {
+    let sentinel = [0xA5u8; 32];
+    let encoded = URL_SAFE_NO_PAD.encode(sentinel);
+    let digest = Sha256::digest(sentinel);
+    assert_ne!(digest.as_slice(), sentinel);
+    assert!(!hex::encode(digest).contains(&encoded));
+}
