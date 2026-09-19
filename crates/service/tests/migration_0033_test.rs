@@ -55,7 +55,7 @@ async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
         migrations: Cow::Owned(
             ALL_MIGRATIONS
                 .iter()
-                .filter(|migration| migration.version != 32)
+                .filter(|migration| migration.version <= 33 && migration.version != 32)
                 .cloned()
                 .collect(),
         ),
@@ -77,14 +77,14 @@ async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
     ALL_MIGRATIONS
         .run(&pool)
         .await
-        .expect("missing 0032 applies after already-applied 0033");
+        .expect("missing 0032 and pending 0034 apply after already-applied 0033");
 
     let finally_applied: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
             .expect("final migration versions");
-    assert_eq!(finally_applied, (1..=33).collect::<Vec<_>>());
+    assert_eq!(finally_applied, (1..=34).collect::<Vec<_>>());
 }
 
 fn aggregate_id(seller: &str, listing_id: &str) -> String {

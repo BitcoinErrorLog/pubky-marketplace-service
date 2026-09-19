@@ -17,6 +17,7 @@ pub mod fx;
 pub mod handlers;
 pub mod homeserver;
 pub mod http;
+pub mod inventory;
 pub mod locks;
 pub(crate) mod logging;
 pub mod model;

@@ -51,7 +51,7 @@ async fn a_valid_auth_token_mints_a_session(pool: PgPool) {
             .fetch_one(&app.pool)
             .await
             .expect("session row");
-    assert_eq!(stored, "");
+    assert_eq!(stored, "/:rw");
 }
 
 #[sqlx::test]
@@ -231,7 +231,7 @@ async fn the_challenge_endpoint_is_gone(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn presented_capabilities_are_returned_but_not_stored(pool: PgPool) {
+async fn verified_capabilities_are_returned_and_stored_canonically(pool: PgPool) {
     let app = test_app(pool).await;
     let (keypair, pubky) = random_keypair();
     let presented = "/pub/pubky.app/:rw,/priv/pubky.app/:rw,/pub/paykit/:rw";
@@ -261,7 +261,7 @@ async fn presented_capabilities_are_returned_but_not_stored(pool: PgPool) {
             .fetch_one(&app.pool)
             .await
             .expect("session row");
-    assert_eq!(stored, "");
+    assert_eq!(stored, presented);
 }
 
 #[sqlx::test]

@@ -536,10 +536,16 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 }
 
 /// The migration catalog is strictly increasing, unique per number, and
-/// contains both the refusal-audit 0032 and reserve-secrecy 0033 migrations.
+/// contains the refusal-audit 0032, reserve-secrecy 0033, and inventory 0034
+/// migrations.
+fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
+    numbers.sort_unstable();
+    numbers
+}
+
 #[test]
-fn migration_catalog_is_gapless_through_0033() {
-    let mut numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
+fn migration_catalog_is_gapless_through_0034() {
+    let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
             let name = entry.ok()?.file_name().into_string().ok()?;
@@ -548,10 +554,23 @@ fn migration_catalog_is_gapless_through_0033() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    numbers.sort_unstable();
-    numbers.dedup();
-    let expected: Vec<u32> = (1..=33).collect();
-    assert_eq!(numbers, expected, "the catalog is 0001..=0033, gapless");
+    let expected = (1..=34).collect::<Vec<_>>();
+    assert_eq!(
+        sorted_migration_catalog(numbers),
+        expected,
+        "the raw catalog is 0001..=0034, gapless"
+    );
+}
+
+#[test]
+fn migration_catalog_rejects_a_duplicate_0034_number() {
+    let numbers = (1..=34).chain([34]).collect::<Vec<_>>();
+    let expected = (1..=34).collect::<Vec<_>>();
+    assert_ne!(
+        sorted_migration_catalog(numbers),
+        expected,
+        "duplicate migration numbers must not be normalized away"
+    );
 }
 
 /// Every writer of `payments.state = 'manual_review'` across Bitcoin,

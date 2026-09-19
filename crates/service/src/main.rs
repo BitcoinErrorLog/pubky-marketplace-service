@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    marketplace_service::inventory::validate_rate_config_from_env()?;
     // Fail closed before serving: a partial Locks configuration (URL without
     // keys, or keys without URL) refuses to start rather than running with
     // verification silently disabled or bearer material unprotected.

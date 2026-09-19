@@ -1,3 +1,4 @@
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::{header, Method, StatusCode};
 use axum::middleware;
@@ -16,6 +17,24 @@ pub fn build_router(state: AppState) -> Router {
         .allow_origin(state.config.allowed_origins.clone())
         .allow_methods([Method::GET, Method::POST, Method::PUT])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+
+    let inventory = Router::new()
+        .route(
+            "/v1/inventory/adjust",
+            post(crate::inventory::adjust_inventory),
+        )
+        .route(
+            "/v1/inventory/listings/{aggregate_id}",
+            get(crate::inventory::get_inventory_projection),
+        )
+        .route_layer(middleware::from_fn(auth::require_inventory_capability))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session,
+        ))
+        .layer(DefaultBodyLimit::max(
+            crate::inventory::MAX_INVENTORY_BODY_BYTES,
+        ));
 
     let protected = Router::new()
         .route("/v1/commands", post(execute_command))
@@ -128,6 +147,7 @@ pub fn build_router(state: AppState) -> Router {
         // the seller's configured email and the exact order total.
         .route("/v0/paypal/ipn", post(crate::payment_methods::paypal_ipn))
         .merge(protected)
+        .merge(inventory)
         .layer(cors)
         .layer(middleware::from_fn(log_request))
         .with_state(state)
