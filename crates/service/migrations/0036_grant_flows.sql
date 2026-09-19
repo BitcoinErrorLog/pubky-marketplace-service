@@ -72,6 +72,17 @@ CREATE TABLE grant_result_nonces (
     CHECK (expires_at > created_at)
 );
 
+CREATE TABLE grant_rate_limits (
+    bucket_hash BYTEA NOT NULL CHECK (octet_length(bucket_hash) = 32),
+    endpoint_class TEXT NOT NULL CHECK (endpoint_class IN (
+        'create_ip', 'create_pubky', 'status_flow',
+        'result_principal', 'result_flow'
+    )),
+    window_started_at TIMESTAMPTZ NOT NULL,
+    request_count INTEGER NOT NULL CHECK (request_count > 0),
+    PRIMARY KEY (bucket_hash, endpoint_class)
+);
+
 CREATE INDEX grant_flows_worker_scan_idx
     ON grant_flows (expires_at, created_at)
     WHERE status IN ('awaiting', 'verifying');
@@ -83,3 +94,6 @@ CREATE INDEX grant_flows_result_expiry_idx
 CREATE INDEX grant_result_nonces_expiry_idx
     ON grant_result_nonces (expires_at)
     WHERE used_at IS NULL;
+
+CREATE INDEX grant_rate_limits_window_idx
+    ON grant_rate_limits (window_started_at);
