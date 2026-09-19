@@ -84,7 +84,13 @@ pub async fn test_app_with_grant(pool: PgPool) -> (TestApp, GrantTestAuthority) 
         .with_grant(Some(authority.runtime.clone()));
     (
         TestApp {
-            router: build_router(state.clone()),
+            router: build_router(state.clone()).layer(
+                axum::extract::connect_info::MockConnectInfo(
+                    "127.0.0.1:41000"
+                        .parse::<std::net::SocketAddr>()
+                        .expect("test peer address"),
+                ),
+            ),
             pool,
             clock,
             state,

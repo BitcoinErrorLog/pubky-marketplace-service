@@ -1006,10 +1006,8 @@ async fn admit_rate(
     Ok(i64::from(count) <= limit)
 }
 
-fn request_ip(connect: Option<ConnectInfo<SocketAddr>>) -> String {
-    connect
-        .map(|ConnectInfo(address)| address.ip().to_string())
-        .unwrap_or_else(|| "unavailable".to_string())
+fn request_ip(ConnectInfo(address): ConnectInfo<SocketAddr>) -> String {
+    address.ip().to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1046,7 +1044,7 @@ fn authorization_cpk(url: &Url) -> anyhow::Result<String> {
 
 pub async fn create_flow(
     State(state): State<AppState>,
-    connect: Option<ConnectInfo<SocketAddr>>,
+    connect: ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -1238,7 +1236,7 @@ struct StatusRow {
 
 pub async fn get_status(
     State(state): State<AppState>,
-    connect: Option<ConnectInfo<SocketAddr>>,
+    connect: ConnectInfo<SocketAddr>,
     Path(flow_id): Path<Uuid>,
 ) -> Response {
     let Some(runtime) = grant_runtime(&state) else {
