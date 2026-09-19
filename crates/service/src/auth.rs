@@ -20,7 +20,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -145,6 +145,39 @@ pub fn verify_auth_token(
 
 pub fn hash_token(token: &[u8]) -> Vec<u8> {
     Sha256::digest(token).to_vec()
+}
+
+/// Resolves an optional marketplace bearer without accepting any client
+/// asserted identity. `Ok(None)` means no Authorization header was present;
+/// a present malformed, unknown, or expired bearer is an authentication
+/// failure.
+pub async fn actor_from_authorization(
+    pool: &sqlx::PgPool,
+    headers: &HeaderMap,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<Actor>> {
+    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let encoded = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| anyhow::anyhow!("invalid marketplace bearer"))?;
+    let token = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| anyhow::anyhow!("invalid marketplace bearer"))?;
+    let pubky: Option<String> = sqlx::query_scalar(
+        "SELECT pubky FROM auth_sessions WHERE token_hash = $1 AND expires_at > $2",
+    )
+    .bind(hash_token(&token))
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    pubky
+        .map(Actor)
+        .ok_or_else(|| anyhow::anyhow!("invalid marketplace bearer"))
+        .map(Some)
 }
 
 fn auth_error(status: StatusCode, message: &str) -> Response {

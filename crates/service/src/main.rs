@@ -30,6 +30,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    let grant =
+        marketplace_service::grant::GrantRuntime::from_env(config.session_ttl_seconds)?;
     marketplace_service::inventory::validate_rate_config_from_env()?;
     // Fail closed before serving: a partial Locks configuration (URL without
     // keys, or keys without URL) refuses to start rather than running with
@@ -130,8 +132,10 @@ async fn main() -> anyhow::Result<()> {
         .with_payments(payments)
         .with_pickup(pickup)
         .with_refusal_audit(refusal_audit)
-        .with_refusal_audit_retention_pool(audit_retention_pool);
+        .with_refusal_audit_retention_pool(audit_retention_pool)
+        .with_grant(grant);
     workers::spawn(state.clone());
+    marketplace_service::grant::spawn(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(addr = %bind_addr, "marketplace transaction service listening");
