@@ -10,6 +10,7 @@ use http_body_util::BodyExt;
 use marketplace_domain::pubky::encode_pubky;
 use marketplace_service::clock::Clock;
 use marketplace_service::grant;
+use marketplace_service::grant::test_support::SeedCompletedFlow;
 use pubky_common::crypto::Keypair;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -175,12 +176,14 @@ async fn flow_id_status_never_returns_result_authority(pool: sqlx::PgPool) {
     let flow_id = authority
         .seed_completed_flow(
             &app.pool,
-            &pubky,
-            &encode_pubky(&result_key.verifying_key().to_bytes()),
-            [5u8; 32],
-            [6u8; 32],
-            [7u8; 32],
-            app.clock.now(),
+            SeedCompletedFlow {
+                expected_pubky: &pubky,
+                result_cpk: &encode_pubky(&result_key.verifying_key().to_bytes()),
+                delivery_id: [5u8; 32],
+                bearer: [6u8; 32],
+                result_token: [7u8; 32],
+                now: app.clock.now(),
+            },
         )
         .await;
     let (status, body) = send(
@@ -239,33 +242,34 @@ async fn wrong_verified_signer_is_visible_409_mints_no_bearer_and_cannot_replay(
     assert_eq!(row, (true, true));
 }
 
-fn proof(
-    key: &SigningKey,
+struct ProofInput<'a> {
     flow_id: Uuid,
-    path: &str,
-    purpose: &str,
-    delivery_id: &[u8; 32],
-    nonce_id: &str,
-    nonce: &str,
+    path: &'a str,
+    purpose: &'a str,
+    delivery_id: &'a [u8; 32],
+    nonce_id: &'a str,
+    nonce: &'a str,
     issued_at: i64,
-) -> Value {
-    let delivery = URL_SAFE_NO_PAD.encode(delivery_id);
+}
+
+fn proof(key: &SigningKey, input: ProofInput<'_>) -> Value {
+    let delivery = URL_SAFE_NO_PAD.encode(input.delivery_id);
     let signed = json!({
         "domain":"marketplace/grant-result-pop/v1",
-        "flow_id":flow_id.to_string(),
-        "issued_at":issued_at,
+        "flow_id":input.flow_id.to_string(),
+        "issued_at":input.issued_at,
         "method":"POST",
-        "nonce":nonce,
-        "nonce_id":nonce_id,
-        "path":path,
-        "purpose":purpose,
+        "nonce":input.nonce,
+        "nonce_id":input.nonce_id,
+        "path":input.path,
+        "purpose":input.purpose,
         "result_delivery_id":delivery,
     });
     let bytes = serde_json_canonicalizer::to_string(&signed).unwrap();
     json!({
-        "issued_at":issued_at,
-        "nonce":nonce,
-        "nonce_id":nonce_id,
+        "issued_at":input.issued_at,
+        "nonce":input.nonce,
+        "nonce_id":input.nonce_id,
         "signature":URL_SAFE_NO_PAD.encode(key.sign(bytes.as_bytes()).to_bytes()),
     })
 }
@@ -301,12 +305,14 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
     let flow_id = authority
         .seed_completed_flow(
             &pool,
-            &pubky,
-            &encode_pubky(&result_key.verifying_key().to_bytes()),
-            delivery_id,
-            bearer,
-            result_token,
-            app.clock.now(),
+            SeedCompletedFlow {
+                expected_pubky: &pubky,
+                result_cpk: &encode_pubky(&result_key.verifying_key().to_bytes()),
+                delivery_id,
+                bearer,
+                result_token,
+                now: app.clock.now(),
+            },
         )
         .await;
 
@@ -315,12 +321,15 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
     let ticket = json!({
         "method":"POST",
         "path":ticket_path,
-        "proof":proof(
-            &result_key, flow_id, &ticket_path, "ticket", &delivery_id,
-            ticket_nonce["nonce_id"].as_str().unwrap(),
-            ticket_nonce["nonce"].as_str().unwrap(),
-            app.clock.now().timestamp(),
-        ),
+        "proof":proof(&result_key, ProofInput {
+            flow_id,
+            path:&ticket_path,
+            purpose:"ticket",
+            delivery_id:&delivery_id,
+            nonce_id:ticket_nonce["nonce_id"].as_str().unwrap(),
+            nonce:ticket_nonce["nonce"].as_str().unwrap(),
+            issued_at:app.clock.now().timestamp(),
+        }),
         "request_id":Uuid::new_v4().to_string(),
         "result_delivery_id":URL_SAFE_NO_PAD.encode(delivery_id),
     });
@@ -351,12 +360,15 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
     let claim = json!({
         "method":"POST",
         "path":claim_path,
-        "proof":proof(
-            &result_key, flow_id, &claim_path, "claim", &delivery_id,
-            claim_nonce["nonce_id"].as_str().unwrap(),
-            claim_nonce["nonce"].as_str().unwrap(),
-            app.clock.now().timestamp(),
-        ),
+        "proof":proof(&result_key, ProofInput {
+            flow_id,
+            path:&claim_path,
+            purpose:"claim",
+            delivery_id:&delivery_id,
+            nonce_id:claim_nonce["nonce_id"].as_str().unwrap(),
+            nonce:claim_nonce["nonce"].as_str().unwrap(),
+            issued_at:app.clock.now().timestamp(),
+        }),
         "request_id":Uuid::new_v4().to_string(),
         "result_delivery_id":URL_SAFE_NO_PAD.encode(delivery_id),
         "result_token":URL_SAFE_NO_PAD.encode(result_token),
@@ -445,23 +457,27 @@ async fn result_expiry_revokes_both_undelivered_and_delivered_sessions(pool: sql
     let undelivered = authority
         .seed_completed_flow(
             &pool,
-            &"y".repeat(52),
-            &result_cpk,
-            [52u8; 32],
-            [53u8; 32],
-            [54u8; 32],
-            app.clock.now(),
+            SeedCompletedFlow {
+                expected_pubky: &"y".repeat(52),
+                result_cpk: &result_cpk,
+                delivery_id: [52u8; 32],
+                bearer: [53u8; 32],
+                result_token: [54u8; 32],
+                now: app.clock.now(),
+            },
         )
         .await;
     let delivered = authority
         .seed_completed_flow(
             &pool,
-            &"o".repeat(52),
-            &result_cpk,
-            [55u8; 32],
-            [56u8; 32],
-            [57u8; 32],
-            app.clock.now(),
+            SeedCompletedFlow {
+                expected_pubky: &"o".repeat(52),
+                result_cpk: &result_cpk,
+                delivery_id: [55u8; 32],
+                bearer: [56u8; 32],
+                result_token: [57u8; 32],
+                now: app.clock.now(),
+            },
         )
         .await;
     sqlx::query("UPDATE grant_flows SET result_token_delivered_at = $2 WHERE flow_id = $1")

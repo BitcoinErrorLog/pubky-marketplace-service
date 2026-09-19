@@ -463,6 +463,15 @@ pub mod test_support {
         request_key: SigningKey,
     }
 
+    pub struct SeedCompletedFlow<'a> {
+        pub expected_pubky: &'a str,
+        pub result_cpk: &'a str,
+        pub delivery_id: [u8; 32],
+        pub bearer: [u8; 32],
+        pub result_token: [u8; 32],
+        pub now: DateTime<Utc>,
+    }
+
     impl GrantTestAuthority {
         pub fn generate(session_ttl_seconds: i64) -> Self {
             let mut assertion_seed = [0u8; 32];
@@ -577,13 +586,16 @@ pub mod test_support {
         pub async fn seed_completed_flow(
             &self,
             pool: &sqlx::PgPool,
-            expected_pubky: &str,
-            result_cpk: &str,
-            delivery_id: [u8; 32],
-            bearer: [u8; 32],
-            result_token: [u8; 32],
-            now: DateTime<Utc>,
+            input: SeedCompletedFlow<'_>,
         ) -> Uuid {
+            let SeedCompletedFlow {
+                expected_pubky,
+                result_cpk,
+                delivery_id,
+                bearer,
+                result_token,
+                now,
+            } = input;
             let flow_id = Uuid::new_v4();
             let key_epoch = self.runtime.active_key_epoch();
             let hash_epoch = self.runtime.active_hash_epoch();
@@ -941,11 +953,8 @@ struct SealedResult {
     session_expires_at: DateTime<Utc>,
 }
 
-fn grant_runtime(state: &AppState) -> Result<&Arc<GrantRuntime>, Response> {
-    state
-        .grant
-        .as_ref()
-        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"))
+fn grant_runtime(state: &AppState) -> Option<&Arc<GrantRuntime>> {
+    state.grant.as_ref()
 }
 
 fn authorization_cpk(url: &Url) -> anyhow::Result<String> {
@@ -966,8 +975,10 @@ pub async fn create_flow(
     body: Bytes,
 ) -> Response {
     let runtime = match grant_runtime(&state) {
-        Ok(runtime) => runtime,
-        Err(response) => return response,
+        Some(runtime) => runtime,
+        None => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
+        }
     };
     let request: CreateGrantFlowRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
@@ -1126,7 +1137,7 @@ struct StatusRow {
 }
 
 pub async fn get_status(State(state): State<AppState>, Path(flow_id): Path<Uuid>) -> Response {
-    if grant_runtime(&state).is_err() {
+    if grant_runtime(&state).is_none() {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
     }
     let row: Option<StatusRow> = match sqlx::query_as(
@@ -1213,8 +1224,10 @@ pub async fn issue_result_nonce(
     body: Bytes,
 ) -> Response {
     let runtime = match grant_runtime(&state) {
-        Ok(runtime) => runtime,
-        Err(response) => return response,
+        Some(runtime) => runtime,
+        None => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
+        }
     };
     let path = format!("/v1/auth/grant-flows/{flow_id}/result-nonces");
     let (principal, value) = match verify_service_request(runtime, &headers, &body, &path) {
@@ -1373,17 +1386,38 @@ fn fixed_digest_matches(stored: &[u8], expected: &[u8; 32]) -> bool {
     stored.len() == 32 && stored.ct_eq(expected).into()
 }
 
+struct PopVerification<'a> {
+    flow_id: Uuid,
+    principal: &'a str,
+    purpose: &'a str,
+    path: &'a str,
+    delivery_id_text: &'a str,
+    result_cpk: &'a str,
+    proof: &'a ResultProof,
+    now: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct NonceRow {
+    nonce_hash: Vec<u8>,
+    expires_at: DateTime<Utc>,
+    used_at: Option<DateTime<Utc>>,
+}
+
 async fn verify_pop_and_consume(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    flow_id: Uuid,
-    principal: &str,
-    purpose: &str,
-    path: &str,
-    delivery_id_text: &str,
-    result_cpk: &str,
-    proof: &ResultProof,
-    now: DateTime<Utc>,
+    input: PopVerification<'_>,
 ) -> anyhow::Result<()> {
+    let PopVerification {
+        flow_id,
+        principal,
+        purpose,
+        path,
+        delivery_id_text,
+        result_cpk,
+        proof,
+        now,
+    } = input;
     if (now.timestamp() - proof.issued_at).abs() > 30 {
         anyhow::bail!("result proof is outside its age window");
     }
@@ -1409,7 +1443,7 @@ async fn verify_pop_and_consume(
     };
     verifying_key.verify(&canonical_json(&message)?, &signature)?;
 
-    let nonce_row: Option<(Vec<u8>, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
+    let nonce_row: Option<NonceRow> = sqlx::query_as(
         "SELECT nonce_hash, expires_at, used_at FROM grant_result_nonces \
          WHERE nonce_id = $1 AND flow_id = $2 AND purpose = $3 AND bff_principal = $4 \
          FOR UPDATE",
@@ -1420,11 +1454,14 @@ async fn verify_pop_and_consume(
     .bind(principal)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((stored_hash, expires_at, used_at)) = nonce_row else {
+    let Some(nonce_row) = nonce_row else {
         anyhow::bail!("result nonce was not found");
     };
     let nonce_hash: [u8; 32] = Sha256::digest(nonce).into();
-    if expires_at <= now || used_at.is_some() || !fixed_digest_matches(&stored_hash, &nonce_hash) {
+    if nonce_row.expires_at <= now
+        || nonce_row.used_at.is_some()
+        || !fixed_digest_matches(&nonce_row.nonce_hash, &nonce_hash)
+    {
         anyhow::bail!("result nonce is unavailable");
     }
     let consumed = sqlx::query(
@@ -1464,8 +1501,10 @@ pub async fn result_ticket(
     body: Bytes,
 ) -> Response {
     let runtime = match grant_runtime(&state) {
-        Ok(runtime) => runtime,
-        Err(response) => return response,
+        Some(runtime) => runtime,
+        None => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
+        }
     };
     let path = format!("/v1/auth/grant-flows/{flow_id}/result-ticket");
     let (principal, value) = match verify_service_request(runtime, &headers, &body, &path) {
@@ -1526,14 +1565,16 @@ pub async fn result_ticket(
     }
     if verify_pop_and_consume(
         &mut tx,
-        flow_id,
-        principal,
-        "ticket",
-        &path,
-        &request.result_delivery_id,
-        &row.result_cpk,
-        &request.proof,
-        now,
+        PopVerification {
+            flow_id,
+            principal,
+            purpose: "ticket",
+            path: &path,
+            delivery_id_text: &request.result_delivery_id,
+            result_cpk: &row.result_cpk,
+            proof: &request.proof,
+            now,
+        },
     )
     .await
     .is_err()
@@ -1583,8 +1624,10 @@ pub async fn claim_result(
     body: Bytes,
 ) -> Response {
     let runtime = match grant_runtime(&state) {
-        Ok(runtime) => runtime,
-        Err(response) => return response,
+        Some(runtime) => runtime,
+        None => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
+        }
     };
     let path = format!("/v1/auth/grant-flows/{flow_id}/claim");
     let (principal, value) = match verify_service_request(runtime, &headers, &body, &path) {
@@ -1658,14 +1701,16 @@ pub async fn claim_result(
     }
     if verify_pop_and_consume(
         &mut tx,
-        flow_id,
-        principal,
-        "claim",
-        &path,
-        &request.result_delivery_id,
-        &row.result_cpk,
-        &request.proof,
-        now,
+        PopVerification {
+            flow_id,
+            principal,
+            purpose: "claim",
+            path: &path,
+            delivery_id_text: &request.result_delivery_id,
+            result_cpk: &row.result_cpk,
+            proof: &request.proof,
+            now,
+        },
     )
     .await
     .is_err()
@@ -1717,8 +1762,10 @@ pub async fn cancel_flow(
     body: Bytes,
 ) -> Response {
     let runtime = match grant_runtime(&state) {
-        Ok(runtime) => runtime,
-        Err(response) => return response,
+        Some(runtime) => runtime,
+        None => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
+        }
     };
     let path = format!("/v1/auth/grant-flows/{flow_id}/cancel");
     let (principal, value) = match verify_service_request(runtime, &headers, &body, &path) {
