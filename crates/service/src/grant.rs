@@ -33,7 +33,7 @@ use tokio::sync::Notify;
 use url::Url;
 use uuid::Uuid;
 
-use crate::auth::{self, Actor};
+use crate::auth;
 use crate::clock::format_timestamp;
 use crate::seal;
 use crate::AppState;
@@ -1730,7 +1730,8 @@ async fn process_lease(
             return Ok(());
         }
     };
-    let stored: StoredGrantState = match serde_json::from_slice(&plaintext) {
+    let stored: StoredGrantState =
+        match serde_json::from_slice::<StoredGrantState>(&plaintext) {
         Ok(stored)
             if stored.version == GRANT_STATE_VERSION
                 && canonical_json(&stored).is_ok_and(|canonical| canonical == plaintext) =>
@@ -1741,7 +1742,7 @@ async fn process_lease(
             terminalize_owned(state, &lease, "failed", "storage_failure", None, now).await?;
             return Ok(());
         }
-    };
+        };
     let flow = match PubkyGrantAuthFlow::restore(stored.state, runtime.client.clone()) {
         Ok(flow) => flow,
         Err(_) => {
