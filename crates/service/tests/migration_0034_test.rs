@@ -243,7 +243,7 @@ async fn migration_0034_caps_conflicts_and_indexes_the_count_prefix(pool: PgPool
 }
 
 #[test]
-fn migration_catalog_reserves_0032_0033_and_adds_only_0034() {
+fn migration_catalog_reserves_0032_and_adds_0033_and_0034() {
     let mut numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -254,9 +254,9 @@ fn migration_catalog_reserves_0032_0033_and_adds_only_0034() {
         })
         .collect();
     numbers.sort_unstable();
-    assert_eq!(numbers, (1..=31).chain([34]).collect::<Vec<_>>());
+    assert_eq!(numbers, (1..=31).chain([33, 34]).collect::<Vec<_>>());
     assert!(
-        !numbers.contains(&32) && !numbers.contains(&33),
-        "0032/0033 belong to adjacent unmerged streams"
+        !numbers.contains(&32),
+        "0032 belongs to its adjacent unmerged stream"
     );
 }
