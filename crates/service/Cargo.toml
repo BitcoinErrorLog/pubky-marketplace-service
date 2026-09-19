@@ -26,6 +26,7 @@ schemars.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
@@ -33,6 +34,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
+hkdf = "0.12"
 
 [features]
 # Test-only fault hooks (e.g. the ambiguous bind-COMMIT injection in

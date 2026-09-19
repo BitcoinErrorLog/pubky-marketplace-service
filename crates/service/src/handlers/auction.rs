@@ -58,13 +58,15 @@ pub async fn place_bid(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(listing) = fetch_listing_for_update(tx, &command.aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::BidListingNotFound,
             ErrorCode::NotFound,
             "The auction listing is not registered.",
         )));
     };
     if listing.seller_pubky == actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::BidSellerForbidden,
             ErrorCode::Unauthorized,
             "A seller cannot bid on their own auction.",
         )));
@@ -72,33 +74,38 @@ pub async fn place_bid(
     let auction = match parse_auction(&listing) {
         Some(auction) => auction,
         None => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::BidNotAuction,
                 ErrorCode::InvalidState,
                 "This listing is not an auction.",
             )));
         }
     };
     let Some(reserve) = fetch_auction_reserve_for_update(tx, &command.aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "The auction reserve authority is missing.",
         )));
     };
     if auction.status != "active" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AuctionClosed,
             ErrorCode::AuctionClosed,
             "The auction is not open for bidding.",
         )));
     }
     if command.expected_revision != listing.server_revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The auction revision is stale.",
             listing.server_revision,
         )));
     }
     if now < auction.starts_at || now >= auction.ends_at {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AuctionClosed,
             ErrorCode::AuctionClosed,
             "The auction is not open for bidding.",
         )));
@@ -106,7 +113,8 @@ pub async fn place_bid(
     if payload.maximum_amount.currency != listing.unit_price_currency
         || payload.maximum_amount.exponent != listing.unit_price_exponent
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::BidWrongAsset,
             ErrorCode::InvalidCommand,
             "Bid maximum must use the auction asset and exponent.",
         )));
@@ -124,7 +132,8 @@ pub async fn place_bid(
         bidder_previous_maximum,
     );
     if payload.maximum_amount.amount_minor < minimum_next_bid {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::BidTooLow,
             ErrorCode::BidTooLow,
             "Bid maximum must meet the current visible price increment and exceed the prior maximum.",
             listing.server_revision,
@@ -259,33 +268,38 @@ pub async fn close(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(listing) = fetch_listing_for_update(tx, &command.aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The auction listing is not registered.",
         )));
     };
     if listing.seller_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the seller may close this sandbox auction.",
         )));
     }
     let auction = parse_auction(&listing);
     let Some(auction) = auction.filter(|auction| auction.status == "active") else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The auction is not active.",
         )));
     };
     if command.expected_revision != listing.server_revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The auction revision is stale.",
             listing.server_revision,
         )));
     }
     if now < auction.ends_at {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AuctionClosed,
             ErrorCode::AuctionClosed,
             "The auction has not ended yet.",
         )));

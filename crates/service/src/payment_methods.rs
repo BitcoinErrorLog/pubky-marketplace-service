@@ -671,12 +671,12 @@ pub async fn bind_payment_method(
     {
         Ok(Ok(order)) => order,
         Ok(Err(failure)) => {
-            let reason = if failure.code == ErrorCode::InsufficientInventory {
+            let reason = if failure.code() == ErrorCode::InsufficientInventory {
                 "sold_out"
             } else {
                 "hold_unavailable"
             };
-            return method_error(failure.code, reason, &failure.message);
+            return method_error(failure.code(), reason, failure.message());
         }
         Err(error) => return internal("payment hold", &error),
     };
@@ -1382,7 +1382,7 @@ async fn apply_fiat_paid(
                 .map_err(|error| internal("fiat confirmation rollback", &error))?;
             tracing::warn!(
                 order_id = %order_id,
-                code = ?failure.code,
+                code = ?failure.code(),
                 "verified fiat payment could not confirm the order; routing to manual review"
             );
             let mut tx = state

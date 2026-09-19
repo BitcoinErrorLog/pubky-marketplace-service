@@ -42,7 +42,8 @@ pub async fn request(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -51,7 +52,8 @@ pub async fn request(
         return Ok(Err(failure));
     }
     if order.buyer_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the buyer may request cancellation.",
         )));
@@ -60,7 +62,8 @@ pub async fn request(
         order.state.as_str(),
         "pending_payment" | "paid" | "processing" | "ready_for_pickup"
     ) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "This order can no longer be cancelled.",
         )));
@@ -173,7 +176,8 @@ pub async fn approve(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -182,13 +186,15 @@ pub async fn approve(
         return Ok(Err(failure));
     }
     if order.seller_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the seller may approve cancellation.",
         )));
     }
     if order.state != "cancel_requested" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "No cancellation is pending.",
         )));
@@ -264,7 +270,8 @@ pub(crate) async fn credit_order_drop(
     {
         Ok(Ok(()))
     } else {
-        Ok(Err(CommandFailure::new(
+        Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "The drop units held by this order are no longer accounted to its drop.",
         )))

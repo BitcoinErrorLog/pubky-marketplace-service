@@ -77,6 +77,7 @@ pub const TASK_SELLER_CONFIRMATION_WINDOW: &str = "seller_confirmation_window";
 pub const TASK_MANUAL_REVIEW_WATCH: &str = "manual_review_watch";
 pub const TASK_PAYKIT_RESOLVE_DELIVERY: &str = "paykit_resolve_delivery";
 pub const TASK_FX_SAMPLER: &str = "fx_sampler";
+pub const TASK_REFUSAL_AUDIT_RETENTION: &str = "refusal_audit_retention";
 
 static AWARD_EXPIRY_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -1273,7 +1274,7 @@ async fn apply_completed_lifecycle(
                     tracing::warn!(
                         payment_id = %payment.id,
                         correlation_id = %row.id,
-                        code = ?failure.code,
+                        code = ?failure.code(),
                         "verified locks completion could not confirm the order; routing to manual review"
                     );
                     apply_manual_review(pool, row, "awaiting_entitlement", now).await
@@ -1716,7 +1717,7 @@ async fn apply_confirmed_paykit_payment(
             tx.rollback().await?;
             tracing::warn!(
                 order_id = %row.id,
-                code = ?failure.code,
+                code = ?failure.code(),
                 "confirmed paykit payment could not confirm the order; routing to manual review"
             );
             let mut tx = pool.begin().await?;
@@ -2929,6 +2930,7 @@ pub struct WorkerSummary {
     pub manual_reviews_abandoned: u64,
     pub resolve_rows_delivered: u64,
     pub fx_samples_accepted: u64,
+    pub refusal_audit_rows_purged: u64,
 }
 
 /// Samples the bounded sole source once per server-time bucket. The unique
@@ -3137,6 +3139,34 @@ pub async fn run_once(
         let result = sample_fx_rate(&state.pool, &state.config.fx_feed_url, now).await;
         release_lease(&state.pool, TASK_FX_SAMPLER, holder, now).await?;
         summary.fx_samples_accepted = result?;
+    }
+    if let Some(retention_pool) = &state.refusal_audit_retention_pool {
+        if try_acquire_lease(
+            &state.pool,
+            TASK_REFUSAL_AUDIT_RETENTION,
+            holder,
+            now,
+            lease_seconds,
+        )
+        .await?
+        {
+            let result = crate::refusal_audit::purge_once(retention_pool, now).await;
+            release_lease(&state.pool, TASK_REFUSAL_AUDIT_RETENTION, holder, now).await?;
+            match result {
+                Ok(purged) => {
+                    summary.refusal_audit_rows_purged = purged as u64;
+                    if let Some(audit) = &state.refusal_audit {
+                        audit.record_purge_success(purged as u64);
+                    }
+                }
+                Err(_) => {
+                    if let Some(audit) = &state.refusal_audit {
+                        audit.record_purge_failure();
+                    }
+                    tracing::warn!("refusal audit retention pass failed; domain work continues");
+                }
+            }
+        }
     }
     // The shared_manual seller-confirmation window (§B.8.8): elapsed
     // windows route to manual_review with the hold preserved.
@@ -3523,6 +3553,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             manual_reviews_abandoned = summary.manual_reviews_abandoned,
                             resolve_rows_delivered = summary.resolve_rows_delivered,
                             fx_samples_accepted = summary.fx_samples_accepted,
+                            refusal_audit_rows_purged = summary.refusal_audit_rows_purged,
                             "worker pass completed"
                         );
                     }

@@ -25,7 +25,8 @@ pub async fn ship(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -34,7 +35,8 @@ pub async fn ship(
         return Ok(Err(failure));
     }
     if order.seller_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the seller may ship this order.",
         )));
@@ -42,13 +44,15 @@ pub async fn ship(
     // A pickup order has no shipment (§A6): the handover commands are its
     // fulfillment path.
     if order.fulfillment == "pickup" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "A pickup order cannot be shipped; use the pickup handover commands.",
         )));
     }
     if !matches!(order.state.as_str(), "paid" | "processing") {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order is not ready to ship.",
         )));
@@ -94,7 +98,8 @@ pub async fn confirm_delivery(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -103,19 +108,22 @@ pub async fn confirm_delivery(
         return Ok(Err(failure));
     }
     if order.buyer_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the buyer may confirm delivery.",
         )));
     }
     if order.fulfillment == "pickup" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "A pickup order has no shipment to confirm; use fulfillment.confirm_pickup.",
         )));
     }
     let Some(shipment) = order.shipment.clone().filter(|_| order.state == "shipped") else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order is not awaiting delivery confirmation.",
         )));
@@ -154,7 +162,8 @@ pub async fn confirm_delivery(
 /// shipped-order commands are refused for it, and vice versa — §A6).
 fn guard_pickup_order(order: &OrderRow) -> Option<CommandFailure> {
     if order.fulfillment != "pickup" {
-        return Some(CommandFailure::new(
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "This command applies only to pickup orders.",
         ));
@@ -175,7 +184,8 @@ pub async fn mark_ready(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -184,7 +194,8 @@ pub async fn mark_ready(
         return Ok(Err(failure));
     }
     if order.seller_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the seller may mark the order ready for pickup.",
         )));
@@ -193,7 +204,8 @@ pub async fn mark_ready(
         return Ok(Err(failure));
     }
     if order.state != "paid" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order is not awaiting pickup readiness.",
         )));
@@ -251,7 +263,8 @@ pub async fn confirm_pickup(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -263,7 +276,8 @@ pub async fn confirm_pickup(
         return Ok(Err(failure));
     }
     if !matches!(order.state.as_str(), "paid" | "ready_for_pickup") {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order is not awaiting a pickup handover.",
         )));
@@ -276,7 +290,8 @@ pub async fn confirm_pickup(
     if confirming_role == "seller"
         && crate::handlers::pickup::order_has_unresolved_terms_change(tx, &order).await?
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The pickup terms changed after payment; the seller cannot confirm the handover \
              until the buyer has seen the change.",

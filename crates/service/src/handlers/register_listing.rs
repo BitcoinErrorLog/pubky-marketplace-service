@@ -28,7 +28,8 @@ pub async fn handle(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     if actor != payload.seller_pubky {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the listing seller may register inventory.",
         )));
@@ -36,7 +37,8 @@ pub async fn handle(
     let expected_aggregate_id =
         ids::listing_aggregate_id(&payload.seller_pubky, &payload.listing_id);
     if command.aggregate_id != expected_aggregate_id {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The listing aggregate id does not match its seller and listing.",
         )));
@@ -47,7 +49,8 @@ pub async fn handle(
     // while the seller registration command is waiting on the network.
     if payload.sale_format == SaleFormat::Auction {
         let Some(homeserver) = homeserver else {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
                 "Listing registration is not enabled on this deployment.",
             )));
@@ -58,45 +61,49 @@ pub async fn handle(
         {
             HomeserverFetchOutcome::Found(record) => record,
             HomeserverFetchOutcome::NotFound => {
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::NotFound,
                     ErrorCode::NotFound,
                     "The seller's homeserver has no such listing record.",
                 )))
             }
             HomeserverFetchOutcome::Unavailable => {
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::UpstreamUnavailable,
                     ErrorCode::UpstreamUnavailable,
                     "The seller's homeserver could not be reached. Try again shortly.",
                 )))
             }
         };
-        let public_candidate =
-            match registration_payload_from_record(
-                &payload.seller_pubky,
-                &payload.listing_id,
-                &public_record,
-            ) {
-                Ok(Some(candidate)) => match validate_public_listing_payload(candidate) {
-                    Ok(candidate) => candidate,
-                    Err(issues) => return Ok(Err(CommandFailure {
-                        issues: Some(issues),
-                        ..CommandFailure::new(
-                            ErrorCode::InvalidState,
-                            "The seller's listing record does not satisfy registration invariants.",
-                        )
-                    })),
-                },
-                _ => {
-                    return Ok(Err(CommandFailure::new(
+        let public_candidate = match registration_payload_from_record(
+            &payload.seller_pubky,
+            &payload.listing_id,
+            &public_record,
+        ) {
+            Ok(Some(candidate)) => match validate_public_listing_payload(candidate) {
+                Ok(candidate) => candidate,
+                Err(issues) => {
+                    return Ok(Err(CommandFailure::refused_with_issues(
+                        crate::refusal_audit::RefusalKind::InvalidState,
                         ErrorCode::InvalidState,
-                        "The seller's listing record could not be interpreted for registration.",
+                        "The seller's listing record does not satisfy registration invariants.",
+                        issues,
                     )))
                 }
-            };
+            },
+            _ => {
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvalidState,
+                    ErrorCode::InvalidState,
+                    "The seller's listing record could not be interpreted for registration.",
+                )))
+            }
+        };
         let mut public_command = payload.clone();
         public_command.auction_reserve = None;
         if public_candidate != public_command {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::RevisionConflict,
                 ErrorCode::RevisionConflict,
                 "The public listing candidate does not match the registration command.",
             )));
@@ -106,7 +113,8 @@ pub async fn handle(
     let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
     let current_revision = current.as_ref().map(|c| c.server_revision).unwrap_or(0);
     if command.expected_revision != current_revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The listing revision is stale.",
             current_revision,
@@ -114,7 +122,8 @@ pub async fn handle(
     }
     if let Some(current) = &current {
         if payload.listing_revision <= current.listing_revision {
-            return Ok(Err(CommandFailure::with_revision(
+            return Ok(Err(CommandFailure::refused_with_revision(
+                crate::refusal_audit::RefusalKind::RevisionConflict,
                 ErrorCode::RevisionConflict,
                 "The public listing revision must advance.",
                 current_revision,
@@ -125,7 +134,8 @@ pub async fn handle(
             SaleFormat::Auction => "auction",
         };
         if current.sale_format != requested_sale_format {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "The listing sale format cannot change after registration.",
             )));
@@ -142,7 +152,8 @@ pub async fn handle(
                 || reserve.expected_record_revision != 0
                 || reserve.record_revision != 1
             {
-                return Ok(Err(CommandFailure::with_revision(
+                return Ok(Err(CommandFailure::refused_with_revision(
+                    crate::refusal_audit::RefusalKind::RevisionConflict,
                     ErrorCode::RevisionConflict,
                     "The reserve record revision is stale.",
                     0,
@@ -154,7 +165,8 @@ pub async fn handle(
             if reserve.expected_record_revision != stored.record_revision
                 || reserve.record_revision != stored.record_revision + 1
             {
-                return Ok(Err(CommandFailure::with_revision(
+                return Ok(Err(CommandFailure::refused_with_revision(
+                    crate::refusal_audit::RefusalKind::RevisionConflict,
                     ErrorCode::RevisionConflict,
                     "The reserve record revision is stale.",
                     listing.server_revision,
@@ -163,7 +175,8 @@ pub async fn handle(
         }
         (Some(listing), None, None) if listing.sale_format == "fixed_price" => {}
         _ => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvariantViolation,
                 ErrorCode::InvariantViolation,
                 "The listing reserve authority is inconsistent.",
             )))
@@ -214,7 +227,8 @@ pub(crate) async fn apply_registration(
     let sold = current.as_ref().map(|c| c.sold_quantity).unwrap_or(0);
     let committed = reserved + sold;
     if payload.quantity < committed {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "Listing quantity cannot fall below committed inventory.",
             current_revision,
@@ -318,7 +332,8 @@ pub(crate) async fn apply_registration(
     };
     if !written {
         let latest = current_listing_revision(tx, aggregate_id).await?;
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The listing revision is stale.",
             latest,
@@ -429,7 +444,8 @@ fn validate_edit(
             SaleFormat::Auction => "auction",
         }
     {
-        return Ok(Some(CommandFailure::new(
+        return Ok(Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The listing sale format cannot change after registration.",
         )));
@@ -438,13 +454,15 @@ fn validate_edit(
         return Ok(None);
     }
     let Some(stored_reserve) = current_reserve else {
-        return Ok(Some(CommandFailure::new(
+        return Ok(Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "The auction reserve authority is missing.",
         )));
     };
     let Some(candidate_reserve) = payload.auction_reserve.as_ref() else {
-        return Ok(Some(CommandFailure::new(
+        return Ok(Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "The auction reserve authority is missing.",
         )));
@@ -472,7 +490,8 @@ fn validate_edit(
         || stored_auction.anti_sniping_extension_seconds
             != candidate_terms.anti_sniping_extension_seconds;
     if terms_changed {
-        return Ok(Some(CommandFailure::new(
+        return Ok(Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "Auction terms cannot change after registration.",
         )));
@@ -493,7 +512,8 @@ fn validate_edit(
         _ => false,
     };
     if !allowed_decrease {
-        return Ok(Some(CommandFailure::new(
+        return Ok(Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The auction reserve change is not permitted.",
         )));

@@ -49,6 +49,44 @@ async fn apply_0033(pool: &PgPool) {
         .expect("real 0033 migration applies");
 }
 
+#[sqlx::test(migrations = false)]
+async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
+    let through_0033_without_0032 = Migrator {
+        migrations: Cow::Owned(
+            ALL_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version != 32)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    };
+    through_0033_without_0032
+        .run(&pool)
+        .await
+        .expect("0001..0031 and 0033 migrate without 0032");
+
+    let initially_applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("initial migration versions");
+    let expected_without_0032: Vec<i64> = (1..=31).chain([33]).collect();
+    assert_eq!(initially_applied, expected_without_0032);
+
+    ALL_MIGRATIONS
+        .run(&pool)
+        .await
+        .expect("missing 0032 applies after already-applied 0033");
+
+    let finally_applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("final migration versions");
+    assert_eq!(finally_applied, (1..=33).collect::<Vec<_>>());
+}
+
 fn aggregate_id(seller: &str, listing_id: &str) -> String {
     format!("listing:{seller}_{listing_id}")
 }

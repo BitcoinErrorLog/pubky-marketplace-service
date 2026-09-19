@@ -37,31 +37,36 @@ pub async fn handle(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(offer) = offer else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the accepted offer's buyer may place this order.",
         )));
     };
     if command.aggregate_id != ids::offer_aggregate_id(offer.id) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The offer checkout input is invalid.",
         )));
     }
     if actor != offer.buyer_pubky {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the accepted offer's buyer may place this order.",
         )));
     }
     if offer.state == "converted" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardAlreadyConverted,
             ErrorCode::AwardAlreadyConverted,
             "This accepted offer has already been converted to an order.",
         )));
     }
     if command.expected_revision != offer.revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The offer revision is stale.",
             offer.revision,
@@ -74,19 +79,22 @@ pub async fn handle(
                 .award_expires_at
                 .is_none_or(|deadline| lock_now >= deadline))
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardExpired,
             ErrorCode::AwardExpired,
             "This accepted offer's checkout window has expired. Nothing was ordered.",
         )));
     }
     if offer.state != "accepted" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "Only an accepted offer can enter offer checkout.",
         )));
     }
     if offer.accepted_variant_id.as_deref() != Some(&payload.variant_id) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardVariantMismatch,
             ErrorCode::AwardVariantMismatch,
             "The checkout variant does not match the accepted offer.",
         )));
@@ -96,13 +104,15 @@ pub async fn handle(
         || offer.accepted_listing_revision != Some(payload.listing_revision)
         || offer.accepted_listing_record_sha256.as_deref() != Some(&payload.listing_record_sha256)
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardListingChanged,
             ErrorCode::AwardListingChanged,
             "The listing snapshot does not match the offer terms.",
         )));
     }
     if offer.accepted_quantity != Some(payload.quantity) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardQuantityMismatch,
             ErrorCode::AwardQuantityMismatch,
             "The checkout quantity does not match the accepted offer.",
         )));
@@ -119,20 +129,23 @@ pub async fn handle(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(reservation) = reservation else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardHoldMissing,
             ErrorCode::AwardHoldMissing,
             "The inventory reserved for this accepted offer is no longer held.",
         )));
     };
     if reservation.status != "active" || reservation.expires_at <= lock_now {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardExpired,
             ErrorCode::AwardExpired,
             "This accepted offer's checkout window has expired. Nothing was ordered.",
         )));
     }
     let Some(listing) = fetch_listing_for_update(tx, &reservation.listing_aggregate_id).await?
     else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardHoldMissing,
             ErrorCode::AwardHoldMissing,
             "The inventory reserved for this accepted offer is no longer held.",
         )));
@@ -143,7 +156,8 @@ pub async fn handle(
         || reservation.offer_award_id != Some(payload.award_id)
         || listing.reserved_quantity < reservation.quantity
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardHoldMissing,
             ErrorCode::AwardHoldMissing,
             "The inventory reserved for this accepted offer is no longer held.",
         )));
@@ -187,7 +201,8 @@ pub async fn handle(
     .fetch_optional(&mut **tx)
     .await?;
     if converted_reservation.is_none() {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardHoldMissing,
             ErrorCode::AwardHoldMissing,
             "The inventory reserved for this accepted offer is no longer held.",
         )));

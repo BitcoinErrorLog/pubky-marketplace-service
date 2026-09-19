@@ -62,18 +62,17 @@ use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 /// The designed binding outcomes (migrations 0028/0031 enforce this
 /// vocabulary): only the two success outcomes exist. Each is stamped on
-/// the correlation's `binding_outcome` column and appended to the audit
-/// table in the transaction that performs the state change. Refusals are
-/// NOT recorded: a refusing command rolls back whole, exactly like any
-/// other rejected command (migration 0031 removed the refusal vocabulary,
-/// the `(payment_id, command_id)` key, and the commit-on-refusal audit
-/// path; refusal auditing returns as a designed item in a later wave).
+/// the correlation's `binding_outcome` column and appended to the historical
+/// outcome table in the transaction that performs the state change. Refusals
+/// are never written to that table: a refusing command rolls back whole,
+/// exactly like any other rejected command (migration 0031 removed its
+/// refusal vocabulary and commit-on-refusal path). The separate refusal-audit
+/// buckets record only a bounded, server-derived descriptor after rollback.
 const OUTCOME_PREPARED: &str = "prepared";
 const OUTCOME_REGISTERED: &str = "registered";
 
-/// Appends one ROW outcome audit row inside the command transaction, so it
-/// commits with the state change. Refusals are never written: a refusing
-/// command rolls back whole.
+/// Appends one success outcome row inside the command transaction, so it
+/// commits with the state change. Refusals are never written to this table.
 async fn record_binding_outcome<'e, E>(
     executor: E,
     command_id: Uuid,
@@ -109,7 +108,8 @@ pub async fn register(
     // Fail closed: without configured keys the bundle id cannot be stored
     // encrypted, so the deployment refuses the command outright.
     let Some(locks) = locks else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Locks verification is not enabled on this deployment.",
         )));
@@ -122,32 +122,37 @@ pub async fn register(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(payment) = payment else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The payment was not found.",
         )));
     };
     if payment.buyer_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::LocksIdentityMismatch,
             ErrorCode::Unauthorized,
             "Only the buyer may register the Locks correlation.",
         )));
     }
     if command.aggregate_id != ids::payment_aggregate_id(payment.id) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The payment aggregate id is invalid.",
         )));
     }
     if command.expected_revision != payment.revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The payment revision is stale.",
             payment.revision,
         )));
     }
     if payment.state != "awaiting_entitlement" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "Only a payment awaiting entitlement can register a Locks correlation.",
         )));
@@ -158,13 +163,15 @@ pub async fn register(
             .fetch_optional(&mut **tx)
             .await?;
     let Some((correlation_id, creator, preparation_state, window_expires_at)) = prepared else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "Prepare the seller-authorized Locks payment before registering a bundle.",
         )));
     };
     if preparation_state != "prepared" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The payment already has a registered Locks bundle.",
         )));
@@ -174,7 +181,8 @@ pub async fn register(
     // still holds exactly that window. Without this an elapsed preparation
     // could attach (and later confirm) before the expiry sweep runs.
     let Some(order) = fetch_order_for_update(tx, payment.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "Payment order is missing.",
         )));
@@ -183,13 +191,15 @@ pub async fn register(
         || !order.stock_held
         || order.hold_expires_at != Some(window_expires_at)
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order no longer holds the prepared Locks payment window.",
         )));
     }
     if now >= window_expires_at {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The Locks preparation has expired.",
         )));
@@ -292,7 +302,8 @@ pub async fn prepare(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let (Some(locks), Some(homeserver)) = (locks, homeserver) else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Locks preparation is not enabled on this deployment.",
         )));
@@ -304,19 +315,22 @@ pub async fn prepare(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(payment) = payment else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The payment was not found.",
         )));
     };
     if payment.buyer_pubky != actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::LocksIdentityMismatch,
             ErrorCode::Unauthorized,
             "Only the buyer may prepare the Locks payment.",
         )));
     }
     if command.aggregate_id != ids::payment_aggregate_id(payment.id) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The payment aggregate id is invalid.",
         )));
@@ -336,7 +350,8 @@ pub async fn prepare(
     match existing.as_ref() {
         Some((state, Some(sealed_reference), expires_at)) if state == "prepared" => {
             if now >= *expires_at {
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvalidState,
                     ErrorCode::InvalidState,
                     "The Locks preparation has expired.",
                 )));
@@ -358,7 +373,8 @@ pub async fn prepare(
             // A prepared row whose sealed reference cannot be opened fails
             // closed (tampering or a key rotation) rather than minting a
             // second preparation.
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "The payment already has a Locks preparation.",
             )));
@@ -366,7 +382,8 @@ pub async fn prepare(
         // Any other existing row (notably `registered`) is a stable
         // INVALID_STATE — never a fall-through to a uniqueness conflict.
         Some(_) => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "The payment already has a Locks preparation.",
             )));
@@ -374,26 +391,30 @@ pub async fn prepare(
         None => {}
     }
     if command.expected_revision != payment.revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The payment revision is stale.",
             payment.revision,
         )));
     }
     if payment.state != "awaiting_entitlement" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "Only a payment awaiting entitlement can prepare Locks.",
         )));
     }
     let Some(order) = fetch_order_for_update(tx, payment.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "Payment order is missing.",
         )));
     };
     if order.state != "pending_payment" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "Only a pending order can prepare Locks.",
         )));
@@ -420,7 +441,8 @@ pub async fn prepare(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(snapshot) = snapshot else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order has no seller-authored Locks payment lock snapshot.",
         )));
@@ -430,7 +452,8 @@ pub async fn prepare(
     // settlement rewrites the payment to SAT/0) priced another rail, not
     // the snapshotted merchandise terms.
     if order.payment_method.is_some() {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The payment is already bound to a non-Locks payment rail.",
         )));
@@ -445,7 +468,8 @@ pub async fn prepare(
         || snapshot.asset != payment.currency
         || snapshot.exponent != payment.exponent
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The checkout Locks snapshot does not match the payment.",
         )));
@@ -458,7 +482,8 @@ pub async fn prepare(
         // A snapshot that does not authenticate under the configured key
         // fails closed (tampering or a key rotation) rather than falling
         // back to the mutable listing rows.
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "The checkout Locks snapshot could not be opened.",
         )));
@@ -467,26 +492,30 @@ pub async fn prepare(
     // sealed at checkout.
     let resource_hash = blake3::hash(resource.as_bytes()).to_hex().to_string();
     if resource_hash != snapshot.expected_resource_hash {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The checkout Locks snapshot does not match the payment.",
         )));
     }
     let Some(canonical_resource) = canonical_lock_resource(&resource) else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The seller's Locks resource is invalid.",
         )));
     };
     let Some((creator, content_path)) = canonical_resource.split_once(LOCKS_CONTENT_LOCK_PREFIX)
     else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The seller's Locks resource is invalid.",
         )));
     };
     if creator != payment.seller_pubky {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The seller's Locks resource creator does not match the order.",
         )));
@@ -500,13 +529,15 @@ pub async fn prepare(
     {
         HomeserverFetchOutcome::Found(value) => value,
         HomeserverFetchOutcome::NotFound => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "The seller's Locks document is unavailable.",
             )));
         }
         HomeserverFetchOutcome::Unavailable => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::LocksUpstreamUnavailable,
                 ErrorCode::UpstreamUnavailable,
                 "The seller's Locks document could not be reached.",
             )));
@@ -515,14 +546,16 @@ pub async fn prepare(
     let content_lock = match crate::content_lock::validate_content_lock_value(&content, &resource) {
         Ok(content_lock) => content_lock,
         Err(_) => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "The seller's Locks document does not match the payment.",
             )));
         }
     };
     if content_lock.validate_paykit_payment_v1_policy().is_err() {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The seller's Locks document does not match the payment.",
         )));
@@ -533,7 +566,8 @@ pub async fn prepare(
         snapshot.amount_minor,
         &snapshot.asset,
     ) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The seller's Locks document does not match the payment.",
         )));

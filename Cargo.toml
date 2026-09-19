@@ -45,6 +45,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # the AuthenticatedJson extractor on the other side.
 serde_json_canonicalizer = "0.3"
 sha2 = "0.10"
+subtle = "2.6"
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",

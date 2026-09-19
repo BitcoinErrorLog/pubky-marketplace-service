@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tracing_subscriber::EnvFilter;
 
 use marketplace_service::clock::SystemClock;
@@ -91,6 +92,27 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("database migrations applied");
+    let audit_writer_options: PgConnectOptions = config.refusal_audit_database_url.parse()?;
+    let audit_writer_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .min_connections(0)
+        .acquire_timeout(Duration::from_millis(100))
+        .idle_timeout(Some(Duration::from_secs(60)))
+        .connect_lazy_with(audit_writer_options);
+    let audit_retention_options: PgConnectOptions =
+        config.refusal_audit_retention_database_url.parse()?;
+    let audit_retention_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .acquire_timeout(Duration::from_millis(100))
+        .idle_timeout(Some(Duration::from_secs(60)))
+        .connect_lazy_with(audit_retention_options);
+    let refusal_audit = Arc::new(
+        marketplace_service::refusal_audit::RefusalAuditRuntime::spawn(
+            audit_writer_pool,
+            config.refusal_audit_keys.clone(),
+        ),
+    );
 
     // The pickup sealing boot probe runs AFTER migrations (the schema must
     // exist first) and attempts one real open — current key, then previous —
@@ -105,7 +127,9 @@ async fn main() -> anyhow::Result<()> {
         .with_attestor(attestor)
         .with_homeserver(Some(homeserver))
         .with_payments(payments)
-        .with_pickup(pickup);
+        .with_pickup(pickup)
+        .with_refusal_audit(refusal_audit)
+        .with_refusal_audit_retention_pool(audit_retention_pool);
     workers::spawn(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

@@ -2,41 +2,79 @@ use marketplace_domain::{Command, ErrorCode, ValidationIssue};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::refusal_audit::RefusalKind;
+
 /// A rejected command. Field names and messages match the TypeScript
 /// prototype engine; wire casing is snake_case per ADR-0019 §3.
 #[derive(Debug, Clone)]
 pub struct CommandFailure {
-    pub code: ErrorCode,
-    pub message: String,
-    pub current_revision: Option<i64>,
-    pub issues: Option<Vec<ValidationIssue>>,
+    code: ErrorCode,
+    refusal_kind: RefusalKind,
+    message: String,
+    current_revision: Option<i64>,
+    issues: Option<Vec<ValidationIssue>>,
 }
 
 impl CommandFailure {
-    pub fn new(code: ErrorCode, message: &str) -> Self {
+    /// The sole general formation gate. Every caller must select a static,
+    /// site-specific refusal kind; no error-code or message inference exists.
+    pub(crate) fn refused(kind: RefusalKind, code: ErrorCode, message: &str) -> Self {
         Self {
             code,
+            refusal_kind: kind,
             message: message.to_string(),
             current_revision: None,
             issues: None,
         }
     }
 
-    pub fn with_revision(code: ErrorCode, message: &str, current_revision: i64) -> Self {
+    pub(crate) fn refused_with_revision(
+        kind: RefusalKind,
+        code: ErrorCode,
+        message: &str,
+        current_revision: i64,
+    ) -> Self {
         Self {
             current_revision: Some(current_revision),
-            ..Self::new(code, message)
+            ..Self::refused(kind, code, message)
         }
     }
 
-    pub fn invalid_command(issues: Vec<ValidationIssue>) -> Self {
+    pub(crate) fn refused_with_issues(
+        kind: RefusalKind,
+        code: ErrorCode,
+        message: &str,
+        issues: Vec<ValidationIssue>,
+    ) -> Self {
         Self {
             issues: Some(issues),
-            ..Self::new(
-                ErrorCode::InvalidCommand,
-                "The marketplace command is invalid.",
-            )
+            ..Self::refused(kind, code, message)
         }
+    }
+
+    pub(crate) fn invalid_envelope(issues: Vec<ValidationIssue>) -> Self {
+        Self::refused_with_issues(
+            RefusalKind::InvalidEnvelope,
+            ErrorCode::InvalidCommand,
+            "The marketplace command is invalid.",
+            issues,
+        )
+    }
+
+    pub(crate) const fn code(&self) -> ErrorCode {
+        self.code
+    }
+
+    pub(crate) const fn refusal_kind(&self) -> RefusalKind {
+        self.refusal_kind
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) const fn current_revision(&self) -> Option<i64> {
+        self.current_revision
     }
 
     pub fn body(&self) -> Value {

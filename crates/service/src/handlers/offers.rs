@@ -68,33 +68,38 @@ pub async fn create(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(listing) = fetch_listing(tx, &command.aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The listing is not registered.",
         )));
     };
     if listing.seller_pubky == actor {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "A seller cannot make an offer on their own listing.",
         )));
     }
     if command.expected_revision != listing.server_revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The listing revision is stale.",
             listing.server_revision,
         )));
     }
     if listing.available_quantity < payload.quantity {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InsufficientInventory,
             ErrorCode::InsufficientInventory,
             "The requested offer quantity is unavailable.",
             listing.server_revision,
         )));
     }
     if !same_asset(&listing, &payload.amount) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Offer amount must use the listing asset and exponent.",
         )));
@@ -103,7 +108,8 @@ pub async fn create(
     // on a listing that does not publish `shipping` is refused with a typed
     // error, never silently converted to shipping.
     if !listing.fulfillment_methods.iter().any(|m| m == "shipping") {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "Offers are available only on listings that ship.",
         )));
@@ -117,7 +123,8 @@ pub async fn create(
             HomeserverRawFetchOutcome::Found(raw) => match award_terms_from_bytes(&raw) {
                 Ok(snapshot) => Some(snapshot),
                 Err(_) => {
-                    return Ok(Err(CommandFailure::new(
+                    return Ok(Err(CommandFailure::refused(
+                        crate::refusal_audit::RefusalKind::AwardListingChanged,
                         ErrorCode::AwardListingChanged,
                         "The listing snapshot does not match the offer terms.",
                     )));
@@ -126,7 +133,8 @@ pub async fn create(
             HomeserverRawFetchOutcome::TooLarge => {
                 // Design §7 designates an oversized seller record as a
                 // changed canonical body, never malformed command input.
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::AwardListingChanged,
                     ErrorCode::AwardListingChanged,
                     "The listing snapshot does not match the offer terms.",
                 )));
@@ -250,7 +258,8 @@ pub async fn counter(
                 .fetch_optional(&mut **tx)
                 .await?;
         let Some(listing_id) = listing_id else {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::NotFound,
                 ErrorCode::NotFound,
                 "The offer listing is unavailable.",
             )));
@@ -263,7 +272,8 @@ pub async fn counter(
                 match award_terms_from_bytes_for_variant(&raw, locator.variant_id.as_deref()) {
                     Ok(snapshot) => Some(snapshot),
                     Err(_) => {
-                        return Ok(Err(CommandFailure::new(
+                        return Ok(Err(CommandFailure::refused(
+                            crate::refusal_audit::RefusalKind::AwardListingChanged,
                             ErrorCode::AwardListingChanged,
                             "The listing snapshot does not match the offer terms.",
                         )));
@@ -271,13 +281,15 @@ pub async fn counter(
                 }
             }
             HomeserverRawFetchOutcome::TooLarge => {
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::AwardListingChanged,
                     ErrorCode::AwardListingChanged,
                     "The listing snapshot does not match the offer terms.",
                 )));
             }
             HomeserverRawFetchOutcome::NotFound | HomeserverRawFetchOutcome::Unavailable => {
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvalidState,
                     ErrorCode::InvalidState,
                     "The seller listing record is unavailable.",
                 )));
@@ -292,20 +304,23 @@ pub async fn counter(
             Err(failure) => return Ok(Err(failure)),
         };
     if command.expected_revision != offer.revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The offer revision is stale.",
             offer.revision,
         )));
     }
     if actor == offer.offered_by {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "The current offer author cannot counter their own terms.",
         )));
     }
     if offer.currency != payload.amount.currency || offer.exponent != payload.amount.exponent {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Counteroffer amount must use the original asset and exponent.",
         )));
@@ -314,7 +329,8 @@ pub async fn counter(
         if snapshot.currency != payload.amount.currency
             || snapshot.exponent != payload.amount.exponent
         {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::AwardListingChanged,
                 ErrorCode::AwardListingChanged,
                 "The listing snapshot does not match the offer terms.",
             )));
@@ -328,13 +344,15 @@ pub async fn counter(
                     .then(|| &snapshot.variants[0])
             });
         let Some(variant) = variant else {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::AwardVariantMismatch,
                 ErrorCode::AwardVariantMismatch,
                 "The checkout variant does not match the accepted offer.",
             )));
         };
         if variant.quantity < payload.quantity {
-            return Ok(Err(CommandFailure::with_revision(
+            return Ok(Err(CommandFailure::refused_with_revision(
+                crate::refusal_audit::RefusalKind::InsufficientInventory,
                 ErrorCode::InsufficientInventory,
                 "The counteroffer quantity is unavailable.",
                 offer.revision,
@@ -345,13 +363,15 @@ pub async fn counter(
         None
     };
     let Some(listing) = fetch_listing(tx, &offer.listing_aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The offer listing is unavailable.",
         )));
     };
     if listing.available_quantity < payload.quantity {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InsufficientInventory,
             ErrorCode::InsufficientInventory,
             "The counteroffer quantity is unavailable.",
             offer.revision,
@@ -456,7 +476,8 @@ pub async fn accept(
             .fetch_optional(&mut **tx)
             .await?;
     let Some(locator) = locator else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The offer was not found.",
         )));
@@ -468,7 +489,8 @@ pub async fn accept(
                 .fetch_optional(&mut **tx)
                 .await?;
         let Some((listing_id,)) = listing_id else {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::NotFound,
                 ErrorCode::NotFound,
                 "The offer listing is unavailable.",
             )));
@@ -481,13 +503,15 @@ pub async fn accept(
             HomeserverRawFetchOutcome::TooLarge => {
                 // Design §7 designates an oversized seller record as a
                 // changed canonical body, never malformed command input.
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::AwardListingChanged,
                     ErrorCode::AwardListingChanged,
                     "The listing snapshot does not match the offer terms.",
                 )));
             }
             HomeserverRawFetchOutcome::NotFound | HomeserverRawFetchOutcome::Unavailable => {
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvalidState,
                     ErrorCode::InvalidState,
                     "The seller listing record is unavailable.",
                 )));
@@ -497,7 +521,8 @@ pub async fn accept(
         {
             Ok(snapshot) => snapshot,
             Err(_) => {
-                return Ok(Err(CommandFailure::new(
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::AwardListingChanged,
                     ErrorCode::AwardListingChanged,
                     "The listing snapshot does not match the offer terms.",
                 )));
@@ -552,21 +577,24 @@ pub async fn accept(
                     || listing.aggregate_id != fetched_aggregate
             })
         {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::AwardListingChanged,
                 ErrorCode::AwardListingChanged,
                 "The listing snapshot does not match the offer terms.",
             )));
         }
     }
     if command.expected_revision != offer.revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The offer revision is stale.",
             offer.revision,
         )));
     }
     if actor == offer.offered_by {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "The current offer author cannot accept their own terms.",
         )));
@@ -579,7 +607,8 @@ pub async fn accept(
             .terms_listing_revision
             .is_some_and(|revision| revision != snapshot.revision)
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardListingChanged,
             ErrorCode::AwardListingChanged,
             "The listing snapshot does not match the offer terms.",
         )));
@@ -595,7 +624,8 @@ pub async fn accept(
         None
     };
     let Some(variant) = variant else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::AwardVariantMismatch,
             ErrorCode::AwardVariantMismatch,
             "The checkout variant does not match the accepted offer.",
         )));
@@ -604,19 +634,22 @@ pub async fn accept(
         || snapshot.currency != offer.currency
         || snapshot.exponent != offer.exponent
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Offer amount must use the listing asset and exponent.",
         )));
     }
     let Some(listing) = fetch_listing_for_update(tx, &offer.listing_aggregate_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The offer listing is unavailable.",
         )));
     };
     if listing.available_quantity < offer.quantity {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InsufficientInventory,
             ErrorCode::InsufficientInventory,
             "The offered quantity is no longer available.",
             offer.revision,
@@ -629,7 +662,8 @@ pub async fn accept(
         "available"
     };
     if !can_transition(&listing_machine(), &listing.state, new_listing_state) {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
             ErrorCode::InvariantViolation,
             "The listing cannot enter the reserved state.",
             listing.server_revision,
@@ -789,14 +823,16 @@ pub async fn reject(
             Err(failure) => return Ok(Err(failure)),
         };
     if command.expected_revision != offer.revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The offer revision is stale.",
             offer.revision,
         )));
     }
     if actor == offer.offered_by {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "The current offer author cannot reject their own terms.",
         )));
@@ -846,13 +882,15 @@ pub async fn withdraw(
         };
     // The prototype checks authorship before the revision (unlike reject).
     if actor != offer.offered_by {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only the current offer author may withdraw it.",
         )));
     }
     if command.expected_revision != offer.revision {
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The offer revision is stale.",
             offer.revision,
@@ -894,31 +932,36 @@ async fn actionable_offer(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(offer) = offer else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The offer was not found.",
         )));
     };
     if aggregate_id != offer.aggregate_id {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The offer aggregate id is invalid.",
         )));
     }
     if actor != offer.buyer_pubky && actor != offer.seller_pubky {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only offer participants may act on it.",
         )));
     }
     if offer.state != "pending" && offer.state != "countered" {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The offer is no longer actionable.",
         )));
     }
     if offer.expires_at <= now {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::OfferExpired,
             ErrorCode::OfferExpired,
             "The offer has expired.",
         )));

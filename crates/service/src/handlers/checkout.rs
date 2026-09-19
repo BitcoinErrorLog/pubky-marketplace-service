@@ -26,7 +26,8 @@ pub async fn handle(
     if command.aggregate_id != ids::checkout_aggregate_id(command.command_id)
         || command.expected_revision != 0
     {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Checkout aggregate identity or revision is invalid.",
         )));
@@ -35,7 +36,8 @@ pub async fn handle(
     let mut resolved: Vec<(&CheckoutLine, ListingRow)> = Vec::with_capacity(payload.lines.len());
     for line in &payload.lines {
         let Some(listing) = fetch_listing(tx, &line.listing_aggregate_id).await? else {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::NotFound,
                 ErrorCode::NotFound,
                 "A checkout listing is unavailable.",
             )));
@@ -44,13 +46,15 @@ pub async fn handle(
     }
     for (line, listing) in &resolved {
         if listing.seller_pubky == actor {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::Unauthorized,
                 ErrorCode::Unauthorized,
                 "A buyer cannot purchase their own listing.",
             )));
         }
         if listing.sale_format != "fixed_price" {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "Only fixed-price listings can enter checkout.",
             )));
@@ -59,25 +63,29 @@ pub async fn handle(
         // buyer's in-flight payment and may restock when its window lapses —
         // the buyer deserves that truth, not a generic unavailability.
         if listing.state == "reserved" {
-            return Ok(Err(CommandFailure::new(
-                ErrorCode::InvalidState,
+            return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
                 "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.",
             )));
         }
         if listing.state == "sold" {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "This listing has sold out.",
             )));
         }
         if listing.state != "available" {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "Only available fixed-price listings can enter checkout.",
             )));
         }
         if line.expected_revision != listing.server_revision {
-            return Ok(Err(CommandFailure::with_revision(
+            return Ok(Err(CommandFailure::refused_with_revision(
+                crate::refusal_audit::RefusalKind::RevisionConflict,
                 ErrorCode::RevisionConflict,
                 "A checkout listing revision is stale.",
                 listing.server_revision,
@@ -87,7 +95,8 @@ pub async fn handle(
         // checkout refuses when the stock is not available at this instant
         // but moves nothing — the hold is acquired at a payment lock point.
         if line.quantity > listing.available_quantity {
-            return Ok(Err(CommandFailure::with_revision(
+            return Ok(Err(CommandFailure::refused_with_revision(
+                crate::refusal_audit::RefusalKind::InsufficientInventory,
                 ErrorCode::InsufficientInventory,
                 "Checkout quantity is unavailable.",
                 listing.server_revision,
@@ -100,7 +109,8 @@ pub async fn handle(
             && listing.unit_price_exponent == first.unit_price_exponent
     });
     if !same_asset {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "One checkout may contain only one asset and exponent.",
         )));
@@ -126,7 +136,8 @@ pub async fn handle(
     let mut drop_aggregate_id: Option<String> = None;
     if let Some(drop) = bound_drop {
         if resolved.len() != 1 || resolved[0].0.quantity != 1 {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
                 crate::handlers::drops::DROP_SINGLE_LINE,
             )));
@@ -154,7 +165,8 @@ pub async fn handle(
             .iter()
             .any(|published| published == method.as_str());
         if !published {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "A checkout line's listing does not publish the chosen fulfillment method.",
             )));
@@ -174,13 +186,15 @@ pub async fn handle(
         .any(|(_, method, _)| *method == FulfillmentMethod::Shipping);
     match (&payload.delivery_address, any_shipped) {
         (Some(_), false) => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
                 "A pickup-only checkout must not carry a delivery address.",
             )));
         }
         (None, true) => {
-            return Ok(Err(CommandFailure::new(
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
                 "A delivery address is required when any checkout group ships.",
             )));
@@ -484,7 +498,8 @@ pub async fn handle(
                 "available"
             };
             if !can_transition(&listing_machine(), &listing.state, new_state) {
-                return Ok(Err(CommandFailure::with_revision(
+                return Ok(Err(CommandFailure::refused_with_revision(
+                    crate::refusal_audit::RefusalKind::InvariantViolation,
                     ErrorCode::InvariantViolation,
                     "The listing cannot enter the reserved state.",
                     listing.server_revision,
@@ -505,7 +520,8 @@ pub async fn handle(
             .await?;
             if updated.rows_affected() != 1 {
                 let latest = current_listing_revision(tx, &listing.aggregate_id).await?;
-                return Ok(Err(CommandFailure::with_revision(
+                return Ok(Err(CommandFailure::refused_with_revision(
+                    crate::refusal_audit::RefusalKind::RevisionConflict,
                     ErrorCode::RevisionConflict,
                     "A checkout listing revision is stale.",
                     latest,

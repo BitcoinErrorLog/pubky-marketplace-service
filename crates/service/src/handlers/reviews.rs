@@ -45,7 +45,8 @@ pub async fn create(
     // order's compare-and-swap, so two same-role commands racing past this
     // read are decided by the unique constraint.
     let Some(order) = fetch_order(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -54,7 +55,8 @@ pub async fn create(
         return Ok(Err(failure));
     }
     if !REVIEWABLE_STATES.contains(&order.state.as_str()) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order is not eligible for review.",
         )));
@@ -66,7 +68,8 @@ pub async fn create(
             .fetch_optional(&mut **tx)
             .await?;
     if existing.is_some() {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "This participant already reviewed the order.",
         )));
@@ -134,7 +137,8 @@ pub async fn create(
             .bind(order.id)
             .fetch_one(&mut **tx)
             .await?;
-        return Ok(Err(CommandFailure::with_revision(
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The order revision is stale.",
             current.0,
@@ -291,7 +295,8 @@ pub async fn update(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -308,13 +313,15 @@ pub async fn update(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(review) = review else {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "This participant has not reviewed the order.",
         )));
     };
     if now > review.created_at + chrono::Duration::seconds(REVIEW_EDIT_WINDOW_SECONDS) {
-        return Ok(Err(CommandFailure::new(
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The review edit window has closed.",
         )));

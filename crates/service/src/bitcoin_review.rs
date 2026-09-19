@@ -465,9 +465,9 @@ pub async fn confirm_bitcoin_payment(
             Ok(Err(failure)) => {
                 let _ = tx.rollback().await;
                 return review_error(
-                    failure.code,
+                    failure.code(),
                     review_reason(ReviewReason::ConfirmationEffectsFailed),
-                    &failure.message,
+                    failure.message(),
                 );
             }
             Err(error) => return internal("confirmation effects", &error),
@@ -653,6 +653,33 @@ fn resolve_request_hash(body: &ResolveBitcoinPaymentBody) -> String {
     blake3::hash(canonical.as_bytes()).to_hex().to_string()
 }
 
+fn audited_resolve_refusal(
+    state: &AppState,
+    actor: &str,
+    resolution_id: Option<Uuid>,
+    code: ErrorCode,
+    reason: ReviewReason,
+    message: &'static str,
+) -> Response {
+    let response = review_error(code, review_reason(reason), message);
+    if let (Some(audit), Some(refusal_kind)) = (
+        &state.refusal_audit,
+        crate::refusal_audit::refusal_kind_for_review_reason(reason),
+    ) {
+        if let Ok(envelope) = audit.envelope(
+            state.clock.now(),
+            crate::refusal_audit::SurfaceKind::BitcoinManualResolve,
+            crate::refusal_audit::CommandKind::ManualResolve,
+            refusal_kind,
+            actor,
+            resolution_id,
+        ) {
+            audit.try_send(envelope);
+        }
+    }
+    response
+}
+
 /// The one peer action on a `manual_review` payment. Authorisation is the
 /// session pubky resolved order -> listing -> seller, BEFORE the
 /// idempotency lookup; the body carries no actor, seller, txid, or amount.
@@ -669,16 +696,22 @@ pub async fn resolve_bitcoin_payment(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<Uuid>().ok());
     let Some(resolution_id) = resolution_id else {
-        return review_error(
+        return audited_resolve_refusal(
+            &state,
+            &actor.0,
+            None,
             ErrorCode::InvalidCommand,
-            review_reason(ReviewReason::InvalidIdempotencyKey),
+            ReviewReason::InvalidIdempotencyKey,
             "The Idempotency-Key header must be a UUID.",
         );
     };
     if !RESOLUTION_OUTCOMES.contains(&body.outcome.as_str()) {
-        return review_error(
+        return audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
             ErrorCode::InvalidCommand,
-            review_reason(ReviewReason::InvalidOutcome),
+            ReviewReason::InvalidOutcome,
             "The outcome must be paid, refunded, or abandoned.",
         );
     }
@@ -687,26 +720,35 @@ pub async fn resolve_bitcoin_payment(
         .as_deref()
         .is_some_and(|reason| reason.len() > 500)
     {
-        return review_error(
+        return audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
             ErrorCode::InvalidCommand,
-            review_reason(ReviewReason::InvalidReason),
+            ReviewReason::InvalidReason,
             "The reason must be at most 500 characters.",
         );
     }
     match (body.outcome.as_str(), &body.external_refund_reference) {
         ("refunded", Some(reference)) if valid_refund_reference(reference) => {}
         ("refunded", _) => {
-            return review_error(
+            return audited_resolve_refusal(
+                &state,
+                &actor.0,
+                Some(resolution_id),
                 ErrorCode::InvalidCommand,
-                review_reason(ReviewReason::InvalidRefundReference),
+                ReviewReason::InvalidRefundReference,
                 "A refunded resolution requires a valid external refund reference.",
             );
         }
         (_, None) => {}
         (_, Some(_)) => {
-            return review_error(
+            return audited_resolve_refusal(
+                &state,
+                &actor.0,
+                Some(resolution_id),
                 ErrorCode::InvalidCommand,
-                review_reason(ReviewReason::InvalidRefundReference),
+                ReviewReason::InvalidRefundReference,
                 "Only a refunded resolution carries a refund reference.",
             );
         }
@@ -715,19 +757,38 @@ pub async fn resolve_bitcoin_payment(
     // BEFORE the idempotency lookup.
     let (order, seller) = match listing_seller_for_order(&state.pool, order_id).await {
         Ok(Some(pair)) => pair,
-        Ok(None) => return order_not_found(),
+        Ok(None) => {
+            return audited_resolve_refusal(
+                &state,
+                &actor.0,
+                Some(resolution_id),
+                ErrorCode::NotFound,
+                ReviewReason::OrderNotFound,
+                "The order was not found.",
+            )
+        }
         Err(error) => return internal("order lookup", &error),
     };
     if seller != actor.0 {
         tracing::info!(order_id = %order_id, "rejected a non-seller bitcoin resolve attempt");
-        return not_order_seller();
+        return audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
+            ErrorCode::Unauthorized,
+            ReviewReason::NotOrderSeller,
+            "Only the seller of this order's listing may perform this action.",
+        );
     }
     // Scope (r12): Paykit Bitcoin only, with both pins persisted. Locks,
     // Stripe, PayPal, sandbox, and missing-pin rows are out of scope.
     if order.payment_method.as_deref() != Some("bitcoin") {
-        return review_error(
+        return audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
             ErrorCode::InvalidState,
-            review_reason(ReviewReason::ResolutionNotApplicable),
+            ReviewReason::ResolutionNotApplicable,
             "Bitcoin resolution applies only to bitcoin-bound orders.",
         );
     }
@@ -735,9 +796,12 @@ pub async fn resolve_bitcoin_payment(
         && order.paykit_stack_id.is_some()
         && order.paykit_stack_endpoint.is_some();
     if !pins_present {
-        return review_error(
+        return audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
             ErrorCode::InvalidState,
-            review_reason(ReviewReason::MissingPin),
+            ReviewReason::MissingPin,
             "This order has no pinned paykit stack to resolve against.",
         );
     }
@@ -761,9 +825,12 @@ pub async fn resolve_bitcoin_payment(
         if stored_hash == request_hash {
             return (StatusCode::OK, Json(response)).into_response();
         }
-        return review_error(
+        return audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
             ErrorCode::IdempotencyConflict,
-            review_reason(ReviewReason::Conflict),
+            ReviewReason::Conflict,
             "The Idempotency-Key was already used with a different resolution.",
         );
     }
@@ -778,9 +845,12 @@ pub async fn resolve_bitcoin_payment(
         Err(error) => return internal("resolution lookup", &error),
     };
     if any_resolution {
-        return review_error(
+        return audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
             ErrorCode::InvalidState,
-            review_reason(ReviewReason::AlreadyResolved),
+            ReviewReason::AlreadyResolved,
             "This order's payment was already resolved.",
         );
     }
@@ -800,24 +870,36 @@ pub async fn resolve_bitcoin_payment(
     };
     match apply_manual_review_resolution(&state, order_id, &input, now).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(ResolutionFailure::AlreadyResolved) => review_error(
+        Err(ResolutionFailure::AlreadyResolved) => audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
             ErrorCode::InvalidState,
-            review_reason(ReviewReason::AlreadyResolved),
+            ReviewReason::AlreadyResolved,
             "This order's payment was already resolved.",
         ),
-        Err(ResolutionFailure::NotInManualReview) => review_error(
+        Err(ResolutionFailure::NotInManualReview) => audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
             ErrorCode::InvalidState,
-            review_reason(ReviewReason::NotInManualReview),
+            ReviewReason::NotInManualReview,
             "This order's payment is not awaiting manual resolution.",
         ),
-        Err(ResolutionFailure::StockUnavailable) => review_error(
+        Err(ResolutionFailure::StockUnavailable) => audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
             ErrorCode::InsufficientInventory,
-            review_reason(ReviewReason::StockUnavailable),
+            ReviewReason::StockUnavailable,
             "The order's inventory can no longer be reacquired; choose refunded or abandoned.",
         ),
-        Err(ResolutionFailure::MissingPin) => review_error(
+        Err(ResolutionFailure::MissingPin) => audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
             ErrorCode::InvalidState,
-            review_reason(ReviewReason::MissingPin),
+            ReviewReason::MissingPin,
             "This order has no pinned paykit stack to resolve against.",
         ),
         Err(ResolutionFailure::Internal(context, error)) => internal(&context, &error),
@@ -1109,14 +1191,14 @@ async fn apply_paid_effects(
     {
         Ok((order, _receipt, _event)) => Ok(order),
         Err(failure) => {
-            if failure.code == ErrorCode::InsufficientInventory
-                || failure.code == ErrorCode::InvalidState
+            if failure.code() == ErrorCode::InsufficientInventory
+                || failure.code() == ErrorCode::InvalidState
             {
                 Err(ResolutionFailure::StockUnavailable)
             } else {
                 Err(ResolutionFailure::Internal(
                     "confirmation effects".into(),
-                    failure.message,
+                    failure.message().to_string(),
                 ))
             }
         }
@@ -1381,20 +1463,23 @@ async fn cancel_held_order(
             .await
             .map_err(|e| ResolutionFailure::Internal("reservation release".into(), e.to_string()))?
             .map_err(|failure| {
-                ResolutionFailure::Internal("reservation release".into(), failure.message)
+                ResolutionFailure::Internal(
+                    "reservation release".into(),
+                    failure.message().to_string(),
+                )
             })?;
     } else if order.stock_held {
         crate::handlers::cancellation::credit_order_drop(tx, order, now)
             .await
             .map_err(|e| ResolutionFailure::Internal("drop credit".into(), e.to_string()))?
             .map_err(|failure| {
-                ResolutionFailure::Internal("drop credit".into(), failure.message)
+                ResolutionFailure::Internal("drop credit".into(), failure.message().to_string())
             })?;
         release_lines(tx, order, HeldQuantity::Reserved, now)
             .await
             .map_err(|e| ResolutionFailure::Internal("hold release".into(), e.to_string()))?
             .map_err(|failure| {
-                ResolutionFailure::Internal("hold release".into(), failure.message)
+                ResolutionFailure::Internal("hold release".into(), failure.message().to_string())
             })?;
     }
     let updated: OrderRow = sqlx::query_as(&format!(
