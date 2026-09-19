@@ -83,6 +83,15 @@ CREATE TABLE grant_rate_limits (
     PRIMARY KEY (bucket_hash, endpoint_class)
 );
 
+CREATE TABLE grant_service_requests (
+    request_id UUID PRIMARY KEY,
+    bff_principal TEXT NOT NULL,
+    endpoint_class TEXT NOT NULL CHECK (endpoint_class IN (
+        'cancel', 'nonce', 'ticket', 'claim'
+    )),
+    used_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE INDEX grant_flows_worker_scan_idx
     ON grant_flows (expires_at, created_at)
     WHERE status IN ('awaiting', 'verifying');
@@ -97,3 +106,6 @@ CREATE INDEX grant_result_nonces_expiry_idx
 
 CREATE INDEX grant_rate_limits_window_idx
     ON grant_rate_limits (window_started_at);
+
+CREATE INDEX grant_service_requests_used_at_idx
+    ON grant_service_requests (used_at);
