@@ -18,7 +18,7 @@ use axum::Json;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use pubky::{
@@ -47,6 +47,7 @@ const DELIVERY_KEY_INFO: &[u8] = b"marketplace/grant-result-hash/delivery-key/v1
 const TOKEN_KEY_INFO: &[u8] = b"marketplace/grant-result-hash/token-key/v1";
 const DELIVERY_HASH_DOMAIN: &[u8] = b"marketplace/grant-result-hash/delivery-id/v1";
 const TOKEN_HASH_DOMAIN: &[u8] = b"marketplace/grant-result-hash/result-token/v1";
+const RATE_HASH_DOMAIN: &[u8] = b"marketplace/grant-rate-limit/bucket/v1";
 const STATE_AAD_DOMAIN: &[u8] = b"marketplace/grant-flow-state/v1";
 const RESULT_AAD_DOMAIN: &[u8] = b"marketplace/grant-flow-result/v1";
 const POP_DOMAIN: &str = "marketplace/grant-result-pop/v1";
@@ -972,16 +973,19 @@ fn error_response(status: StatusCode, code: &'static str) -> Response {
 
 async fn admit_rate(
     state: &AppState,
+    runtime: &GrantRuntime,
     endpoint_class: &str,
     bucket: &str,
     limit: i64,
 ) -> anyhow::Result<bool> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"marketplace/grant-rate-limit/v1");
-    hasher.update(endpoint_class.as_bytes());
-    hasher.update([0]);
-    hasher.update(bucket.as_bytes());
-    let bucket_hash = hasher.finalize();
+    let (rate_key, _) = runtime.result_keys(runtime.active_hash_epoch())?;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&rate_key)
+        .map_err(|_| anyhow::anyhow!("grant rate HMAC initialization failed"))?;
+    mac.update(RATE_HASH_DOMAIN);
+    mac.update(endpoint_class.as_bytes());
+    mac.update(&[0]);
+    mac.update(bucket.as_bytes());
+    let bucket_hash = mac.finalize().into_bytes();
     let now = state.clock.now();
     let window_floor = now - Duration::seconds(60);
     let count: i32 = sqlx::query_scalar(
@@ -1056,6 +1060,7 @@ pub async fn create_flow(
     };
     match admit_rate(
         &state,
+        runtime,
         "create_ip",
         &request_ip(connect),
         runtime.config.create_per_ip_per_minute,
@@ -1101,6 +1106,7 @@ pub async fn create_flow(
     }
     match admit_rate(
         &state,
+        runtime,
         "create_pubky",
         &expected_pubky,
         runtime.config.create_per_pubky_per_minute,
@@ -1110,22 +1116,6 @@ pub async fn create_flow(
         Ok(true) => {}
         Ok(false) => return error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
-    }
-
-    let live: i64 = match sqlx::query_scalar(
-        "SELECT COUNT(*) FROM grant_flows \
-         WHERE status IN ('awaiting','verifying','complete') \
-           AND expires_at > $1 AND result_claimed_at IS NULL",
-    )
-    .bind(now)
-    .fetch_one(&state.pool)
-    .await
-    {
-        Ok(count) => count,
-        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
-    };
-    if live >= runtime.config.max_live_flows {
-        return error_response(StatusCode::TOO_MANY_REQUESTS, "capacity_exhausted");
     }
 
     let client_id = match ClientId::new(&runtime.config.client_id) {
@@ -1178,6 +1168,33 @@ pub async fn create_flow(
             Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
         };
 
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
+    };
+    if sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(6_747_261_680_359_579_715_i64)
+        .execute(&mut *tx)
+        .await
+        .is_err()
+    {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
+    }
+    let live: i64 = match sqlx::query_scalar(
+        "SELECT COUNT(*) FROM grant_flows \
+         WHERE status IN ('awaiting','verifying','complete') \
+           AND expires_at > $1 AND result_claimed_at IS NULL",
+    )
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(count) => count,
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
+    };
+    if live >= runtime.config.max_live_flows {
+        return error_response(StatusCode::TOO_MANY_REQUESTS, "capacity_exhausted");
+    }
     let inserted = sqlx::query(
         "INSERT INTO grant_flows (flow_id, expected_pubky, assertion_jti, client_id, cpk, \
          capabilities, relay_url, grant_state_sealed, key_epoch, result_hash_epoch, status, \
@@ -1197,10 +1214,13 @@ pub async fn create_flow(
     .bind(&assertion.result_cpk)
     .bind(now)
     .bind(expires_at)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
     match inserted {
         Ok(_) => {
+            if tx.commit().await.is_err() {
+                return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
+            }
             runtime.notify.notify_one();
             no_store(
                 (
@@ -1245,6 +1265,7 @@ pub async fn get_status(
     let bucket = format!("{}:{flow_id}", request_ip(connect));
     match admit_rate(
         &state,
+        runtime,
         "status_flow",
         &bucket,
         runtime.config.status_per_flow_per_minute,
@@ -1331,6 +1352,7 @@ async fn admit_result_rates(
 ) -> anyhow::Result<bool> {
     if !admit_rate(
         state,
+        runtime,
         "result_principal",
         principal,
         runtime.config.result_per_principal_per_minute,
@@ -1339,7 +1361,28 @@ async fn admit_result_rates(
     {
         return Ok(false);
     }
-    admit_rate(state, "result_flow", &flow_id.to_string(), 10).await
+    admit_rate(state, runtime, "result_flow", &flow_id.to_string(), 10).await
+}
+
+async fn consume_service_request(
+    state: &AppState,
+    principal: &str,
+    endpoint_class: &str,
+    request_id: &str,
+) -> anyhow::Result<bool> {
+    let request_id = canonical_uuid(request_id)?;
+    let inserted = sqlx::query(
+        "INSERT INTO grant_service_requests \
+         (request_id, bff_principal, endpoint_class, used_at) \
+         VALUES ($1,$2,$3,$4) ON CONFLICT (request_id) DO NOTHING",
+    )
+    .bind(request_id)
+    .bind(principal)
+    .bind(endpoint_class)
+    .bind(state.clock.now())
+    .execute(&state.pool)
+    .await?;
+    Ok(inserted.rows_affected() == 1)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1385,6 +1428,11 @@ pub async fn issue_result_nonce(
         || canonical_uuid(&request.request_id).is_err()
     {
         return error_response(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    match consume_service_request(&state, principal, "nonce", &request.request_id).await {
+        Ok(true) => {}
+        Ok(false) => return result_denied(flow_id, principal),
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
     }
     let exists: bool =
         match sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM grant_flows WHERE flow_id = $1)")
@@ -1580,7 +1628,7 @@ async fn verify_pop_and_consume(
         purpose,
         result_delivery_id: delivery_id_text,
     };
-    verifying_key.verify(&canonical_json(&message)?, &signature)?;
+    verifying_key.verify_strict(&canonical_json(&message)?, &signature)?;
 
     let nonce_row: Option<NonceRow> = sqlx::query_as(
         "SELECT nonce_hash, expires_at, used_at FROM grant_result_nonces \
@@ -1666,6 +1714,11 @@ pub async fn result_ticket(
         || canonical_uuid(&request.request_id).is_err()
     {
         return error_response(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    match consume_service_request(&state, principal, "ticket", &request.request_id).await {
+        Ok(true) => {}
+        Ok(false) => return result_denied(flow_id, principal),
+        Err(_) => return result_denied(flow_id, principal),
     }
     let delivery_id = match decode_32("result_delivery_id", &request.result_delivery_id) {
         Ok(value) => value,
@@ -1794,6 +1847,11 @@ pub async fn claim_result(
         || canonical_uuid(&request.request_id).is_err()
     {
         return error_response(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    match consume_service_request(&state, principal, "claim", &request.request_id).await {
+        Ok(true) => {}
+        Ok(false) => return result_denied(flow_id, principal),
+        Err(_) => return result_denied(flow_id, principal),
     }
     let delivery_id = match decode_32("result_delivery_id", &request.result_delivery_id) {
         Ok(value) => value,
@@ -1937,6 +1995,11 @@ pub async fn cancel_flow(
         || canonical_uuid(&request.request_id).is_err()
     {
         return error_response(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    match consume_service_request(&state, principal, "cancel", &request.request_id).await {
+        Ok(true) => {}
+        Ok(false) => return result_denied(flow_id, principal),
+        Err(_) => return result_denied(flow_id, principal),
     }
     let delivery_id = match decode_32("result_delivery_id", &request.result_delivery_id) {
         Ok(value) => value,
@@ -2287,6 +2350,7 @@ pub async fn reap_once(state: &AppState) -> anyhow::Result<u64> {
         "SELECT flow_id, result_auth_session_id FROM grant_flows \
          WHERE status = 'complete' AND result_claimed_at IS NULL \
            AND result_token_expires_at <= $1 \
+           AND (result_payload_sealed IS NOT NULL OR result_auth_session_id IS NOT NULL) \
          ORDER BY result_token_expires_at FOR UPDATE SKIP LOCKED LIMIT $2",
     )
     .bind(now)
@@ -2302,7 +2366,8 @@ pub async fn reap_once(state: &AppState) -> anyhow::Result<u64> {
         }
         sqlx::query(
             "UPDATE grant_flows SET result_token_hash = NULL, result_payload_sealed = NULL, \
-             result_auth_session_id = NULL, terminal_code = 'flow_expired' WHERE flow_id = $1",
+             result_token_expires_at = NULL, result_auth_session_id = NULL, \
+             terminal_code = 'flow_expired' WHERE flow_id = $1",
         )
         .bind(flow_id)
         .execute(&mut *tx)
@@ -2317,6 +2382,10 @@ pub async fn reap_once(state: &AppState) -> anyhow::Result<u64> {
         .await?;
     sqlx::query("DELETE FROM grant_rate_limits WHERE window_started_at <= $1")
         .bind(now - Duration::seconds(120))
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("DELETE FROM grant_service_requests WHERE used_at <= $1")
+        .bind(now - Duration::seconds(runtime.config.terminal_retention_seconds))
         .execute(&state.pool)
         .await?;
     let purged = sqlx::query(

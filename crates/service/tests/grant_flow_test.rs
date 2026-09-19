@@ -231,13 +231,20 @@ async fn status_rate_limit_is_shared_in_postgres(pool: sqlx::PgPool) {
     let (status, body) = send(app.router, "GET", &uri, None, &Value::Null).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body["error"], "rate_limited");
-    let count: i32 = sqlx::query_scalar(
-        "SELECT request_count FROM grant_rate_limits WHERE endpoint_class = 'status_flow'",
+    let (count, bucket_hash): (i32, Vec<u8>) = sqlx::query_as(
+        "SELECT request_count, bucket_hash FROM grant_rate_limits \
+         WHERE endpoint_class = 'status_flow'",
     )
     .fetch_one(&app.pool)
     .await
     .unwrap();
     assert_eq!(count, 61);
+    let mut unhashed = Sha256::new();
+    unhashed.update(b"marketplace/grant-rate-limit/v1");
+    unhashed.update(b"status_flow");
+    unhashed.update([0]);
+    unhashed.update(format!("127.0.0.1:{flow_id}").as_bytes());
+    assert_ne!(bucket_hash, unhashed.finalize().as_slice());
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -395,7 +402,7 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
 
     let claim_nonce = nonce(&app, &authority, flow_id, "claim").await;
     let claim_path = format!("/v1/auth/grant-flows/{flow_id}/claim");
-    let claim = json!({
+    let mut claim = json!({
         "method":"POST",
         "path":claim_path,
         "proof":proof(&result_key, ProofInput {
@@ -420,6 +427,7 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
     assert_eq!(wrong_response["error"], "result_denied");
     assert_eq!(wrong_response.as_object().unwrap().len(), 1);
 
+    claim["request_id"] = Value::String(Uuid::new_v4().to_string());
     let (claim_body, claim_signature) = authority.sign_service_body(&claim);
     let (status, _, response) = send_signed(
         app.router.clone(),
@@ -441,6 +449,14 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
     .await
     .unwrap();
     assert_eq!(row, (true, true, true));
+    let service_requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM grant_service_requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        service_requests, 5,
+        "duplicate request IDs are not reinserted"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -528,6 +544,11 @@ async fn result_expiry_revokes_both_undelivered_and_delivered_sessions(pool: sql
         .unwrap();
     app.clock.advance_seconds(61);
     assert_eq!(grant::reap_once(&app.state).await.unwrap(), 2);
+    assert_eq!(
+        grant::reap_once(&app.state).await.unwrap(),
+        0,
+        "cleared result rows must not be reprocessed"
+    );
     let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions")
         .fetch_one(&pool)
         .await
