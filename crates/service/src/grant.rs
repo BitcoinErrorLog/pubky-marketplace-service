@@ -671,6 +671,61 @@ pub mod test_support {
             .expect("seed completed flow");
             flow_id
         }
+
+        pub async fn settle_verified_identity(
+            &self,
+            state: &AppState,
+            expected_pubky: &str,
+            approved_pubky: &str,
+        ) -> (Uuid, bool, bool) {
+            let flow_id = Uuid::new_v4();
+            let lease_owner = Uuid::new_v4();
+            let now = state.clock.now();
+            let cpk = "y".repeat(52);
+            sqlx::query(
+                "INSERT INTO grant_flows (flow_id,expected_pubky,assertion_jti,client_id,cpk,\
+                 capabilities,relay_url,grant_state_sealed,key_epoch,result_hash_epoch,status,\
+                 version,lease_owner,lease_until,result_delivery_id_hash,result_cpk,created_at,expires_at) \
+                 VALUES ($1,$2,$3,$4,$5,'',$6,$7,1,1,'verifying',1,$8,$9,$10,$11,$12,$13)",
+            )
+            .bind(flow_id)
+            .bind(expected_pubky)
+            .bind(Uuid::new_v4())
+            .bind(&self.runtime.config.client_id)
+            .bind(&cpk)
+            .bind(self.runtime.config.relay_url.as_str())
+            .bind(vec![1u8; 80])
+            .bind(lease_owner)
+            .bind(now + Duration::seconds(30))
+            .bind(vec![2u8; 32])
+            .bind(&cpk)
+            .bind(now)
+            .bind(now + Duration::seconds(300))
+            .execute(&state.pool)
+            .await
+            .expect("seed verifying flow");
+            let lease = FlowLease {
+                flow_id,
+                expected_pubky: expected_pubky.to_string(),
+                client_id: self.runtime.config.client_id.clone(),
+                cpk,
+                grant_state_sealed: vec![1u8; 80],
+                key_epoch: 1,
+                result_hash_epoch: 1,
+                result_cpk: "y".repeat(52),
+                lease_owner,
+                version: 1,
+            };
+            let first =
+                settle_verified(state, &self.runtime, &lease, approved_pubky, now)
+                    .await
+                    .expect("first settlement");
+            let replay =
+                settle_verified(state, &self.runtime, &lease, approved_pubky, now)
+                    .await
+                    .expect("replay settlement");
+            (flow_id, first, replay)
+        }
     }
 }
 
@@ -1912,6 +1967,28 @@ async fn complete_owned(
     Ok(true)
 }
 
+async fn settle_verified(
+    state: &AppState,
+    runtime: &GrantRuntime,
+    lease: &FlowLease,
+    approved_pubky: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    if approved_pubky != lease.expected_pubky {
+        terminalize_owned(
+            state,
+            lease,
+            "mismatch",
+            "identity_mismatch",
+            Some(approved_pubky),
+            now,
+        )
+        .await
+    } else {
+        complete_owned(state, runtime, lease, approved_pubky, now).await
+    }
+}
+
 async fn process_lease(
     state: &AppState,
     runtime: &GrantRuntime,
@@ -1961,19 +2038,7 @@ async fn process_lease(
         }
         Ok(Some(session)) => {
             let approved_pubky = session.public_key().z32();
-            if approved_pubky != lease.expected_pubky {
-                terminalize_owned(
-                    state,
-                    &lease,
-                    "mismatch",
-                    "identity_mismatch",
-                    Some(&approved_pubky),
-                    now,
-                )
-                .await?;
-            } else {
-                complete_owned(state, runtime, &lease, &approved_pubky, now).await?;
-            }
+            settle_verified(state, runtime, &lease, &approved_pubky, now).await?;
         }
         Err(error) => {
             let (status, code) = match error {

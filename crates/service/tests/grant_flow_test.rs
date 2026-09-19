@@ -8,9 +8,9 @@ use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use http_body_util::BodyExt;
 use marketplace_domain::pubky::encode_pubky;
+use marketplace_service::clock::Clock;
 use marketplace_service::grant;
 use pubky_common::crypto::Keypair;
-use rand::RngCore;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
@@ -199,6 +199,46 @@ async fn flow_id_status_never_returns_result_authority(pool: sqlx::PgPool) {
     }
 }
 
+#[sqlx::test(migrations = "./migrations")]
+async fn wrong_verified_signer_is_visible_409_mints_no_bearer_and_cannot_replay(
+    pool: sqlx::PgPool,
+) {
+    let (app, authority) = test_app_with_grant(pool.clone()).await;
+    let expected = "y".repeat(52);
+    let approved = "o".repeat(52);
+    let (flow_id, first, replay) = authority
+        .settle_verified_identity(&app.state, &expected, &approved)
+        .await;
+    assert!(first);
+    assert!(!replay, "terminal approval must not settle twice");
+
+    let (status, body) = send(
+        app.router,
+        "GET",
+        &format!("/v1/auth/grant-flows/{flow_id}"),
+        None,
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["status"], "mismatch");
+    assert_eq!(body["terminal_code"], "identity_mismatch");
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0);
+    let row: (bool, bool) = sqlx::query_as(
+        "SELECT grant_state_sealed IS NULL, result_payload_sealed IS NULL \
+         FROM grant_flows WHERE flow_id = $1",
+    )
+    .bind(flow_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row, (true, true));
+}
+
 fn proof(
     key: &SigningKey,
     flow_id: Uuid,
@@ -317,6 +357,20 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
         "result_delivery_id":URL_SAFE_NO_PAD.encode(delivery_id),
         "result_token":URL_SAFE_NO_PAD.encode(result_token),
     });
+    let mut wrong_claim = claim.clone();
+    wrong_claim["result_token"] = Value::String(URL_SAFE_NO_PAD.encode([99u8; 32]));
+    let (wrong_body, wrong_signature) = authority.sign_service_body(&wrong_claim);
+    let (status, _, wrong_response) = send_signed(
+        app.router.clone(),
+        &claim_path,
+        wrong_body,
+        wrong_signature,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(wrong_response["error"], "result_denied");
+    assert_eq!(wrong_response.as_object().unwrap().len(), 1);
+
     let (claim_body, claim_signature) = authority.sign_service_body(&claim);
     let (status, _, response) = send_signed(
         app.router.clone(),
@@ -383,6 +437,59 @@ async fn reaper_terminalizes_expiry_and_stale_lease_without_replay(pool: sqlx::P
     .unwrap();
     assert!(rows.contains(&("expired".into(), "flow_expired".into(), true)));
     assert!(rows.contains(&("failed".into(), "lease_lost".into(), true)));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn result_expiry_revokes_both_undelivered_and_delivered_sessions(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool.clone()).await;
+    let result_key = SigningKey::from_bytes(&[51u8; 32]);
+    let result_cpk = encode_pubky(&result_key.verifying_key().to_bytes());
+    let undelivered = authority
+        .seed_completed_flow(
+            &pool,
+            &"y".repeat(52),
+            &result_cpk,
+            [52u8; 32],
+            [53u8; 32],
+            [54u8; 32],
+            app.clock.now(),
+        )
+        .await;
+    let delivered = authority
+        .seed_completed_flow(
+            &pool,
+            &"o".repeat(52),
+            &result_cpk,
+            [55u8; 32],
+            [56u8; 32],
+            [57u8; 32],
+            app.clock.now(),
+        )
+        .await;
+    sqlx::query("UPDATE grant_flows SET result_token_delivered_at = $2 WHERE flow_id = $1")
+        .bind(delivered)
+        .bind(app.clock.now())
+        .execute(&pool)
+        .await
+        .unwrap();
+    app.clock.advance_seconds(61);
+    assert_eq!(grant::reap_once(&app.state).await.unwrap(), 2);
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0);
+    for flow_id in [undelivered, delivered] {
+        let cleared: (bool, bool, bool) = sqlx::query_as(
+            "SELECT result_token_hash IS NULL, result_payload_sealed IS NULL, \
+             result_auth_session_id IS NULL FROM grant_flows WHERE flow_id = $1",
+        )
+        .bind(flow_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cleared, (true, true, true));
+    }
 }
 
 #[test]
