@@ -28,9 +28,9 @@ use std::sync::Mutex;
 use marketplace_service::attestor::Attestor;
 use marketplace_service::clock::{AdjustableClock, Clock};
 use marketplace_service::config::Config;
+use marketplace_service::grant::test_support::GrantTestAuthority;
 use marketplace_service::homeserver::{HomeserverListingClient, HttpHomeserverClient};
 use marketplace_service::http::build_router;
-use marketplace_service::grant::test_support::GrantTestAuthority;
 use marketplace_service::locks::{
     LocksKeys, LocksLifecycleClient, LocksLookupOutcome, LocksRuntime,
 };

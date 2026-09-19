@@ -21,8 +21,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use pubky::{
-    AuthFlowKind, Capabilities, ClientId, GrantAuthFlowState, PubkyGrantAuthFlow,
-    PubkyHttpClient, PublicKey,
+    AuthFlowKind, Capabilities, ClientId, GrantAuthFlowState, PubkyGrantAuthFlow, PubkyHttpClient,
+    PublicKey,
 };
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -268,9 +268,7 @@ fn parse_secret_ring(
                 epoch: parse_epoch(previous_epoch_name, &epoch)?,
             };
             if slot.epoch != active.epoch - 1 || slot.key == active.key {
-                anyhow::bail!(
-                    "{previous_epoch_name} must be active minus one with a distinct key"
-                );
+                anyhow::bail!("{previous_epoch_name} must be active minus one with a distinct key");
             }
             Some(slot)
         }
@@ -283,14 +281,11 @@ fn parse_secret_ring(
 
 fn valid_kid(kid: &str) -> bool {
     (1..=64).contains(&kid.len())
-        && kid
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| match byte {
-                b'a'..=b'z' | b'0'..=b'9' => true,
-                b'.' | b'_' | b'-' if index > 0 => true,
-                _ => false,
-            })
+        && kid.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'.' | b'_' | b'-' if index > 0 => true,
+            _ => false,
+        })
 }
 
 fn parse_verify_ring(name: &str) -> anyhow::Result<VerifyKeyRing> {
@@ -350,8 +345,7 @@ impl GrantRuntime {
         {
             anyhow::bail!("MARKETPLACE_GRANT_RELAY_URL must be a clean HTTPS URL");
         }
-        let flow_ttl_seconds =
-            env_bounded_i64("MARKETPLACE_GRANT_FLOW_TTL_SECONDS", 300, 60, 600)?;
+        let flow_ttl_seconds = env_bounded_i64("MARKETPLACE_GRANT_FLOW_TTL_SECONDS", 300, 60, 600)?;
         let verify_lease_seconds =
             env_bounded_i64("MARKETPLACE_GRANT_VERIFY_LEASE_SECONDS", 30, 10, 60)?;
         if verify_lease_seconds >= flow_ttl_seconds {
@@ -368,24 +362,9 @@ impl GrantRuntime {
                 250,
                 5000,
             )? as u64,
-            max_live_flows: env_bounded_i64(
-                "MARKETPLACE_GRANT_MAX_LIVE_FLOWS",
-                1000,
-                1,
-                i64::MAX,
-            )?,
-            worker_batch_size: env_bounded_i64(
-                "MARKETPLACE_GRANT_WORKER_BATCH_SIZE",
-                25,
-                1,
-                100,
-            )?,
-            reaper_batch_size: env_bounded_i64(
-                "MARKETPLACE_GRANT_REAPER_BATCH_SIZE",
-                100,
-                1,
-                500,
-            )?,
+            max_live_flows: env_bounded_i64("MARKETPLACE_GRANT_MAX_LIVE_FLOWS", 1000, 1, i64::MAX)?,
+            worker_batch_size: env_bounded_i64("MARKETPLACE_GRANT_WORKER_BATCH_SIZE", 25, 1, 100)?,
+            reaper_batch_size: env_bounded_i64("MARKETPLACE_GRANT_REAPER_BATCH_SIZE", 100, 1, 500)?,
             terminal_retention_seconds: env_bounded_i64(
                 "MARKETPLACE_GRANT_TERMINAL_RETENTION_SECONDS",
                 86_400,
@@ -504,8 +483,7 @@ pub mod test_support {
             let runtime = GrantRuntime {
                 config: GrantConfig {
                     client_id: "marketplace.localhost".to_string(),
-                    relay_url: Url::parse("http://127.0.0.1:1/inbox")
-                        .expect("test relay URL"),
+                    relay_url: Url::parse("http://127.0.0.1:1/inbox").expect("test relay URL"),
                     flow_ttl_seconds: 300,
                     verify_lease_seconds: 30,
                     relay_poll_milliseconds: 1000,
@@ -716,14 +694,12 @@ pub mod test_support {
                 lease_owner,
                 version: 1,
             };
-            let first =
-                settle_verified(state, &self.runtime, &lease, approved_pubky, now)
-                    .await
-                    .expect("first settlement");
-            let replay =
-                settle_verified(state, &self.runtime, &lease, approved_pubky, now)
-                    .await
-                    .expect("replay settlement");
+            let first = settle_verified(state, &self.runtime, &lease, approved_pubky, now)
+                .await
+                .expect("first settlement");
+            let replay = settle_verified(state, &self.runtime, &lease, approved_pubky, now)
+                .await
+                .expect("replay settlement");
             (flow_id, first, replay)
         }
     }
@@ -843,8 +819,8 @@ fn decode_jcs_segment<T: DeserializeOwned + Serialize>(segment: &str) -> anyhow:
     if URL_SAFE_NO_PAD.encode(&decoded) != segment {
         anyhow::bail!("assertion segment is not canonical Base64url");
     }
-    let parsed: T =
-        serde_json::from_slice(&decoded).map_err(|_| anyhow::anyhow!("assertion JSON is invalid"))?;
+    let parsed: T = serde_json::from_slice(&decoded)
+        .map_err(|_| anyhow::anyhow!("assertion JSON is invalid"))?;
     if canonical_json(&parsed)? != decoded {
         anyhow::bail!("assertion JSON is not RFC 8785 canonical");
     }
@@ -883,34 +859,33 @@ fn verify_assertion(
         &signature,
     )?;
 
-    let (aud, exp, iat, iss, jti, purpose, result_cpk, result_delivery_id, sub) =
-        if bootstrap {
-            let claims: BootstrapAssertion = decode_jcs_segment(segments[1])?;
-            (
-                claims.aud,
-                claims.exp,
-                claims.iat,
-                claims.iss,
-                claims.jti,
-                claims.purpose,
-                claims.result_cpk,
-                claims.result_delivery_id,
-                Some(claims.sub),
-            )
-        } else {
-            let claims: DeliveryAssertion = decode_jcs_segment(segments[1])?;
-            (
-                claims.aud,
-                claims.exp,
-                claims.iat,
-                claims.iss,
-                claims.jti,
-                claims.purpose,
-                claims.result_cpk,
-                claims.result_delivery_id,
-                None,
-            )
-        };
+    let (aud, exp, iat, iss, jti, purpose, result_cpk, result_delivery_id, sub) = if bootstrap {
+        let claims: BootstrapAssertion = decode_jcs_segment(segments[1])?;
+        (
+            claims.aud,
+            claims.exp,
+            claims.iat,
+            claims.iss,
+            claims.jti,
+            claims.purpose,
+            claims.result_cpk,
+            claims.result_delivery_id,
+            Some(claims.sub),
+        )
+    } else {
+        let claims: DeliveryAssertion = decode_jcs_segment(segments[1])?;
+        (
+            claims.aud,
+            claims.exp,
+            claims.iat,
+            claims.iss,
+            claims.jti,
+            claims.purpose,
+            claims.result_cpk,
+            claims.result_delivery_id,
+            None,
+        )
+    };
     let expected_purpose = if bootstrap {
         ASSERTION_BOOTSTRAP_PURPOSE
     } else {
@@ -974,7 +949,10 @@ fn grant_runtime(state: &AppState) -> Result<&Arc<GrantRuntime>, Response> {
 }
 
 fn authorization_cpk(url: &Url) -> anyhow::Result<String> {
-    let pairs: HashMap<_, _> = url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    let pairs: HashMap<_, _> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
     let cpk = pairs
         .get("cpk")
         .ok_or_else(|| anyhow::anyhow!("SDK grant URL omitted cpk"))?;
@@ -1115,18 +1093,24 @@ pub async fn create_flow(
     match inserted {
         Ok(_) => {
             runtime.notify.notify_one();
-            no_store((
-                StatusCode::CREATED,
-                Json(json!({
-                    "authorization_url": authorization_url.as_str(),
-                    "expires_at": format_timestamp(expires_at),
-                    "flow_id": flow_id,
-                    "status": "awaiting",
-                })),
+            no_store(
+                (
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "authorization_url": authorization_url.as_str(),
+                        "expires_at": format_timestamp(expires_at),
+                        "flow_id": flow_id,
+                        "status": "awaiting",
+                    })),
+                )
+                    .into_response(),
             )
-                .into_response())
         }
-        Err(error) if error.as_database_error().is_some_and(|error| error.is_unique_violation()) => {
+        Err(error)
+            if error
+                .as_database_error()
+                .is_some_and(|error| error.is_unique_violation()) =>
+        {
             error_response(StatusCode::CONFLICT, "assertion_replayed")
         }
         Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
@@ -1141,10 +1125,7 @@ struct StatusRow {
     expires_at: DateTime<Utc>,
 }
 
-pub async fn get_status(
-    State(state): State<AppState>,
-    Path(flow_id): Path<Uuid>,
-) -> Response {
+pub async fn get_status(State(state): State<AppState>, Path(flow_id): Path<Uuid>) -> Response {
     if grant_runtime(&state).is_err() {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
     }
@@ -1167,16 +1148,18 @@ pub async fn get_status(
         "invalid" | "failed" => StatusCode::UNPROCESSABLE_ENTITY,
         _ => StatusCode::OK,
     };
-    no_store((
-        status,
-        Json(json!({
-            "expires_at": format_timestamp(row.expires_at),
-            "flow_id": row.flow_id,
-            "status": row.status,
-            "terminal_code": row.terminal_code,
-        })),
+    no_store(
+        (
+            status,
+            Json(json!({
+                "expires_at": format_timestamp(row.expires_at),
+                "flow_id": row.flow_id,
+                "status": row.status,
+                "terminal_code": row.terminal_code,
+            })),
+        )
+            .into_response(),
     )
-        .into_response())
 }
 
 fn verify_service_request<'a>(
@@ -1185,10 +1168,7 @@ fn verify_service_request<'a>(
     body: &[u8],
     expected_path: &str,
 ) -> anyhow::Result<(&'a str, Value)> {
-    let signatures: Vec<_> = headers
-        .get_all("x-marketplace-signature")
-        .iter()
-        .collect();
+    let signatures: Vec<_> = headers.get_all("x-marketplace-signature").iter().collect();
     if signatures.len() != 1 {
         anyhow::bail!("exactly one service signature is required");
     }
@@ -1254,16 +1234,15 @@ pub async fn issue_result_nonce(
     {
         return error_response(StatusCode::BAD_REQUEST, "invalid_request");
     }
-    let exists: bool = match sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM grant_flows WHERE flow_id = $1)",
-    )
-    .bind(flow_id)
-    .fetch_one(&state.pool)
-    .await
-    {
-        Ok(exists) => exists,
-        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
-    };
+    let exists: bool =
+        match sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM grant_flows WHERE flow_id = $1)")
+            .bind(flow_id)
+            .fetch_one(&state.pool)
+            .await
+        {
+            Ok(exists) => exists,
+            Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
+        };
     if !exists {
         return error_response(StatusCode::FORBIDDEN, RESULT_DENIED);
     }
@@ -1290,15 +1269,17 @@ pub async fn issue_result_nonce(
     if inserted.is_err() {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
     }
-    no_store((
-        StatusCode::CREATED,
-        Json(json!({
-            "expires_at": format_timestamp(expires_at),
-            "nonce": URL_SAFE_NO_PAD.encode(nonce),
-            "nonce_id": nonce_id,
-        })),
+    no_store(
+        (
+            StatusCode::CREATED,
+            Json(json!({
+                "expires_at": format_timestamp(expires_at),
+                "nonce": URL_SAFE_NO_PAD.encode(nonce),
+                "nonce_id": nonce_id,
+            })),
+        )
+            .into_response(),
     )
-        .into_response())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1536,7 +1517,9 @@ pub async fn result_ticket(
     if row.status != "complete"
         || row.result_claimed_at.is_some()
         || row.result_token_delivered_at.is_some()
-        || row.result_token_expires_at.is_none_or(|expires| expires <= now)
+        || row
+            .result_token_expires_at
+            .is_none_or(|expires| expires <= now)
         || !fixed_digest_matches(&row.result_delivery_id_hash, &expected_delivery_hash)
     {
         return result_denied(flow_id, principal);
@@ -1581,14 +1564,16 @@ pub async fn result_ticket(
     if stamped.rows_affected() != 1 || tx.commit().await.is_err() {
         return result_denied(flow_id, principal);
     }
-    no_store((
-        StatusCode::OK,
-        Json(json!({
-            "expires_at": format_timestamp(row.result_token_expires_at.expect("checked")),
-            "result_token": URL_SAFE_NO_PAD.encode(result.result_token),
-        })),
+    no_store(
+        (
+            StatusCode::OK,
+            Json(json!({
+                "expires_at": format_timestamp(row.result_token_expires_at.expect("checked")),
+                "result_token": URL_SAFE_NO_PAD.encode(result.result_token),
+            })),
+        )
+            .into_response(),
     )
-        .into_response())
 }
 
 pub async fn claim_result(
@@ -1660,7 +1645,9 @@ pub async fn claim_result(
     if row.status != "complete"
         || row.result_claimed_at.is_some()
         || row.result_token_delivered_at.is_none()
-        || row.result_token_expires_at.is_none_or(|expires| expires <= now)
+        || row
+            .result_token_expires_at
+            .is_none_or(|expires| expires <= now)
         || !fixed_digest_matches(&row.result_delivery_id_hash, &expected_delivery_hash)
         || row
             .result_token_hash
@@ -1709,16 +1696,18 @@ pub async fn claim_result(
     if consumed.rows_affected() != 1 || tx.commit().await.is_err() {
         return result_denied(flow_id, principal);
     }
-    no_store((
-        StatusCode::OK,
-        Json(json!({
-            "capabilities": "",
-            "expires_at": format_timestamp(result.session_expires_at),
-            "pubky": row.expected_pubky,
-            "token": URL_SAFE_NO_PAD.encode(result.bearer),
-        })),
+    no_store(
+        (
+            StatusCode::OK,
+            Json(json!({
+                "capabilities": "",
+                "expires_at": format_timestamp(result.session_expires_at),
+                "pubky": row.expected_pubky,
+                "token": URL_SAFE_NO_PAD.encode(result.bearer),
+            })),
+        )
+            .into_response(),
     )
-        .into_response())
 }
 
 pub async fn cancel_flow(
@@ -1787,7 +1776,9 @@ pub async fn cancel_flow(
     .execute(&state.pool)
     .await;
     match updated {
-        Ok(result) if result.rows_affected() == 1 => no_store(StatusCode::NO_CONTENT.into_response()),
+        Ok(result) if result.rows_affected() == 1 => {
+            no_store(StatusCode::NO_CONTENT.into_response())
+        }
         _ => error_response(StatusCode::CONFLICT, "flow_not_cancellable"),
     }
 }
@@ -1872,10 +1863,7 @@ async fn terminalize_owned(
     Ok(result.rows_affected() == 1)
 }
 
-async fn return_owned_to_awaiting(
-    state: &AppState,
-    lease: &FlowLease,
-) -> anyhow::Result<bool> {
+async fn return_owned_to_awaiting(state: &AppState, lease: &FlowLease) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "UPDATE grant_flows SET status = 'awaiting', lease_owner = NULL, lease_until = NULL \
          WHERE flow_id = $1 AND status = 'verifying' AND lease_owner = $2 AND version = $3",
@@ -1911,11 +1899,7 @@ async fn complete_owned(
     };
     let plaintext = canonical_json(&payload)?;
     let aad = result_aad(lease.flow_id, &lease.result_cpk, lease.key_epoch)?;
-    let sealed = seal::seal(
-        runtime.encryption_key(lease.key_epoch)?,
-        &aad,
-        &plaintext,
-    );
+    let sealed = seal::seal(runtime.encryption_key(lease.key_epoch)?, &aad, &plaintext);
 
     let mut tx = state.pool.begin().await?;
     let owns: bool = sqlx::query_scalar(
@@ -1995,12 +1979,7 @@ async fn process_lease(
     lease: FlowLease,
 ) -> anyhow::Result<()> {
     let now = state.clock.now();
-    let aad = state_aad(
-        lease.flow_id,
-        &lease.client_id,
-        &lease.cpk,
-        lease.key_epoch,
-    )?;
+    let aad = state_aad(lease.flow_id, &lease.client_id, &lease.cpk, lease.key_epoch)?;
     let plaintext = match seal::open(
         runtime.encryption_key(lease.key_epoch)?,
         &aad,
@@ -2012,8 +1991,7 @@ async fn process_lease(
             return Ok(());
         }
     };
-    let stored: StoredGrantState =
-        match serde_json::from_slice::<StoredGrantState>(&plaintext) {
+    let stored: StoredGrantState = match serde_json::from_slice::<StoredGrantState>(&plaintext) {
         Ok(stored)
             if stored.version == GRANT_STATE_VERSION
                 && canonical_json(&stored).is_ok_and(|canonical| canonical == plaintext) =>
@@ -2024,7 +2002,7 @@ async fn process_lease(
             terminalize_owned(state, &lease, "failed", "storage_failure", None, now).await?;
             return Ok(());
         }
-        };
+    };
     let flow = match PubkyGrantAuthFlow::restore(stored.state, runtime.client.clone()) {
         Ok(flow) => flow,
         Err(_) => {
@@ -2045,9 +2023,7 @@ async fn process_lease(
                 pubky::Error::Authentication(_) | pubky::Error::Parse(_) => {
                     ("invalid", "grant_invalid")
                 }
-                pubky::Error::Pkarr(_) | pubky::Error::Request(_) => {
-                    ("failed", "grant_exchange")
-                }
+                pubky::Error::Pkarr(_) | pubky::Error::Request(_) => ("failed", "grant_exchange"),
                 pubky::Error::Build(_) => ("failed", "relay_transport"),
             };
             terminalize_owned(state, &lease, status, code, None, now).await?;
