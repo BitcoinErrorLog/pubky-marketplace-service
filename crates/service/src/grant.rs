@@ -2346,7 +2346,7 @@ pub async fn reap_once(state: &AppState) -> anyhow::Result<u64> {
     affected += stale.rows_affected();
 
     let mut tx = state.pool.begin().await?;
-    let result_rows: Vec<(Uuid, Option<i64>)> = sqlx::query_as(
+    let result_rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
         "SELECT flow_id, result_auth_session_id FROM grant_flows \
          WHERE status = 'complete' AND result_claimed_at IS NULL \
            AND result_token_expires_at <= $1 \
