@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -63,6 +64,7 @@ pub struct GrantConfig {
     pub relay_url: Url,
     pub flow_ttl_seconds: i64,
     pub verify_lease_seconds: i64,
+    pub exchange_timeout_seconds: i64,
     pub relay_poll_milliseconds: u64,
     pub max_live_flows: i64,
     pub worker_batch_size: i64,
@@ -358,11 +360,14 @@ impl GrantRuntime {
         if verify_lease_seconds >= flow_ttl_seconds {
             anyhow::bail!("grant verification lease must be shorter than flow TTL");
         }
+        let exchange_timeout_seconds =
+            env_bounded_i64("MARKETPLACE_GRANT_EXCHANGE_TIMEOUT_SECONDS", 30, 1, 120)?;
         let config = GrantConfig {
             client_id,
             relay_url,
             flow_ttl_seconds,
             verify_lease_seconds,
+            exchange_timeout_seconds,
             relay_poll_milliseconds: env_bounded_i64(
                 "MARKETPLACE_GRANT_RELAY_POLL_MILLISECONDS",
                 1000,
@@ -517,6 +522,20 @@ pub mod test_support {
             relay_url: Url,
             verify_lease_seconds: i64,
         ) -> Self {
+            Self::generate_with_relay_timeouts(
+                session_ttl_seconds,
+                relay_url,
+                verify_lease_seconds,
+                30,
+            )
+        }
+
+        pub fn generate_with_relay_timeouts(
+            session_ttl_seconds: i64,
+            relay_url: Url,
+            verify_lease_seconds: i64,
+            exchange_timeout_seconds: i64,
+        ) -> Self {
             let mut assertion_seed = [0u8; 32];
             let mut request_seed = [0u8; 32];
             let mut encryption_key = [0u8; 32];
@@ -538,6 +557,7 @@ pub mod test_support {
                     relay_url,
                     flow_ttl_seconds: 300,
                     verify_lease_seconds,
+                    exchange_timeout_seconds,
                     relay_poll_milliseconds: 1000,
                     max_live_flows: 1000,
                     worker_batch_size: 25,
@@ -778,6 +798,7 @@ pub mod test_support {
                 lease_owner,
                 lease_until: now + Duration::seconds(30),
                 version: 1,
+                expires_at: now + Duration::seconds(300),
             };
             let first = settle_verified(state, &self.runtime, &lease, approved_pubky, now)
                 .await
@@ -2110,6 +2131,7 @@ struct FlowLease {
     lease_owner: Uuid,
     lease_until: DateTime<Utc>,
     version: i64,
+    expires_at: DateTime<Utc>,
 }
 
 struct LeaseReturnGuard {
@@ -2157,6 +2179,22 @@ fn remaining_lease(lease: &FlowLease, now: DateTime<Utc>) -> std::time::Duration
         .unwrap_or(std::time::Duration::ZERO)
 }
 
+fn remaining_exchange(
+    lease: &FlowLease,
+    now: DateTime<Utc>,
+    timeout_seconds: i64,
+) -> std::time::Duration {
+    let until_flow = (lease.expires_at - now)
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO);
+    let ceiling = std::time::Duration::from_secs(timeout_seconds.max(0) as u64);
+    until_flow.min(ceiling)
+}
+
+fn heartbeat_period(verify_lease_seconds: i64) -> std::time::Duration {
+    std::time::Duration::from_millis((verify_lease_seconds.max(0) as u64 * 1000 / 3).max(100))
+}
+
 async fn acquire_flows(
     state: &AppState,
     runtime: &GrantRuntime,
@@ -2181,7 +2219,8 @@ async fn acquire_flows(
              lease_until = $3, version = version + 1 \
              WHERE flow_id = $1 AND status = 'awaiting' AND expires_at > $4 \
              RETURNING flow_id, expected_pubky, client_id, cpk, grant_state_sealed, \
-             key_epoch, result_hash_epoch, result_cpk, lease_owner, lease_until, version",
+             key_epoch, result_hash_epoch, result_cpk, lease_owner, lease_until, version, \
+             expires_at",
         )
         .bind(flow_id)
         .bind(lease_owner)
@@ -2267,7 +2306,7 @@ async fn heartbeat_lease(
     lease: &FlowLease,
     lease_until: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE grant_flows SET lease_until = $3 \
          WHERE flow_id = $1 AND status = 'verifying' AND lease_owner = $2",
     )
@@ -2276,6 +2315,9 @@ async fn heartbeat_lease(
     .bind(lease_until)
     .execute(&state.pool)
     .await?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("grant lease heartbeat lost ownership of {}", lease.flow_id);
+    }
     Ok(())
 }
 
@@ -2283,10 +2325,12 @@ fn spawn_lease_heartbeat(
     state: AppState,
     lease: FlowLease,
     verify_lease_seconds: i64,
+    failed: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let period = heartbeat_period(verify_lease_seconds);
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(period).await;
             let until = state.clock.now() + Duration::seconds(verify_lease_seconds);
             if let Err(error) = heartbeat_lease(&state, &lease, until).await {
                 tracing::error!(
@@ -2294,6 +2338,7 @@ fn spawn_lease_heartbeat(
                     flow_id = %lease.flow_id,
                     "grant lease heartbeat failed"
                 );
+                failed.store(true, Ordering::SeqCst);
                 return;
             }
         }
@@ -2529,11 +2574,13 @@ async fn process_lease(
         }
     };
     let mut guard = LeaseReturnGuard::new(state.clone(), lease.clone());
-    let _heartbeat = HeartbeatGuard {
+    let heartbeat_failed = Arc::new(AtomicBool::new(false));
+    let heartbeat = HeartbeatGuard {
         handle: spawn_lease_heartbeat(
             state.clone(),
             lease.clone(),
             runtime.config.verify_lease_seconds,
+            heartbeat_failed.clone(),
         ),
     };
     // PubkyGrantAuthFlow::restore starts AuthRelayListener, which DELETE-ACKs
@@ -2546,7 +2593,7 @@ async fn process_lease(
     let payload = match poll_inbox_until(&channel, &runtime.client, deadline).await {
         Ok(payload) => payload,
         Err(_) => {
-            drop(_heartbeat);
+            drop(heartbeat);
             guard.disarm();
             require_applied(
                 terminalize_owned(state, &lease, "failed", "relay_transport", None, now).await?,
@@ -2558,7 +2605,7 @@ async fn process_lease(
     };
     let Some(payload) = payload else {
         drop(channel);
-        drop(_heartbeat);
+        drop(heartbeat);
         guard.disarm();
         require_applied(
             return_owned_to_awaiting(state, &lease).await?,
@@ -2613,9 +2660,37 @@ async fn process_lease(
         }
     };
     // Restore spawns a new GET; the inbox still holds the payload until this
-    // listener DELETEs. Keep polling until exchange completes. Heartbeat keeps
-    // the exchanging row off the reaper.
+    // listener DELETEs. Bound the exchange: flow expires_at, a hard
+    // MARKETPLACE_GRANT_EXCHANGE_TIMEOUT_SECONDS ceiling, and heartbeat death.
+    // An unbounded try_poll_once + lease renewal would pin verifying forever.
+    let exchange_deadline = tokio::time::Instant::now()
+        + remaining_exchange(
+            &lease,
+            state.clock.now(),
+            runtime.config.exchange_timeout_seconds,
+        );
     let outcome = loop {
+        let heartbeat_lost = heartbeat_failed.load(Ordering::SeqCst);
+        let timed_out = tokio::time::Instant::now() >= exchange_deadline
+            || state.clock.now() >= lease.expires_at;
+        if heartbeat_lost || timed_out {
+            drop(flow);
+            drop(heartbeat);
+            let applied = terminalize_owned(
+                state,
+                &lease,
+                "failed",
+                "grant_exchange",
+                Some(&approved_pubky),
+                state.clock.now(),
+            )
+            .await?;
+            if heartbeat_lost && !applied {
+                return Ok(());
+            }
+            require_applied(applied, "grant_exchange", lease.flow_id)?;
+            return Ok(());
+        }
         match flow.try_poll_once().await {
             Ok(Some(session)) => break Ok(session),
             Ok(None) => {
@@ -2625,6 +2700,7 @@ async fn process_lease(
         }
     };
     drop(flow);
+    drop(heartbeat);
     match outcome {
         Ok(session) => {
             require_applied(

@@ -36,6 +36,7 @@ struct RelayInner {
     messages: std::sync::Mutex<HashMap<String, Bytes>>,
     acked: std::sync::Mutex<HashMap<String, bool>>,
     stall: std::sync::Mutex<Option<Arc<Notify>>>,
+    stall_after: std::sync::Mutex<Option<u64>>,
     ack_stall: std::sync::Mutex<Option<Arc<Notify>>>,
     posted: Notify,
     get_started: Notify,
@@ -69,6 +70,7 @@ impl RelayInbox {
             messages: std::sync::Mutex::new(HashMap::new()),
             acked: std::sync::Mutex::new(HashMap::new()),
             stall: std::sync::Mutex::new(None),
+            stall_after: std::sync::Mutex::new(None),
             ack_stall: std::sync::Mutex::new(None),
             posted: Notify::new(),
             get_started: Notify::new(),
@@ -130,8 +132,16 @@ impl RelayInbox {
         notify
     }
 
+    fn stall_gets_after(&self, after: u64) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        *self.inner.stall.lock().expect("stall") = Some(notify.clone());
+        *self.inner.stall_after.lock().expect("stall_after") = Some(after);
+        notify
+    }
+
     fn clear_stall(&self) {
         *self.inner.stall.lock().expect("stall") = None;
+        *self.inner.stall_after.lock().expect("stall_after") = None;
         *self.inner.ack_stall.lock().expect("ack stall") = None;
     }
 
@@ -185,6 +195,12 @@ impl RelayInbox {
 }
 
 async fn maybe_stall(state: &Arc<RelayInner>) {
+    let after = *state.stall_after.lock().expect("stall_after");
+    if let Some(after) = after {
+        if state.gets.load(Ordering::SeqCst) <= after {
+            return;
+        }
+    }
     let stall = state.stall.lock().expect("stall").clone();
     if let Some(stall) = stall {
         stall.notified().await;
@@ -307,10 +323,19 @@ struct FlowHarness {
 }
 
 async fn create_awaiting_flow(pool: PgPool, relay: RelayInbox) -> FlowHarness {
-    let authority = GrantTestAuthority::generate_with_relay(
+    create_awaiting_flow_timeouts(pool, relay, 30).await
+}
+
+async fn create_awaiting_flow_timeouts(
+    pool: PgPool,
+    relay: RelayInbox,
+    exchange_timeout_seconds: i64,
+) -> FlowHarness {
+    let authority = GrantTestAuthority::generate_with_relay_timeouts(
         Config::for_tests().session_ttl_seconds,
         relay.base(),
         VERIFY_LEASE_SECONDS,
+        exchange_timeout_seconds,
     );
     let (app, authority) = test_app_with_grant_authority(pool.clone(), authority).await;
     let signer = Keypair::random();
@@ -461,6 +486,48 @@ async fn restore_observes_preexisting_inbox_message_on_one_durable_lease(pool: P
 
     let (status, terminal_code) = flow_row(&harness.pool, harness.flow_id).await;
     assert_processed(&status, terminal_code.as_deref(), &harness.relay);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sdk_poll_that_never_returns_fails_grant_exchange_within_cap(pool: PgPool) {
+    let relay = RelayInbox::spawn().await;
+    let harness = create_awaiting_flow_timeouts(pool.clone(), relay.clone(), 1).await;
+    approve(&harness).await;
+    let stall = harness.relay.stall_gets_after(harness.relay.gets() + 1);
+    let started = Instant::now();
+    let scanned =
+        tokio::time::timeout(Duration::from_secs(5), grant::poll_once(&harness.app.state))
+            .await
+            .expect("exchange must finish within the cap")
+            .expect("bounded exchange must return");
+    assert_eq!(scanned, 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "SDK that never yields must not pin the worker, elapsed={:?}",
+        started.elapsed()
+    );
+    stall.notify_waiters();
+    harness.relay.clear_stall();
+    harness.relay.wait_idle().await;
+
+    let (status, terminal_code) = flow_row(&harness.pool, harness.flow_id).await;
+    assert_eq!(status, "failed");
+    assert_eq!(terminal_code.as_deref(), Some("grant_exchange"));
+    let lease_owner: Option<Uuid> =
+        sqlx::query_scalar("SELECT lease_owner FROM grant_flows WHERE flow_id = $1")
+            .bind(harness.flow_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("lease_owner");
+    assert_eq!(
+        lease_owner, None,
+        "timeout must stop the heartbeat and clear the lease"
+    );
+
+    let scanned = grant::poll_once(&harness.app.state)
+        .await
+        .expect("terminal flow is not re-leased");
+    assert_eq!(scanned, 0, "no leaked task may leave the row leasable");
 }
 
 #[sqlx::test(migrations = "./migrations")]
