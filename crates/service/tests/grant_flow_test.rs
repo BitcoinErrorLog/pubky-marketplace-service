@@ -1,23 +1,25 @@
 mod common;
 
 use axum::body::Body;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use http_body_util::BodyExt;
 use marketplace_domain::pubky::encode_pubky;
 use marketplace_service::clock::Clock;
 use marketplace_service::grant;
 use marketplace_service::grant::test_support::SeedCompletedFlow;
-use pubky_common::crypto::Keypair;
+use pubky_common::crypto::{Keypair, PublicKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 use common::{send, test_app_with_grant, NOW};
+
+const RC55_CAPTURE_ATTESTATION_KEY: &str = "RJWeSyXMVeBbAFV_Q-FKGqipnh-JC65BII65MV-a894";
 
 async fn send_signed(
     router: axum::Router,
@@ -60,6 +62,29 @@ fn assert_no_store(headers: &axum::http::HeaderMap) {
         .is_some_and(|value| value.contains("no-store")));
 }
 
+async fn insert_marketplace_session(
+    pool: &sqlx::PgPool,
+    pubky: &str,
+    bearer: &[u8; 32],
+    now: DateTime<Utc>,
+    revoked: bool,
+) -> String {
+    sqlx::query(
+        "INSERT INTO auth_sessions \
+         (token_hash,pubky,capabilities,created_at,expires_at,revoked_at) \
+         VALUES ($1,$2,'',$3,$4,$5)",
+    )
+    .bind(marketplace_service::auth::hash_token(bearer))
+    .bind(pubky)
+    .bind(now)
+    .bind(now + Duration::hours(1))
+    .bind(revoked.then_some(now))
+    .execute(pool)
+    .await
+    .unwrap();
+    URL_SAFE_NO_PAD.encode(bearer)
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn migration_0036_preserves_bearer_key_and_reuses_uuid_session_identity(pool: sqlx::PgPool) {
     let token_hash = vec![7u8; 32];
@@ -83,6 +108,18 @@ async fn migration_0036_preserves_bearer_key_and_reuses_uuid_session_identity(po
             .await
             .unwrap();
     assert_eq!(stored, token_hash);
+    let grant_capabilities_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'grant_flows' \
+           AND column_name = 'capabilities')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !grant_capabilities_column,
+        "unreleased migration must not retain dead grant capability data"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -114,6 +151,96 @@ async fn client_asserted_identity_and_ambiguous_principal_create_nothing(pool: s
         .await
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn revoked_bearer_is_rejected_by_every_session_resolver_and_reconnect(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool.clone()).await;
+    let now = app.clock.now();
+    let pubky = Keypair::random().public_key().z32();
+    let token = insert_marketplace_session(&pool, &pubky, &[70u8; 32], now, true).await;
+    let result_key = SigningKey::from_bytes(&[71u8; 32]);
+    let result_cpk = encode_pubky(&result_key.verifying_key().to_bytes());
+    let assertion =
+        authority.sign_delivery_assertion(&pubky, &[72u8; 32], &result_cpk, now, Uuid::new_v4());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    assert!(
+        marketplace_service::auth::actor_from_authorization(&pool, &headers, now)
+            .await
+            .is_err(),
+        "grant reconnect resolver must reject revoked sessions"
+    );
+
+    for (method, path, body) in [
+        ("GET", "/v1/auth/sessions", Value::Null),
+        ("GET", "/v0/sellers/me/payment-config", Value::Null),
+        (
+            "POST",
+            "/v1/auth/grant-flows",
+            json!({"delivery_assertion":assertion}),
+        ),
+    ] {
+        let (status, response) = send(app.router.clone(), method, path, Some(&token), &body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {response}");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM grant_flows")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn delivery_assertion_subject_must_match_active_bearer(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool.clone()).await;
+    let now = app.clock.now();
+    let pubky = Keypair::random().public_key().z32();
+    let other_pubky = Keypair::random().public_key().z32();
+    let token = insert_marketplace_session(&pool, &pubky, &[73u8; 32], now, false).await;
+    let result_key = SigningKey::from_bytes(&[74u8; 32]);
+    let result_cpk = encode_pubky(&result_key.verifying_key().to_bytes());
+
+    let mismatched = authority.sign_delivery_assertion(
+        &other_pubky,
+        &[75u8; 32],
+        &result_cpk,
+        now,
+        Uuid::new_v4(),
+    );
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/auth/grant-flows",
+        Some(&token),
+        &json!({"delivery_assertion":mismatched}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "invalid_assertion");
+
+    let matching =
+        authority.sign_delivery_assertion(&pubky, &[76u8; 32], &result_cpk, now, Uuid::new_v4());
+    let (status, body) = send(
+        app.router,
+        "POST",
+        "/v1/auth/grant-flows",
+        Some(&token),
+        &json!({"delivery_assertion":matching}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let expected: String =
+        sqlx::query_scalar("SELECT expected_pubky FROM grant_flows WHERE flow_id = $1")
+            .bind(Uuid::parse_str(body["flow_id"].as_str().unwrap()).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(expected, pubky);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -248,7 +375,7 @@ async fn status_rate_limit_is_shared_in_postgres(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn wrong_verified_signer_is_visible_409_mints_no_bearer_and_cannot_replay(
+async fn wrong_verified_signer_is_terminal_without_an_identity_oracle_and_mints_no_bearer(
     pool: sqlx::PgPool,
 ) {
     let (app, authority) = test_app_with_grant(pool.clone()).await;
@@ -268,9 +395,8 @@ async fn wrong_verified_signer_is_visible_409_mints_no_bearer_and_cannot_replay(
         &Value::Null,
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["status"], "mismatch");
-    assert_eq!(body["terminal_code"], "identity_mismatch");
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body, json!({"status":"terminal"}));
     let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions")
         .fetch_one(&pool)
         .await
@@ -469,9 +595,9 @@ async fn reaper_terminalizes_expiry_and_stale_lease_without_replay(pool: sqlx::P
     ] {
         sqlx::query(
             "INSERT INTO grant_flows (flow_id,expected_pubky,assertion_jti,client_id,cpk,\
-             capabilities,relay_url,grant_state_sealed,key_epoch,result_hash_epoch,status,\
+             relay_url,grant_state_sealed,key_epoch,result_hash_epoch,status,\
              version,lease_owner,lease_until,result_delivery_id_hash,result_cpk,created_at,expires_at) \
-             VALUES ($1,$2,$3,$4,$5,'',$6,$7,1,1,$8,1,$9,$10,$11,$12,$13,$14)",
+             VALUES ($1,$2,$3,$4,$5,$6,$7,1,1,$8,1,$9,$10,$11,$12,$13,$14)",
         )
         .bind(Uuid::new_v4())
         .bind("y".repeat(52))
@@ -567,38 +693,111 @@ async fn result_expiry_revokes_both_undelivered_and_delivered_sessions(pool: sql
     }
 }
 
+fn required_string<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing string at {pointer}"))
+}
+
+fn verify_rc55_capture(value: &Value) -> Result<(), String> {
+    if value["schema_version"] != 2
+        || value["intent"] != "signin_grant"
+        || value["parameter_names"]
+            != json!(["caps", "cid", "cpk", "relay", "secret", "x-bitkit-claim"])
+        || value["parameter_cardinality"] != "one_each"
+        || value["cpk_decoded_bytes"] != 32
+        || value["cid_utf8_bytes"] != 13
+        || value["secret_decoded_bytes"] != 32
+        || value["claim_type"] != "watch-only-account-v1"
+    {
+        return Err("captured rc55 contract fields changed".into());
+    }
+    let cpk = required_string(value, "/cpk_public_key")?;
+    let parsed_cpk =
+        PublicKey::try_from_z32(cpk).map_err(|_| "cpk is not a real public key".to_string())?;
+    if parsed_cpk.z32() != cpk || cpk.len() != 52 {
+        return Err("cpk is not canonical z-base-32".into());
+    }
+    let raw_url_hash = required_string(value, "/authorization_url_sha256")?;
+    if raw_url_hash.len() != 64
+        || !raw_url_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("raw authorization URL digest is not canonical SHA-256".into());
+    }
+    let redacted_url = required_string(value, "/authorization_url_redacted")?;
+    for parameter in ["secret", "cid", "cpk"] {
+        if !redacted_url.contains(&format!("{parameter}=%3Credacted%3E")) {
+            return Err(format!("{parameter} is not redacted"));
+        }
+    }
+    if value["provenance"]["staging_source_head"] != "1f0d0974"
+        || value["provenance"]["source_flow"] != "Paykit staging /setup from issue #48"
+        || value["provenance"]["sensitive_payload_recorded"] != false
+    {
+        return Err("capture provenance changed".into());
+    }
+    let captured_at = required_string(value, "/provenance/captured_at_utc")?;
+    DateTime::parse_from_rfc3339(captured_at)
+        .map_err(|_| "capture time is not RFC 3339".to_string())?;
+
+    if value["capture_attestation"]["algorithm"] != "Ed25519"
+        || value["capture_attestation"]["domain"] != "marketplace/rc55-staging-capture/v1"
+        || value["capture_attestation"]["public_key"] != RC55_CAPTURE_ATTESTATION_KEY
+    {
+        return Err("capture attestation identity changed".into());
+    }
+    let public_key: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(RC55_CAPTURE_ATTESTATION_KEY)
+        .map_err(|_| "capture public key is invalid".to_string())?
+        .try_into()
+        .map_err(|_| "capture public key length is invalid".to_string())?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(required_string(value, "/capture_attestation/signature")?)
+        .map_err(|_| "capture signature is invalid Base64url".to_string())?;
+    let signature =
+        Signature::from_slice(&signature).map_err(|_| "capture signature length is invalid")?;
+    let message = format!(
+        "marketplace/rc55-staging-capture/v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        raw_url_hash,
+        required_string(value, "/intent")?,
+        cpk,
+        value["cpk_decoded_bytes"],
+        value["cid_utf8_bytes"],
+        value["secret_decoded_bytes"],
+        required_string(value, "/claim_type")?,
+        captured_at,
+        required_string(value, "/provenance/staging_source_head")?,
+    );
+    VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| "capture public key is not Ed25519".to_string())?
+        .verify_strict(message.as_bytes(), &signature)
+        .map_err(|_| "capture signature does not verify".to_string())
+}
+
 #[test]
 fn real_rc55_bitkit_artifact_is_pinned_before_enablement() {
     let fixture = std::fs::read_to_string("tests/fixtures/grant/bitkit-rc55-staging.json")
         .expect("real staging artifact is pinned");
     let value: Value = serde_json::from_str(&fixture).expect("artifact JSON");
-    assert_eq!(value["schema_version"], 1);
-    assert_eq!(value["intent"], "signin_grant");
-    assert_eq!(
-        value["parameter_names"],
-        json!(["caps", "cid", "cpk", "relay", "secret", "x-bitkit-claim"])
-    );
-    assert_eq!(value["parameter_cardinality"], "one_each");
-    assert_eq!(value["secret_decoded_bytes"], 32);
-    assert_eq!(value["claim_type"], "watch-only-account-v1");
-    let redacted_url = value["authorization_url_redacted"]
-        .as_str()
-        .expect("redacted authorization URL");
-    for parameter in ["secret", "cid", "cpk"] {
-        assert!(
-            redacted_url.contains(&format!("{parameter}=%3Credacted%3E")),
-            "{parameter} must be redacted"
-        );
-    }
-    assert_eq!(value["provenance"]["staging_source_head"], "1f0d0974");
-    assert_eq!(
-        value["provenance"]["source_flow"],
-        "Paykit staging /setup from issue #48"
-    );
-    assert_eq!(value["provenance"]["sensitive_payload_recorded"], false);
+    verify_rc55_capture(&value).expect("live capture attestation and rc55 contract must verify");
     for forbidden in ["grant", "pop_private_key", "bearer", "relay_secret"] {
         assert!(value.get(forbidden).is_none());
     }
+}
+
+#[test]
+fn hand_authored_rc55_lookalike_fails_capture_attestation() {
+    let fixture = std::fs::read_to_string("tests/fixtures/grant/bitkit-rc55-staging.json")
+        .expect("real staging artifact is pinned");
+    let mut fake: Value = serde_json::from_str(&fixture).expect("artifact JSON");
+    fake["authorization_url_sha256"] = Value::String("0".repeat(64));
+    assert!(
+        verify_rc55_capture(&fake).is_err(),
+        "a structurally valid hand-authored lookalike must not pass"
+    );
 }
 
 #[test]

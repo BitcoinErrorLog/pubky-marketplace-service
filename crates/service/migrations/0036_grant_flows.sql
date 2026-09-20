@@ -11,7 +11,6 @@ CREATE TABLE grant_flows (
     assertion_jti UUID UNIQUE,
     client_id TEXT NOT NULL,
     cpk TEXT NOT NULL,
-    capabilities TEXT NOT NULL,
     relay_url TEXT NOT NULL,
     grant_state_sealed BYTEA,
     key_epoch SMALLINT NOT NULL,

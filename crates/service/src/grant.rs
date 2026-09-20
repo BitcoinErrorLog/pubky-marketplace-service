@@ -599,6 +599,27 @@ pub mod test_support {
             }))
         }
 
+        pub fn sign_delivery_assertion(
+            &self,
+            sub: &str,
+            result_delivery_id: &[u8; 32],
+            result_cpk: &str,
+            now: DateTime<Utc>,
+            jti: Uuid,
+        ) -> String {
+            self.sign_assertion(json!({
+                "aud": ASSERTION_AUDIENCE,
+                "exp": now.timestamp() + 60,
+                "iat": now.timestamp(),
+                "iss": self.runtime.config.assertion_issuer,
+                "jti": jti.to_string(),
+                "purpose": ASSERTION_DELIVERY_PURPOSE,
+                "result_cpk": result_cpk,
+                "result_delivery_id": URL_SAFE_NO_PAD.encode(result_delivery_id),
+                "sub": sub,
+            }))
+        }
+
         fn sign_assertion(&self, claims: Value) -> String {
             let header = json!({"alg":"EdDSA","kid":"shop-test-0001","typ":"JWT"});
             let header = URL_SAFE_NO_PAD.encode(canonical_json(&header).expect("header JCS"));
@@ -669,16 +690,20 @@ pub mod test_support {
             .expect("seed auth session");
             sqlx::query(
                 "INSERT INTO grant_flows (flow_id,expected_pubky,assertion_jti,client_id,cpk,\
-                 capabilities,relay_url,key_epoch,result_hash_epoch,status,approved_pubky,\
+                 relay_url,key_epoch,result_hash_epoch,status,approved_pubky,\
                  result_delivery_id_hash,result_cpk,result_token_hash,result_token_expires_at,\
                  result_payload_sealed,result_auth_session_id,created_at,expires_at,terminal_at) \
-                 VALUES ($1,$2,$3,$4,$5,'',$6,$7,$8,'complete',$2,$9,$10,$11,$12,$13,$14,$15,$16,$15)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'complete',$2,$9,$10,$11,$12,$13,$14,$15,$16,$15)",
             )
             .bind(flow_id)
             .bind(expected_pubky)
             .bind(Uuid::new_v4())
             .bind(&self.runtime.config.client_id)
-            .bind(PublicKey::try_from_z32(result_cpk).expect("result key").z32())
+            .bind(
+                PublicKey::try_from_z32(result_cpk)
+                    .expect("result key")
+                    .z32(),
+            )
             .bind(self.runtime.config.relay_url.as_str())
             .bind(key_epoch)
             .bind(hash_epoch)
@@ -708,9 +733,9 @@ pub mod test_support {
             let cpk = "y".repeat(52);
             sqlx::query(
                 "INSERT INTO grant_flows (flow_id,expected_pubky,assertion_jti,client_id,cpk,\
-                 capabilities,relay_url,grant_state_sealed,key_epoch,result_hash_epoch,status,\
+                 relay_url,grant_state_sealed,key_epoch,result_hash_epoch,status,\
                  version,lease_owner,lease_until,result_delivery_id_hash,result_cpk,created_at,expires_at) \
-                 VALUES ($1,$2,$3,$4,$5,'',$6,$7,1,1,'verifying',1,$8,$9,$10,$11,$12,$13)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,1,1,'verifying',1,$8,$9,$10,$11,$12,$13)",
             )
             .bind(flow_id)
             .bind(expected_pubky)
@@ -848,6 +873,7 @@ struct DeliveryAssertion {
     purpose: String,
     result_cpk: String,
     result_delivery_id: String,
+    sub: String,
 }
 
 #[derive(Debug)]
@@ -929,7 +955,7 @@ fn verify_assertion(
             claims.purpose,
             claims.result_cpk,
             claims.result_delivery_id,
-            None,
+            Some(claims.sub),
         )
     };
     let expected_purpose = if bootstrap {
@@ -1099,7 +1125,11 @@ pub async fn create_flow(
             .clone()
             .expect("bootstrap verifier requires sub")
     } else {
-        actor.expect("reconnect mode requires actor").0
+        let actor_pubky = actor.expect("reconnect mode requires actor").0;
+        if assertion.expected_pubky.as_deref() != Some(actor_pubky.as_str()) {
+            return error_response(StatusCode::UNAUTHORIZED, "invalid_assertion");
+        }
+        actor_pubky
     };
     if !marketplace_domain::pubky::is_valid_pubky(&expected_pubky) {
         return error_response(StatusCode::UNAUTHORIZED, "invalid_assertion");
@@ -1197,9 +1227,9 @@ pub async fn create_flow(
     }
     let inserted = sqlx::query(
         "INSERT INTO grant_flows (flow_id, expected_pubky, assertion_jti, client_id, cpk, \
-         capabilities, relay_url, grant_state_sealed, key_epoch, result_hash_epoch, status, \
+         relay_url, grant_state_sealed, key_epoch, result_hash_epoch, status, \
          result_delivery_id_hash, result_cpk, created_at, expires_at) \
-         VALUES ($1,$2,$3,$4,$5,'',$6,$7,$8,$9,'awaiting',$10,$11,$12,$13)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'awaiting',$10,$11,$12,$13)",
     )
     .bind(flow_id)
     .bind(&expected_pubky)
@@ -1250,7 +1280,6 @@ pub async fn create_flow(
 struct StatusRow {
     flow_id: Uuid,
     status: String,
-    terminal_code: Option<String>,
     expires_at: DateTime<Utc>,
 }
 
@@ -1277,7 +1306,7 @@ pub async fn get_status(
         Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
     }
     let row: Option<StatusRow> = match sqlx::query_as(
-        "SELECT flow_id, status, terminal_code, expires_at FROM grant_flows WHERE flow_id = $1",
+        "SELECT flow_id, status, expires_at FROM grant_flows WHERE flow_id = $1",
     )
     .bind(flow_id)
     .fetch_optional(&state.pool)
@@ -1289,20 +1318,27 @@ pub async fn get_status(
     let Some(row) = row else {
         return error_response(StatusCode::NOT_FOUND, "flow_not_found");
     };
-    let status = match row.status.as_str() {
-        "mismatch" => StatusCode::CONFLICT,
-        "expired" | "cancelled" => StatusCode::GONE,
-        "invalid" | "failed" => StatusCode::UNPROCESSABLE_ENTITY,
-        _ => StatusCode::OK,
-    };
+    if matches!(
+        row.status.as_str(),
+        "mismatch" | "expired" | "cancelled" | "invalid" | "failed"
+    ) {
+        return no_store(
+            (
+                StatusCode::GONE,
+                Json(json!({
+                    "status": "terminal",
+                })),
+            )
+                .into_response(),
+        );
+    }
     no_store(
         (
-            status,
+            StatusCode::OK,
             Json(json!({
                 "expires_at": format_timestamp(row.expires_at),
                 "flow_id": row.flow_id,
                 "status": row.status,
-                "terminal_code": row.terminal_code,
             })),
         )
             .into_response(),
