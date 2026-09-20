@@ -1209,37 +1209,43 @@ pub enum WebhookVerifyError {
     InvalidSignature,
 }
 
+pub struct WebhookVerifyInput<'a> {
+    pub secret: &'a [u8],
+    pub expected_key_id: Uuid,
+    pub event_id: &'a str,
+    pub timestamp: &'a str,
+    pub key_id: &'a str,
+    pub signature: &'a str,
+    pub raw: &'a [u8],
+    pub receiver_now: DateTime<Utc>,
+    pub max_skew_seconds: i64,
+}
+
 pub fn verify_webhook(
-    secret: &[u8],
-    expected_key_id: Uuid,
-    event_id: &str,
-    timestamp: &str,
-    key_id: &str,
-    signature: &str,
-    raw: &[u8],
-    receiver_now: DateTime<Utc>,
-    max_skew_seconds: i64,
+    input: WebhookVerifyInput<'_>,
 ) -> Result<VerifiedWebhook, WebhookVerifyError> {
-    let event_id = Uuid::parse_str(event_id).map_err(|_| WebhookVerifyError::Malformed)?;
-    let key_id = Uuid::parse_str(key_id).map_err(|_| WebhookVerifyError::Malformed)?;
-    if key_id != expected_key_id {
+    let event_id = Uuid::parse_str(input.event_id).map_err(|_| WebhookVerifyError::Malformed)?;
+    let key_id = Uuid::parse_str(input.key_id).map_err(|_| WebhookVerifyError::Malformed)?;
+    if key_id != input.expected_key_id {
         return Err(WebhookVerifyError::WrongKey);
     }
-    let timestamp_seconds = timestamp
+    let timestamp_seconds = input
+        .timestamp
         .parse::<i64>()
         .map_err(|_| WebhookVerifyError::Malformed)?;
     if timestamp_seconds
-        .checked_sub(receiver_now.timestamp())
-        .is_none_or(|delta| delta.unsigned_abs() > max_skew_seconds.max(0) as u64)
+        .checked_sub(input.receiver_now.timestamp())
+        .is_none_or(|delta| delta.unsigned_abs() > input.max_skew_seconds.max(0) as u64)
     {
         return Err(WebhookVerifyError::Stale);
     }
-    let supplied = signature
+    let supplied = input
+        .signature
         .strip_prefix("v1=")
         .filter(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .ok_or(WebhookVerifyError::Malformed)?;
-    let signing_key = Sha256::digest(secret);
-    let expected = webhook_signature(&signing_key, timestamp, event_id, raw)
+    let signing_key = Sha256::digest(input.secret);
+    let expected = webhook_signature(&signing_key, input.timestamp, event_id, input.raw)
         .ok_or(WebhookVerifyError::Malformed)?;
     use subtle::ConstantTimeEq;
     if !bool::from(expected.as_bytes().ct_eq(supplied.as_bytes())) {
@@ -1248,7 +1254,7 @@ pub fn verify_webhook(
     Ok(VerifiedWebhook {
         event_id,
         key_id,
-        payload_sha256: hex::encode(Sha256::digest(raw)),
+        payload_sha256: hex::encode(Sha256::digest(input.raw)),
     })
 }
 
@@ -1428,17 +1434,19 @@ mod tests {
             "v1={}",
             webhook_signature(&signing_key, &timestamp, event_id, raw).expect("signature")
         );
-        let verified = verify_webhook(
-            &secret,
-            key_id,
-            &event_id.to_string(),
-            &timestamp,
-            &key_id.to_string(),
-            &signature,
+        let event_id_text = event_id.to_string();
+        let key_id_text = key_id.to_string();
+        let verified = verify_webhook(WebhookVerifyInput {
+            secret: &secret,
+            expected_key_id: key_id,
+            event_id: &event_id_text,
+            timestamp: &timestamp,
+            key_id: &key_id_text,
+            signature: &signature,
             raw,
-            now,
-            300,
-        )
+            receiver_now: now,
+            max_skew_seconds: 300,
+        })
         .expect("fresh signature verifies");
         assert_eq!(
             classify_webhook_replay(None, &verified.payload_sha256),
@@ -1453,17 +1461,17 @@ mod tests {
             WebhookReplayDecision::QuarantineChangedPayload
         );
         assert_eq!(
-            verify_webhook(
-                &secret,
-                key_id,
-                &event_id.to_string(),
-                &timestamp,
-                &key_id.to_string(),
-                &signature,
+            verify_webhook(WebhookVerifyInput {
+                secret: &secret,
+                expected_key_id: key_id,
+                event_id: &event_id_text,
+                timestamp: &timestamp,
+                key_id: &key_id_text,
+                signature: &signature,
                 raw,
-                now + chrono::Duration::seconds(301),
-                300,
-            ),
+                receiver_now: now + chrono::Duration::seconds(301),
+                max_skew_seconds: 300,
+            }),
             Err(WebhookVerifyError::Stale)
         );
     }
