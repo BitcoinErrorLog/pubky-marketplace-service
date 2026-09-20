@@ -75,11 +75,11 @@ jobs:
       - name: Install native build deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
       - uses: Swatinem/rust-cache@v2
-      # ubuntu-24.04 GitHub-hosted is 2-core. Two test threads matches that
-      # and keeps concurrent #[sqlx::test] pools inside default
-      # max_connections=100 (GHA service containers cannot pass
-      # `postgres -c max_connections=`). shm-size is set on the service.
-      - run: cargo test --workspace -- --test-threads=2
+      # One thread: migrations CREATE ROLE names that are cluster-global, and
+      # pg_advisory_xact_lock keys are instance-wide, so two #[sqlx::test]
+      # databases on one Postgres cannot run in parallel. shm-size is set on
+      # the service; GHA cannot pass `postgres -c max_connections=`.
+      - run: cargo test --workspace -- --test-threads=1
 
   migrations:
     name: migrations
