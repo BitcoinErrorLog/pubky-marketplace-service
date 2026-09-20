@@ -7,6 +7,30 @@ use uuid::Uuid;
 
 static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 
+#[test]
+fn migration_0035_never_changes_roles_grants_or_ownership() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations/0035_automation_apis.sql"
+    ))
+    .expect("migration source");
+    let uppercase = source.to_ascii_uppercase();
+    for forbidden in [
+        "CREATE ROLE",
+        "ALTER ROLE",
+        "GRANT ",
+        "REVOKE ",
+        "ALTER OWNER",
+        " OWNER TO ",
+        "SECURITY DEFINER",
+    ] {
+        assert!(
+            !uppercase.contains(forbidden),
+            "migration 0035 must not contain {forbidden}"
+        );
+    }
+}
+
 #[sqlx::test(migrations = false)]
 async fn migration_0035_upgrades_the_exact_0034_catalog_and_preserves_sessions(pool: PgPool) {
     let through_0034 = Migrator {
@@ -92,6 +116,43 @@ async fn automation_schema_is_additive_and_constrained(pool: PgPool) {
     .await
     .expect("session column catalog");
     assert_eq!(session_columns, 5);
+
+    let endpoint_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'webhook_endpoints' \
+           AND column_name = ANY($1)",
+    )
+    .bind(&["enqueue_sequence", "enqueue_checked_at"][..])
+    .fetch_one(&pool)
+    .await
+    .expect("endpoint cursor catalog");
+    assert_eq!(endpoint_columns, 2);
+
+    let principal: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(&pool)
+        .await
+        .expect("current principal");
+    for table in [
+        "webhook_endpoints",
+        "webhook_deliveries",
+        "webhook_dead_letters",
+        "automation_rate_limits",
+    ] {
+        let (owner, dml): (String, bool) = sqlx::query_as(
+            "SELECT tableowner, has_table_privilege(current_user, $1, \
+             'SELECT,INSERT,UPDATE,DELETE') FROM pg_tables \
+             WHERE schemaname = 'public' AND tablename = $1",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .expect("owner and DML privileges");
+        assert_eq!(
+            owner, principal,
+            "{table} must be owned by the migration principal"
+        );
+        assert!(dml, "{table} must be usable by the runtime principal");
+    }
 
     let earlier_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version BETWEEN 1 AND 34")
