@@ -698,3 +698,61 @@ async fn webhook_endpoint_quota_is_atomic_and_new_endpoints_do_not_backfill(pool
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_failed_webhook_retry_can_recover_to_delivered(pool: PgPool) {
+    let mut config = marketplace_service::config::Config::for_tests();
+    config.webhook_retry_base_seconds = 1;
+    config.webhook_retry_max_seconds = 1;
+    let app = test_app_with_config(pool, config).await;
+    let seller = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let endpoint_id = Uuid::new_v4();
+    let now: DateTime<Utc> = common::NOW.parse().expect("fixture timestamp");
+    sqlx::query(
+        "INSERT INTO webhook_endpoints \
+         (id, seller_pubky, endpoint_url, key_id, signing_key, created_at, updated_at) \
+         VALUES ($1, $2, 'https://127.0.0.1/hook', $3, $4, $5, $5)",
+    )
+    .bind(endpoint_id)
+    .bind(&seller.pubky)
+    .bind(Uuid::new_v4())
+    .bind(vec![7_u8; 32])
+    .bind(now)
+    .execute(&app.pool)
+    .await
+    .expect("endpoint fixture");
+    marketplace_service::automation::run_webhook_pass(&app.state)
+        .await
+        .expect("failed first attempt");
+    let event_id: Uuid =
+        sqlx::query_scalar("SELECT event_id FROM webhook_deliveries WHERE endpoint_id = $1")
+            .bind(endpoint_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("delivery event");
+    app.clock.advance_seconds(2);
+    assert!(
+        marketplace_service::automation::record_webhook_outcome_for_proof(
+            &app.state,
+            endpoint_id,
+            event_id,
+            Some(204),
+        )
+        .await
+        .expect("successful retry state transition")
+    );
+    let row: (i32, Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT attempt_count, delivered_at, dead_lettered_at \
+         FROM webhook_deliveries WHERE endpoint_id = $1 AND event_id = $2",
+    )
+    .bind(endpoint_id)
+    .bind(event_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("delivery state");
+    assert_eq!(row.0, 2);
+    assert!(row.1.is_some());
+    assert!(row.2.is_none());
+}

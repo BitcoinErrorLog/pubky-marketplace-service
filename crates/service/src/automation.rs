@@ -981,77 +981,112 @@ pub async fn run_webhook_pass(state: &AppState) -> anyhow::Result<u64> {
             continue;
         }
         let status = deliver(&delivery, now).await.ok().map(i32::from);
-        let attempt = delivery.attempt_count + 1;
-        let age = now - delivery.created_at;
-        if status.is_some_and(|status| (200..300).contains(&status)) {
-            sqlx::query(
-                "UPDATE webhook_deliveries SET attempt_count = $3, last_status = $4, \
-                 delivered_at = $5, lease_until = NULL \
-                 WHERE endpoint_id = $1 AND event_id = $2 AND delivered_at IS NULL \
-                   AND dead_lettered_at IS NULL",
-            )
-            .bind(delivery.endpoint_id)
-            .bind(delivery.event_id)
-            .bind(attempt)
-            .bind(status)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
+        if persist_delivery_outcome(&mut tx, &state.config, &delivery, now, status).await? {
             terminal += 1;
-        } else if attempt >= state.config.webhook_max_attempts
-            || age >= chrono::Duration::hours(state.config.webhook_max_age_hours)
-        {
-            sqlx::query(
-                "UPDATE webhook_deliveries SET attempt_count = $3, last_status = $4, \
-                 dead_lettered_at = $5, lease_until = NULL \
-                 WHERE endpoint_id = $1 AND event_id = $2 AND delivered_at IS NULL \
-                   AND dead_lettered_at IS NULL",
-            )
-            .bind(delivery.endpoint_id)
-            .bind(delivery.event_id)
-            .bind(attempt)
-            .bind(status)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "INSERT INTO webhook_dead_letters \
-                 (endpoint_id, event_id, attempt_count, final_status, dead_lettered_at) \
-                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-            )
-            .bind(delivery.endpoint_id)
-            .bind(delivery.event_id)
-            .bind(attempt)
-            .bind(status)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            terminal += 1;
-        } else {
-            let shift = u32::try_from(attempt.saturating_sub(1).min(20)).unwrap_or(20);
-            let backoff = state
-                .config
-                .webhook_retry_base_seconds
-                .saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
-                .min(state.config.webhook_retry_max_seconds);
-            sqlx::query(
-                "UPDATE webhook_deliveries SET attempt_count = $3, last_status = $4, \
-                 next_attempt_at = $5, lease_until = NULL \
-                 WHERE endpoint_id = $1 AND event_id = $2 AND delivered_at IS NULL \
-                   AND dead_lettered_at IS NULL",
-            )
-            .bind(delivery.endpoint_id)
-            .bind(delivery.event_id)
-            .bind(attempt)
-            .bind(status)
-            .bind(now + chrono::Duration::seconds(backoff))
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
         }
+        tx.commit().await?;
     }
+    Ok(terminal)
+}
+
+async fn persist_delivery_outcome(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    config: &crate::config::Config,
+    delivery: &Delivery,
+    now: DateTime<Utc>,
+    status: Option<i32>,
+) -> Result<bool, sqlx::Error> {
+    let attempt = delivery.attempt_count + 1;
+    let age = now - delivery.created_at;
+    if status.is_some_and(|status| (200..300).contains(&status)) {
+        sqlx::query(
+            "UPDATE webhook_deliveries SET attempt_count = $3, last_status = $4, \
+             delivered_at = $5, lease_until = NULL \
+             WHERE endpoint_id = $1 AND event_id = $2 AND delivered_at IS NULL \
+               AND dead_lettered_at IS NULL",
+        )
+        .bind(delivery.endpoint_id)
+        .bind(delivery.event_id)
+        .bind(attempt)
+        .bind(status)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(true);
+    }
+    if attempt >= config.webhook_max_attempts
+        || age >= chrono::Duration::hours(config.webhook_max_age_hours)
+    {
+        sqlx::query(
+            "UPDATE webhook_deliveries SET attempt_count = $3, last_status = $4, \
+             dead_lettered_at = $5, lease_until = NULL \
+             WHERE endpoint_id = $1 AND event_id = $2 AND delivered_at IS NULL \
+               AND dead_lettered_at IS NULL",
+        )
+        .bind(delivery.endpoint_id)
+        .bind(delivery.event_id)
+        .bind(attempt)
+        .bind(status)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO webhook_dead_letters \
+             (endpoint_id, event_id, attempt_count, final_status, dead_lettered_at) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        )
+        .bind(delivery.endpoint_id)
+        .bind(delivery.event_id)
+        .bind(attempt)
+        .bind(status)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(true);
+    }
+    let shift = u32::try_from(attempt.saturating_sub(1).min(20)).unwrap_or(20);
+    let backoff = config
+        .webhook_retry_base_seconds
+        .saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
+        .min(config.webhook_retry_max_seconds);
+    sqlx::query(
+        "UPDATE webhook_deliveries SET attempt_count = $3, last_status = $4, \
+         next_attempt_at = $5, lease_until = NULL \
+         WHERE endpoint_id = $1 AND event_id = $2 AND delivered_at IS NULL \
+           AND dead_lettered_at IS NULL",
+    )
+    .bind(delivery.endpoint_id)
+    .bind(delivery.event_id)
+    .bind(attempt)
+    .bind(status)
+    .bind(now + chrono::Duration::seconds(backoff))
+    .execute(&mut **tx)
+    .await?;
+    Ok(false)
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+pub async fn record_webhook_outcome_for_proof(
+    state: &AppState,
+    endpoint_id: Uuid,
+    event_id: Uuid,
+    status: Option<i32>,
+) -> anyhow::Result<bool> {
+    let mut tx = state.pool.begin().await?;
+    let delivery: Delivery = sqlx::query_as(
+        "SELECT d.endpoint_id, d.event_id, w.endpoint_url, d.key_id, d.signing_key, \
+                d.body, d.attempt_count, d.created_at \
+         FROM webhook_deliveries d JOIN webhook_endpoints w ON w.id = d.endpoint_id \
+         WHERE d.endpoint_id = $1 AND d.event_id = $2 FOR UPDATE",
+    )
+    .bind(endpoint_id)
+    .bind(event_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let terminal =
+        persist_delivery_outcome(&mut tx, &state.config, &delivery, state.clock.now(), status)
+            .await?;
+    tx.commit().await?;
     Ok(terminal)
 }
 
