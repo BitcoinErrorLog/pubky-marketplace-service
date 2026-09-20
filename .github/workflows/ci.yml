@@ -1,0 +1,133 @@
+# Local merge gates (README Test + marketplace-service release skill):
+#   cargo fmt --check
+#   cargo clippy --workspace --all-targets -- -D warnings
+#   cargo test --workspace
+# plus applying crates/service/migrations twice on a fresh Postgres.
+# Toolchain is Dockerfile `rust:1.89-slim-bookworm` (no rust-toolchain.toml).
+# This workflow is merge gates only.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # #[sqlx::test] reads DATABASE_URL and creates one database per test.
+      # No other harness env is required; Config::for_tests() is in-process.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  migrations:
+    name: migrations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache sqlx-cli
+        id: cache-sqlx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/sqlx
+          key: ${{ runner.os }}-sqlx-cli-0.8.6-rustls-postgres
+      - name: Install sqlx-cli
+        if: steps.cache-sqlx.outputs.cache-hit != 'true'
+        run: cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,postgres --locked
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: Apply all migrations twice
+        working-directory: crates/service
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/marketplace_migrate
+        run: |
+          set -euo pipefail
+          psql postgres://postgres:postgres@localhost:5432/postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE marketplace_migrate;'
+          sqlx migrate run
+          first="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAc \
+            "select version::text || ':' || encode(checksum, 'hex') from _sqlx_migrations where success order by version")"
+          files="$(find migrations -maxdepth 1 -name '[0-9]*.sql' | wc -l | tr -d ' ')"
+          applied="$(printf '%s\n' "$first" | awk 'NF{n++} END{print n+0}')"
+          echo "applied=${applied} files=${files}"
+          test "$applied" = "$files"
+          test -n "$first"
+          sqlx migrate run
+          second="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAc \
+            "select version::text || ':' || encode(checksum, 'hex') from _sqlx_migrations where success order by version")"
+          test "$first" = "$second"
