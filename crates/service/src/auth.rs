@@ -161,6 +161,79 @@ pub fn hash_token(token: &[u8]) -> Vec<u8> {
     Sha256::digest(token).to_vec()
 }
 
+fn bearer_from_headers(headers: &HeaderMap) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let encoded = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| anyhow::anyhow!("invalid marketplace bearer"))?;
+    URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid marketplace bearer"))
+}
+
+/// The one active-session predicate used by middleware, session administration,
+/// and grant reconnect. Keeping the lookup here prevents revocation semantics
+/// from drifting between authorization surfaces.
+async fn resolve_active_session(
+    pool: &sqlx::PgPool,
+    token: &[u8],
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<AuthSession>> {
+    let token_hash = hash_token(token);
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT pubky, capabilities FROM auth_sessions \
+         WHERE token_hash = $1 AND expires_at > $2 AND revoked_at IS NULL",
+    )
+    .bind(&token_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(pubky, capabilities)| AuthSession {
+        actor: Actor(pubky),
+        capabilities,
+        token_hash,
+    }))
+}
+
+async fn record_session_use(pool: &sqlx::PgPool, token_hash: &[u8], now: DateTime<Utc>) {
+    if let Err(error) = sqlx::query(
+        "UPDATE auth_sessions SET last_used_at = $2 WHERE token_hash = $1 \
+         AND revoked_at IS NULL \
+         AND (last_used_at IS NULL OR last_used_at < $2 - INTERVAL '60 seconds')",
+    )
+    .bind(token_hash)
+    .bind(now)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(error = %error, "failed to update session last use");
+    }
+}
+
+/// Resolves an optional marketplace bearer without accepting any client
+/// asserted identity. `Ok(None)` means no Authorization header was present;
+/// a present malformed, unknown, or expired bearer is an authentication
+/// failure.
+pub async fn actor_from_authorization(
+    pool: &sqlx::PgPool,
+    headers: &HeaderMap,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<Actor>> {
+    let Some(token) = bearer_from_headers(headers)? else {
+        return Ok(None);
+    };
+    resolve_active_session(pool, &token, now)
+        .await?
+        .map(|session| session.actor)
+        .ok_or_else(|| anyhow::anyhow!("invalid marketplace bearer"))
+        .map(Some)
+}
+
 fn auth_error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": { "message": message } }))).into_response()
 }
@@ -290,70 +363,52 @@ pub async fn require_session(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let token = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .and_then(|token| URL_SAFE_NO_PAD.decode(token).ok());
-    let Some(token) = token else {
-        tracing::warn!(
-            route = logging::route_template(&request),
-            status = StatusCode::UNAUTHORIZED.as_u16(),
-            reason = "MISSING_OR_MALFORMED_BEARER",
-            "auth.rejected"
-        );
-        return auth_error(
-            StatusCode::UNAUTHORIZED,
-            "A session bearer token is required.",
-        );
+    let token = match bearer_from_headers(request.headers()) {
+        Ok(Some(token)) => token,
+        Ok(None) | Err(_) => {
+            tracing::warn!(
+                route = logging::route_template(&request),
+                status = StatusCode::UNAUTHORIZED.as_u16(),
+                reason = "MISSING_OR_MALFORMED_BEARER",
+                "auth.rejected"
+            );
+            return auth_error(
+                StatusCode::UNAUTHORIZED,
+                "A session bearer token is required.",
+            );
+        }
     };
 
     let now = state.clock.now();
-    let token_hash = hash_token(&token);
-    let session: Option<(String, String, DateTime<Utc>)> = match sqlx::query_as(
-        "SELECT pubky, capabilities, expires_at FROM auth_sessions \
-         WHERE token_hash = $1 AND expires_at > $2 AND revoked_at IS NULL",
-    )
-    .bind(&token_hash)
-    .bind(now)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(row) => row,
+    let session = match resolve_active_session(&state.pool, &token, now).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            tracing::warn!(
+                route = logging::route_template(&request),
+                status = StatusCode::UNAUTHORIZED.as_u16(),
+                reason = "INVALID_OR_EXPIRED_SESSION",
+                "auth.rejected"
+            );
+            return auth_error(
+                StatusCode::UNAUTHORIZED,
+                "The session is invalid or expired.",
+            );
+        }
         Err(error) => {
             tracing::error!(error = %error, "failed to resolve session");
             return auth_error(StatusCode::INTERNAL_SERVER_ERROR, "Session lookup failed.");
         }
     };
-    let Some((pubky, capabilities, _)) = session else {
-        tracing::warn!(
-            route = logging::route_template(&request),
-            status = StatusCode::UNAUTHORIZED.as_u16(),
-            reason = "INVALID_OR_EXPIRED_SESSION",
-            "auth.rejected"
-        );
-        return auth_error(
-            StatusCode::UNAUTHORIZED,
-            "The session is invalid or expired.",
-        );
-    };
-    if let Err(error) = sqlx::query(
-        "UPDATE auth_sessions SET last_used_at = $2 WHERE token_hash = $1 \
-         AND (last_used_at IS NULL OR last_used_at < $2 - INTERVAL '60 seconds')",
-    )
-    .bind(&token_hash)
-    .bind(now)
-    .execute(&state.pool)
-    .await
-    {
-        tracing::warn!(error = %error, "failed to update session last use");
-    }
+    record_session_use(&state.pool, &session.token_hash, now).await;
 
-    let actor = Actor(pubky);
+    let AuthSession {
+        actor,
+        capabilities,
+        token_hash,
+    } = session;
     request.extensions_mut().insert(actor.clone());
     request.extensions_mut().insert(AuthSession {
-        actor,
+        actor: actor.clone(),
         capabilities,
         token_hash,
     });
@@ -372,53 +427,30 @@ async fn resolve_header_session(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<AuthSession, Response> {
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .and_then(|token| URL_SAFE_NO_PAD.decode(token).ok())
+    let token = match bearer_from_headers(headers) {
+        Ok(Some(token)) => token,
+        Ok(None) | Err(_) => {
+            return Err(auth_error(
+                StatusCode::UNAUTHORIZED,
+                "A session bearer token is required.",
+            ));
+        }
+    };
+    let now = state.clock.now();
+    let session = resolve_active_session(&state.pool, &token, now)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "failed to resolve session");
+            auth_error(StatusCode::INTERNAL_SERVER_ERROR, "Session lookup failed.")
+        })?
         .ok_or_else(|| {
             auth_error(
                 StatusCode::UNAUTHORIZED,
-                "A session bearer token is required.",
+                "The session is invalid or expired.",
             )
         })?;
-    let token_hash = hash_token(&token);
-    let now = state.clock.now();
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT pubky, capabilities FROM auth_sessions \
-         WHERE token_hash = $1 AND expires_at > $2 AND revoked_at IS NULL",
-    )
-    .bind(&token_hash)
-    .bind(now)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|error| {
-        tracing::error!(error = %error, "failed to resolve session");
-        auth_error(StatusCode::INTERNAL_SERVER_ERROR, "Session lookup failed.")
-    })?;
-    let (pubky, capabilities) = row.ok_or_else(|| {
-        auth_error(
-            StatusCode::UNAUTHORIZED,
-            "The session is invalid or expired.",
-        )
-    })?;
-    if let Err(error) = sqlx::query(
-        "UPDATE auth_sessions SET last_used_at = $2 WHERE token_hash = $1 \
-         AND (last_used_at IS NULL OR last_used_at < $2 - INTERVAL '60 seconds')",
-    )
-    .bind(&token_hash)
-    .bind(now)
-    .execute(&state.pool)
-    .await
-    {
-        tracing::warn!(error = %error, "failed to update session last use");
-    }
-    Ok(AuthSession {
-        actor: Actor(pubky),
-        capabilities,
-        token_hash,
-    })
+    record_session_use(&state.pool, &session.token_hash, now).await;
+    Ok(session)
 }
 
 pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {

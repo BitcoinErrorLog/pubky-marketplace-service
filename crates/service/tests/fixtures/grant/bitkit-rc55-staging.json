@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "intent": "signin_grant",
+  "authorization_url_redacted": "pubkyauth://signin_grant?caps=%2Fpub%2Fpaykit%2Fv0%2Fbitkit%2Fserver%2F%3Arw%2C%2Fpub%2Fpaykit%2Fv0%2Fprivate%2Fbitkit%2Fserver%2F%3Arw&relay=https%3A%2F%2Fhttprelay.pubky.app%2Finbox&secret=%3Credacted%3E&cid=%3Credacted%3E&cpk=%3Credacted%3E&x-bitkit-claim=watch-only-account-v1",
+  "authorization_url_sha256": "6690193c4a3f5f2fc86f7bfd7e659c2e967b72debca4f9e7f3d2051a8750c639",
+  "parameter_names": [
+    "caps",
+    "cid",
+    "cpk",
+    "relay",
+    "secret",
+    "x-bitkit-claim"
+  ],
+  "parameter_cardinality": "one_each",
+  "cpk_public_key": "8kx66g68cjmea1pnyjfmqmhx5er61guojqg71mnjbe1myb35nx1y",
+  "cpk_decoded_bytes": 32,
+  "cid_utf8_bytes": 13,
+  "secret_decoded_bytes": 32,
+  "claim_type": "watch-only-account-v1",
+  "provenance": {
+    "captured_at_utc": "2026-09-20T15:43:20+00:00",
+    "source_flow": "Paykit staging /setup from issue #48",
+    "source_endpoint": "https://paykit-server-production.up.railway.app/setup",
+    "staging_source_head": "1f0d0974",
+    "fresh_seat_pubky_prefix": "o1m5x55m",
+    "capture_method": "Minted a single-use staging invite, created a fresh Pubky seat, then requested the live #48 setup page and parsed its rc55-built URL.",
+    "redacted_parameters": [
+      "cid",
+      "cpk",
+      "secret"
+    ],
+    "sensitive_payload_recorded": false
+  },
+  "capture_attestation": {
+    "algorithm": "Ed25519",
+    "domain": "marketplace/rc55-staging-capture/v1",
+    "public_key": "RJWeSyXMVeBbAFV_Q-FKGqipnh-JC65BII65MV-a894",
+    "signature": "OQHD3G-0uE6Kqn4aErHZr5ONWAkw4CsHCcrtWHfjuhpeIerwDxYU4NHSKaB96b3b1ff8YvxEagCH6YTxknBqBQ"
+  }
+}

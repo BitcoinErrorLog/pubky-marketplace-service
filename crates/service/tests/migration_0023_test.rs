@@ -536,15 +536,15 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 }
 
 /// The migration catalog is strictly increasing, unique per number, and
-/// contains the refusal-audit 0032, reserve-secrecy 0033, inventory 0034,
-/// and automation API 0035 migrations.
+/// contains refusal-audit 0032, reserve-secrecy 0033, inventory 0034,
+/// automation API 0035, and grant-flow 0036.
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0035() {
+fn migration_catalog_is_gapless_through_0036() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -554,18 +554,18 @@ fn migration_catalog_is_gapless_through_0035() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    let expected = (1..=35).collect::<Vec<_>>();
+    let expected = (1..=36).collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
         expected,
-        "the raw catalog is 0001..=0035, gapless"
+        "the raw catalog is 0001..=0036, gapless"
     );
 }
 
 #[test]
-fn migration_catalog_rejects_a_duplicate_0035_number() {
-    let numbers = (1..=35).chain([35]).collect::<Vec<_>>();
-    let expected = (1..=35).collect::<Vec<_>>();
+fn migration_catalog_rejects_a_duplicate_0036_number() {
+    let numbers = (1..=36).chain([36]).collect::<Vec<_>>();
+    let expected = (1..=36).collect::<Vec<_>>();
     assert_ne!(
         sorted_migration_catalog(numbers),
         expected,

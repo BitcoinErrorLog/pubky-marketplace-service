@@ -176,6 +176,27 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/auth/sessions",
             post(auth::create_session).get(auth::list_sessions),
         )
+        .route("/v1/auth/grant-flows", post(crate::grant::create_flow))
+        .route(
+            "/v1/auth/grant-flows/{flow_id}",
+            get(crate::grant::get_status),
+        )
+        .route(
+            "/v1/auth/grant-flows/{flow_id}/cancel",
+            post(crate::grant::cancel_flow),
+        )
+        .route(
+            "/v1/auth/grant-flows/{flow_id}/result-nonces",
+            post(crate::grant::issue_result_nonce),
+        )
+        .route(
+            "/v1/auth/grant-flows/{flow_id}/result-ticket",
+            post(crate::grant::result_ticket),
+        )
+        .route(
+            "/v1/auth/grant-flows/{flow_id}/claim",
+            post(crate::grant::claim_result),
+        )
         // Public: buyers read a seller's available rails before checkout.
         .route(
             "/v0/sellers/{pubky}/payment-config",
