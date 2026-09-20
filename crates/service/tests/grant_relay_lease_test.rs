@@ -13,6 +13,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
+use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
 use marketplace_domain::pubky::encode_pubky;
 use marketplace_service::clock::Clock;
@@ -35,6 +36,7 @@ struct RelayInner {
     messages: std::sync::Mutex<HashMap<String, Bytes>>,
     acked: std::sync::Mutex<HashMap<String, bool>>,
     stall: std::sync::Mutex<Option<Arc<Notify>>>,
+    ack_stall: std::sync::Mutex<Option<Arc<Notify>>>,
     posted: Notify,
     get_started: Notify,
     idle: Notify,
@@ -67,6 +69,7 @@ impl RelayInbox {
             messages: std::sync::Mutex::new(HashMap::new()),
             acked: std::sync::Mutex::new(HashMap::new()),
             stall: std::sync::Mutex::new(None),
+            ack_stall: std::sync::Mutex::new(None),
             posted: Notify::new(),
             get_started: Notify::new(),
             idle: Notify::new(),
@@ -114,14 +117,35 @@ impl RelayInbox {
         !self.inner.messages.lock().expect("messages").is_empty()
     }
 
+    #[allow(dead_code)]
     fn stall(&self) -> Arc<Notify> {
         let notify = Arc::new(Notify::new());
         *self.inner.stall.lock().expect("stall") = Some(notify.clone());
         notify
     }
 
+    fn stall_delete(&self) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        *self.inner.ack_stall.lock().expect("ack stall") = Some(notify.clone());
+        notify
+    }
+
     fn clear_stall(&self) {
         *self.inner.stall.lock().expect("stall") = None;
+        *self.inner.ack_stall.lock().expect("ack stall") = None;
+    }
+
+    async fn wait_deletes(&self, count: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.deletes() >= count {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("inbox DELETE count {} < {count}", self.deletes());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn wait_get_started(&self) {
@@ -162,6 +186,13 @@ impl RelayInbox {
 
 async fn maybe_stall(state: &Arc<RelayInner>) {
     let stall = state.stall.lock().expect("stall").clone();
+    if let Some(stall) = stall {
+        stall.notified().await;
+    }
+}
+
+async fn maybe_stall_delete(state: &Arc<RelayInner>) {
+    let stall = state.ack_stall.lock().expect("ack stall").clone();
     if let Some(stall) = stall {
         stall.notified().await;
     }
@@ -224,6 +255,7 @@ async fn relay_delete(
     Path(channel): Path<String>,
 ) -> StatusCode {
     state.deletes.fetch_add(1, Ordering::SeqCst);
+    maybe_stall_delete(&state).await;
     let removed = state
         .messages
         .lock()
@@ -332,6 +364,61 @@ async fn flow_row(pool: &PgPool, flow_id: Uuid) -> (String, Option<String>) {
         .expect("flow row")
 }
 
+async fn approved_pubky(pool: &PgPool, flow_id: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT approved_pubky FROM grant_flows WHERE flow_id = $1")
+        .bind(flow_id)
+        .fetch_one(pool)
+        .await
+        .expect("approved_pubky")
+}
+
+async fn wait_exchanging(pool: &PgPool, flow_id: Uuid) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if approved_pubky(pool, flow_id).await.is_some() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("flow did not enter exchanging (approved_pubky unset)");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_live_lease(pool: &PgPool, flow_id: Uuid, now: DateTime<Utc>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let live: Option<bool> =
+            sqlx::query_scalar("SELECT lease_until > $2 FROM grant_flows WHERE flow_id = $1")
+                .bind(flow_id)
+                .bind(now)
+                .fetch_optional(pool)
+                .await
+                .expect("lease_until");
+        if live == Some(true) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("heartbeat did not renew lease_until past {now}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_not_awaiting(pool: &PgPool, flow_id: Uuid) -> (String, Option<String>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = flow_row(pool, flow_id).await;
+        if row.0 != "awaiting" {
+            return row;
+        }
+        if Instant::now() >= deadline {
+            panic!("flow returned to awaiting after inbox consume");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn assert_processed(status: &str, terminal_code: Option<&str>, relay: &RelayInbox) {
     assert_ne!(
         status,
@@ -425,46 +512,134 @@ async fn two_workers_race_and_only_one_consumes(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn worker_crash_mid_lease_returns_awaiting_and_does_not_lose_message(pool: PgPool) {
+async fn worker_crash_after_inbox_consume_does_not_return_awaiting(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
-    let stall = harness.relay.stall();
+    let stall = harness.relay.stall_delete();
+    approve(&harness).await;
     let state = harness.app.state.clone();
     let worker = tokio::spawn(async move { grant::poll_once(&state).await });
-    harness.relay.wait_get_started().await;
+    harness.relay.wait_deletes(1).await;
     worker.abort();
     let join = worker.await;
-    assert!(join.is_err(), "mid-lease crash aborts the worker task");
+    assert!(join.is_err(), "post-consume crash aborts the worker task");
     stall.notify_waiters();
     harness.relay.clear_stall();
     harness.relay.wait_idle().await;
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let (status, _) = flow_row(&harness.pool, harness.flow_id).await;
-        if status == "awaiting" {
-            break;
-        }
-        if Instant::now() >= deadline {
-            panic!("crashed lease did not return to awaiting, status={status}");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(harness.relay.deletes(), 0, "aborted GET must not ACK");
-    assert!(
-        !harness.relay.has_message(),
-        "crash is before produce; inbox still empty"
+    let (status, _) = wait_not_awaiting(&harness.pool, harness.flow_id).await;
+    assert_ne!(
+        status, "awaiting",
+        "abort after inbox consume must not revive awaiting"
     );
+    assert_eq!(harness.relay.deletes(), 1, "consume already ACKed");
 
-    approve(&harness).await;
-    assert!(
-        harness.relay.has_message(),
-        "approval must survive the crash"
-    );
     let scanned = grant::poll_once(&harness.app.state)
         .await
-        .expect("successor lease");
+        .expect("no successor lease after consume");
+    assert_eq!(scanned, 0, "retry must not require a second produce");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn replica_reaper_does_not_lease_lost_after_inbox_consume(pool: PgPool) {
+    let relay = RelayInbox::spawn().await;
+    let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
+    let stall = harness.relay.stall_delete();
+    approve(&harness).await;
+
+    let state = harness.app.state.clone();
+    let worker = tokio::spawn(async move { grant::poll_once(&state).await });
+    wait_exchanging(&harness.pool, harness.flow_id).await;
+    harness.app.clock.advance_seconds(60);
+    wait_live_lease(&harness.pool, harness.flow_id, harness.app.clock.now()).await;
+    let _ = grant::reap_once(&harness.app.state)
+        .await
+        .expect("replica reaper");
+    stall.notify_waiters();
+    harness.relay.clear_stall();
+    worker.await.expect("worker join").expect("worker poll");
+
+    let (status, terminal_code) = flow_row(&harness.pool, harness.flow_id).await;
+    assert_ne!(
+        terminal_code.as_deref(),
+        Some("lease_lost"),
+        "consumed approval must not be reap-lost, status={status}"
+    );
+    assert_processed(&status, terminal_code.as_deref(), &harness.relay);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn post_ack_abort_does_not_return_awaiting(pool: PgPool) {
+    let relay = RelayInbox::spawn().await;
+    let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
+    let stall = harness.relay.stall_delete();
+    approve(&harness).await;
+
+    let state = harness.app.state.clone();
+    let worker = tokio::spawn(async move { grant::poll_once(&state).await });
+    harness.relay.wait_deletes(1).await;
+    worker.abort();
+    let _ = worker.await;
+    stall.notify_waiters();
+    harness.relay.clear_stall();
+    harness.relay.wait_idle().await;
+
+    let (status, _) = wait_not_awaiting(&harness.pool, harness.flow_id).await;
+    assert_ne!(status, "awaiting");
+    assert_eq!(harness.relay.deletes(), 1, "consume already ACKed");
+
+    harness.app.clock.advance_seconds(60);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = grant::reap_once(&harness.app.state)
+        .await
+        .expect("reap dead exchanging");
+    let (status, terminal_code) = flow_row(&harness.pool, harness.flow_id).await;
+    assert_ne!(status, "awaiting");
+    assert_eq!(status, "failed");
+    assert_eq!(terminal_code.as_deref(), Some("grant_exchange"));
+
+    let scanned = grant::poll_once(&harness.app.state)
+        .await
+        .expect("no successor lease");
+    assert_eq!(scanned, 0, "retry must not require a second produce");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn duplicate_inbox_message_after_commit_is_ignored(pool: PgPool) {
+    let relay = RelayInbox::spawn().await;
+    let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
+    approve(&harness).await;
+    let scanned = grant::poll_once(&harness.app.state)
+        .await
+        .expect("first consume");
     assert_eq!(scanned, 1);
+    let (status, terminal_code) = flow_row(&harness.pool, harness.flow_id).await;
+    assert_processed(&status, terminal_code.as_deref(), &harness.relay);
+
+    approve(&harness).await;
+    let scanned = grant::poll_once(&harness.app.state)
+        .await
+        .expect("duplicate must not acquire a terminal flow");
+    assert_eq!(scanned, 0);
+    let (again, again_code) = flow_row(&harness.pool, harness.flow_id).await;
+    assert_eq!(again, status);
+    assert_eq!(again_code, terminal_code);
+    assert_eq!(
+        harness.relay.deletes(),
+        1,
+        "duplicate leftover must not be consumed"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn late_inbox_message_within_lease_is_observed(pool: PgPool) {
+    let relay = RelayInbox::spawn().await;
+    let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
+    let state = harness.app.state.clone();
+    let worker = tokio::spawn(async move { grant::poll_once(&state).await });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    approve(&harness).await;
+    worker.await.expect("worker join").expect("late consume");
     let (status, terminal_code) = flow_row(&harness.pool, harness.flow_id).await;
     assert_processed(&status, terminal_code.as_deref(), &harness.relay);
 }
