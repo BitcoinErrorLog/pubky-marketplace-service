@@ -64,6 +64,7 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+          --shm-size=256m
     env:
       # #[sqlx::test] reads DATABASE_URL and creates one database per test.
       # No other harness env is required; Config::for_tests() is in-process.
@@ -74,7 +75,11 @@ jobs:
       - name: Install native build deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      # ubuntu-24.04 GitHub-hosted is 2-core. Two test threads matches that
+      # and keeps concurrent #[sqlx::test] pools inside default
+      # max_connections=100 (GHA service containers cannot pass
+      # `postgres -c max_connections=`). shm-size is set on the service.
+      - run: cargo test --workspace -- --test-threads=2
 
   migrations:
     name: migrations
