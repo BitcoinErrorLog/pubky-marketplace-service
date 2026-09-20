@@ -763,10 +763,40 @@ pub async fn add_webhook(
     let (secret, key_id, signing_key) = new_signing_material();
     let id = Uuid::new_v4();
     let now = state.clock.now();
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => return internal("webhook registration transaction", &error),
+    };
+    if let Err(error) = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6355))")
+        .bind(&actor.0)
+        .execute(&mut *tx)
+        .await
+    {
+        return internal("webhook seller quota lock", &error);
+    }
+    let endpoint_count: i64 = match sqlx::query_scalar(
+        "SELECT COUNT(*) FROM webhook_endpoints \
+         WHERE seller_pubky = $1 AND deleted_at IS NULL",
+    )
+    .bind(&actor.0)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(count) => count,
+        Err(error) => return internal("webhook seller quota", &error),
+    };
+    if endpoint_count >= state.config.webhook_max_endpoints_per_seller {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "webhook_endpoint_limit",
+            "The seller webhook endpoint limit was reached.",
+        );
+    }
     let result = sqlx::query(
         "INSERT INTO webhook_endpoints \
-         (id, seller_pubky, endpoint_url, key_id, signing_key, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $6)",
+         (id, seller_pubky, endpoint_url, key_id, signing_key, enqueue_sequence, \
+          created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, (SELECT COALESCE(MAX(sequence), 0) FROM events), $6, $6)",
     )
     .bind(id)
     .bind(&actor.0)
@@ -774,17 +804,22 @@ pub async fn add_webhook(
     .bind(key_id)
     .bind(signing_key)
     .bind(now)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
     match result {
-        Ok(_) => response(
-            StatusCode::CREATED,
-            json!({
-                "schema_version": 1,
-                "webhook": {"id": id, "url": url, "key_id": key_id, "created_at": format_timestamp(now)},
-                "secret": secret
-            }),
-        ),
+        Ok(_) => {
+            if let Err(error) = tx.commit().await {
+                return internal("webhook registration commit", &error);
+            }
+            response(
+                StatusCode::CREATED,
+                json!({
+                    "schema_version": 1,
+                    "webhook": {"id": id, "url": url, "key_id": key_id, "created_at": format_timestamp(now)},
+                    "secret": secret
+                }),
+            )
+        }
         Err(sqlx::Error::Database(database)) if database.is_unique_violation() => error(
             StatusCode::CONFLICT,
             "webhook_exists",
@@ -906,6 +941,7 @@ struct SignedWebhookRequest {
 
 pub async fn run_webhook_pass(state: &AppState) -> anyhow::Result<u64> {
     let now = state.clock.now();
+    purge_terminal_webhooks(state, now).await?;
     enqueue_webhook_deliveries(state, now).await?;
     let lease_until = now + chrono::Duration::seconds(state.config.webhook_lease_seconds);
     let deliveries: Vec<Delivery> = sqlx::query_as(
@@ -1017,6 +1053,38 @@ pub async fn run_webhook_pass(state: &AppState) -> anyhow::Result<u64> {
         }
     }
     Ok(terminal)
+}
+
+async fn purge_terminal_webhooks(state: &AppState, now: DateTime<Utc>) -> anyhow::Result<u64> {
+    let cutoff = now - chrono::Duration::days(state.config.webhook_terminal_retention_days);
+    let dead_letters = sqlx::query(
+        "WITH due AS ( \
+           SELECT endpoint_id, event_id FROM webhook_dead_letters \
+           WHERE dead_lettered_at < $1 ORDER BY dead_lettered_at \
+           LIMIT $2 \
+         ) DELETE FROM webhook_dead_letters d USING due \
+         WHERE d.endpoint_id = due.endpoint_id AND d.event_id = due.event_id",
+    )
+    .bind(cutoff)
+    .bind(state.config.webhook_purge_batch_size)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+    let deliveries = sqlx::query(
+        "WITH due AS ( \
+           SELECT endpoint_id, event_id FROM webhook_deliveries \
+           WHERE COALESCE(delivered_at, dead_lettered_at) < $1 \
+           ORDER BY COALESCE(delivered_at, dead_lettered_at) \
+           LIMIT $2 \
+         ) DELETE FROM webhook_deliveries d USING due \
+         WHERE d.endpoint_id = due.endpoint_id AND d.event_id = due.event_id",
+    )
+    .bind(cutoff)
+    .bind(state.config.webhook_purge_batch_size)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+    Ok(dead_letters + deliveries)
 }
 
 async fn enqueue_webhook_deliveries(state: &AppState, now: DateTime<Utc>) -> anyhow::Result<()> {
@@ -1298,11 +1366,16 @@ fn public_ip(ip: IpAddr) -> bool {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return public_ip(IpAddr::V4(mapped));
             }
+            let octets = ip.octets();
+            let documentation = octets[0..4] == [0x20, 0x01, 0x0d, 0xb8];
+            let six_to_four = octets[0..2] == [0x20, 0x02];
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || ip.is_unique_local()
-                || ip.is_unicast_link_local())
+                || ip.is_unicast_link_local()
+                || documentation
+                || six_to_four)
         }
     }
 }
@@ -1357,6 +1430,9 @@ mod tests {
             "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+            "2001:db8::1",
+            "2002:7f00:1::1",
         ] {
             assert!(!public_ip(address.parse().expect("test IP parses")));
         }

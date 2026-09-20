@@ -54,6 +54,11 @@ pub struct Config {
     pub webhook_enqueue_endpoints_per_pass: i64,
     /// Maximum non-terminal deliveries retained for one seller.
     pub webhook_max_pending_per_seller: i64,
+    /// Maximum active endpoints one seller may fan out to.
+    pub webhook_max_endpoints_per_seller: i64,
+    /// Terminal delivery/dead-letter retention and bounded purge size.
+    pub webhook_terminal_retention_days: i64,
+    pub webhook_purge_batch_size: i64,
     /// Initial and maximum exponential retry delays.
     pub webhook_retry_base_seconds: i64,
     pub webhook_retry_max_seconds: i64,
@@ -212,6 +217,10 @@ impl Config {
             positive_i64("WEBHOOK_ENQUEUE_ENDPOINTS_PER_PASS", 100)?;
         let webhook_max_pending_per_seller =
             positive_i64("WEBHOOK_MAX_PENDING_PER_SELLER", 10_000)?;
+        let webhook_max_endpoints_per_seller =
+            positive_i64("WEBHOOK_MAX_ENDPOINTS_PER_SELLER", 100)?;
+        let webhook_terminal_retention_days = positive_i64("WEBHOOK_TERMINAL_RETENTION_DAYS", 30)?;
+        let webhook_purge_batch_size = positive_i64("WEBHOOK_PURGE_BATCH_SIZE", 500)?;
         let webhook_retry_base_seconds = positive_i64("WEBHOOK_RETRY_BASE_SECONDS", 5)?;
         let webhook_retry_max_seconds = positive_i64("WEBHOOK_RETRY_MAX_SECONDS", 3_600)?;
         if webhook_retry_max_seconds < webhook_retry_base_seconds {
@@ -281,6 +290,9 @@ impl Config {
             webhook_enqueue_batch_size,
             webhook_enqueue_endpoints_per_pass,
             webhook_max_pending_per_seller,
+            webhook_max_endpoints_per_seller,
+            webhook_terminal_retention_days,
+            webhook_purge_batch_size,
             webhook_retry_base_seconds,
             webhook_retry_max_seconds,
             worker_interval_seconds,
@@ -329,6 +341,9 @@ impl Config {
             webhook_enqueue_batch_size: 100,
             webhook_enqueue_endpoints_per_pass: 100,
             webhook_max_pending_per_seller: 10_000,
+            webhook_max_endpoints_per_seller: 100,
+            webhook_terminal_retention_days: 30,
+            webhook_purge_batch_size: 500,
             webhook_retry_base_seconds: 5,
             webhook_retry_max_seconds: 3_600,
             worker_interval_seconds: 3_600,

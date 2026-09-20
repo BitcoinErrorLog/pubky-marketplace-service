@@ -338,15 +338,16 @@ pub async fn require_session(
             "The session is invalid or expired.",
         );
     };
-    if let Err(error) =
-        sqlx::query("UPDATE auth_sessions SET last_used_at = $2 WHERE token_hash = $1")
-            .bind(&token_hash)
-            .bind(now)
-            .execute(&state.pool)
-            .await
+    if let Err(error) = sqlx::query(
+        "UPDATE auth_sessions SET last_used_at = $2 WHERE token_hash = $1 \
+         AND (last_used_at IS NULL OR last_used_at < $2 - INTERVAL '60 seconds')",
+    )
+    .bind(&token_hash)
+    .bind(now)
+    .execute(&state.pool)
+    .await
     {
-        tracing::error!(error = %error, "failed to update session last use");
-        return auth_error(StatusCode::INTERNAL_SERVER_ERROR, "Session lookup failed.");
+        tracing::warn!(error = %error, "failed to update session last use");
     }
 
     let actor = Actor(pubky);
@@ -385,9 +386,8 @@ async fn resolve_header_session(
     let token_hash = hash_token(&token);
     let now = state.clock.now();
     let row: Option<(String, String)> = sqlx::query_as(
-        "UPDATE auth_sessions SET last_used_at = $2 \
-         WHERE token_hash = $1 AND expires_at > $2 AND revoked_at IS NULL \
-         RETURNING pubky, capabilities",
+        "SELECT pubky, capabilities FROM auth_sessions \
+         WHERE token_hash = $1 AND expires_at > $2 AND revoked_at IS NULL",
     )
     .bind(&token_hash)
     .bind(now)
@@ -403,6 +403,17 @@ async fn resolve_header_session(
             "The session is invalid or expired.",
         )
     })?;
+    if let Err(error) = sqlx::query(
+        "UPDATE auth_sessions SET last_used_at = $2 WHERE token_hash = $1 \
+         AND (last_used_at IS NULL OR last_used_at < $2 - INTERVAL '60 seconds')",
+    )
+    .bind(&token_hash)
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(error = %error, "failed to update session last use");
+    }
     Ok(AuthSession {
         actor: Actor(pubky),
         capabilities,

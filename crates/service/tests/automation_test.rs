@@ -304,8 +304,11 @@ async fn webhook_lifecycle_returns_each_secret_once_and_deletion_fences_delivery
         "https://127.0.0.1/hook",
         "https://[::ffff:127.0.0.1]/hook",
         "https://[::ffff:10.0.0.1]/hook",
+        "https://[::ffff:169.254.169.254]/hook",
         "https://[fe80::1]/hook",
         "https://[fc00::1]/hook",
+        "https://[2001:db8::1]/hook",
+        "https://[2002:7f00:1::1]/hook",
     ] {
         let (status, body) = send(
             app.router.clone(),
@@ -552,6 +555,21 @@ async fn unsafe_delivery_retries_then_dead_letters_without_connecting(pool: PgPo
             .await
             .expect("dead-letter count");
     assert_eq!(dead_letters, 1);
+
+    app.clock.advance_seconds(31 * 24 * 60 * 60);
+    marketplace_service::automation::run_webhook_pass(&app.state)
+        .await
+        .expect("retention purge pass");
+    let terminal_rows: i64 = sqlx::query_scalar(
+        "SELECT \
+           (SELECT COUNT(*) FROM webhook_dead_letters WHERE endpoint_id = $1) + \
+           (SELECT COUNT(*) FROM webhook_deliveries WHERE endpoint_id = $1)",
+    )
+    .bind(endpoint_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("terminal retention count");
+    assert_eq!(terminal_rows, 0);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -616,4 +634,67 @@ async fn webhook_enqueue_is_cursor_bounded_and_applies_per_seller_backpressure(p
         second, first,
         "a full seller backlog must stop cursor advance"
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn webhook_endpoint_quota_is_atomic_and_new_endpoints_do_not_backfill(pool: PgPool) {
+    let mut config = marketplace_service::config::Config::for_tests();
+    config.webhook_max_endpoints_per_seller = 1;
+    let app = test_app_with_config(pool, config).await;
+    let seller = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, first) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/webhooks",
+        Some(&seller.token),
+        &json!({"url": "https://hooks.example.com/one"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let first_id = first["webhook"]["id"].as_str().expect("first endpoint");
+
+    marketplace_service::automation::run_webhook_pass(&app.state)
+        .await
+        .expect("worker pass");
+    let deliveries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+        .fetch_one(&app.pool)
+        .await
+        .expect("delivery count");
+    assert_eq!(
+        deliveries, 0,
+        "new endpoints start at the event high-water mark"
+    );
+
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/webhooks",
+        Some(&seller.token),
+        &json!({"url": "https://hooks.example.com/two"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], json!("webhook_endpoint_limit"));
+
+    let (status, _) = send(
+        app.router.clone(),
+        "DELETE",
+        &format!("/v1/webhooks/{first_id}"),
+        Some(&seller.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/webhooks",
+        Some(&seller.token),
+        &json!({"url": "https://hooks.example.com/two"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
