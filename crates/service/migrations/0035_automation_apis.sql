@@ -21,6 +21,9 @@ WHERE session_id IS NULL;
 
 ALTER TABLE auth_sessions
     ALTER COLUMN session_id SET NOT NULL,
+    ALTER COLUMN session_id SET DEFAULT (
+        md5(random()::text || clock_timestamp()::text)::uuid
+    ),
     ADD CONSTRAINT auth_sessions_session_id_unique UNIQUE (session_id),
     ADD CONSTRAINT auth_sessions_label_bounded CHECK (
         label IS NULL OR (
