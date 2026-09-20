@@ -726,11 +726,12 @@ fn validate_webhook_url(raw: &str) -> Result<url::Url, &'static str> {
     {
         return Err("Webhook URLs must use HTTPS on port 443 without credentials or fragments.");
     }
-    if url
-        .host_str()
-        .and_then(|host| host.parse::<IpAddr>().ok())
-        .is_some_and(|ip| !public_ip(ip))
-    {
+    let literal_ip = match url.host() {
+        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        _ => None,
+    };
+    if literal_ip.is_some_and(|ip| !public_ip(ip)) {
         return Err("Webhook URLs cannot use a private or special IP address.");
     }
     Ok(url)
@@ -1124,8 +1125,12 @@ async fn enqueue_webhook_deliveries(state: &AppState, now: DateTime<Utc>) -> any
 
 async fn deliver(delivery: &Delivery, now: DateTime<Utc>) -> Result<u16, ()> {
     let url = validate_webhook_url(&delivery.endpoint_url).map_err(|_| ())?;
-    let host = url.host_str().ok_or(())?;
-    let addresses = tokio::net::lookup_host((host, 443))
+    let host = match url.host().ok_or(())? {
+        url::Host::Domain(host) => host.to_string(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
+    };
+    let addresses = tokio::net::lookup_host((host.as_str(), 443))
         .await
         .map_err(|_| ())?
         .collect::<Vec<_>>();
@@ -1133,7 +1138,7 @@ async fn deliver(delivery: &Delivery, now: DateTime<Utc>) -> Result<u16, ()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
-        .resolve(host, pinned)
+        .resolve(&host, pinned)
         .build()
         .map_err(|_| ())?;
     let signed = signed_webhook_request(delivery, now).ok_or(())?;
