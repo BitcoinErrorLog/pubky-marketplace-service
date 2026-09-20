@@ -568,15 +568,34 @@ async fn result_expiry_revokes_both_undelivered_and_delivered_sessions(pool: sql
 }
 
 #[test]
-#[ignore = "#48 must reach staging and provide the redacted real Bitkit rc55 artifact"]
 fn real_rc55_bitkit_artifact_is_pinned_before_enablement() {
     let fixture = std::fs::read_to_string("tests/fixtures/grant/bitkit-rc55-staging.json")
-        .expect("capture the real staging artifact before removing #[ignore]");
+        .expect("real staging artifact is pinned");
     let value: Value = serde_json::from_str(&fixture).expect("artifact JSON");
+    assert_eq!(value["schema_version"], 1);
     assert_eq!(value["intent"], "signin_grant");
-    assert!(value["authorization_url_redacted"]
+    assert_eq!(
+        value["parameter_names"],
+        json!(["caps", "cid", "cpk", "relay", "secret", "x-bitkit-claim"])
+    );
+    assert_eq!(value["parameter_cardinality"], "one_each");
+    assert_eq!(value["secret_decoded_bytes"], 32);
+    assert_eq!(value["claim_type"], "watch-only-account-v1");
+    let redacted_url = value["authorization_url_redacted"]
         .as_str()
-        .is_some_and(|url| url.contains("secret=%3Credacted%3E")));
+        .expect("redacted authorization URL");
+    for parameter in ["secret", "cid", "cpk"] {
+        assert!(
+            redacted_url.contains(&format!("{parameter}=%3Credacted%3E")),
+            "{parameter} must be redacted"
+        );
+    }
+    assert_eq!(value["provenance"]["staging_source_head"], "1f0d0974");
+    assert_eq!(
+        value["provenance"]["source_flow"],
+        "Paykit staging /setup from issue #48"
+    );
+    assert_eq!(value["provenance"]["sensitive_payload_recorded"], false);
     for forbidden in ["grant", "pop_private_key", "bearer", "relay_secret"] {
         assert!(value.get(forbidden).is_none());
     }
