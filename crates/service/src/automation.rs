@@ -809,6 +809,13 @@ pub async fn delete_webhook(
         Ok(tx) => tx,
         Err(error) => return internal("webhook deletion transaction", &error),
     };
+    if let Err(error) = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6354))")
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await
+    {
+        return internal("webhook deletion fence", &error);
+    }
     let changed = match sqlx::query(
         "UPDATE webhook_endpoints SET deleted_at = $3, updated_at = $3 \
          WHERE id = $1 AND seller_pubky = $2 AND deleted_at IS NULL",
@@ -882,14 +889,20 @@ pub async fn run_webhook_pass(state: &AppState) -> anyhow::Result<u64> {
     .await?;
     let mut terminal = 0;
     for delivery in deliveries {
+        let mut tx = state.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6354))")
+            .bind(delivery.endpoint_id.to_string())
+            .execute(&mut *tx)
+            .await?;
         let still_active: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM webhook_endpoints \
              WHERE id = $1 AND deleted_at IS NULL)",
         )
         .bind(delivery.endpoint_id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await?;
         if !still_active {
+            tx.commit().await?;
             continue;
         }
         let status = deliver(&delivery, now).await.ok().map(i32::from);
@@ -907,13 +920,13 @@ pub async fn run_webhook_pass(state: &AppState) -> anyhow::Result<u64> {
             .bind(attempt)
             .bind(status)
             .bind(now)
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             terminal += 1;
         } else if attempt >= state.config.webhook_max_attempts
             || age >= chrono::Duration::hours(state.config.webhook_max_age_hours)
         {
-            let mut tx = state.pool.begin().await?;
             sqlx::query(
                 "UPDATE webhook_deliveries SET attempt_count = $3, last_status = $4, \
                  dead_lettered_at = $5, lease_until = NULL \
@@ -959,8 +972,9 @@ pub async fn run_webhook_pass(state: &AppState) -> anyhow::Result<u64> {
             .bind(attempt)
             .bind(status)
             .bind(now + chrono::Duration::seconds(backoff))
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
         }
     }
     Ok(terminal)
@@ -973,6 +987,7 @@ async fn enqueue_webhook_deliveries(state: &AppState, now: DateTime<Utc>) -> any
          SELECT w.id, e.id, w.key_id, w.signing_key, \
            jsonb_build_object( \
              'schema_version', 1, 'id', e.id, 'sequence', e.sequence, \
+             'cursor', translate(rtrim(encode(int8send(e.sequence), 'base64'), '='), '+/', '-_'), \
              'seller_pubky', w.seller_pubky, 'aggregate_id', e.aggregate_id, \
              'revision', e.revision, 'type', e.kind, \
              'occurred_at', to_char(e.occurred_at AT TIME ZONE 'UTC', \

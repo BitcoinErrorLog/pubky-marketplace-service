@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -179,14 +181,27 @@ async fn webhook_lifecycle_returns_each_secret_once_and_deletion_fences_delivery
     );
     assert_ne!(added["webhook"]["key_id"], rotated["key_id"]);
 
-    let (status, _) = send(
-        app.router.clone(),
-        "DELETE",
-        &format!("/v1/webhooks/{id}"),
-        Some(&seller.token),
-        &Value::Null,
-    )
-    .await;
+    let mut fence = app.pool.begin().await.expect("delivery fence transaction");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6354))")
+        .bind(id)
+        .execute(&mut *fence)
+        .await
+        .expect("delivery fence lock");
+    let router = app.router.clone();
+    let token = seller.token.clone();
+    let path = format!("/v1/webhooks/{id}");
+    let mut deletion =
+        tokio::spawn(
+            async move { send(router, "DELETE", &path, Some(&token), &Value::Null).await },
+        );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut deletion)
+            .await
+            .is_err(),
+        "delete returned while a delivery held the linearization fence"
+    );
+    fence.commit().await.expect("release delivery fence");
+    let (status, _) = deletion.await.expect("deletion task joins");
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let active: bool =
