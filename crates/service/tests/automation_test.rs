@@ -5,8 +5,10 @@
 mod common;
 
 use axum::http::StatusCode;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use common::{
     checkout_command, execute, new_actor, register_command, send, test_app, test_app_with_config,
@@ -16,6 +18,16 @@ use common::{
 async fn sessions_can_be_listed_labeled_and_revoked(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
+
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/webhooks",
+        Some(&seller.token),
+        &json!({"url": "https://127.0.0.1/hook"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 
     let (status, body) = send(
         app.router.clone(),
@@ -81,7 +93,24 @@ async fn listing_export_event_cursor_and_sync_many_are_seller_scoped(pool: PgPoo
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["kind"], json!("seller_listing_export"));
-    assert_eq!(body["listings"][0]["available_quantity"], json!(3));
+    assert_eq!(
+        body["listings"][0]["projection"]["available_quantity"],
+        json!(3)
+    );
+    assert_eq!(
+        body["listings"][0]["record"]["listingId"],
+        json!("boots_01")
+    );
+    assert!(body["listings"][0]["record_bytes_base64"]
+        .as_str()
+        .is_some());
+    assert_eq!(
+        body["listings"][0]["record_sha256"]
+            .as_str()
+            .expect("record digest")
+            .len(),
+        64
+    );
 
     let (status, body) = send(
         app.router.clone(),
@@ -234,4 +263,49 @@ async fn seller_order_export_uses_the_private_safe_allowlist(pool: PgPool) {
             "{forbidden} leaked: {order}"
         );
     }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn unsafe_delivery_retries_then_dead_letters_without_connecting(pool: PgPool) {
+    let mut config = marketplace_service::config::Config::for_tests();
+    config.webhook_max_attempts = 2;
+    config.webhook_retry_base_seconds = 1;
+    config.webhook_retry_max_seconds = 1;
+    let app = test_app_with_config(pool, config).await;
+    let seller = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let endpoint_id = Uuid::new_v4();
+    let key_id = Uuid::new_v4();
+    let now: DateTime<Utc> = common::NOW.parse().expect("fixture timestamp");
+    sqlx::query(
+        "INSERT INTO webhook_endpoints \
+         (id, seller_pubky, endpoint_url, key_id, signing_key, created_at, updated_at) \
+         VALUES ($1, $2, 'https://127.0.0.1/hook', $3, $4, $5, $5)",
+    )
+    .bind(endpoint_id)
+    .bind(&seller.pubky)
+    .bind(key_id)
+    .bind(vec![7_u8; 32])
+    .bind(now)
+    .execute(&app.pool)
+    .await
+    .expect("unsafe fixture endpoint");
+
+    marketplace_service::automation::run_webhook_pass(&app.state)
+        .await
+        .expect("first worker pass");
+    app.clock.advance_seconds(2);
+    marketplace_service::automation::run_webhook_pass(&app.state)
+        .await
+        .expect("second worker pass");
+
+    let dead_letters: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_dead_letters WHERE endpoint_id = $1")
+            .bind(endpoint_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("dead-letter count");
+    assert_eq!(dead_letters, 1);
 }

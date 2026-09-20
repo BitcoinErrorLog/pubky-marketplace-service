@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::auth::Actor;
 use crate::clock::format_timestamp;
 use crate::handlers::LISTING_COLUMNS;
+use crate::homeserver::HomeserverRawFetchOutcome;
 use crate::model::ListingRow;
 use crate::AppState;
 
@@ -276,13 +277,13 @@ pub async fn list_seller_listings(
         .flatten();
     let mut listings = Vec::with_capacity(rows.len());
     for row in rows {
-        match row.public_projection() {
-            Ok(projection) => listings.push(projection),
+        match exported_listing(&state, &row).await {
+            Ok(listing) => listings.push(listing),
             Err(_) => {
                 return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "projection_inconsistent",
-                    "The listing projection is inconsistent.",
+                    StatusCode::BAD_GATEWAY,
+                    "listing_record_unavailable",
+                    "A canonical listing record could not be exported.",
                 )
             }
         }
@@ -323,17 +324,52 @@ pub async fn get_seller_listing(
         Ok(row) => row,
         Err(error) => return internal("seller listing read", &error),
     };
-    match row.and_then(|row| row.public_projection().ok()) {
-        Some(listing) => conditional_json(
-            &headers,
-            json!({"schema_version": 1, "kind": "seller_listing", "listing": listing}),
-        ),
-        None => error(
+    let Some(row) = row else {
+        return error(
             StatusCode::NOT_FOUND,
             "not_found",
             "The listing was not found.",
+        );
+    };
+    match exported_listing(&state, &row).await {
+        Ok(listing) => conditional_json(
+            &headers,
+            json!({"schema_version": 1, "kind": "seller_listing", "listing": listing}),
+        ),
+        Err(_) => error(
+            StatusCode::BAD_GATEWAY,
+            "listing_record_unavailable",
+            "The canonical listing record could not be exported.",
         ),
     }
+}
+
+async fn exported_listing(state: &AppState, row: &ListingRow) -> Result<Value, &'static str> {
+    let homeserver = state.homeserver.as_deref().ok_or("homeserver disabled")?;
+    let raw = match homeserver
+        .fetch_listing_raw(&row.seller_pubky, &row.listing_id)
+        .await
+    {
+        HomeserverRawFetchOutcome::Found(raw) => raw,
+        HomeserverRawFetchOutcome::NotFound
+        | HomeserverRawFetchOutcome::TooLarge
+        | HomeserverRawFetchOutcome::Unavailable => return Err("record unavailable"),
+    };
+    let record: Value = serde_json::from_slice(&raw).map_err(|_| "record malformed")?;
+    let projection = row
+        .public_projection()
+        .map_err(|_| "projection inconsistent")?;
+    let record_uri = format!(
+        "pubky://{}/pub/pubky.app/marketplace/v1/listings/{}",
+        row.seller_pubky, row.listing_id
+    );
+    Ok(json!({
+        "record_uri": record_uri,
+        "record": record,
+        "record_bytes_base64": base64::engine::general_purpose::STANDARD.encode(&raw),
+        "record_sha256": hex::encode(Sha256::digest(&raw)),
+        "projection": projection
+    }))
 }
 
 pub async fn list_seller_orders(
@@ -659,6 +695,13 @@ fn validate_webhook_url(raw: &str) -> Result<url::Url, &'static str> {
         || url.host_str().is_none()
     {
         return Err("Webhook URLs must use HTTPS on port 443 without credentials or fragments.");
+    }
+    if url
+        .host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|ip| !public_ip(ip))
+    {
+        return Err("Webhook URLs cannot use a private or special IP address.");
     }
     Ok(url)
 }

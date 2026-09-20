@@ -45,12 +45,15 @@ CREATE TABLE webhook_endpoints (
     signing_key BYTEA NOT NULL CHECK (octet_length(signing_key) = 32),
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT webhook_endpoint_owner_url_unique UNIQUE (seller_pubky, endpoint_url)
+    deleted_at TIMESTAMPTZ
 );
 
 CREATE INDEX webhook_endpoints_active_owner_idx
     ON webhook_endpoints (seller_pubky, id)
+    WHERE deleted_at IS NULL;
+
+CREATE UNIQUE INDEX webhook_endpoints_active_owner_url_unique
+    ON webhook_endpoints (seller_pubky, endpoint_url)
     WHERE deleted_at IS NULL;
 
 CREATE TABLE webhook_deliveries (
