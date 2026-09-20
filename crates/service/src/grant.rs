@@ -504,6 +504,18 @@ pub mod test_support {
 
     impl GrantTestAuthority {
         pub fn generate(session_ttl_seconds: i64) -> Self {
+            Self::generate_with_relay(
+                session_ttl_seconds,
+                Url::parse("http://127.0.0.1:1/inbox").expect("test relay URL"),
+                30,
+            )
+        }
+
+        pub fn generate_with_relay(
+            session_ttl_seconds: i64,
+            relay_url: Url,
+            verify_lease_seconds: i64,
+        ) -> Self {
             let mut assertion_seed = [0u8; 32];
             let mut request_seed = [0u8; 32];
             let mut encryption_key = [0u8; 32];
@@ -522,9 +534,9 @@ pub mod test_support {
             let runtime = GrantRuntime {
                 config: GrantConfig {
                     client_id: "marketplace.localhost".to_string(),
-                    relay_url: Url::parse("http://127.0.0.1:1/inbox").expect("test relay URL"),
+                    relay_url,
                     flow_ttl_seconds: 300,
-                    verify_lease_seconds: 30,
+                    verify_lease_seconds,
                     relay_poll_milliseconds: 1000,
                     max_live_flows: 1000,
                     worker_batch_size: 25,
@@ -763,6 +775,7 @@ pub mod test_support {
                 result_hash_epoch: 1,
                 result_cpk: "y".repeat(52),
                 lease_owner,
+                lease_until: now + Duration::seconds(30),
                 version: 1,
             };
             let first = settle_verified(state, &self.runtime, &lease, approved_pubky, now)
@@ -2083,7 +2096,7 @@ pub async fn cancel_flow(
     }
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct FlowLease {
     flow_id: Uuid,
     expected_pubky: String,
@@ -2094,7 +2107,53 @@ struct FlowLease {
     result_hash_epoch: i16,
     result_cpk: String,
     lease_owner: Uuid,
+    lease_until: DateTime<Utc>,
     version: i64,
+}
+
+struct LeaseReturnGuard {
+    state: AppState,
+    lease: FlowLease,
+    armed: bool,
+}
+
+impl LeaseReturnGuard {
+    fn new(state: AppState, lease: FlowLease) -> Self {
+        Self {
+            state,
+            lease,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LeaseReturnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let lease = self.lease.clone();
+        tokio::spawn(async move {
+            if let Err(error) = return_owned_to_awaiting(&state, &lease).await {
+                tracing::error!(
+                    error = %error,
+                    flow_id = %lease.flow_id,
+                    "grant lease return on drop failed"
+                );
+            }
+        });
+    }
+}
+
+fn remaining_lease(lease: &FlowLease, now: DateTime<Utc>) -> std::time::Duration {
+    (lease.lease_until - now)
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO)
 }
 
 async fn acquire_flows(
@@ -2121,7 +2180,7 @@ async fn acquire_flows(
              lease_until = $3, version = version + 1 \
              WHERE flow_id = $1 AND status = 'awaiting' AND expires_at > $4 \
              RETURNING flow_id, expected_pubky, client_id, cpk, grant_state_sealed, \
-             key_epoch, result_hash_epoch, result_cpk, lease_owner, version",
+             key_epoch, result_hash_epoch, result_cpk, lease_owner, lease_until, version",
         )
         .bind(flow_id)
         .bind(lease_owner)
@@ -2279,6 +2338,11 @@ async fn process_lease(
     lease: FlowLease,
 ) -> anyhow::Result<()> {
     let now = state.clock.now();
+    let remaining = remaining_lease(&lease, now);
+    if remaining.is_zero() {
+        return_owned_to_awaiting(state, &lease).await?;
+        return Ok(());
+    }
     let aad = state_aad(lease.flow_id, &lease.client_id, &lease.cpk, lease.key_epoch)?;
     let plaintext = match seal::open(
         runtime.encryption_key(lease.key_epoch)?,
@@ -2310,15 +2374,41 @@ async fn process_lease(
             return Ok(());
         }
     };
-    match flow.try_poll_once().await {
-        Ok(None) => {
-            return_owned_to_awaiting(state, &lease).await?;
+    let mut guard = LeaseReturnGuard::new(state.clone(), lease.clone());
+    // Hold the restored flow (and its relay listener) for the remaining lease.
+    // Paykit #48 keeps `await_approval` alive for the same reason. The lease
+    // deadline applies only while the inbox has not delivered; once the SDK
+    // observes a payload it has already ACKed, so homeserver/PKARR exchange
+    // must run to completion instead of being cancelled back to `awaiting`.
+    let deadline = tokio::time::Instant::now() + remaining;
+    let outcome = loop {
+        match flow.try_poll_once().await {
+            Ok(Some(session)) => break Ok(Some(session)),
+            Ok(None) => {
+                let now_inst = tokio::time::Instant::now();
+                if now_inst >= deadline {
+                    break Ok(None);
+                }
+                let wait = deadline
+                    .saturating_duration_since(now_inst)
+                    .min(std::time::Duration::from_millis(50));
+                tokio::time::sleep(wait).await;
+            }
+            Err(error) => break Err(error),
         }
+    };
+    match outcome {
         Ok(Some(session)) => {
+            guard.disarm();
             let approved_pubky = session.public_key().z32();
             settle_verified(state, runtime, &lease, &approved_pubky, now).await?;
         }
+        Ok(None) => {
+            guard.disarm();
+            return_owned_to_awaiting(state, &lease).await?;
+        }
         Err(error) => {
+            guard.disarm();
             let (status, code) = match error {
                 pubky::Error::Authentication(_) | pubky::Error::Parse(_) => {
                     ("invalid", "grant_invalid")
@@ -2333,14 +2423,26 @@ async fn process_lease(
 }
 
 pub async fn poll_once(state: &AppState) -> anyhow::Result<u64> {
-    let Some(runtime) = state.grant.as_ref() else {
+    let Some(runtime) = state.grant.clone() else {
         return Ok(0);
     };
-    let leases = acquire_flows(state, runtime, state.clock.now()).await?;
+    let leases = acquire_flows(state, &runtime, state.clock.now()).await?;
     let count = leases.len() as u64;
+    let mut tasks = tokio::task::JoinSet::new();
     for lease in leases {
-        if let Err(error) = process_lease(state, runtime, lease).await {
-            tracing::error!(error = %error, "grant flow worker failed closed");
+        let state = state.clone();
+        let runtime = runtime.clone();
+        tasks.spawn(async move { process_lease(&state, &runtime, lease).await });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(error = %error, "grant flow worker failed closed");
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "grant flow worker join failed");
+            }
         }
     }
     Ok(count)
