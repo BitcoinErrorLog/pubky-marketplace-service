@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         .with_refusal_audit(refusal_audit)
         .with_refusal_audit_retention_pool(audit_retention_pool);
     workers::spawn(state.clone());
+    marketplace_service::automation::spawn_webhook_worker(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(addr = %bind_addr, "marketplace transaction service listening");

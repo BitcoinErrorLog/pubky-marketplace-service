@@ -3,7 +3,7 @@ use axum::extract::State;
 use axum::http::{header, Method, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -35,6 +35,48 @@ pub fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(
             crate::inventory::MAX_INVENTORY_BODY_BYTES,
         ));
+
+    let automation = Router::new()
+        .route(
+            "/v1/auth/sessions/{id}",
+            patch(auth::update_session_metadata).delete(auth::revoke_session),
+        )
+        .route(
+            "/v1/sellers/{pubky}/listings",
+            get(crate::automation::list_seller_listings),
+        )
+        .route(
+            "/v1/listings/{seller}/{listing_id}",
+            get(crate::automation::get_seller_listing),
+        )
+        .route(
+            "/v1/sellers/{pubky}/orders",
+            get(crate::automation::list_seller_orders),
+        )
+        .route(
+            "/v1/sellers/{pubky}/events",
+            get(crate::automation::list_seller_events),
+        )
+        .route("/v1/listings/sync-many", post(crate::automation::sync_many))
+        .route("/v1/webhooks", post(crate::automation::add_webhook))
+        .route(
+            "/v1/webhooks/{id}/rotate",
+            post(crate::automation::rotate_webhook),
+        )
+        .route(
+            "/v1/webhooks/{id}",
+            delete(crate::automation::delete_webhook),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::automation::require_automation_rate,
+        ))
+        .route_layer(middleware::from_fn(auth::require_inventory_capability))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session,
+        ))
+        .layer(DefaultBodyLimit::max(64 * 1024));
 
     let protected = Router::new()
         .route("/v1/commands", post(execute_command))
@@ -130,7 +172,10 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/v1/auth/sessions", post(auth::create_session))
+        .route(
+            "/v1/auth/sessions",
+            post(auth::create_session).get(auth::list_sessions),
+        )
         // Public: buyers read a seller's available rails before checkout.
         .route(
             "/v0/sellers/{pubky}/payment-config",
@@ -148,6 +193,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v0/paypal/ipn", post(crate::payment_methods::paypal_ipn))
         .merge(protected)
         .merge(inventory)
+        .merge(automation)
         .layer(cors)
         .layer(middleware::from_fn(log_request))
         .with_state(state)

@@ -19,11 +19,11 @@
 //!    headers.
 
 use axum::body::Bytes;
-use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -31,8 +31,10 @@ use pubky_common::auth::AuthToken;
 use pubky_common::capabilities::{Action, Capabilities};
 use pubky_common::StoragePath;
 use rand::RngCore;
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::clock::format_timestamp;
 use crate::logging;
@@ -66,6 +68,18 @@ pub struct AuthSession {
     pub actor: Actor,
     pub capabilities: String,
     pub token_hash: Vec<u8>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SessionAdminRow {
+    session_id: Uuid,
+    label: Option<String>,
+    client_metadata: Value,
+    capabilities: String,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    last_used_at: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
 }
 
 impl AuthSession {
@@ -222,11 +236,14 @@ pub async fn create_session(State(state): State<AppState>, body: Bytes) -> Respo
     let mut token = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut token);
     let expires_at = now + chrono::Duration::seconds(state.config.session_ttl_seconds);
+    let session_id = Uuid::new_v4();
     let stored = sqlx::query(
-        "INSERT INTO auth_sessions (token_hash, pubky, capabilities, created_at, expires_at) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO auth_sessions \
+         (token_hash, session_id, pubky, capabilities, created_at, expires_at, last_used_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $5)",
     )
     .bind(hash_token(&token))
+    .bind(session_id)
     .bind(&verified.pubky)
     // Persist only the normalized verified grant, never the credential bytes.
     // Inventory route middleware and the handler boundary both enforce it.
@@ -258,6 +275,7 @@ pub async fn create_session(State(state): State<AppState>, body: Bytes) -> Respo
         StatusCode::CREATED,
         Json(json!({
             "token": URL_SAFE_NO_PAD.encode(token),
+            "session_id": session_id,
             "pubky": verified.pubky,
             "capabilities": verified.capabilities,
             "expires_at": format_timestamp(expires_at),
@@ -295,7 +313,7 @@ pub async fn require_session(
     let token_hash = hash_token(&token);
     let session: Option<(String, String, DateTime<Utc>)> = match sqlx::query_as(
         "SELECT pubky, capabilities, expires_at FROM auth_sessions \
-         WHERE token_hash = $1 AND expires_at > $2",
+         WHERE token_hash = $1 AND expires_at > $2 AND revoked_at IS NULL",
     )
     .bind(&token_hash)
     .bind(now)
@@ -320,6 +338,17 @@ pub async fn require_session(
             "The session is invalid or expired.",
         );
     };
+    if let Err(error) = sqlx::query(
+        "UPDATE auth_sessions SET last_used_at = $2 WHERE token_hash = $1 \
+         AND (last_used_at IS NULL OR last_used_at < $2 - INTERVAL '60 seconds')",
+    )
+    .bind(&token_hash)
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(error = %error, "failed to update session last use");
+    }
 
     let actor = Actor(pubky);
     request.extensions_mut().insert(actor.clone());
@@ -337,6 +366,220 @@ pub async fn require_session(
     let mut response = next.run(request).await;
     response.extensions_mut().insert(actor);
     response
+}
+
+async fn resolve_header_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthSession, Response> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|token| URL_SAFE_NO_PAD.decode(token).ok())
+        .ok_or_else(|| {
+            auth_error(
+                StatusCode::UNAUTHORIZED,
+                "A session bearer token is required.",
+            )
+        })?;
+    let token_hash = hash_token(&token);
+    let now = state.clock.now();
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT pubky, capabilities FROM auth_sessions \
+         WHERE token_hash = $1 AND expires_at > $2 AND revoked_at IS NULL",
+    )
+    .bind(&token_hash)
+    .bind(now)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, "failed to resolve session");
+        auth_error(StatusCode::INTERNAL_SERVER_ERROR, "Session lookup failed.")
+    })?;
+    let (pubky, capabilities) = row.ok_or_else(|| {
+        auth_error(
+            StatusCode::UNAUTHORIZED,
+            "The session is invalid or expired.",
+        )
+    })?;
+    if let Err(error) = sqlx::query(
+        "UPDATE auth_sessions SET last_used_at = $2 WHERE token_hash = $1 \
+         AND (last_used_at IS NULL OR last_used_at < $2 - INTERVAL '60 seconds')",
+    )
+    .bind(&token_hash)
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(error = %error, "failed to update session last use");
+    }
+    Ok(AuthSession {
+        actor: Actor(pubky),
+        capabilities,
+        token_hash,
+    })
+}
+
+pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session = match resolve_header_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if !session.covers_inventory_service() {
+        return capability_error();
+    }
+    match crate::automation::consume_automation_rate(&state, &session.actor.0, "session.admin")
+        .await
+    {
+        Ok(Some(retry_after)) => {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "ok": false,
+                    "error": {
+                        "code": "rate_limited",
+                        "message": "The request rate limit was exceeded."
+                    }
+                })),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_str(&retry_after.to_string())
+                    .expect("retry-after is a safe integer"),
+            );
+            return response;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(error = %error, "session administration rate limit failed");
+            return auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Sessions could not be read.",
+            );
+        }
+    }
+    let rows: Result<Vec<SessionAdminRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT session_id, label, client_metadata, capabilities, created_at, expires_at, \
+                    last_used_at, revoked_at \
+             FROM auth_sessions WHERE pubky = $1 \
+             ORDER BY created_at DESC, session_id DESC LIMIT 200",
+    )
+    .bind(&session.actor.0)
+    .fetch_all(&state.pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let sessions = rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "id": row.session_id,
+                        "label": row.label,
+                        "metadata": row.client_metadata,
+                        "capabilities": row.capabilities,
+                        "created_at": format_timestamp(row.created_at),
+                        "expires_at": format_timestamp(row.expires_at),
+                        "last_used_at": row.last_used_at.map(format_timestamp),
+                        "revoked_at": row.revoked_at.map(format_timestamp),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (
+                StatusCode::OK,
+                Json(json!({"schema_version": 1, "sessions": sessions})),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to list sessions");
+            auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Sessions could not be read.",
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMetadataUpdate {
+    label: Option<String>,
+    #[serde(default)]
+    metadata: Value,
+}
+
+pub async fn update_session_metadata(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<Uuid>,
+    Json(update): Json<SessionMetadataUpdate>,
+) -> Response {
+    let label_valid = update.label.as_ref().is_none_or(|label| {
+        !label.is_empty() && label.len() <= 80 && !label.chars().any(char::is_control)
+    });
+    let metadata_valid = update.metadata.is_object()
+        && serde_json::to_vec(&update.metadata).is_ok_and(|bytes| bytes.len() <= 2048);
+    if !label_valid || !metadata_valid {
+        return auth_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Session metadata is invalid.",
+        );
+    }
+    match sqlx::query(
+        "UPDATE auth_sessions SET label = $3, client_metadata = $4 \
+         WHERE session_id = $1 AND pubky = $2 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .bind(&actor.0)
+    .bind(&update.label)
+    .bind(&update.metadata)
+    .execute(&state.pool)
+    .await
+    {
+        Ok(result) if result.rows_affected() == 1 => (
+            StatusCode::OK,
+            Json(json!({"schema_version": 1, "id": id, "label": update.label, "metadata": update.metadata})),
+        )
+            .into_response(),
+        Ok(_) => auth_error(StatusCode::NOT_FOUND, "The session was not found."),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to update session metadata");
+            auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Session metadata could not be updated.",
+            )
+        }
+    }
+}
+
+pub async fn revoke_session(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let now = state.clock.now();
+    match sqlx::query(
+        "UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, $3) \
+         WHERE session_id = $1 AND pubky = $2",
+    )
+    .bind(id)
+    .bind(&actor.0)
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    {
+        Ok(result) if result.rows_affected() == 1 => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => auth_error(StatusCode::NOT_FOUND, "The session was not found."),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to revoke session");
+            auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The session could not be revoked.",
+            )
+        }
+    }
 }
 
 fn capability_error() -> Response {
