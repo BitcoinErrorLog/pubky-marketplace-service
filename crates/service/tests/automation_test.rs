@@ -136,6 +136,40 @@ async fn sessions_can_be_listed_labeled_and_revoked(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn session_admin_cors_preflight_allows_patch_and_delete(pool: PgPool) {
+    let app = test_app(pool).await;
+    let session_id = Uuid::nil();
+    for method in ["PATCH", "DELETE"] {
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri(format!("/v1/auth/sessions/{session_id}"))
+            .header("origin", "http://localhost:3000")
+            .header("access-control-request-method", method)
+            .body(Body::empty())
+            .expect("preflight builds");
+        let response = app
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("preflight executes");
+        assert_eq!(response.status(), StatusCode::OK, "{method}");
+        let allow = response
+            .headers()
+            .get("access-control-allow-methods")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            allow
+                .to_ascii_uppercase()
+                .split(',')
+                .any(|allowed| allowed.trim() == method),
+            "{method} missing from {allow}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn listing_export_event_cursor_and_sync_many_are_seller_scoped(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -281,6 +315,18 @@ async fn listing_export_event_cursor_and_sync_many_are_seller_scoped(pool: PgPoo
             .count(),
         99
     );
+    for result in body["results"].as_array().expect("batch results") {
+        marketplace_service::reserve_secrecy::ensure_actor_reserve_audience(
+            &result["result"],
+            &seller.pubky,
+        )
+        .expect("sync_many item body must satisfy the listing.sync HTTP reserve-audience guard");
+        assert_ne!(
+            result["status"],
+            json!(500),
+            "reserve-audience guard must not reject a well-formed listing.sync item: {result}"
+        );
+    }
 
     app.clock.advance_seconds(31 * 24 * 60 * 60);
     let (status, body) = send(
@@ -309,6 +355,13 @@ async fn webhook_lifecycle_returns_each_secret_once_and_deletion_fences_delivery
         "https://[fc00::1]/hook",
         "https://[2001:db8::1]/hook",
         "https://[2002:7f00:1::1]/hook",
+        "https://100.64.0.1/hook",
+        "https://198.18.0.1/hook",
+        "https://240.0.0.1/hook",
+        "https://[::ffff:100.64.0.1]/hook",
+        "https://[2001:0::1]/hook",
+        "https://[64:ff9b::10.0.0.1]/hook",
+        "https://[::10.0.0.1]/hook",
     ] {
         let (status, body) = send(
             app.router.clone(),

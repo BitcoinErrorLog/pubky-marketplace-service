@@ -93,8 +93,11 @@ pub async fn consume_automation_rate(
 ) -> Result<Option<i64>, sqlx::Error> {
     let now = state.clock.now();
     let rate = state.config.automation_rate_limit_per_minute as f64;
-    let capacity = (state.config.automation_rate_limit_per_minute
-        * state.config.automation_rate_limit_burst_multiplier) as f64;
+    let capacity = state
+        .config
+        .automation_rate_limit_per_minute
+        .saturating_mul(state.config.automation_rate_limit_burst_multiplier)
+        .min(crate::config::AUTOMATION_RATE_LIMIT_MAX_TOKENS) as f64;
     let mut tx = state.pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6353))")
         .bind(format!("{actor}:{class}"))
@@ -682,12 +685,19 @@ pub async fn sync_many(
             }
         });
         match crate::executor::execute(&state, &actor.0, &raw).await {
-            Ok((status, body)) => results.push(json!({
-                "seller_pubky": item.seller_pubky,
-                "listing_id": item.listing_id,
-                "status": status.as_u16(),
-                "result": body
-            })),
+            Ok((status, body)) => {
+                let (status, body) =
+                    match crate::reserve_secrecy::guard_command_result(&actor.0, body) {
+                        Ok(body) => (status, body),
+                        Err(body) => (StatusCode::INTERNAL_SERVER_ERROR, body),
+                    };
+                results.push(json!({
+                    "seller_pubky": item.seller_pubky,
+                    "listing_id": item.listing_id,
+                    "status": status.as_u16(),
+                    "result": body
+                }));
+            }
             Err(error) => {
                 tracing::error!(error = %error, "listing.sync_many item failed");
                 results.push(json!({
@@ -1387,6 +1397,10 @@ pub fn classify_webhook_replay(
 fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            let cgnat = octets[0] == 100 && (64..128).contains(&octets[1]);
+            let benchmarking = octets[0] == 198 && (18..20).contains(&octets[1]);
+            let class_e = octets[0] >= 240;
             !(ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
@@ -1394,23 +1408,33 @@ fn public_ip(ip: IpAddr) -> bool {
                 || ip.is_documentation()
                 || ip.is_unspecified()
                 || ip.is_multicast()
-                || ip.octets()[0] == 0
-                || ip.octets() == [169, 254, 169, 254])
+                || cgnat
+                || benchmarking
+                || class_e
+                || octets[0] == 0
+                || octets == [169, 254, 169, 254])
         }
         IpAddr::V6(ip) => {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return public_ip(IpAddr::V4(mapped));
             }
+            if ip.to_ipv4().is_some() {
+                return false;
+            }
             let octets = ip.octets();
             let documentation = octets[0..4] == [0x20, 0x01, 0x0d, 0xb8];
             let six_to_four = octets[0..2] == [0x20, 0x02];
+            let teredo = octets[0..4] == [0x20, 0x01, 0x00, 0x00];
+            let nat64 = octets[0..4] == [0x00, 0x64, 0xff, 0x9b];
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
                 || documentation
-                || six_to_four)
+                || six_to_four
+                || teredo
+                || nat64)
         }
     }
 }
@@ -1460,18 +1484,37 @@ mod tests {
             "127.0.0.1",
             "10.0.0.1",
             "169.254.169.254",
+            "100.64.0.1",
+            "100.127.255.255",
+            "198.18.0.1",
+            "198.19.255.255",
+            "240.0.0.1",
+            "255.0.0.1",
             "::1",
             "fc00::1",
             "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
             "::ffff:169.254.169.254",
+            "::ffff:100.64.0.1",
+            "::ffff:198.18.0.1",
+            "::ffff:240.0.0.1",
             "2001:db8::1",
             "2002:7f00:1::1",
+            "2001:0::1",
+            "64:ff9b::10.0.0.1",
+            "64:ff9b:1::1",
+            "::10.0.0.1",
         ] {
-            assert!(!public_ip(address.parse().expect("test IP parses")));
+            assert!(
+                !public_ip(address.parse().expect("test IP parses")),
+                "{address} must be refused"
+            );
         }
         assert!(public_ip("1.1.1.1".parse().expect("test IP parses")));
+        assert!(public_ip(
+            "2606:4700:4700::1111".parse().expect("public v6 parses")
+        ));
     }
 
     #[test]

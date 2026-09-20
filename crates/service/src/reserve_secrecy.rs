@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub const FORBIDDEN_RESERVE_KEYS: [&str; 4] =
     ["reserve_price", "reservePrice", "reserve_met", "reserveMet"];
@@ -80,9 +80,27 @@ pub fn ensure_actor_reserve_audience(
     Ok(())
 }
 
+/// HTTP command-result audience guard used by `/v1/commands` and
+/// `listing.sync_many`. A leaking body is replaced with a generic 500
+/// envelope so reserve fields never leave the process.
+pub fn guard_command_result(actor: &str, body: Value) -> Result<Value, Value> {
+    if ensure_actor_reserve_audience(&body, actor).is_err() {
+        tracing::error!("command result reserve audience guard rejected a response");
+        Err(json!({
+            "ok": false,
+            "error": {
+                "code": "INTERNAL",
+                "message": "The command could not be processed."
+            },
+        }))
+    } else {
+        Ok(body)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ensure_actor_reserve_audience, ensure_reserve_free};
+    use super::{ensure_actor_reserve_audience, ensure_reserve_free, guard_command_result};
     use serde_json::json;
 
     #[test]
@@ -124,5 +142,22 @@ mod tests {
         ] {
             assert!(ensure_actor_reserve_audience(&bad, "seller").is_err());
         }
+    }
+
+    #[test]
+    fn command_result_guard_matches_listing_sync_http_envelope() {
+        let leaking = json!({"ok": true, "reserve_price": 1});
+        let body = guard_command_result("buyer", leaking).expect_err("leak must fail closed");
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["error"]["code"], json!("INTERNAL"));
+        assert!(!body.to_string().contains("reserve_price"));
+
+        let allowed = json!({
+            "ok": true,
+            "seller_pubky": "seller",
+            "reserve_price": {"amount_minor": 1}
+        });
+        let body = guard_command_result("seller", allowed).expect("matching seller is allowed");
+        assert_eq!(body["reserve_price"]["amount_minor"], json!(1));
     }
 }

@@ -12,6 +12,9 @@ pub const DEFAULT_AUTO_COMPLETE_DAYS: i64 = 14;
 /// Default `DELIVERY_SWEEP_BATCH_SIZE`: rows claimed per inner pass
 /// (same shape as the paykit/outbox worker batches).
 pub const DEFAULT_DELIVERY_SWEEP_BATCH_SIZE: i64 = 100;
+/// Upper bound of `automation_rate_limits.tokens`. Env `rate × burst`
+/// capacity must fit this CHECK or process start fails closed.
+pub const AUTOMATION_RATE_LIMIT_MAX_TOKENS: i64 = 20_000;
 
 #[derive(Clone)]
 pub struct Config {
@@ -204,6 +207,10 @@ impl Config {
         if automation_rate_limit_burst_multiplier > 10 {
             anyhow::bail!("AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER must be at most 10");
         }
+        automation_rate_capacity(
+            automation_rate_limit_per_minute,
+            automation_rate_limit_burst_multiplier,
+        )?;
         let event_retention_days = env_days("EVENT_RETENTION_DAYS", 30)?;
         let webhook_worker_interval_seconds =
             positive_i64("WEBHOOK_WORKER_INTERVAL_SECONDS", 10)?.try_into()?;
@@ -459,6 +466,20 @@ fn positive_i64(name: &str, default: i64) -> anyhow::Result<i64> {
     Ok(value)
 }
 
+fn automation_rate_capacity(rate: i64, burst: i64) -> anyhow::Result<i64> {
+    let Some(capacity) = rate.checked_mul(burst) else {
+        anyhow::bail!(
+            "AUTOMATION_RATE_LIMIT_PER_MINUTE × AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER must be at most {AUTOMATION_RATE_LIMIT_MAX_TOKENS}"
+        );
+    };
+    if capacity > AUTOMATION_RATE_LIMIT_MAX_TOKENS {
+        anyhow::bail!(
+            "AUTOMATION_RATE_LIMIT_PER_MINUTE × AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER must be at most {AUTOMATION_RATE_LIMIT_MAX_TOKENS}"
+        );
+    }
+    Ok(capacity)
+}
+
 /// A positive whole-day count from the environment (minimum 1, so a
 /// deployment cannot disable or zero out a server-time post-purchase
 /// transition).
@@ -512,8 +533,9 @@ fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_days, refusal_audit_keys_from_env, reject_audit_url_reuse, required_postgres_url,
-        validate_postgres_url, Config, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS,
+        automation_rate_capacity, parse_days, refusal_audit_keys_from_env, reject_audit_url_reuse,
+        required_postgres_url, validate_postgres_url, Config, AUTOMATION_RATE_LIMIT_MAX_TOKENS,
+        DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS,
     };
 
     /// Serializes the environment-mutating test (env is process-global).
@@ -580,6 +602,87 @@ mod tests {
             config.fx_feed_url,
             crate::fx::FX_URL,
             "a release binary cannot be repointed by FX_FEED_URL"
+        );
+    }
+
+    #[test]
+    fn automation_rate_capacity_matches_tokens_check() {
+        assert_eq!(automation_rate_capacity(120, 2).expect("default"), 240);
+        assert_eq!(
+            automation_rate_capacity(2_000, 10).expect("exact CHECK bound"),
+            AUTOMATION_RATE_LIMIT_MAX_TOKENS
+        );
+        let overflow = automation_rate_capacity(5_000, 10).expect_err("exceeds CHECK");
+        assert!(
+            overflow
+                .to_string()
+                .contains(&AUTOMATION_RATE_LIMIT_MAX_TOKENS.to_string()),
+            "unexpected: {overflow}"
+        );
+    }
+
+    #[test]
+    fn from_env_rejects_rate_burst_that_exceeds_tokens_check() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_database_url = std::env::var("DATABASE_URL").ok();
+        let previous_writer_url = std::env::var("REFUSAL_AUDIT_DATABASE_URL").ok();
+        let previous_retention_url = std::env::var("REFUSAL_AUDIT_RETENTION_DATABASE_URL").ok();
+        let previous_root = std::env::var("REFUSAL_AUDIT_HMAC_ROOT_B64").ok();
+        let previous_epoch = std::env::var("REFUSAL_AUDIT_HMAC_KEY_EPOCH").ok();
+        let previous_backup = std::env::var("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED").ok();
+        let previous_replica = std::env::var("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED").ok();
+        let previous_risk = std::env::var("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED").ok();
+        let previous_rate = std::env::var("AUTOMATION_RATE_LIMIT_PER_MINUTE").ok();
+        let previous_burst = std::env::var("AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER").ok();
+        std::env::set_var("DATABASE_URL", "postgres://example.invalid/test");
+        std::env::set_var(
+            "REFUSAL_AUDIT_DATABASE_URL",
+            "postgres://marketplace_refusal_audit_writer_login@audit.example/refusal",
+        );
+        std::env::set_var(
+            "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
+            "postgres://marketplace_refusal_audit_retention@audit.example/refusal",
+        );
+        std::env::set_var(
+            "REFUSAL_AUDIT_HMAC_ROOT_B64",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]),
+        );
+        std::env::set_var("REFUSAL_AUDIT_HMAC_KEY_EPOCH", "1");
+        std::env::set_var("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", "true");
+        std::env::set_var("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", "true");
+        std::env::set_var("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", "true");
+        std::env::set_var("AUTOMATION_RATE_LIMIT_PER_MINUTE", "5000");
+        std::env::set_var("AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER", "10");
+        let result = Config::from_env();
+        match previous_database_url {
+            Some(value) => std::env::set_var("DATABASE_URL", value),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        for (name, previous) in [
+            ("REFUSAL_AUDIT_DATABASE_URL", previous_writer_url),
+            (
+                "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
+                previous_retention_url,
+            ),
+            ("REFUSAL_AUDIT_HMAC_ROOT_B64", previous_root),
+            ("REFUSAL_AUDIT_HMAC_KEY_EPOCH", previous_epoch),
+            ("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", previous_backup),
+            ("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", previous_replica),
+            ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", previous_risk),
+            ("AUTOMATION_RATE_LIMIT_PER_MINUTE", previous_rate),
+            ("AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER", previous_burst),
+        ] {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let error = result.expect_err("rate × burst above CHECK must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains(&AUTOMATION_RATE_LIMIT_MAX_TOKENS.to_string()),
+            "unexpected: {error}"
         );
     }
 
