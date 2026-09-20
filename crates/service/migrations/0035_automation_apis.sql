@@ -46,6 +46,8 @@ CREATE TABLE webhook_endpoints (
     contract_version INTEGER NOT NULL DEFAULT 1 CHECK (contract_version = 1),
     key_id UUID NOT NULL,
     signing_key BYTEA NOT NULL CHECK (octet_length(signing_key) = 32),
+    enqueue_sequence BIGINT NOT NULL DEFAULT 0 CHECK (enqueue_sequence >= 0),
+    enqueue_checked_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     deleted_at TIMESTAMPTZ

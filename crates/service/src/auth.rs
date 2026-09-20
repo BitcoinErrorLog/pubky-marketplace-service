@@ -550,8 +550,8 @@ pub async fn revoke_session(
 ) -> Response {
     let now = state.clock.now();
     match sqlx::query(
-        "UPDATE auth_sessions SET revoked_at = $3 \
-         WHERE session_id = $1 AND pubky = $2 AND revoked_at IS NULL",
+        "UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, $3) \
+         WHERE session_id = $1 AND pubky = $2",
     )
     .bind(id)
     .bind(&actor.0)

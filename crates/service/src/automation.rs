@@ -32,6 +32,11 @@ pub const MAX_PAGE_SIZE: i64 = 200;
 pub const MAX_SYNC_MANY: usize = 100;
 pub const WEBHOOK_BODY_LIMIT: usize = 64 * 1024;
 const DELIVERY_BATCH_SIZE: i64 = 50;
+const WEBHOOK_VERSION_HEADER: &str = "Pubky-Webhook-Version";
+const WEBHOOK_ID_HEADER: &str = "Pubky-Webhook-Id";
+const WEBHOOK_TIMESTAMP_HEADER: &str = "Pubky-Webhook-Timestamp";
+const WEBHOOK_KEY_ID_HEADER: &str = "Pubky-Webhook-Key-Id";
+const WEBHOOK_SIGNATURE_HEADER: &str = "Pubky-Webhook-Signature";
 
 fn endpoint_class(path: &str) -> &'static str {
     if path.starts_with("/v1/auth/sessions") {
@@ -549,12 +554,37 @@ pub async fn list_seller_events(
         Ok(value) => value,
         Err(error) => return internal("event retention boundary", &error),
     };
-    if after > 0 && minimum.is_some_and(|minimum| after < minimum - 1) {
-        return error(
-            StatusCode::GONE,
-            "cursor_expired",
-            "The cursor has expired; perform a full pull.",
-        );
+    if after > 0 {
+        let cursor_time: Option<DateTime<Utc>> = match sqlx::query_scalar(&format!(
+            "SELECT e.occurred_at {SELLER_EVENT_FROM} \
+             WHERE COALESCE(l.seller_pubky, o.seller_pubky, f.seller_pubky, d.seller_pubky) = $1 \
+               AND e.sequence = $2"
+        ))
+        .bind(&seller)
+        .bind(after)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => return internal("event cursor lookup", &error),
+        };
+        if cursor_time.is_some_and(|occurred_at| occurred_at < cutoff)
+            || (cursor_time.is_none()
+                && minimum.is_some_and(|minimum| after < minimum.saturating_sub(1)))
+        {
+            return error(
+                StatusCode::GONE,
+                "cursor_expired",
+                "The cursor has expired; perform a full pull.",
+            );
+        }
+        if cursor_time.is_none() {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_cursor",
+                "The cursor was not issued for this seller.",
+            );
+        }
     }
     let rows: Vec<EventRow> = match sqlx::query_as(&format!(
         "SELECT e.id, e.sequence, e.aggregate_id, e.revision, e.kind, e.occurred_at \
@@ -865,6 +895,14 @@ struct Delivery {
     created_at: DateTime<Utc>,
 }
 
+struct SignedWebhookRequest {
+    raw: Vec<u8>,
+    timestamp: String,
+    event_id: String,
+    key_id: String,
+    signature: String,
+}
+
 pub async fn run_webhook_pass(state: &AppState) -> anyhow::Result<u64> {
     let now = state.clock.now();
     enqueue_webhook_deliveries(state, now).await?;
@@ -981,33 +1019,106 @@ pub async fn run_webhook_pass(state: &AppState) -> anyhow::Result<u64> {
 }
 
 async fn enqueue_webhook_deliveries(state: &AppState, now: DateTime<Utc>) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO webhook_deliveries \
-         (endpoint_id, event_id, key_id, signing_key, body, next_attempt_at, created_at) \
-         SELECT w.id, e.id, w.key_id, w.signing_key, \
-           jsonb_build_object( \
-             'schema_version', 1, 'id', e.id, 'sequence', e.sequence, \
-             'cursor', translate(rtrim(encode(int8send(e.sequence), 'base64'), '='), '+/', '-_'), \
-             'seller_pubky', w.seller_pubky, 'aggregate_id', e.aggregate_id, \
-             'revision', e.revision, 'type', e.kind, \
-             'occurred_at', to_char(e.occurred_at AT TIME ZONE 'UTC', \
-               'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), 'data', '{}'::jsonb), \
-           $1, $1 \
-         FROM events e \
-         LEFT JOIN listings l ON l.aggregate_id = e.aggregate_id \
-         LEFT JOIN orders o ON e.aggregate_id = 'order:' || o.id::text \
-         LEFT JOIN offers f ON f.aggregate_id = e.aggregate_id \
-         LEFT JOIN drops d ON d.aggregate_id = e.aggregate_id \
-         JOIN webhook_endpoints w ON w.seller_pubky = \
-           COALESCE(l.seller_pubky, o.seller_pubky, f.seller_pubky, d.seller_pubky) \
-          AND w.deleted_at IS NULL \
-         WHERE e.occurred_at >= $2 \
-         ON CONFLICT DO NOTHING",
+    let endpoint_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM webhook_endpoints WHERE deleted_at IS NULL \
+         ORDER BY enqueue_checked_at, id LIMIT $1",
     )
-    .bind(now)
-    .bind(now - chrono::Duration::days(state.config.event_retention_days))
-    .execute(&state.pool)
+    .bind(state.config.webhook_enqueue_endpoints_per_pass)
+    .fetch_all(&state.pool)
     .await?;
+    let cutoff = now - chrono::Duration::days(state.config.event_retention_days);
+    for endpoint_id in endpoint_ids {
+        let mut tx = state.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6354))")
+            .bind(endpoint_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let endpoint: Option<(String, Uuid, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT seller_pubky, key_id, signing_key, enqueue_sequence \
+             FROM webhook_endpoints WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(endpoint_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((seller, key_id, signing_key, cursor)) = endpoint else {
+            tx.commit().await?;
+            continue;
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6355))")
+            .bind(&seller)
+            .execute(&mut *tx)
+            .await?;
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM webhook_deliveries d \
+             JOIN webhook_endpoints w ON w.id = d.endpoint_id \
+             WHERE w.seller_pubky = $1 AND d.delivered_at IS NULL \
+               AND d.dead_lettered_at IS NULL",
+        )
+        .bind(&seller)
+        .fetch_one(&mut *tx)
+        .await?;
+        let room = state
+            .config
+            .webhook_max_pending_per_seller
+            .saturating_sub(pending);
+        if room <= 0 {
+            sqlx::query("UPDATE webhook_endpoints SET enqueue_checked_at = $2 WHERE id = $1")
+                .bind(endpoint_id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            continue;
+        }
+        let limit = room.min(state.config.webhook_enqueue_batch_size);
+        let rows: Vec<EventRow> = sqlx::query_as(&format!(
+            "SELECT e.id, e.sequence, e.aggregate_id, e.revision, e.kind, e.occurred_at \
+             {SELLER_EVENT_FROM} \
+             WHERE COALESCE(l.seller_pubky, o.seller_pubky, f.seller_pubky, d.seller_pubky) = $1 \
+               AND e.sequence > $2 AND e.occurred_at >= $3 \
+             ORDER BY e.sequence LIMIT $4"
+        ))
+        .bind(&seller)
+        .bind(cursor)
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in &rows {
+            sqlx::query(
+                "INSERT INTO webhook_deliveries \
+                 (endpoint_id, event_id, key_id, signing_key, body, next_attempt_at, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $6) ON CONFLICT DO NOTHING",
+            )
+            .bind(endpoint_id)
+            .bind(row.id)
+            .bind(key_id)
+            .bind(&signing_key)
+            .bind(event_value(&seller, row))
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let next_cursor = if rows.len() as i64 == limit {
+            rows.last().map_or(cursor, |row| row.sequence)
+        } else {
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(sequence) FROM events")
+                .fetch_one(&mut *tx)
+                .await?
+                .unwrap_or(cursor)
+                .max(cursor)
+        };
+        sqlx::query(
+            "UPDATE webhook_endpoints SET enqueue_sequence = $2, enqueue_checked_at = $3 \
+             WHERE id = $1",
+        )
+        .bind(endpoint_id)
+        .bind(next_cursor)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
     Ok(())
 }
 
@@ -1018,29 +1129,23 @@ async fn deliver(delivery: &Delivery, now: DateTime<Utc>) -> Result<u16, ()> {
         .await
         .map_err(|_| ())?
         .collect::<Vec<_>>();
-    if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
-        return Err(());
-    }
-    let pinned = SocketAddr::new(addresses[0].ip(), 443);
+    let pinned = validate_resolved_addresses(&addresses).ok_or(())?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .resolve(host, pinned)
         .build()
         .map_err(|_| ())?;
-    let raw = serde_json::to_vec(&delivery.body).map_err(|_| ())?;
-    let timestamp = now.timestamp().to_string();
-    let signature =
-        webhook_signature(&delivery.signing_key, &timestamp, delivery.event_id, &raw).ok_or(())?;
+    let signed = signed_webhook_request(delivery, now).ok_or(())?;
     let mut response = client
         .post(url)
         .header("content-type", "application/json")
-        .header("Pubky-Webhook-Version", "1")
-        .header("Pubky-Webhook-Id", delivery.event_id.to_string())
-        .header("Pubky-Webhook-Timestamp", timestamp)
-        .header("Pubky-Webhook-Key-Id", delivery.key_id.to_string())
-        .header("Pubky-Webhook-Signature", format!("v1={signature}"))
-        .body(raw)
+        .header(WEBHOOK_VERSION_HEADER, "1")
+        .header(WEBHOOK_ID_HEADER, signed.event_id)
+        .header(WEBHOOK_TIMESTAMP_HEADER, signed.timestamp)
+        .header(WEBHOOK_KEY_ID_HEADER, signed.key_id)
+        .header(WEBHOOK_SIGNATURE_HEADER, signed.signature)
+        .body(signed.raw)
         .send()
         .await
         .map_err(|_| ())?;
@@ -1053,6 +1158,19 @@ async fn deliver(delivery: &Delivery, now: DateTime<Utc>) -> Result<u16, ()> {
         }
     }
     Ok(status)
+}
+
+fn signed_webhook_request(delivery: &Delivery, now: DateTime<Utc>) -> Option<SignedWebhookRequest> {
+    let raw = serde_json::to_vec(&delivery.body).ok()?;
+    let timestamp = now.timestamp().to_string();
+    let signature = webhook_signature(&delivery.signing_key, &timestamp, delivery.event_id, &raw)?;
+    Some(SignedWebhookRequest {
+        raw,
+        timestamp,
+        event_id: delivery.event_id.to_string(),
+        key_id: delivery.key_id.to_string(),
+        signature: format!("v1={signature}"),
+    })
 }
 
 fn webhook_signature(
@@ -1076,6 +1194,82 @@ fn webhook_signature(
     Some(hex::encode(mac.finalize().into_bytes()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedWebhook {
+    pub event_id: Uuid,
+    pub key_id: Uuid,
+    pub payload_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookVerifyError {
+    Malformed,
+    Stale,
+    WrongKey,
+    InvalidSignature,
+}
+
+pub fn verify_webhook(
+    secret: &[u8],
+    expected_key_id: Uuid,
+    event_id: &str,
+    timestamp: &str,
+    key_id: &str,
+    signature: &str,
+    raw: &[u8],
+    receiver_now: DateTime<Utc>,
+    max_skew_seconds: i64,
+) -> Result<VerifiedWebhook, WebhookVerifyError> {
+    let event_id = Uuid::parse_str(event_id).map_err(|_| WebhookVerifyError::Malformed)?;
+    let key_id = Uuid::parse_str(key_id).map_err(|_| WebhookVerifyError::Malformed)?;
+    if key_id != expected_key_id {
+        return Err(WebhookVerifyError::WrongKey);
+    }
+    let timestamp_seconds = timestamp
+        .parse::<i64>()
+        .map_err(|_| WebhookVerifyError::Malformed)?;
+    if timestamp_seconds
+        .checked_sub(receiver_now.timestamp())
+        .is_none_or(|delta| delta.unsigned_abs() > max_skew_seconds.max(0) as u64)
+    {
+        return Err(WebhookVerifyError::Stale);
+    }
+    let supplied = signature
+        .strip_prefix("v1=")
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or(WebhookVerifyError::Malformed)?;
+    let signing_key = Sha256::digest(secret);
+    let expected = webhook_signature(&signing_key, timestamp, event_id, raw)
+        .ok_or(WebhookVerifyError::Malformed)?;
+    use subtle::ConstantTimeEq;
+    if !bool::from(expected.as_bytes().ct_eq(supplied.as_bytes())) {
+        return Err(WebhookVerifyError::InvalidSignature);
+    }
+    Ok(VerifiedWebhook {
+        event_id,
+        key_id,
+        payload_sha256: hex::encode(Sha256::digest(raw)),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookReplayDecision {
+    Apply,
+    AlreadyApplied,
+    QuarantineChangedPayload,
+}
+
+pub fn classify_webhook_replay(
+    stored_payload_sha256: Option<&str>,
+    received_payload_sha256: &str,
+) -> WebhookReplayDecision {
+    match stored_payload_sha256 {
+        None => WebhookReplayDecision::Apply,
+        Some(stored) if stored == received_payload_sha256 => WebhookReplayDecision::AlreadyApplied,
+        Some(_) => WebhookReplayDecision::QuarantineChangedPayload,
+    }
+}
+
 fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -1090,6 +1284,9 @@ fn public_ip(ip: IpAddr) -> bool {
                 || ip.octets() == [169, 254, 169, 254])
         }
         IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return public_ip(IpAddr::V4(mapped));
+            }
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
@@ -1097,6 +1294,13 @@ fn public_ip(ip: IpAddr) -> bool {
                 || ip.is_unicast_link_local())
         }
     }
+}
+
+fn validate_resolved_addresses(addresses: &[SocketAddr]) -> Option<SocketAddr> {
+    if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
+        return None;
+    }
+    Some(SocketAddr::new(addresses[0].ip(), 443))
 }
 
 pub fn spawn_webhook_worker(state: AppState) {
@@ -1133,10 +1337,38 @@ mod tests {
 
     #[test]
     fn private_and_special_addresses_are_rejected() {
-        for address in ["127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "fc00::1"] {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+        ] {
             assert!(!public_ip(address.parse().expect("test IP parses")));
         }
         assert!(public_ip("1.1.1.1".parse().expect("test IP parses")));
+    }
+
+    #[test]
+    fn every_dns_answer_must_be_public_before_one_is_pinned() {
+        let public = "1.1.1.1:443".parse().expect("public address");
+        let rebinding = "[::ffff:127.0.0.1]:443"
+            .parse()
+            .expect("mapped loopback address");
+        assert_eq!(
+            validate_resolved_addresses(&[public]),
+            Some(public),
+            "a public-only resolution is pinned"
+        );
+        assert_eq!(
+            validate_resolved_addresses(&[public, rebinding]),
+            None,
+            "a mixed DNS answer is rejected instead of selecting the public decoy"
+        );
+        assert_eq!(validate_resolved_addresses(&[]), None);
     }
 
     #[test]
@@ -1149,6 +1381,90 @@ mod tests {
         assert_eq!(
             signature,
             "340177cd5af321108cc3b5322ae9abf0c24c093df2a60172c413a73ca9d14931"
+        );
+    }
+
+    #[test]
+    fn outbound_headers_and_raw_body_are_exact_and_stable() {
+        let now: DateTime<Utc> = "2023-11-14T22:13:20Z".parse().expect("test time");
+        let event_id = Uuid::parse_str("018f47d2-6a27-7c23-a49d-6b21bb770120").expect("event id");
+        let key_id = Uuid::parse_str("018f47d2-6a27-7c23-a49d-6b21bb770121").expect("key id");
+        let delivery = Delivery {
+            endpoint_id: Uuid::nil(),
+            event_id,
+            endpoint_url: "https://example.com/hook".to_string(),
+            key_id,
+            signing_key: (0_u8..32).collect(),
+            body: serde_json::from_str(r#"{"ok":true}"#).expect("body"),
+            attempt_count: 0,
+            created_at: now,
+        };
+        let signed = signed_webhook_request(&delivery, now).expect("signed request");
+        assert_eq!(signed.raw, br#"{"ok":true}"#);
+        assert_eq!(signed.timestamp, "1700000000");
+        assert_eq!(signed.event_id, event_id.to_string());
+        assert_eq!(signed.key_id, key_id.to_string());
+        assert_eq!(
+            signed.signature,
+            "v1=340177cd5af321108cc3b5322ae9abf0c24c093df2a60172c413a73ca9d14931"
+        );
+        assert_eq!(WEBHOOK_VERSION_HEADER, "Pubky-Webhook-Version");
+        assert_eq!(WEBHOOK_ID_HEADER, "Pubky-Webhook-Id");
+        assert_eq!(WEBHOOK_TIMESTAMP_HEADER, "Pubky-Webhook-Timestamp");
+        assert_eq!(WEBHOOK_KEY_ID_HEADER, "Pubky-Webhook-Key-Id");
+        assert_eq!(WEBHOOK_SIGNATURE_HEADER, "Pubky-Webhook-Signature");
+    }
+
+    #[test]
+    fn receiver_rejects_skew_and_classifies_replays_by_payload_hash() {
+        let secret = [9_u8; 32];
+        let key_id = Uuid::new_v4();
+        let event_id = Uuid::new_v4();
+        let now: DateTime<Utc> = "2026-09-20T08:00:00Z".parse().expect("test time");
+        let timestamp = now.timestamp().to_string();
+        let raw = br#"{"schema_version":1,"type":"listing.synced"}"#;
+        let signing_key = Sha256::digest(secret);
+        let signature = format!(
+            "v1={}",
+            webhook_signature(&signing_key, &timestamp, event_id, raw).expect("signature")
+        );
+        let verified = verify_webhook(
+            &secret,
+            key_id,
+            &event_id.to_string(),
+            &timestamp,
+            &key_id.to_string(),
+            &signature,
+            raw,
+            now,
+            300,
+        )
+        .expect("fresh signature verifies");
+        assert_eq!(
+            classify_webhook_replay(None, &verified.payload_sha256),
+            WebhookReplayDecision::Apply
+        );
+        assert_eq!(
+            classify_webhook_replay(Some(&verified.payload_sha256), &verified.payload_sha256),
+            WebhookReplayDecision::AlreadyApplied
+        );
+        assert_eq!(
+            classify_webhook_replay(Some(&"0".repeat(64)), &verified.payload_sha256),
+            WebhookReplayDecision::QuarantineChangedPayload
+        );
+        assert_eq!(
+            verify_webhook(
+                &secret,
+                key_id,
+                &event_id.to_string(),
+                &timestamp,
+                &key_id.to_string(),
+                &signature,
+                raw,
+                now + chrono::Duration::seconds(301),
+                300,
+            ),
+            Err(WebhookVerifyError::Stale)
         );
     }
 }

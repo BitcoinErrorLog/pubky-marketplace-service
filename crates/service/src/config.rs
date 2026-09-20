@@ -48,6 +48,12 @@ pub struct Config {
     pub webhook_max_attempts: i32,
     /// Maximum delivery age in hours (`WEBHOOK_MAX_AGE_HOURS`, default 24).
     pub webhook_max_age_hours: i64,
+    /// Maximum retained events enqueued for one endpoint in one worker pass.
+    pub webhook_enqueue_batch_size: i64,
+    /// Maximum endpoints whose enqueue cursor advances in one worker pass.
+    pub webhook_enqueue_endpoints_per_pass: i64,
+    /// Maximum non-terminal deliveries retained for one seller.
+    pub webhook_max_pending_per_seller: i64,
     /// Initial and maximum exponential retry delays.
     pub webhook_retry_base_seconds: i64,
     pub webhook_retry_max_seconds: i64,
@@ -201,6 +207,11 @@ impl Config {
             .try_into()
             .map_err(|_| anyhow::anyhow!("WEBHOOK_MAX_ATTEMPTS is too large"))?;
         let webhook_max_age_hours = positive_i64("WEBHOOK_MAX_AGE_HOURS", 24)?;
+        let webhook_enqueue_batch_size = positive_i64("WEBHOOK_ENQUEUE_BATCH_SIZE", 100)?;
+        let webhook_enqueue_endpoints_per_pass =
+            positive_i64("WEBHOOK_ENQUEUE_ENDPOINTS_PER_PASS", 100)?;
+        let webhook_max_pending_per_seller =
+            positive_i64("WEBHOOK_MAX_PENDING_PER_SELLER", 10_000)?;
         let webhook_retry_base_seconds = positive_i64("WEBHOOK_RETRY_BASE_SECONDS", 5)?;
         let webhook_retry_max_seconds = positive_i64("WEBHOOK_RETRY_MAX_SECONDS", 3_600)?;
         if webhook_retry_max_seconds < webhook_retry_base_seconds {
@@ -267,6 +278,9 @@ impl Config {
             webhook_lease_seconds,
             webhook_max_attempts,
             webhook_max_age_hours,
+            webhook_enqueue_batch_size,
+            webhook_enqueue_endpoints_per_pass,
+            webhook_max_pending_per_seller,
             webhook_retry_base_seconds,
             webhook_retry_max_seconds,
             worker_interval_seconds,
@@ -312,6 +326,9 @@ impl Config {
             webhook_lease_seconds: 30,
             webhook_max_attempts: 12,
             webhook_max_age_hours: 24,
+            webhook_enqueue_batch_size: 100,
+            webhook_enqueue_endpoints_per_pass: 100,
+            webhook_max_pending_per_seller: 10_000,
             webhook_retry_base_seconds: 5,
             webhook_retry_max_seconds: 3_600,
             worker_interval_seconds: 3_600,
