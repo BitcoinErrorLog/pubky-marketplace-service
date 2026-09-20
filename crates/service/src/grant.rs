@@ -656,7 +656,7 @@ pub mod test_support {
                 &aad,
                 &canonical_json(&payload).expect("result JSON"),
             );
-            let session_id: i64 = sqlx::query_scalar(
+            let session_id: Uuid = sqlx::query_scalar(
                 "INSERT INTO auth_sessions (token_hash,pubky,capabilities,created_at,expires_at) \
                  VALUES ($1,$2,'',$3,$4) RETURNING session_id",
             )
@@ -2179,7 +2179,7 @@ async fn complete_owned(
         tx.rollback().await?;
         return Ok(false);
     }
-    let session_id: i64 = sqlx::query_scalar(
+    let session_id: Uuid = sqlx::query_scalar(
         "INSERT INTO auth_sessions (token_hash, pubky, capabilities, created_at, expires_at) \
          VALUES ($1,$2,'',$3,$4) RETURNING session_id",
     )

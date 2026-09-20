@@ -61,10 +61,10 @@ fn assert_no_store(headers: &axum::http::HeaderMap) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn migration_0035_preserves_bearer_key_and_adds_session_identity(pool: sqlx::PgPool) {
+async fn migration_0036_preserves_bearer_key_and_reuses_uuid_session_identity(pool: sqlx::PgPool) {
     let token_hash = vec![7u8; 32];
     let now: DateTime<Utc> = NOW.parse().unwrap();
-    let session_id: i64 = sqlx::query_scalar(
+    let session_id: Uuid = sqlx::query_scalar(
         "INSERT INTO auth_sessions (token_hash,pubky,capabilities,created_at,expires_at) \
          VALUES ($1,$2,'',$3,$4) RETURNING session_id",
     )
@@ -75,7 +75,7 @@ async fn migration_0035_preserves_bearer_key_and_adds_session_identity(pool: sql
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(session_id > 0);
+    assert!(!session_id.is_nil());
     let stored: Vec<u8> =
         sqlx::query_scalar("SELECT token_hash FROM auth_sessions WHERE session_id = $1")
             .bind(session_id)

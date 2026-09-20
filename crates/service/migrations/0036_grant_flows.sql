@@ -2,13 +2,8 @@
 --
 -- `flow_id` is correlation only. Secret grant state and the temporary result
 -- payload are XChaCha20-Poly1305 ciphertexts; raw delivery IDs, result tokens,
--- and result nonces are never stored.
-
-ALTER TABLE auth_sessions
-    ADD COLUMN session_id BIGINT GENERATED ALWAYS AS IDENTITY;
-
-ALTER TABLE auth_sessions
-    ADD CONSTRAINT auth_sessions_session_id_key UNIQUE (session_id);
+-- and result nonces are never stored. Migration 0035 owns the UUID session
+-- identity this migration references.
 
 CREATE TABLE grant_flows (
     flow_id UUID PRIMARY KEY,
@@ -41,7 +36,7 @@ CREATE TABLE grant_flows (
     result_token_expires_at TIMESTAMPTZ,
     result_token_delivered_at TIMESTAMPTZ,
     result_payload_sealed BYTEA,
-    result_auth_session_id BIGINT,
+    result_auth_session_id UUID,
     created_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     terminal_at TIMESTAMPTZ,
