@@ -15,7 +15,13 @@ use crate::{executor, logging, queries, AppState};
 pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(state.config.allowed_origins.clone())
-        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let inventory = Router::new()
@@ -279,23 +285,10 @@ async fn execute_command(
     Json(raw): Json<Value>,
 ) -> Response {
     match executor::execute(&state, &actor.0, &raw).await {
-        Ok((status, body)) => {
-            if crate::reserve_secrecy::ensure_actor_reserve_audience(&body, &actor.0).is_err() {
-                tracing::error!("command result reserve audience guard rejected a response");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "ok": false,
-                        "error": {
-                            "code": "INTERNAL",
-                            "message": "The command could not be processed."
-                        },
-                    })),
-                )
-                    .into_response();
-            }
-            (status, Json(body)).into_response()
-        }
+        Ok((status, body)) => match crate::reserve_secrecy::guard_command_result(&actor.0, body) {
+            Ok(body) => (status, Json(body)).into_response(),
+            Err(body) => (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response(),
+        },
         Err(error) => {
             tracing::error!(error = %error, "command execution failed");
             (
