@@ -6,6 +6,7 @@
 
 pub mod attestor;
 pub mod auth;
+pub mod automation;
 pub mod bitcoin_review;
 pub mod clock;
 pub mod config;

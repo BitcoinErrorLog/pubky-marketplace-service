@@ -32,6 +32,25 @@ pub struct Config {
     /// deployments where the injected clock diverges from system time.
     pub auth_token_window_seconds: i64,
     pub session_ttl_seconds: i64,
+    /// Per-seller sustained request limit for Wave 3a endpoint classes.
+    pub automation_rate_limit_per_minute: i64,
+    /// Token-bucket capacity multiplier for Wave 3a endpoints.
+    pub automation_rate_limit_burst_multiplier: i64,
+    /// Seller event cursor retention (`EVENT_RETENTION_DAYS`, default 30).
+    pub event_retention_days: i64,
+    /// Signed-webhook worker cadence (`WEBHOOK_WORKER_INTERVAL_SECONDS`,
+    /// default 10).
+    pub webhook_worker_interval_seconds: u64,
+    /// Delivery lease duration (`WEBHOOK_LEASE_SECONDS`, default 30).
+    pub webhook_lease_seconds: i64,
+    /// Maximum delivery attempts before dead-lettering
+    /// (`WEBHOOK_MAX_ATTEMPTS`, default 12).
+    pub webhook_max_attempts: i32,
+    /// Maximum delivery age in hours (`WEBHOOK_MAX_AGE_HOURS`, default 24).
+    pub webhook_max_age_hours: i64,
+    /// Initial and maximum exponential retry delays.
+    pub webhook_retry_base_seconds: i64,
+    pub webhook_retry_max_seconds: i64,
     pub worker_interval_seconds: u64,
     pub worker_lease_seconds: i64,
     /// Marketplace payment window armed by `payment.register_locks`: the
@@ -167,6 +186,26 @@ impl Config {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let auth_token_window_seconds = env_i64("AUTH_TOKEN_WINDOW_SECONDS", 120)?;
         let session_ttl_seconds = env_i64("AUTH_SESSION_TTL_SECONDS", 86_400)?;
+        let automation_rate_limit_per_minute =
+            positive_i64("AUTOMATION_RATE_LIMIT_PER_MINUTE", 120)?;
+        let automation_rate_limit_burst_multiplier =
+            positive_i64("AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER", 2)?;
+        if automation_rate_limit_burst_multiplier > 10 {
+            anyhow::bail!("AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER must be at most 10");
+        }
+        let event_retention_days = env_days("EVENT_RETENTION_DAYS", 30)?;
+        let webhook_worker_interval_seconds =
+            positive_i64("WEBHOOK_WORKER_INTERVAL_SECONDS", 10)?.try_into()?;
+        let webhook_lease_seconds = positive_i64("WEBHOOK_LEASE_SECONDS", 30)?;
+        let webhook_max_attempts: i32 = positive_i64("WEBHOOK_MAX_ATTEMPTS", 12)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("WEBHOOK_MAX_ATTEMPTS is too large"))?;
+        let webhook_max_age_hours = positive_i64("WEBHOOK_MAX_AGE_HOURS", 24)?;
+        let webhook_retry_base_seconds = positive_i64("WEBHOOK_RETRY_BASE_SECONDS", 5)?;
+        let webhook_retry_max_seconds = positive_i64("WEBHOOK_RETRY_MAX_SECONDS", 3_600)?;
+        if webhook_retry_max_seconds < webhook_retry_base_seconds {
+            anyhow::bail!("WEBHOOK_RETRY_MAX_SECONDS must be at least WEBHOOK_RETRY_BASE_SECONDS");
+        }
         let worker_interval_seconds = env_i64("WORKER_INTERVAL_SECONDS", 10)?.try_into()?;
         let worker_lease_seconds = env_i64("WORKER_LEASE_SECONDS", 30)?;
         let locks_payment_window_seconds = env_i64("LOCKS_PAYMENT_WINDOW_SECONDS", 3_600)?;
@@ -221,6 +260,15 @@ impl Config {
             allowed_origins,
             auth_token_window_seconds,
             session_ttl_seconds,
+            automation_rate_limit_per_minute,
+            automation_rate_limit_burst_multiplier,
+            event_retention_days,
+            webhook_worker_interval_seconds,
+            webhook_lease_seconds,
+            webhook_max_attempts,
+            webhook_max_age_hours,
+            webhook_retry_base_seconds,
+            webhook_retry_max_seconds,
             worker_interval_seconds,
             worker_lease_seconds,
             locks_payment_window_seconds,
@@ -257,6 +305,15 @@ impl Config {
             allowed_origins: vec![HeaderValue::from_static("http://localhost:3000")],
             auth_token_window_seconds: 120,
             session_ttl_seconds: 86_400,
+            automation_rate_limit_per_minute: 120,
+            automation_rate_limit_burst_multiplier: 2,
+            event_retention_days: 30,
+            webhook_worker_interval_seconds: 3_600,
+            webhook_lease_seconds: 30,
+            webhook_max_attempts: 12,
+            webhook_max_age_hours: 24,
+            webhook_retry_base_seconds: 5,
+            webhook_retry_max_seconds: 3_600,
             worker_interval_seconds: 3_600,
             worker_lease_seconds: 30,
             locks_payment_window_seconds: 3_600,
@@ -360,6 +417,14 @@ fn env_i64(name: &str, default: i64) -> anyhow::Result<i64> {
             .map_err(|_| anyhow::anyhow!("{name} must be an integer")),
         Err(_) => Ok(default),
     }
+}
+
+fn positive_i64(name: &str, default: i64) -> anyhow::Result<i64> {
+    let value = env_i64(name, default)?;
+    if value < 1 {
+        anyhow::bail!("{name} must be at least 1");
+    }
+    Ok(value)
 }
 
 /// A positive whole-day count from the environment (minimum 1, so a
