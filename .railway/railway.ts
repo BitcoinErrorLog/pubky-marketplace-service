@@ -96,6 +96,9 @@ export default defineRailway((ctx) => {
   const marketplace_service = service("marketplace-service", {
     ...sharedServiceConfig,
     env: isProduction ? productionEnv : stagingEnv,
+    // Staging custom host is CLI-attached. Rolling-deploys IaC must not omit
+    // this list or apply will delete it. Generated *.up.railway.app stays CLI.
+    domains: isStaging ? ["staging-api.pubky.app"] : [],
   });
 
   return project(
