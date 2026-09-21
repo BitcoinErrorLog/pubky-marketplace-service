@@ -40,6 +40,7 @@ use marketplace_service::payments::{
 };
 use marketplace_service::pickup::PickupKeys;
 use marketplace_service::AppState;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 /// The fixed test instant used by the TypeScript prototype suite.
 pub const NOW: &str = "2026-08-19T22:00:00Z";
@@ -107,6 +108,80 @@ pub async fn test_app_with_grant_authority(
         },
         authority,
     )
+}
+
+static REFUSAL_AUDIT_WRITER_LOGIN: AsyncMutex<()> = AsyncMutex::const_new(());
+static REFUSAL_AUDIT_RETENTION_LOGIN: AsyncMutex<()> = AsyncMutex::const_new(());
+
+pub struct RefusalAuditWriterLogin {
+    pub url: String,
+    _guard: AsyncMutexGuard<'static, ()>,
+}
+
+pub struct RefusalAuditRetentionLogin {
+    pub url: String,
+    _guard: AsyncMutexGuard<'static, ()>,
+}
+
+async fn claim_named_login(
+    pool: &PgPool,
+    role: &str,
+    guard: AsyncMutexGuard<'static, ()>,
+) -> (String, AsyncMutexGuard<'static, ()>) {
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .expect("database name");
+    let password = format!("test-only-{}", uuid::Uuid::new_v4());
+    sqlx::query(&format!(
+        "ALTER ROLE {role} PASSWORD '{}'",
+        password.replace('\'', "''")
+    ))
+    .execute(pool)
+    .await
+    .expect("set isolated test login password");
+    let quoted_database = format!("\"{}\"", database.replace('"', "\"\""));
+    sqlx::query(&format!(
+        "GRANT CONNECT ON DATABASE {quoted_database} TO {role}"
+    ))
+    .execute(pool)
+    .await
+    .expect("grant test database connect");
+    (
+        format!("postgres://{role}:{password}@localhost:5432/{database}"),
+        guard,
+    )
+}
+
+pub async fn claim_refusal_audit_writer_login(pool: &PgPool) -> RefusalAuditWriterLogin {
+    let (url, guard) = claim_named_login(
+        pool,
+        "marketplace_refusal_audit_writer_login",
+        REFUSAL_AUDIT_WRITER_LOGIN.lock().await,
+    )
+    .await;
+    RefusalAuditWriterLogin { url, _guard: guard }
+}
+
+pub async fn claim_refusal_audit_retention_login(pool: &PgPool) -> RefusalAuditRetentionLogin {
+    let (url, guard) = claim_named_login(
+        pool,
+        "marketplace_refusal_audit_retention",
+        REFUSAL_AUDIT_RETENTION_LOGIN.lock().await,
+    )
+    .await;
+    RefusalAuditRetentionLogin { url, _guard: guard }
+}
+
+pub async fn pool_with_limit(url: &str, max_connections: u32) -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .min_connections(0)
+        .acquire_timeout(std::time::Duration::from_millis(100))
+        .idle_timeout(Some(std::time::Duration::from_secs(60)))
+        .connect(url)
+        .await
+        .expect("named login connects")
 }
 
 pub async fn test_app_full(

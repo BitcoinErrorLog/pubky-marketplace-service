@@ -19,10 +19,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
-static WRITER_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
 static ADMIN_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
 
 type AttackBucketRow = (i16, i64, Vec<u8>, bool, Option<Vec<u8>>);
@@ -157,19 +156,16 @@ struct ActualWriterFixture {
     runtime: Arc<RefusalAuditRuntime>,
     pool: PgPool,
     keys: AuditKeys,
-    login_guard: Option<MutexGuard<'static, ()>>,
+    login: Option<common::RefusalAuditWriterLogin>,
 }
 
 impl Drop for ActualWriterFixture {
     fn drop(&mut self) {
         let pool = self.pool.clone();
-        let login_guard = self
-            .login_guard
-            .take()
-            .expect("writer fixture guard is present");
+        let login = self.login.take();
         tokio::spawn(async move {
             pool.close().await;
-            drop(login_guard);
+            drop(login);
         });
     }
 }
@@ -275,38 +271,12 @@ async fn insert_bucket(
 }
 
 async fn actual_writer_fixture(pool: &PgPool) -> ActualWriterFixture {
-    let login_guard = WRITER_LOGIN_FIXTURE.lock().await;
-    let database: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(pool)
-        .await
-        .expect("database name");
-    let password = format!("test-only-{}", Uuid::new_v4());
-    sqlx::query(&format!(
-        "ALTER ROLE marketplace_refusal_audit_writer_login PASSWORD '{}'",
-        password.replace('\'', "''")
-    ))
-    .execute(pool)
-    .await
-    .expect("set isolated test login password");
-    let quoted_database = format!("\"{}\"", database.replace('"', "\"\""));
-    sqlx::query(&format!(
-        "GRANT CONNECT ON DATABASE {quoted_database} TO marketplace_refusal_audit_writer_login"
-    ))
-    .execute(pool)
-    .await
-    .expect("grant test database connect");
-    let url = format!(
-        "postgres://marketplace_refusal_audit_writer_login:{}@localhost:5432/{}",
-        password, database
-    );
-    let writer_pool = PgPoolOptions::new()
-        .max_connections(2)
-        .min_connections(0)
-        .acquire_timeout(StdDuration::from_millis(100))
-        .idle_timeout(Some(StdDuration::from_secs(60)))
-        .connect(&url)
-        .await
-        .expect("actual writer login connects");
+    let login = common::claim_refusal_audit_writer_login(pool).await;
+    let writer_pool = common::pool_with_limit(
+        &login.url,
+        marketplace_service::refusal_audit::WRITER_POOL_MAX_CONNECTIONS,
+    )
+    .await;
     let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8; 32]);
     let keys = AuditKeys::parse(&root, "1", None, None).expect("keys");
     let runtime = Arc::new(RefusalAuditRuntime::spawn(
@@ -319,7 +289,7 @@ async fn actual_writer_fixture(pool: &PgPool) -> ActualWriterFixture {
                 runtime,
                 pool: writer_pool,
                 keys,
-                login_guard: Some(login_guard),
+                login: Some(login),
             };
         }
         tokio::time::sleep(StdDuration::from_millis(10)).await;
@@ -1405,7 +1375,10 @@ async fn refusal_audit_uses_separate_least_privilege_pool(pool: PgPool) {
     let writer = actual_writer_fixture(&pool).await;
     let runtime = &writer.runtime;
     let writer_pool = &writer.pool;
-    assert_eq!(writer_pool.options().get_max_connections(), 2);
+    assert_eq!(
+        writer_pool.options().get_max_connections(),
+        marketplace_service::refusal_audit::WRITER_POOL_MAX_CONNECTIONS
+    );
     assert_eq!(writer_pool.options().get_min_connections(), 0);
     assert_eq!(
         writer_pool.options().get_acquire_timeout(),
