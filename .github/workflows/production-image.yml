@@ -1,6 +1,9 @@
 name: Production image
 
 on:
+  push:
+    branches:
+      - "cursor/marketplace-image-*"
   workflow_dispatch:
     inputs:
       source_sha:
@@ -17,6 +20,7 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/bitcoinerrorlog/pubky-marketplace-service
+  SOURCE_SHA: ${{ github.event.inputs.source_sha || '2f844c1084c432d8dd6d7e66c320dcaeeb9eb02e' }}
 
 jobs:
   publish:
@@ -31,7 +35,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.inputs.source_sha }}
+          ref: ${{ github.event.inputs.source_sha || '2f844c1084c432d8dd6d7e66c320dcaeeb9eb02e' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -43,7 +47,7 @@ jobs:
 
       - name: Publish linux/amd64 image
         env:
-          SOURCE_SHA: ${{ github.event.inputs.source_sha }}
+          SOURCE_SHA: ${{ env.SOURCE_SHA }}
         run: |
           set -eu
           case "$SOURCE_SHA" in
@@ -97,6 +101,6 @@ jobs:
       - name: Upload publish evidence
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
-          name: marketplace-service-production-image-publish-${{ github.event.inputs.source_sha }}
+          name: marketplace-service-production-image-publish-${{ env.SOURCE_SHA }}
           path: ${{ runner.temp }}/production-image/publish-evidence.json
           retention-days: 14
