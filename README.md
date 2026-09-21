@@ -417,25 +417,76 @@ envelope; unknown fields and unsupported versions are rejected
   `IDEMPOTENCY_CONFLICT`. Canonicalization hashes the parsed, normalized
   command (key order, timestamp formatting, and schema defaults do not affect
   the hash).
-- `expected_revision` is enforced with a compare-and-swap in the `UPDATE`
-  statement; a stale revision returns 409 `REVISION_CONFLICT` with
-  `current_revision`.
+- `expected_revision` is a required envelope integer (`0..=2^53-1`). It is
+  **not** compare-and-swapped on every command. CAS commands refuse a stale
+  value with 409 `REVISION_CONFLICT` and `current_revision`. ADR-0019 §3
+  scopes that check to stale accepted-offer, stock, auction, and order
+  writes. `listing.sync` and `drop.sync` are **convergent**: any
+  authenticated actor may sync (provenance is the homeserver fetch), and a
+  stale or mismatched `expected_revision` is accepted — send `0`.
 - Server time is authoritative; `issued_at` is diagnostic only.
 - Failures are not stored: retrying a rejected command re-executes it
   (matching the prototype engine).
 
-Commands implemented: `listing.register`, `drop.sync`, `drop.cancel`,
-`drop.release_listings` (see Drops), `inventory.reserve`,
+### Per-command `expected_revision`
+
+Derived from the command handlers. Order-action kinds share
+`guard_order_action` (`crates/service/src/handlers/mod.rs:146`). The
+envelope field is always parsed; "ignored" means the handler does not
+compare it.
+
+| Command | Envelope `expected_revision` | Source |
+| --- | --- | --- |
+| `listing.register` | CAS 409 vs listing `server_revision` | `register_listing.rs:115` |
+| `listing.sync` | Convergent — ignored; any actor; stale accepted | `sync_listing.rs:12` (never read) |
+| `drop.sync` | Convergent — ignored; any actor; stale accepted | `drops.rs:98` (never read) |
+| `drop.cancel` | CAS 409 vs drop `revision` | `drops.rs:388` |
+| `drop.release_listings` | CAS 409 vs drop `revision` | `drops.rs:485` |
+| `inventory.reserve` | CAS 409 vs listing `server_revision` | `reserve_inventory.rs:36` |
+| `checkout.create` | Envelope must be `0` (`INVALID_COMMAND`); each `payload.lines[].expected_revision` is CAS 409 vs that listing | `checkout.rs:27`, `checkout.rs:86` |
+| `offer.create` | CAS 409 vs listing `server_revision` | `offers.rs:84` |
+| `offer.counter` | CAS 409 vs offer `revision` | `offers.rs:306` |
+| `offer.accept` | CAS 409 vs offer `revision` | `offers.rs:587` |
+| `offer.checkout` | CAS 409 vs offer `revision` | `offer_checkout.rs:67` |
+| `offer.reject` | CAS 409 vs offer `revision` | `offers.rs:825` |
+| `offer.withdraw` | CAS 409 vs offer `revision` | `offers.rs:891` |
+| `auction.place_bid` | CAS 409 vs listing `server_revision` | `auction.rs:98` |
+| `auction.close` | CAS 409 vs listing `server_revision` | `auction.rs:292` |
+| `payment.sandbox_advance` | CAS 409 vs payment `revision` | `payment.rs:76` |
+| `payment.prepare_locks` | CAS 409 vs payment `revision` | `locks.rs:145` |
+| `payment.register_locks` | CAS 409 vs payment `revision` | `locks.rs:393` |
+| `order.cancel_request` | CAS 409 vs order `revision` | `cancellation.rs:51` |
+| `order.cancel_approve` | CAS 409 vs order `revision` | `cancellation.rs:185` |
+| `fulfillment.ship` | CAS 409 vs order `revision` | `fulfillment.rs:34` |
+| `fulfillment.confirm_delivery` | CAS 409 vs order `revision` | `fulfillment.rs:107` |
+| `pickup_details.set` | Envelope ignored; `payload.expected_version` is CAS 409 vs the pickup version counter | `pickup.rs:270` |
+| `pickup_details.clear` | Envelope ignored; `payload.expected_version` is CAS 409 vs the pickup version counter | `pickup.rs:346` |
+| `fulfillment.mark_ready` | CAS 409 vs order `revision` | `fulfillment.rs:193` |
+| `fulfillment.confirm_pickup` | CAS 409 vs order `revision` | `fulfillment.rs:272` |
+| `return.request` | CAS 409 vs order `revision` | `returns.rs:40` |
+| `return.approve` | CAS 409 vs order `revision` | `returns.rs:171` |
+| `return.receive` | CAS 409 vs order `revision` | `returns.rs:171` |
+| `refund.record_external` | CAS 409 vs order `revision` | `returns.rs:251` |
+| `review.create` | CAS 409 vs order `revision` | `reviews.rs:54` |
+| `review.update` | CAS 409 vs order `revision` | `reviews.rs:304` |
+| `attestation.set_band_consent` | CAS 409 vs stored consent revision (`0` on first write) | `attestation.rs:47` |
+
+Handler paths are under `crates/service/src/handlers/`.
+`POST /v1/inventory/adjust` is a separate HTTP route (not this envelope)
+and does enforce wire `expected_revision` with HTTP 409 `revision_conflict`
+(`crates/service/src/inventory.rs:730`).
+
+Commands implemented: `listing.register`, `listing.sync` (convergent; any
+actor may sync), `drop.sync` (convergent; any actor may sync),
+`drop.cancel`, `drop.release_listings` (see Drops), `inventory.reserve`,
 `checkout.create`, `offer.create`, `offer.counter`, `offer.accept`,
-`offer.reject`, `offer.withdraw`, `auction.place_bid`, `auction.close`,
-`payment.sandbox_advance`, `payment.register_locks`,
-`order.cancel_request`, `order.cancel_approve`,
-`fulfillment.ship`,
-`fulfillment.confirm_delivery`, `pickup_details.set`,
+`offer.checkout`, `offer.reject`, `offer.withdraw`, `auction.place_bid`,
+`auction.close`, `payment.sandbox_advance`, `payment.prepare_locks`,
+`payment.register_locks`, `order.cancel_request`, `order.cancel_approve`,
+`fulfillment.ship`, `fulfillment.confirm_delivery`, `pickup_details.set`,
 `pickup_details.clear`, `fulfillment.mark_ready`,
-`fulfillment.confirm_pickup` (see Local pickup),
-`return.request`, `return.approve`,
-`return.receive`, `refund.record_external`,
+`fulfillment.confirm_pickup` (see Local pickup), `return.request`,
+`return.approve`, `return.receive`, `refund.record_external`,
 `review.create`, `review.update` (this service only), and
 `attestation.set_band_consent`.
 Server-driven transitions (reservation expiry, offer expiry, auction close
