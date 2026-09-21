@@ -1399,6 +1399,8 @@ fn public_ip(ip: IpAddr) -> bool {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
             let cgnat = octets[0] == 100 && (64..128).contains(&octets[1]);
+            let ietf_protocol = octets[0..3] == [192, 0, 0];
+            let deprecated_6to4_anycast = octets[0..3] == [192, 88, 99];
             let benchmarking = octets[0] == 198 && (18..20).contains(&octets[1]);
             let class_e = octets[0] >= 240;
             !(ip.is_private()
@@ -1409,6 +1411,8 @@ fn public_ip(ip: IpAddr) -> bool {
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || cgnat
+                || ietf_protocol
+                || deprecated_6to4_anycast
                 || benchmarking
                 || class_e
                 || octets[0] == 0
@@ -1423,18 +1427,32 @@ fn public_ip(ip: IpAddr) -> bool {
             }
             let octets = ip.octets();
             let documentation = octets[0..4] == [0x20, 0x01, 0x0d, 0xb8];
+            let documentation_3fff = octets[0] == 0x3f && (octets[1] & 0xf0) == 0xf0;
             let six_to_four = octets[0..2] == [0x20, 0x02];
             let teredo = octets[0..4] == [0x20, 0x01, 0x00, 0x00];
+            let v6_benchmarking = octets[0..6] == [0x20, 0x01, 0x00, 0x02, 0x00, 0x00];
+            let orchid = octets[0..3] == [0x20, 0x01, 0x00] && (octets[3] & 0xf0) == 0x10;
+            let orchid_v2 = octets[0..3] == [0x20, 0x01, 0x00] && (octets[3] & 0xf0) == 0x20;
             let nat64 = octets[0..4] == [0x00, 0x64, 0xff, 0x9b];
+            let discard = octets[0..8] == [0x01, 0x00, 0, 0, 0, 0, 0, 0];
+            let dummy_v6 = octets[0..8] == [0x01, 0x00, 0, 0, 0, 0, 0, 1];
+            let srv6_sids = octets[0..2] == [0x5f, 0x00];
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
                 || documentation
+                || documentation_3fff
                 || six_to_four
                 || teredo
-                || nat64)
+                || v6_benchmarking
+                || orchid
+                || orchid_v2
+                || nat64
+                || discard
+                || dummy_v6
+                || srv6_sids)
         }
     }
 }
@@ -1499,11 +1517,25 @@ mod tests {
             "::ffff:100.64.0.1",
             "::ffff:198.18.0.1",
             "::ffff:240.0.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "198.51.100.1",
+            "203.0.113.1",
             "2001:db8::1",
             "2002:7f00:1::1",
             "2001:0::1",
+            "2001:2::1",
+            "2001:10::1",
+            "2001:20::1",
+            "3fff::1",
+            "5f00::1",
+            "100::1",
+            "100:0:0:1::1",
             "64:ff9b::10.0.0.1",
             "64:ff9b:1::1",
+            "::ffff:192.0.0.1",
+            "::ffff:192.88.99.1",
             "::10.0.0.1",
         ] {
             assert!(
