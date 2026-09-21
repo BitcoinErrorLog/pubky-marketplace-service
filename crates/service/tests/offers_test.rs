@@ -270,7 +270,11 @@ async fn accepted_offer_fixture(
     seller: &common::TestActor,
     buyer: &common::TestActor,
 ) -> (String, String, String, i64, String, i64) {
-    app.clock.set(chrono::Utc::now());
+    // timestamptz stores microseconds; Linux Utc::now() often has leftover nanos.
+    app.clock.set(
+        chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+            .expect("microsecond timestamp"),
+    );
     execute(app, &seller.token, &register_command(&seller.pubky, 2)).await;
     let (status, body) = execute(app, &buyer.token, &create_offer_command(&seller.pubky, 1)).await;
     assert_eq!(status, StatusCode::OK, "offer create failed: {body}");
@@ -518,7 +522,10 @@ async fn offer_checkout_uses_injected_clock_and_longest_configured_hold_window(p
             .fetch_one(&app.pool)
             .await
             .expect("hold deadline");
-    assert_eq!(hold_expires_at, lock_now + chrono::Duration::seconds(6_000));
+    assert_eq!(
+        marketplace_service::clock::format_timestamp(hold_expires_at),
+        marketplace_service::clock::format_timestamp(lock_now + chrono::Duration::seconds(6_000)),
+    );
 }
 
 #[sqlx::test]

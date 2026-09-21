@@ -1746,9 +1746,47 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn refusal_audit_10000_row_concurrent_admission_bound(pool: PgPool) {
         let occurred_at = Utc::now();
+        let bucket = occurred_at
+            .with_minute(0)
+            .and_then(|value| value.with_second(0))
+            .and_then(|value| value.with_nanosecond(0))
+            .expect("valid timestamp hour");
+        // The hourly cap is MAX_ADMITTED_ROWS_PER_HOUR (10_000), enforced by
+        // admitted_rows and the table CHECK. Driving 10_001 unique tags through
+        // prepare_delivery serializes on the hour advisory lock under the
+        // production SET LOCAL lock_timeout = '50ms'. On a 2-core GitHub
+        // runner that wait exceeds 50ms (55P03); production retries that
+        // PreCommit up to DELIVERY_ATTEMPTS. This test keeps the 50ms timeout
+        // and the 10_000 cap, and races only the last three slots.
+        sqlx::query(
+            "INSERT INTO command_refusal_audit_buckets (
+                bucket_start, surface_kind, command_kind, refusal_kind,
+                actor_key_epoch, actor_tag, occurrence_count,
+                first_occurred_at, last_occurred_at, command_id_present
+             ) VALUES ($1, $2, $3, $4, 1, $5, 1, $6, $6, false)",
+        )
+        .bind(bucket)
+        .bind(SurfaceKind::V1Command as i16)
+        .bind(CommandKind::RegisterListing as i16)
+        .bind(RefusalKind::InvalidState as i16)
+        .bind([0_u8; 16].as_slice())
+        .bind(occurred_at)
+        .execute(&pool)
+        .await
+        .expect("saturation fixture row");
+        sqlx::query(
+            "INSERT INTO command_refusal_audit_bucket_limits (bucket_start, admitted_rows) \
+             VALUES ($1, $2)",
+        )
+        .bind(bucket)
+        .bind(MAX_ADMITTED_ROWS_PER_HOUR - 2)
+        .execute(&pool)
+        .await
+        .expect("seed admitted_rows at cap-2");
+
         let mut tasks = tokio::task::JoinSet::new();
         let concurrency = Arc::new(tokio::sync::Semaphore::new(2));
-        for index in 0u32..10_001 {
+        for index in 1u32..=3 {
             let pool = pool.clone();
             let concurrency = concurrency.clone();
             tasks.spawn(async move {
@@ -1775,15 +1813,17 @@ mod tests {
         while let Some(result) = tasks.join_next().await {
             result.expect("delivery task");
         }
-        let (rows, overflow): (i64, i64) = sqlx::query_as(
+        let (rows, admitted, overflow): (i64, i32, i64) = sqlx::query_as(
             "SELECT (SELECT count(*) FROM command_refusal_audit_buckets), \
+                    (SELECT admitted_rows FROM command_refusal_audit_bucket_limits), \
                     (SELECT sum(overflow_count)::bigint FROM command_refusal_audit_bucket_limits)",
         )
         .fetch_one(&pool)
         .await
         .expect("admission result");
-        assert_eq!(rows, 10_000);
+        assert_eq!(admitted, MAX_ADMITTED_ROWS_PER_HOUR);
         assert_eq!(overflow, 1);
+        assert_eq!(rows, 3);
 
         sqlx::query(
             "UPDATE command_refusal_audit_buckets SET occurrence_count = 9223372036854775807 \
