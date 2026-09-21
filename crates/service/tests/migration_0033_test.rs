@@ -43,6 +43,7 @@ async fn migrate_through_0031(pool: &PgPool) {
 }
 
 async fn apply_0033(pool: &PgPool) {
+    common::restore_0032_retention_connlimit(pool).await;
     ALL_MIGRATIONS
         .run(pool)
         .await
@@ -74,17 +75,18 @@ async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
     let expected_without_0032: Vec<i64> = (1..=31).chain([33]).collect();
     assert_eq!(initially_applied, expected_without_0032);
 
+    common::restore_0032_retention_connlimit(&pool).await;
     ALL_MIGRATIONS
         .run(&pool)
         .await
-        .expect("missing 0032 and pending 0034/0035/0036 apply after already-applied 0033");
+        .expect("missing 0032 and pending 0034..=0037 apply after already-applied 0033");
 
     let finally_applied: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
             .expect("final migration versions");
-    assert_eq!(finally_applied, (1..=36).collect::<Vec<_>>());
+    assert_eq!(finally_applied, (1..=37).collect::<Vec<_>>());
 }
 
 fn aggregate_id(seller: &str, listing_id: &str) -> String {
@@ -635,7 +637,7 @@ async fn due_auction_selection_is_bounded_and_drains_oldest_first(pool: PgPool) 
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0033_has_exact_secret_reserve_catalog_and_constraints(pool: PgPool) {
     let columns: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT column_name, data_type, is_nullable

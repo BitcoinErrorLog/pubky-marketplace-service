@@ -180,7 +180,7 @@ fn band_consent_command(
     })
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn review_create_issues_a_verifiable_attestation_with_the_designed_claims(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -293,7 +293,7 @@ async fn review_create_issues_a_verifiable_attestation_with_the_designed_claims(
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn amount_band_requires_both_sides_consent(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
 
@@ -403,7 +403,7 @@ async fn amount_band_requires_both_sides_consent(pool: PgPool) {
     assert_eq!(body["allows_amount_band"], json!(false));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn band_consent_endpoint_defaults_to_false_and_conflicts_are_surfaced(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -451,7 +451,7 @@ async fn band_consent_endpoint_defaults_to_false_and_conflicts_are_surfaced(pool
     assert_eq!(body["error"]["current_revision"], json!(1));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn attestation_refetch_is_idempotent_and_participant_scoped(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -531,7 +531,7 @@ async fn attestation_refetch_is_idempotent_and_participant_scoped(pool: PgPool) 
     assert_eq!(updated["result"]["attestation"]["jws"], json!(issued_jws));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reviews_still_work_without_an_attestor_and_return_no_attestation(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -565,7 +565,7 @@ async fn reviews_still_work_without_an_attestor_and_return_no_attestation(pool: 
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refund_outcomes_annotate_the_order_ref(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let attestor = test_attestor();
@@ -627,7 +627,7 @@ async fn refund_outcomes_annotate_the_order_ref(pool: PgPool) {
     assert_eq!(outcomes, vec![("refunded".to_string(),)]);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn new_ordinary_receipt_attestation_uses_v2_and_binds_both_totals(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -697,7 +697,7 @@ async fn new_ordinary_receipt_attestation_uses_v2_and_binds_both_totals(pool: Pg
     assert_eq!(claims["iat"], json!(app.clock.now().timestamp()));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bitcoin_settled_receipt_attestation_is_v2_with_distinct_money_fields(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -761,7 +761,7 @@ async fn bitcoin_settled_receipt_attestation_is_v2_with_distinct_money_fields(po
     assert_eq!(claims["iss"], json!(test_attestor().pubky()));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn legacy_receipt_reissue_is_byte_identical_to_the_v1_prechange_output(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -839,7 +839,7 @@ async fn legacy_receipt_reissue_is_byte_identical_to_the_v1_prechange_output(poo
     assert_eq!(receipt["merchandise_total"], Value::Null);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn legacy_non_bitcoin_views_synthesize_merchandise_from_the_legacy_total(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -890,7 +890,7 @@ async fn legacy_non_bitcoin_views_synthesize_merchandise_from_the_legacy_total(p
     assert_eq!(receipt["merchandise_total"], expected);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn new_offer_receipt_attestation_uses_v2(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -984,7 +984,7 @@ async fn new_offer_receipt_attestation_uses_v2(pool: PgPool) {
     assert_eq!(body["receipt_attestation"]["claims"]["v"], json!(2));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn receipt_attestation_is_byte_identical_across_calls_and_participants(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -1017,7 +1017,7 @@ async fn receipt_attestation_is_byte_identical_across_calls_and_participants(poo
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn receipt_attestation_is_participant_scoped(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -1044,7 +1044,7 @@ async fn receipt_attestation_is_participant_scoped(pool: PgPool) {
     assert_eq!(foreign, missing);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn receipt_attestation_for_an_unknown_receipt_is_not_found(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let buyer = new_actor(&app).await;
@@ -1060,7 +1060,7 @@ async fn receipt_attestation_for_an_unknown_receipt_is_not_found(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn receipt_attestation_without_an_attestor_is_not_found(pool: PgPool) {
     // Mirrors the review-attestation re-fetch on an attestor-less
     // deployment: a participant's fetch for a real receipt is 404.
@@ -1080,7 +1080,7 @@ async fn receipt_attestation_without_an_attestor_is_not_found(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn receipt_attestation_paid_at_matches_the_receipt_projection(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -1180,7 +1180,7 @@ async fn drop_paid_order(
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn edition_attestation_is_verifiable_and_binds_the_drop_order_facts(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver_and_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -1262,7 +1262,7 @@ async fn edition_attestation_is_verifiable_and_binds_the_drop_order_facts(pool: 
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn edition_attestation_for_a_non_drop_order_is_not_found(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let seller = new_actor(&app).await;
@@ -1295,7 +1295,7 @@ async fn edition_attestation_for_a_non_drop_order_is_not_found(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn edition_attestation_without_an_attestor_is_not_found(pool: PgPool) {
     // A real paid drop order on an attestor-less deployment: the fetch is
     // 404 with the receipt read's body, like the other attestation reads.
@@ -1319,7 +1319,7 @@ async fn edition_attestation_without_an_attestor_is_not_found(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn stat_attestation_job_signs_weekly_seller_stats(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
     let attestor = test_attestor();

@@ -97,7 +97,7 @@ async fn order_state(pool: &PgPool, order_id: &str) -> (String, bool, i64) {
 
 // The shipped → delivered assumption: due only after DELIVERY_ASSUME_DAYS,
 // flagged on the projection, system-attributed, both participants notified.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn assumes_delivery_after_the_configured_window_and_flags_the_projection(pool: PgPool) {
     let app = test_app(pool).await;
     let holder = Uuid::new_v4();
@@ -172,7 +172,7 @@ async fn assumes_delivery_after_the_configured_window_and_flags_the_projection(p
 
 // The delivered → completed auto-completion: due only after
 // AUTO_COMPLETE_DAYS, system-attributed, both participants notified.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn auto_completes_delivered_orders_after_the_configured_window(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -223,7 +223,7 @@ async fn auto_completes_delivered_orders_after_the_configured_window(pool: PgPoo
 // An open return blocks auto-completion; an open cancel request keeps the
 // order out of both sweeps. Both are their own order states, so the block
 // is structural, not a best-effort check.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn open_return_or_cancel_requests_block_auto_complete(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -289,7 +289,7 @@ async fn open_return_or_cancel_requests_block_auto_complete(pool: PgPool) {
 
 // A completed-via-review order, and an order that completed through the
 // assumption + auto-complete pipeline, stay done; nothing regresses.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn worker_transitions_are_idempotent_under_double_claim(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -376,7 +376,7 @@ async fn worker_transitions_are_idempotent_under_double_claim(pool: PgPool) {
 
 // N+1 due orders with batch_size N are drained across successive passes
 // (max_batches = 1 so each call is one inner claim).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn delivery_sweep_processes_a_batch_plus_one_across_passes(pool: PgPool) {
     let app = test_app(pool).await;
     for i in 0..3 {
@@ -413,7 +413,7 @@ async fn delivery_sweep_processes_a_batch_plus_one_across_passes(pool: PgPool) {
 
 // A malformed shipment timestamp is skipped (logged by order id) and does
 // not abort valid due rows in the same claim.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn malformed_shipment_timestamp_is_skipped_and_valid_rows_still_transition(pool: PgPool) {
     let app = test_app(pool).await;
     let seller_ok = new_actor(&app).await;

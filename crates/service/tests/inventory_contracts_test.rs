@@ -68,7 +68,7 @@ fn exchange(method: &str, path: &str, request: Value, status: StatusCode, body: 
     })
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn inventory_contract_regenerates_from_executable_routes(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;

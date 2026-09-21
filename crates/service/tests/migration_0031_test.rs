@@ -11,7 +11,7 @@ mod common;
 
 use sqlx::PgPool;
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0031_removes_refusal_auditing(pool: PgPool) {
     // The narrowed CHECK: the exact vocabulary is the two success
     // outcomes, enforced by the constraint definition itself.

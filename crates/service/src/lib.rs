@@ -4,6 +4,11 @@
 //! checkout/orders, and payments per ADR-0019, implemented in Rust per
 //! ADR-0022 with PostgreSQL as the persistence boundary.
 
+#[cfg(any(test, feature = "test-faults"))]
+mod test_migrator;
+#[cfg(any(test, feature = "test-faults"))]
+pub use test_migrator::TEST_MIGRATOR;
+
 pub mod attestor;
 pub mod auth;
 pub mod automation;

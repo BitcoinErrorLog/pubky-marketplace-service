@@ -304,7 +304,7 @@ async fn paid_pickup_order(
 // The entitlement is the durable payment fact, re-evaluated on every read:
 // an unpaid buyer is refused; the paying buyer gets the pinned snapshot per
 // line — and LATER EDITS never change what the reveal serves.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reveal_requires_payment_and_serves_the_pinned_snapshot(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -393,7 +393,7 @@ async fn reveal_requires_payment_and_serves_the_pinned_snapshot(pool: PgPool) {
 }
 
 // Cache-Control: no-store on both entitled reads.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn entitled_reads_are_no_store(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -436,7 +436,7 @@ async fn entitled_reads_are_no_store(pool: PgPool) {
 // Wrong-role rejection across the whole surface: the seller never calls the
 // buyer reveal, a non-owner never reads or writes the details, and the
 // handover commands reject outsiders and wrong roles.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn wrong_roles_are_rejected_everywhere(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -519,7 +519,7 @@ async fn wrong_roles_are_rejected_everywhere(pool: PgPool) {
 // pending_payment never established it (no receipt); a paid order cancelled
 // on ANY path refuses from the cancel event on; any other terminal state
 // refuses too.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reveal_entitlement_ends_at_terminal_states(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -697,7 +697,7 @@ async fn reveal_entitlement_ends_at_terminal_states(pool: PgPool) {
 // The standard projection (cached, shape-logged, list-rendered) NEVER
 // carries details; command results, notifications, and Debug impls are
 // redacted; the meeting point appears only in the two entitled reads.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn no_serialization_surface_leaks_the_meeting_point(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -804,7 +804,7 @@ async fn no_serialization_surface_leaks_the_meeting_point(pool: PgPool) {
 // Mixed carts split one order per (seller, fulfillment): several pickup
 // lines from one seller share one pickup order; pickup orders charge no
 // shipping and store no address; shipped orders keep both.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn mixed_cart_splits_per_seller_fulfillment(pool: PgPool) {
     let app = test_app(pool).await;
     let seller_a = new_actor(&app).await;
@@ -901,7 +901,7 @@ async fn mixed_cart_splits_per_seller_fulfillment(pool: PgPool) {
 // The address rule pair: a pickup-only checkout PRESENTING a
 // delivery_address is rejected INVALID_COMMAND; a shipped checkout MISSING
 // one is rejected too.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn pickup_only_checkout_address_rules(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -952,7 +952,7 @@ async fn pickup_only_checkout_address_rules(pool: PgPool) {
 // Sandbox-pinned snapshots are refused by the reveal EVEN AFTER the
 // deployment sandbox flag flips back off — the pinned adapter, not the
 // current flag, decides (the flag-toggle window off->on->off).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sandbox_pinned_snapshot_stays_refused_across_flag_flips(pool: PgPool) {
     // Details are set while the flag is OFF.
     let app_off = test_app_with_pickup(pool.clone(), false).await;
@@ -1006,7 +1006,7 @@ async fn sandbox_pinned_snapshot_stays_refused_across_flag_flips(pool: PgPool) {
 // Sandbox payments enabled: pickup_details.set is refused, the buyer reveal
 // is refused (the deployment boundary, independent of the pinned adapter),
 // and pickup_available reports off.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sandbox_deployments_refuse_pickup_writes_and_reveals(pool: PgPool) {
     let app = test_app_with_pickup(pool.clone(), true).await;
     let seller = new_actor(&app).await;
@@ -1095,7 +1095,7 @@ async fn sandbox_deployments_refuse_pickup_writes_and_reveals(pool: PgPool) {
 // `pickup_details.clear`; the post-clear set CASes against it and continues
 // the sequence, and terms-change detection still fires against a pre-clear
 // version_at_payment. A stale expected_version conflicts.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn versions_are_monotonic_across_clear(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -1193,7 +1193,7 @@ async fn versions_are_monotonic_across_clear(pool: PgPool) {
 // terminal — with the cancelled-order exception living until refund
 // evidence is recorded, and the ordinary terminal purge taking it when no
 // evidence lands.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn clear_retention_and_terminal_purge(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -1364,7 +1364,7 @@ async fn clear_retention_and_terminal_purge(pool: PgPool) {
 
 // Editing details after payment bumps the version and notifies exactly the
 // paid buyers of orders on that listing.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn edit_after_payment_notifies_exactly_the_paid_buyers(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -1435,7 +1435,7 @@ async fn edit_after_payment_notifies_exactly_the_paid_buyers(pool: PgPool) {
 // both move the order straight to cancelled with the distinct event kind,
 // release inventory through approve's path, and notify the seller; outside
 // the conditions the same command is the ordinary cancel_requested.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unilateral_exits_and_their_window_edges(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -1781,7 +1781,7 @@ async fn unilateral_exits_and_their_window_edges(pool: PgPool) {
 // instant; a duplicate confirm cannot write a second row; the
 // fulfillment-method guards reject cross-method commands; next_actor maps
 // the pickup states.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn confirm_pickup_matrix_and_method_guards(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -2034,7 +2034,7 @@ async fn confirm_pickup_matrix_and_method_guards(pool: PgPool) {
 
 // The auto-complete sweep coalesces the handover instant for pickup orders
 // on the same deadline as shipped orders' shipment delivered_at.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn auto_complete_coalesces_the_handover_instant(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -2087,7 +2087,7 @@ async fn auto_complete_coalesces_the_handover_instant(pool: PgPool) {
 // terminated_badly (including a refund.recorded_external leg on it), while
 // an ordinary approved cancel still counts; pickup completions count under
 // the confirming-actor rule.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reputation_rules_for_pickup(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
     let fake = Arc::new(FakeLocksClient::default());
@@ -2468,7 +2468,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
 // The confirming-actor rule: a buyer-confirmed handover counts at once; a
 // seller-unilateral confirm counts only after a dispute-free auto-complete
 // and never before it.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reputation_counts_pickup_completions_by_confirming_actor(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
     let fake = Arc::new(FakeLocksClient::default());
@@ -2695,7 +2695,7 @@ async fn reputation_counts_pickup_completions_by_confirming_actor(pool: PgPool) 
 
 // listing.sync carries no details and can never null them; the public
 // fulfillmentMethods converge through both register and sync.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sync_converges_methods_but_never_touches_details(pool: PgPool) {
     let homeserver = spawn_fake_homeserver().await;
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
@@ -2763,7 +2763,7 @@ async fn sync_converges_methods_but_never_touches_details(pool: PgPool) {
 // Key absent (all-or-none gating): pickup_details.set and the buyer reveal
 // are refused even on a non-sandbox deployment; nothing is ever stored
 // plaintext.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn key_absent_refuses_writes_and_reveals(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
     let fake = Arc::new(FakeLocksClient::default());
@@ -2817,7 +2817,7 @@ async fn key_absent_refuses_writes_and_reveals(pool: PgPool) {
 // key that opens NEITHER family refuses startup; the dual-key window and
 // the re-seal job rotate both families with a completion criterion over
 // both.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn boot_probe_and_two_family_rotation(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
     let current = common::test_pickup_keys();
@@ -2928,7 +2928,7 @@ async fn boot_probe_and_two_family_rotation(pool: PgPool) {
 // Rotation past the first batch: 130 details rows sealed under the previous
 // key must ALL rotate in one job run — a first-100-only batch would re-read
 // the same rotated rows on every pass and never report completion.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rotation_walks_past_the_first_batch_and_reports_completion(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
     let current = common::test_pickup_keys();
@@ -2994,7 +2994,7 @@ async fn rotation_walks_past_the_first_batch_and_reports_completion(pool: PgPool
 // of the family, no spin. The re-seal also never touches `updated_at`
 // (the owner-read "details last edited" fact): a key rotation is not an
 // edit.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reseal_skips_an_unopenable_row_and_reports_it(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
     let sealed_at = now - chrono::Duration::days(30);
@@ -3105,7 +3105,7 @@ async fn reseal_skips_an_unopenable_row_and_reports_it(pool: PgPool) {
 // The boot probe must catch a HALF-rotated table whose previous key was
 // dropped: probing only the first row per family would sample the rotated
 // row and pass, leaving the straggler to fail the first buyer's reveal.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn boot_probe_catches_a_half_rotated_table_with_the_previous_key_dropped(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
     let current = common::test_pickup_keys();
@@ -3147,7 +3147,7 @@ async fn boot_probe_catches_a_half_rotated_table_with_the_previous_key_dropped(p
 // checkout) has no meeting point: the reveal is a typed refusal and never
 // stamps first_revealed_at, so the buyer's cancel stays on the ordinary
 // path while the seller can still complete the handover.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reveal_refuses_an_order_that_pinned_nothing(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -3302,7 +3302,7 @@ async fn reveal_refuses_an_order_that_pinned_nothing(pool: PgPool) {
 // reveal serves that pinned subset instead of refusing the order. The
 // orders-list projection's `pickup_terms_changed` flag reads false before
 // an edit and true after one.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reveal_serves_the_pinned_subset_of_a_partially_detailed_order(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -3437,7 +3437,7 @@ async fn reveal_serves_the_pinned_subset_of_a_partially_detailed_order(pool: PgP
 
 // A details row that fails to open (sealed under an unknown key) must FAIL
 // the confirmation cleanly — receipt transaction rolled back, no panic.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn confirm_order_fails_cleanly_on_an_unopenable_details_row(pool: PgPool) {
     // Sandbox on (so payment.sandbox_advance confirms) with pickup keys
     // configured; the corrupted row is seeded directly, as an operator
@@ -3512,7 +3512,7 @@ async fn confirm_order_fails_cleanly_on_an_unopenable_details_row(pool: PgPool) 
 // The worker path: one unopenable details row fails the pass LOUDLY (the
 // worker loop logs and continues) instead of panicking the loop dead; once
 // the row is repaired the next pass confirms the payment.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -3623,7 +3623,7 @@ async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
 // details row opens under no configured key), the SECOND still confirms in
 // the same pass — a per-item error is logged, never head-of-line for the
 // rest of the batch — and the task lease is released for the next holder.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_failed_claimed_item_does_not_stall_the_rest_of_the_batch(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -3781,7 +3781,7 @@ async fn a_failed_claimed_item_does_not_stall_the_rest_of_the_batch(pool: PgPool
 // pass error is logged per-task (its unopenable count rides the message),
 // the remaining worker tasks still run, and run_once returns Ok with the
 // tick summary.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_failing_reseal_task_does_not_fail_the_tick(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
@@ -3862,7 +3862,7 @@ async fn a_failing_reseal_task_does_not_fail_the_tick(pool: PgPool) {
 // One buyer with TWO paid orders on the same listing gets one notification
 // per order on a details update — the notifications dedup on (event id,
 // recipient) must never collapse them.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn details_update_notifies_each_paid_order_of_the_same_buyer(pool: PgPool) {
     let (app, fake) = test_app_with_pickup_and_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -3968,7 +3968,7 @@ async fn details_update_notifies_each_paid_order_of_the_same_buyer(pool: PgPool)
 // (["shipping", "pickup", "shipping"]) must converge to the unique
 // first-seen methods — adjacent-only dedup would fail registration
 // validation and block the sync forever.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sync_dedups_non_adjacent_fulfillment_methods(pool: PgPool) {
     let homeserver = spawn_fake_homeserver().await;
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
@@ -4011,7 +4011,7 @@ async fn sync_dedups_non_adjacent_fulfillment_methods(pool: PgPool) {
 // `pickup_details.set` on a listing that does not publish pickup is refused
 // (the details would be unreachable); `clear` stays allowed so stale
 // details remain removable.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn set_requires_the_listing_to_publish_pickup(pool: PgPool) {
     let app = test_app_with_pickup(pool, false).await;
     let seller = new_actor(&app).await;

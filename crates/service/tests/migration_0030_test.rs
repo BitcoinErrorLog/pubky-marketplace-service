@@ -13,7 +13,7 @@ mod common;
 
 use sqlx::PgPool;
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0030_keys_binding_outcomes_per_command(pool: PgPool) {
     // The 0030 key column exists and stays nullable (legacy rows predate
     // it); additive-only history never drops it.

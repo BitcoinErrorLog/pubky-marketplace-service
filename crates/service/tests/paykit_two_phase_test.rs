@@ -149,7 +149,7 @@ fn host_of(base_url: &str) -> String {
 
 // 1. Phase 1 persists the prepared body, from the body, in the bind
 //    transaction — and exactly one `paykit.activate` row with it.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn phase_one_persists_the_prepared_body_and_one_activate_row(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     // The pin persists the phase-1 allocation mode verbatim; the double
@@ -233,7 +233,7 @@ async fn phase_one_persists_the_prepared_body_and_one_activate_row(pool: PgPool)
 //    dials the configured endpoint instead of the row's
 //    `paykit_stack_endpoint` (the activate then reaches B, and the
 //    "the activate went to A" assertion bites).
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn activation_routes_to_the_persisted_endpoint_after_a_repoint(pool: PgPool) {
     let (app, _stripe, paykit_a) = test_app_with_payments(pool.clone()).await;
     let paykit_b = spawn_fake_paykit().await;
@@ -292,7 +292,7 @@ async fn activation_routes_to_the_persisted_endpoint_after_a_repoint(pool: PgPoo
 // 3. A genuine commit failure after a phase-1 200 rolls the whole bind
 //    back (no bind, no outbox row): the ambiguous-commit re-read confirms
 //    the bind ABSENT, so exactly one courtesy void fires.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_failed_commit_after_phase_one_rolls_back_and_voids(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -374,7 +374,7 @@ async fn a_failed_commit_after_phase_one_rolls_back_and_voids(pool: PgPool) {
 //     `tx.commit()` result into `Err` at the call site, so the production
 //     re-read runs. It finds the bind, so ZERO voids may leave for paykit —
 //     the activation outbox row carries the bind forward.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_ambiguous_commit_with_a_durable_bind_never_voids(pool: PgPool) {
     install_log_capture();
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
@@ -446,7 +446,7 @@ async fn an_ambiguous_commit_with_a_durable_bind_never_voids(pool: PgPool) {
 // outbox row — the whole transaction rolls back — with one courtesy void
 // for the prepared invoice. Removing the guard (committing the bind
 // despite the failed insert) fails this test at the "no bind" assertion.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_failure_at_the_outbox_insert_leaves_neither_bind_nor_row(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -509,7 +509,7 @@ async fn a_failure_at_the_outbox_insert_leaves_neither_bind_nor_row(pool: PgPool
 }
 
 // 4. Phase-1 refusals keep their semantics and write nothing.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn phase_one_refusals_keep_their_semantics(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -564,7 +564,7 @@ async fn phase_one_refusals_keep_their_semantics(pool: PgPool) {
 
 // 5. A bodyless 204, a missing field, or an inconsistent total: refused,
 //    nothing persisted.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn phase_one_shape_violations_are_refused(pool: PgPool) {
     install_log_capture();
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
@@ -616,7 +616,7 @@ async fn phase_one_shape_violations_are_refused(pool: PgPool) {
 //     binds. A later or earlier echo is a terminal refusal in the
 //     total-mismatch class — no bind, no outbox row, one courtesy void,
 //     alerted — and the bound order persists the LOCAL hold deadline.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn phase_one_expires_at_echo_is_verified(pool: PgPool) {
     install_log_capture();
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
@@ -690,7 +690,7 @@ async fn phase_one_expires_at_echo_is_verified(pool: PgPool) {
 // 6. Activation flips `preparing → active` and `paykit_request_state →
 //    pending` with the delivered mark in one transaction; a failure
 //    between the HTTP call and the commit changes nothing.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn activation_flips_preparing_to_active_atomically(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -743,7 +743,7 @@ async fn activation_flips_preparing_to_active_atomically(pool: PgPool) {
 // 6b. A well-formed activation 200 whose `state` is not `observing` is a
 //     malformed success: nothing flips locally, the row retries under its
 //     lease, and a later well-formed 200 completes the activation.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn activation_success_with_a_non_observing_state_retries(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let paykit_client = app
@@ -817,7 +817,7 @@ async fn activation_success_with_a_non_observing_state_retries(pool: PgPool) {
 
 // 7. A redelivered activate row cannot apply twice: no second HTTP call,
 //    no state change.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn activation_redelivery_cannot_apply_twice(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -863,7 +863,7 @@ async fn activation_redelivery_cannot_apply_twice(pool: PgPool) {
 // no state change, no re-enqueue; the row is only re-stamped. Removing
 // the `preparing` guard in the delivery path sends a second activate to
 // paykit and fails this test at the call-count assertion.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_stale_activation_after_void_is_a_noop(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -932,7 +932,7 @@ async fn a_stale_activation_after_void_is_a_noop(pool: PgPool) {
 // 8. Every terminal error voids the bind, releases the hold, emits the
 //    `payment.bitcoin_prepare_voided` intent and stamps the row; the
 //    mismatch cases alert.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn activation_terminal_errors_void_the_bind(pool: PgPool) {
     install_log_capture();
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
@@ -1052,7 +1052,7 @@ async fn activation_terminal_errors_void_the_bind(pool: PgPool) {
 
 // A voided bind is released: the buyer binds again, and the retry is a
 // fresh phase 1 with a fresh idempotency key.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_voided_bind_retries_with_a_fresh_idempotency_key(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1097,7 +1097,7 @@ async fn a_voided_bind_retries_with_a_fresh_idempotency_key(pool: PgPool) {
 
 // 9. A 5xx leaves the row undelivered and re-leased; a later 200 completes
 //    it.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn activation_unavailable_retries_then_completes(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1150,7 +1150,7 @@ async fn activation_unavailable_retries_then_completes(pool: PgPool) {
 
 // 10. A `preparing` order is not claimed by the paykit poll; after
 //     activation it is.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_preparing_order_is_not_polled(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1202,7 +1202,7 @@ async fn a_preparing_order_is_not_polled(pool: PgPool) {
 // 11. The buyer-facing total is the paykit total (price + nonce) on the
 //     order projection, the payment step, and the receipt — never the
 //     pre-nonce amount.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_buyer_total_is_the_paykit_total(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1258,7 +1258,7 @@ async fn the_buyer_total_is_the_paykit_total(pool: PgPool) {
 
 // 12a. Hold expiry on a `preparing` order: the void succeeds → the order
 //      expires exactly as an unpaid order, with the void event.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn hold_expiry_on_a_preparing_order_voids_and_expires(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1333,7 +1333,7 @@ async fn hold_expiry_on_a_preparing_order_voids_and_expires(pool: PgPool) {
 // 12b. Hold expiry with `invoice_finalized` (paykit already activated — a
 //      lost 2xx): the order becomes active/pending and the ordinary expiry
 //      takes it from the next tick.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn hold_expiry_with_invoice_finalized_marks_the_order_active(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1379,7 +1379,7 @@ async fn hold_expiry_with_invoice_finalized_marks_the_order_active(pool: PgPool)
 
 // 12c. Hold expiry while the activate row's lease is held (a delivery in
 //      flight): the order is skipped this tick.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn hold_expiry_skips_an_order_whose_activation_is_in_flight(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1420,7 +1420,7 @@ async fn hold_expiry_skips_an_order_whose_activation_is_in_flight(pool: PgPool) 
 // 12d. Paykit unreachable: within the 30-minute grace the tick retries;
 //      past it the marketplace voids locally and enqueues a `paykit.void`
 //      row that delivers once paykit returns.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn hold_expiry_unreachable_voids_locally_past_the_grace(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;

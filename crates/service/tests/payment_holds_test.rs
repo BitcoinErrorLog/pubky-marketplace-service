@@ -57,7 +57,7 @@ async fn order_hold(app: &TestApp, order_id: &str) -> (bool, Option<String>) {
 // Two buyers check out the LAST unit: both orders are created (checkout no
 // longer contends); the first payment lock point wins the hold; the second
 // fails with the pinned sold-out copy.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn both_buyers_check_out_the_last_unit_and_the_first_lock_point_wins(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -129,7 +129,7 @@ async fn both_buyers_check_out_the_last_unit_and_the_first_lock_point_wins(pool:
 // An abandoned checkout — an order with no payment activity — holds
 // nothing: the listing stays buyable and another buyer pays it through
 // immediately.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_abandoned_checkout_holds_nothing_and_blocks_nobody(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -180,7 +180,7 @@ async fn an_abandoned_checkout_holds_nothing_and_blocks_nobody(pool: PgPool) {
 // the Locks payment window (the correlation window IS the hold window). An
 // exact replay of the registration returns the stored result without a
 // second decrement.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn register_locks_acquires_the_hold_and_arms_the_locks_window(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -244,7 +244,7 @@ async fn register_locks_acquires_the_hold_and_arms_the_locks_window(pool: PgPool
 
 // The payment-method bind is a lock point for all three rails: it acquires
 // the hold and arms the fiat payment window.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -331,7 +331,7 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
 // The sandbox lock point arms the sandbox window on the FIRST transition
 // out of awaiting_entitlement; the later confirm converts the same held
 // unit without a second decrement.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_sandbox_first_advance_arms_the_sandbox_window_and_never_double_decrements(
     pool: PgPool,
 ) {
@@ -378,7 +378,7 @@ async fn the_sandbox_first_advance_arms_the_sandbox_window_and_never_double_decr
 // simply checks out again. The sandbox 'detected' payment has no
 // detected → expired edge, so — exactly like buyer cancellation — the sweep
 // leaves the payment record untouched.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_lapsed_sandbox_hold_restocks_and_the_buyer_can_recheckout(pool: PgPool) {
     let app = test_app(pool).await;
     let holder = Uuid::new_v4();
@@ -473,7 +473,7 @@ async fn a_lapsed_sandbox_hold_restocks_and_the_buyer_can_recheckout(pool: PgPoo
 
 // The sweep never touches confirmed orders, no matter how much server time
 // passes after payment.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_sweep_never_touches_confirmed_orders(pool: PgPool) {
     let app = test_app(pool).await;
     let holder = Uuid::new_v4();
@@ -503,7 +503,7 @@ async fn the_sweep_never_touches_confirmed_orders(pool: PgPool) {
 // source; auction orders and settled orders are untouched. The rows are
 // inserted with the new columns' defaults (the legacy shape) and the
 // migration's own backfill UPDATE is executed against them verbatim.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_backfill_marks_exactly_the_legacy_pending_checkout_orders(pool: PgPool) {
     let app = test_app(pool.clone()).await;
     let now: DateTime<Utc> = app.clock.now();

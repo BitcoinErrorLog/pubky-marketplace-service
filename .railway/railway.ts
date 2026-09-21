@@ -16,6 +16,10 @@ const sharedServiceConfig = {
     healthcheckPath: "/ready",
     healthcheckTimeout: 120,
     restartPolicyType: "ON_FAILURE" as const,
+    // Apply only after the 0037 image is SUCCESS. Dual-replica bound is
+    // healthcheckTimeout 120 + overlapSeconds 60 + drainingSeconds 15.
+    overlapSeconds: 60,
+    drainingSeconds: 15,
   },
 };
 

@@ -27,7 +27,7 @@ const REMOVED_REFUSAL_OUTCOMES: [&str; 8] = [
     "refused_no_snapshot",
 ];
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0028_adds_the_binding_outcome_audit(pool: PgPool) {
     // The exact column set, enumerated once so a drift (or a new sensitive
     // column) fails loudly: the audit table carries ids, the static outcome

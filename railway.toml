@@ -2,6 +2,8 @@
 builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
+# overlapSeconds / drainingSeconds are authored in .railway/railway.ts.
+# This file remains the deprecated builder/healthcheck/restart mirror.
 [deploy]
 healthcheckPath = "/ready"
 healthcheckTimeout = 120

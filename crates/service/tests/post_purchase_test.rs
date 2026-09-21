@@ -25,7 +25,7 @@ async fn get(app: &TestApp, uri: &str, token: &str) -> (StatusCode, Value) {
 
 // TS case: "advances sandbox payment through detection to confirmation and
 // issues a receipt".
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn advances_sandbox_payment_through_detection_to_confirmation_and_issues_receipt(
     pool: PgPool,
 ) {
@@ -145,7 +145,7 @@ async fn advances_sandbox_payment_through_detection_to_confirmation_and_issues_r
 // and invalid payment transitions" — the payment-transition half, now that
 // payment.sandbox_advance is ported (the checkout half lives in
 // commands_test.rs).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_invalid_payment_transitions_and_non_buyer_advancement(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -212,7 +212,7 @@ async fn rejects_invalid_payment_transitions_and_non_buyer_advancement(pool: PgP
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sandbox_manual_review_stamps_the_receiver_clock(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -244,7 +244,7 @@ async fn sandbox_manual_review_stamps_the_receiver_clock(pool: PgPool) {
 }
 
 // TS case: "ships, confirms delivery, and allows one review per participant".
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn ships_confirms_delivery_and_allows_one_review_per_participant(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -384,7 +384,7 @@ async fn ships_confirms_delivery_and_allows_one_review_per_participant(pool: PgP
 
 // TS case: "runs return approval, receipt, and externally verified refund
 // without claiming custody".
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn runs_return_approval_receipt_and_externally_verified_refund_without_claiming_custody(
     pool: PgPool,
 ) {
@@ -518,7 +518,7 @@ async fn runs_return_approval_receipt_and_externally_verified_refund_without_cla
 
 // New in the Rust service: the refund record is refused without independent
 // evidence, above the order value, and from ineligible states.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refuses_external_refunds_without_independent_evidence(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -584,7 +584,7 @@ async fn refuses_external_refunds_without_independent_evidence(pool: PgPool) {
 // New in the Rust service: every post-purchase command refuses a
 // non-participant outright — a refusal, not an empty result — and the
 // receipt endpoint hides foreign receipts.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refuses_non_participants_on_every_post_purchase_command(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -657,7 +657,7 @@ async fn refuses_non_participants_on_every_post_purchase_command(pool: PgPool) {
 
 // New in the Rust service: exact replays of every post-purchase command
 // return the stored result without re-executing (ADR-0019 §3).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn replays_each_post_purchase_command_idempotently(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -778,7 +778,7 @@ async fn replays_each_post_purchase_command_idempotently(pool: PgPool) {
 // reviews_one_per_order_role constraint even when two same-role commands
 // race — the competing uncommitted insert forces the handler through the
 // constraint instead of its sequential pre-check.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn review_uniqueness_is_enforced_by_the_database_constraint_under_concurrency(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -870,7 +870,7 @@ async fn review_uniqueness_is_enforced_by_the_database_constraint_under_concurre
 
 // New in the Rust service (review.update has no prototype counterpart):
 // the reviewer may revise within the bounded window, and only the reviewer.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reviews_are_editable_by_their_author_within_the_bounded_window(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -967,7 +967,7 @@ async fn reviews_are_editable_by_their_author_within_the_bounded_window(pool: Pg
 // New in the Rust service: confirming an auction winner's payment converts
 // the winning reservation and sells the held unit; once the hold lapses on
 // server time, confirmation is refused instead of overselling.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn auction_payment_confirmation_converts_the_winning_reservation(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1041,7 +1041,7 @@ async fn auction_payment_confirmation_converts_the_winning_reservation(pool: PgP
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refuses_payment_confirmation_after_the_winning_hold_lapses(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1107,7 +1107,7 @@ async fn refuses_payment_confirmation_after_the_winning_hold_lapses(pool: PgPool
 // New in the Rust service: the order read projections now carry the
 // post-purchase sub-objects for participants, matching the client's
 // orderSchema field names, still without the delivery address.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn order_projections_carry_post_purchase_sub_objects_for_participants(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1188,7 +1188,7 @@ async fn order_projections_carry_post_purchase_sub_objects_for_participants(pool
 // The return/refund loop is strictly two-party (ADR-0019: no arbiter, no
 // custody): each step accepts exactly one role, and the projection always
 // names who acts next.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn return_flow_rejects_wrong_roles_and_shows_who_acts_next(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;

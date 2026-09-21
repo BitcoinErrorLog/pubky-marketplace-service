@@ -41,7 +41,7 @@ const SENSITIVE_CORRELATION_COLUMNS: [(&str, &str); 6] = [
     ("lock_resource_hash", "text"),
 ];
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0026_adds_the_locks_binding_schema(pool: PgPool) {
     for (table, columns) in [
         ("listings", LISTING_LOCK_COLUMNS.as_slice()),
@@ -140,7 +140,7 @@ async fn migration_0026_adds_the_locks_binding_schema(pool: PgPool) {
 // sealed or hashed — never plaintext — so the table's retention story (an
 // audit row with no purge) never exposes correlation secrets, and a future
 // column cannot join the table unreviewed.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn locks_correlation_sensitive_columns_stay_sealed_or_hashed(pool: PgPool) {
     let columns: Vec<(String, String)> = sqlx::query_as(
         "SELECT column_name, data_type FROM information_schema.columns \

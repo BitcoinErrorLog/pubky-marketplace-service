@@ -85,7 +85,7 @@ async fn insert_marketplace_session(
     URL_SAFE_NO_PAD.encode(bearer)
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0036_preserves_bearer_key_and_reuses_uuid_session_identity(pool: sqlx::PgPool) {
     let token_hash = vec![7u8; 32];
     let now: DateTime<Utc> = NOW.parse().unwrap();
@@ -122,7 +122,7 @@ async fn migration_0036_preserves_bearer_key_and_reuses_uuid_session_identity(po
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn client_asserted_identity_and_ambiguous_principal_create_nothing(pool: sqlx::PgPool) {
     let (app, _) = test_app_with_grant(pool.clone()).await;
     let (status, body) = send(
@@ -153,7 +153,7 @@ async fn client_asserted_identity_and_ambiguous_principal_create_nothing(pool: s
     assert_eq!(count, 0);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn revoked_bearer_is_rejected_by_every_session_resolver_and_reconnect(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool.clone()).await;
     let now = app.clock.now();
@@ -195,7 +195,7 @@ async fn revoked_bearer_is_rejected_by_every_session_resolver_and_reconnect(pool
     assert_eq!(count, 0);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn delivery_assertion_subject_must_match_active_bearer(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool.clone()).await;
     let now = app.clock.now();
@@ -243,7 +243,7 @@ async fn delivery_assertion_subject_must_match_active_bearer(pool: sqlx::PgPool)
     assert_eq!(expected, pubky);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bootstrap_identity_is_assertion_derived_and_jti_is_single_use(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool.clone()).await;
     let now = app.clock.now();
@@ -295,7 +295,7 @@ async fn bootstrap_identity_is_assertion_derived_and_jti_is_single_use(pool: sql
     assert_eq!(count, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn flow_id_status_never_returns_result_authority(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool).await;
     let result_key = SigningKey::from_bytes(&[31u8; 32]);
@@ -329,7 +329,7 @@ async fn flow_id_status_never_returns_result_authority(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn status_rate_limit_is_shared_in_postgres(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool).await;
     let result_key = SigningKey::from_bytes(&[30u8; 32]);
@@ -374,7 +374,7 @@ async fn status_rate_limit_is_shared_in_postgres(pool: sqlx::PgPool) {
     assert_ne!(bucket_hash, unhashed.finalize().as_slice());
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn wrong_verified_signer_is_terminal_without_an_identity_oracle_and_mints_no_bearer(
     pool: sqlx::PgPool,
 ) {
@@ -416,7 +416,7 @@ async fn wrong_verified_signer_is_terminal_without_an_identity_oracle_and_mints_
 const INVENTORY_RW: &str = "/pub/pubky.app/marketplace-service/v1/:rw";
 const INVENTORY_R: &str = "/pub/pubky.app/marketplace-service/v1/:r";
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn grant_settle_with_shop_caps_opens_inventory(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool).await;
     let pubky = "y".repeat(52);
@@ -439,7 +439,7 @@ async fn grant_settle_with_shop_caps_opens_inventory(pool: sqlx::PgPool) {
     assert_eq!(status, StatusCode::OK, "inventory projection: {body}");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn grant_settle_with_insufficient_caps_is_not_widened(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool).await;
     let pubky = "o".repeat(52);
@@ -460,7 +460,7 @@ async fn grant_settle_with_insufficient_caps_is_not_widened(pool: sqlx::PgPool) 
     assert_eq!(body["error"]["code"], json!("capability_required"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn grant_settle_forged_claims_cannot_mint_inventory_caps(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool).await;
     let pubky = "f".repeat(52);
@@ -481,7 +481,7 @@ async fn grant_settle_forged_claims_cannot_mint_inventory_caps(pool: sqlx::PgPoo
     assert_eq!(body["error"]["code"], json!("capability_required"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn grant_settle_wider_than_requested_is_rejected(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool).await;
     let pubky = "w".repeat(52);
@@ -508,7 +508,7 @@ async fn grant_settle_wider_than_requested_is_rejected(pool: sqlx::PgPool) {
     assert_eq!(body, json!({"status":"terminal"}));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn grant_settle_root_request_is_rejected(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool).await;
     let pubky = "r".repeat(52);
@@ -587,7 +587,7 @@ async fn nonce(
     response
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool.clone()).await;
     let result_key = SigningKey::from_bytes(&[41u8; 32]);
@@ -707,7 +707,7 @@ async fn retrieval_token_is_delivered_and_claimed_once(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reaper_terminalizes_expiry_and_stale_lease_without_replay(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool.clone()).await;
     let now = app.clock.now();
@@ -751,7 +751,7 @@ async fn reaper_terminalizes_expiry_and_stale_lease_without_replay(pool: sqlx::P
     assert!(rows.contains(&("failed".into(), "lease_lost".into(), true)));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn result_expiry_revokes_both_undelivered_and_delivered_sessions(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool.clone()).await;
     let result_key = SigningKey::from_bytes(&[51u8; 32]);

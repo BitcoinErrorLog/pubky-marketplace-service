@@ -173,15 +173,45 @@ pub async fn claim_refusal_audit_retention_login(pool: &PgPool) -> RefusalAuditR
     RefusalAuditRetentionLogin { url, _guard: guard }
 }
 
+/// 0032 is fail-closed on retention `CONNECTION LIMIT 1`. 0037 raises that
+/// cluster-global limit to 2, so a later catalog replay of 0032 aborts
+/// unless the 0032-era limit is restored first.
+pub async fn restore_0032_retention_connlimit(pool: &PgPool) {
+    sqlx::query(
+        "DO $restore$
+         BEGIN
+           IF EXISTS (
+             SELECT 1 FROM pg_catalog.pg_roles
+             WHERE rolname = 'marketplace_refusal_audit_retention'
+           ) THEN
+             ALTER ROLE marketplace_refusal_audit_retention CONNECTION LIMIT 1;
+           END IF;
+         END $restore$;",
+    )
+    .execute(pool)
+    .await
+    .expect("restore 0032-era retention CONNECTION LIMIT");
+}
+
 pub async fn pool_with_limit(url: &str, max_connections: u32) -> PgPool {
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(max_connections)
-        .min_connections(0)
-        .acquire_timeout(std::time::Duration::from_millis(100))
-        .idle_timeout(Some(std::time::Duration::from_secs(60)))
-        .connect(url)
-        .await
-        .expect("named login connects")
+    let mut last_error = None;
+    for _ in 0..20 {
+        match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(max_connections)
+            .min_connections(0)
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .idle_timeout(Some(std::time::Duration::from_secs(60)))
+            .connect(url)
+            .await
+        {
+            Ok(pool) => return pool,
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!("named login connects: {last_error:?}")
 }
 
 pub async fn test_app_full(

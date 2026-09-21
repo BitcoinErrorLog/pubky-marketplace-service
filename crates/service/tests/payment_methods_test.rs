@@ -113,7 +113,7 @@ async fn read_order(app: &TestApp, token: &str, order_id: &str) -> Value {
 // Seller payment configuration
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn payment_config_upserts_and_never_returns_the_restricted_key(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -198,7 +198,7 @@ async fn payment_config_upserts_and_never_returns_the_restricted_key(pool: PgPoo
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn payment_config_validation_refuses_bad_inputs(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -234,7 +234,7 @@ async fn payment_config_validation_refuses_bad_inputs(pool: PgPool) {
     assert_eq!(body["stripe_payment_link"], Value::Null);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_config_reports_bitcoin_availability_from_paykit(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -264,7 +264,7 @@ async fn public_config_reports_bitcoin_availability_from_paykit(pool: PgPool) {
     assert_eq!(body["error"]["reason"], json!("invalid_pubky"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_config_mirrors_and_caches_the_rail_gate(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -309,7 +309,7 @@ async fn public_config_mirrors_and_caches_the_rail_gate(pool: PgPool) {
     assert_eq!(body["bitcoin_offer_available"], json!(false));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paykit_failure_uses_last_known_then_fails_closed_without_503(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -330,7 +330,7 @@ async fn paykit_failure_uses_last_known_then_fails_closed_without_503(pool: PgPo
     assert_eq!(body["bitcoin_offer_available"], json!(false));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn legacy_paykit_rail_fallback_uses_electrum_component(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -380,7 +380,7 @@ async fn legacy_paykit_rail_fallback_uses_electrum_component(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn account_failure_returns_ok_with_bitcoin_unavailable(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -394,7 +394,7 @@ async fn account_failure_returns_ok_with_bitcoin_unavailable(pool: PgPool) {
     assert_eq!(body["bitcoin_offer_available"], json!(true));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn worker_refreshes_paykit_rail_for_health(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
     paykit.set_rail_health(json!({
@@ -411,7 +411,7 @@ async fn worker_refreshes_paykit_rail_for_health(pool: PgPool) {
     assert_eq!(body["paykit_rail"]["age_seconds"], json!(0));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn own_config_returns_the_stored_row_verbatim(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -452,7 +452,7 @@ async fn own_config_returns_the_stored_row_verbatim(pool: PgPool) {
     assert_eq!(body["payment_config"], Value::Null);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn own_config_is_null_before_the_first_save(pool: PgPool) {
     // Deliberately without the payments runtime: reading the stored row must
     // not be gated on payment rails being configured.
@@ -463,14 +463,14 @@ async fn own_config_is_null_before_the_first_save(pool: PgPool) {
     assert_eq!(body, json!({ "payment_config": Value::Null }));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn own_config_requires_a_session(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let (status, _) = get_own_config(&app, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_payment_surface_is_refused_without_the_runtime(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -483,7 +483,7 @@ async fn the_payment_surface_is_refused_without_the_runtime(pool: PgPool) {
 // Method binding
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unbound_pending_order_actor_reflects_seller_rail_configuration(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller_with_rail = new_actor(&app).await;
@@ -506,7 +506,7 @@ async fn unbound_pending_order_actor_reflects_seller_rail_configuration(pool: Pg
     assert_eq!(view["next_actor"], json!("seller"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn stripe_binding_snapshots_the_checkout_url(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -541,7 +541,7 @@ async fn stripe_binding_snapshots_the_checkout_url(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn binding_rejections_cover_role_availability_and_currency(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -605,7 +605,7 @@ async fn binding_rejections_cover_role_availability_and_currency(pool: PgPool) {
     assert!(paykit.requests().is_empty(), "nothing reached paykit");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paypal_binding_builds_the_seller_direct_checkout_url(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -646,7 +646,7 @@ async fn paypal_binding_builds_the_seller_direct_checkout_url(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bitcoin_binding_creates_the_signed_paykit_request(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -720,7 +720,7 @@ async fn bitcoin_binding_creates_the_signed_paykit_request(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bitcoin_binding_binds_small_unquoted_sat_orders(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -762,7 +762,7 @@ async fn bitcoin_binding_binds_small_unquoted_sat_orders(pool: PgPool) {
     assert_eq!(quoted, None, "an unquoted SAT order stores no FX quote");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_refused_paykit_request_leaves_the_order_unbound(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -817,7 +817,7 @@ async fn verify(app: &TestApp, token: &str, order_id: &str) -> (StatusCode, Valu
     .await
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn stripe_verification_pays_the_order_on_a_matching_paid_session(pool: PgPool) {
     let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -882,7 +882,7 @@ async fn stripe_verification_pays_the_order_on_a_matching_paid_session(pool: PgP
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn stripe_verification_surfaces_key_problems_honestly(pool: PgPool) {
     let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -960,7 +960,7 @@ async fn confirm_received(app: &TestApp, token: &str, order_id: &str) -> (Status
     .await
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paypal_two_step_attestation_pays_the_order(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1028,7 +1028,7 @@ async fn paypal_two_step_attestation_pays_the_order(pool: PgPool) {
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paypal_attestation_applies_only_to_paypal_orders(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
@@ -1081,7 +1081,7 @@ async fn post_ipn(app: &TestApp, body: String) -> StatusCode {
     status
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_verified_completed_ipn_pays_the_order_without_any_participant(pool: PgPool) {
     let (app, _stripe, _paykit, ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1120,7 +1120,7 @@ async fn a_verified_completed_ipn_pays_the_order_without_any_participant(pool: P
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_ipn_that_fails_postback_validation_is_dropped(pool: PgPool) {
     let (app, _stripe, _paykit, ipn) = test_app_with_payments_and_ipn(pool).await;
     let seller = new_actor(&app).await;
@@ -1138,7 +1138,7 @@ async fn an_ipn_that_fails_postback_validation_is_dropped(pool: PgPool) {
     assert_eq!(order_view["fiat_verification"], json!("seller-attested"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_ipn_that_does_not_match_server_held_facts_is_dropped(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool).await;
     let seller = new_actor(&app).await;
@@ -1171,7 +1171,7 @@ async fn an_ipn_that_does_not_match_server_held_facts_is_dropped(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn duplicate_ipns_confirm_exactly_once(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1193,7 +1193,7 @@ async fn duplicate_ipns_confirm_exactly_once(pool: PgPool) {
 // Paykit verification worker (physical bitcoin orders)
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_paykit_worker_confirms_a_settled_bitcoin_order(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1288,7 +1288,7 @@ async fn the_paykit_worker_confirms_a_settled_bitcoin_order(pool: PgPool) {
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_confirmed_but_mismatched_amount_routes_to_manual_review(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;

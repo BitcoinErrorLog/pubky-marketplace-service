@@ -23,7 +23,7 @@ use common::{
 // racing checkouts against 10 units create orders. The stock decides at the
 // payment lock points: exactly 10 of the 100 concurrent lock acquisitions
 // win holds, and the 90 losers fail clean with the pinned sold-out copy.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn hundred_concurrent_checkouts_all_succeed_and_exactly_ten_payments_win_holds(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -120,7 +120,7 @@ async fn hundred_concurrent_checkouts_all_succeed_and_exactly_ten_payments_win_h
     assert_eq!((available, reserved, state.as_str()), (0, 10, "reserved"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn duplicate_checkout_replays_the_stored_result_without_a_second_order(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -149,7 +149,7 @@ async fn duplicate_checkout_replays_the_stored_result_without_a_second_order(poo
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_duplicate_checkouts_converge_on_one_stored_result(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -182,7 +182,7 @@ async fn concurrent_duplicate_checkouts_converge_on_one_stored_result(pool: PgPo
 /// revision conflicts, stopping on BID_TOO_LOW) converge on one
 /// deterministic leader — the highest maximum — and the close produces
 /// exactly one result and one winning order even when raced.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn hundred_concurrent_proxy_bids_produce_one_deterministic_leader_and_one_close(
     pool: PgPool,
 ) {

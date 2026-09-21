@@ -469,7 +469,7 @@ fn assert_processed(status: &str, terminal_code: Option<&str>, relay: &RelayInbo
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn restore_observes_preexisting_inbox_message_on_one_durable_lease(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
@@ -488,7 +488,7 @@ async fn restore_observes_preexisting_inbox_message_on_one_durable_lease(pool: P
     assert_processed(&status, terminal_code.as_deref(), &harness.relay);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sdk_poll_that_never_returns_fails_grant_exchange_within_cap(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow_timeouts(pool.clone(), relay.clone(), 1).await;
@@ -530,7 +530,7 @@ async fn sdk_poll_that_never_returns_fails_grant_exchange_within_cap(pool: PgPoo
     assert_eq!(scanned, 0, "no leaked task may leave the row leasable");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn lease_expiry_with_live_listener_returns_awaiting_without_consuming(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
@@ -558,7 +558,7 @@ async fn lease_expiry_with_live_listener_returns_awaiting_without_consuming(pool
     assert_processed(&status, terminal_code.as_deref(), &harness.relay);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn two_workers_race_and_only_one_consumes(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
@@ -578,7 +578,7 @@ async fn two_workers_race_and_only_one_consumes(pool: PgPool) {
     assert_processed(&status, terminal_code.as_deref(), &harness.relay);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn worker_crash_after_inbox_consume_does_not_return_awaiting(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
@@ -607,7 +607,7 @@ async fn worker_crash_after_inbox_consume_does_not_return_awaiting(pool: PgPool)
     assert_eq!(scanned, 0, "retry must not require a second produce");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn replica_reaper_does_not_lease_lost_after_inbox_consume(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
@@ -635,7 +635,7 @@ async fn replica_reaper_does_not_lease_lost_after_inbox_consume(pool: PgPool) {
     assert_processed(&status, terminal_code.as_deref(), &harness.relay);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn post_ack_abort_does_not_return_awaiting(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
@@ -671,7 +671,7 @@ async fn post_ack_abort_does_not_return_awaiting(pool: PgPool) {
     assert_eq!(scanned, 0, "retry must not require a second produce");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn duplicate_inbox_message_after_commit_is_ignored(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
@@ -698,7 +698,7 @@ async fn duplicate_inbox_message_after_commit_is_ignored(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn late_inbox_message_within_lease_is_observed(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;

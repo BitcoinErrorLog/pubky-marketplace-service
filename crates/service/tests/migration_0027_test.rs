@@ -8,7 +8,7 @@ mod common;
 
 use sqlx::PgPool;
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0027_scopes_the_claim_index_and_registered_state(pool: PgPool) {
     let (definition,): (String,) = sqlx::query_as(
         "SELECT pg_get_indexdef('payment_locks_correlations_pending_idx'::regclass)",

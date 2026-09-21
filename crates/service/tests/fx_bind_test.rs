@@ -189,7 +189,7 @@ fn assert_no_side_effects(facts: &FxOrderFacts, paykit: &FakePaykit, context: &s
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn feed_failures_are_typed_409_with_no_side_effects_and_clean_tracing(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     let now = fixture.app.clock.now();
@@ -278,7 +278,7 @@ async fn feed_failures_are_typed_409_with_no_side_effects_and_clean_tracing(pool
     }
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bootstrap_below_three_samples_is_refused_without_a_fetch(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     let now = fixture.app.clock.now();
@@ -307,7 +307,7 @@ async fn bootstrap_below_three_samples_is_refused_without_a_fetch(pool: PgPool) 
     assert_no_side_effects(&facts, &fixture.paykit, "two samples");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sampler_persists_samples_rejects_outliers_and_quotes_across_restart(pool: PgPool) {
     let (app, paykit, fx) = test_app_with_payments_and_fx(pool.clone()).await;
     let now = app.clock.now();
@@ -358,7 +358,7 @@ async fn sampler_persists_samples_rejects_outliers_and_quotes_across_restart(poo
     assert_eq!(paykit.requests().len(), 0, "the first process is untouched");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bind_replay_conflict_and_race_yield_exactly_one_quote(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     let now = fixture.app.clock.now();
@@ -436,7 +436,7 @@ async fn bind_replay_conflict_and_race_yield_exactly_one_quote(pool: PgPool) {
     assert!(facts.stock_held, "the winner holds the stock");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn lifecycle_prepare_activate_void_and_expiry_keep_the_quote(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     let now = fixture.app.clock.now();
@@ -534,7 +534,7 @@ async fn lifecycle_prepare_activate_void_and_expiry_keep_the_quote(pool: PgPool)
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn shared_manual_extension_and_late_settlement_retain_the_quote(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     let now = fixture.app.clock.now();
@@ -634,7 +634,7 @@ async fn shared_manual_extension_and_late_settlement_retain_the_quote(pool: PgPo
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn quote_divergent_observation_clears_an_active_seller_window(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     let now = fixture.app.clock.now();
@@ -690,7 +690,7 @@ async fn quote_divergent_observation_clears_an_active_seller_window(pool: PgPool
     assert_eq!(deadline, None);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn settlement_only_exact_non_late_exclusive_auto_pays(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     let now = fixture.app.clock.now();
@@ -764,7 +764,7 @@ async fn settlement_only_exact_non_late_exclusive_auto_pays(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
     install_log_capture();
     let fixture = fx_fixture(pool.clone()).await;
@@ -965,7 +965,7 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
     assert_eq!(observation_after["confirmations"], json!(9));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn shared_manual_freeze_pins_the_first_observation_for_refunds(pool: PgPool) {
     install_log_capture();
     let fixture = fx_fixture(pool.clone()).await;
@@ -1090,7 +1090,7 @@ async fn shared_manual_freeze_pins_the_first_observation_for_refunds(pool: PgPoo
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn usd_bind_end_to_end_amount_and_role_scoped_projection(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     let now = fixture.app.clock.now();
@@ -1149,7 +1149,7 @@ async fn usd_bind_end_to_end_amount_and_role_scoped_projection(pool: PgPool) {
     assert_eq!(status, StatusCode::NOT_FOUND, "strangers see no quote");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn usd_offer_checkout_bitcoin_bind_keeps_settlement_and_merchandise_typed(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     seed_fx_samples(&pool, RATE, fixture.app.clock.now(), 3).await;

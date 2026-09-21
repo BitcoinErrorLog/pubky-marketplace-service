@@ -36,8 +36,8 @@ pub const RETENTION_LOGIN: &str = "marketplace_refusal_audit_retention";
 pub const WRITER_POOL_MAX_CONNECTIONS: u32 = 1;
 pub const WRITER_LOGIN_CONN_LIMIT: i32 = 2;
 pub const RETENTION_POOL_MAX_CONNECTIONS: u32 = 1;
-/// Stop-start image: survive today's LIMIT 1 and post-0037 LIMIT 2.
-pub const RETENTION_CONN_LIMIT_MIN: i32 = 1;
+/// First rolling image: require LIMIT 2 after 0037.
+pub const RETENTION_CONN_LIMIT_MIN: i32 = 2;
 const DELIVERY_ATTEMPTS: usize = 3;
 const DELIVERY_DEADLINE: Duration = Duration::from_millis(250);
 const CONNECTION_CLEANUP_DEADLINE: Duration = Duration::from_millis(50);
@@ -956,14 +956,12 @@ async fn retention_authority_probe(
     }
 }
 
-#[cfg(any(test, feature = "test-faults"))]
 pub async fn probe_writer_authority(
     connection: &mut PoolConnection<Postgres>,
 ) -> Result<(), sqlx::Error> {
     bounded_authority_probe(connection).await
 }
 
-#[cfg(any(test, feature = "test-faults"))]
 pub async fn probe_retention_authority(
     connection: &mut PoolConnection<Postgres>,
 ) -> Result<(), sqlx::Error> {
@@ -1775,7 +1773,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrations = "./migrations")]
+    #[sqlx::test(migrator = "crate::TEST_MIGRATOR")]
     async fn refusal_audit_10000_row_concurrent_admission_bound(pool: PgPool) {
         let occurred_at = Utc::now();
         let bucket = occurred_at

@@ -863,7 +863,7 @@ mod tests {
     // batch settles the family; with a previous key configured the hunt for
     // the straggler class stops at PROBE_MAX_BATCHES (stragglers beyond the
     // bound are the re-seal job's responsibility).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::TEST_MIGRATOR")]
     async fn boot_probe_stays_bounded_on_a_large_all_current_table(pool: PgPool) {
         let keys = keys();
         let rotated =
@@ -914,7 +914,7 @@ mod tests {
     // hiding at the END of the family would boot green and fail the first
     // buyer's reveal — the probe also samples the family's LAST batch, so
     // the straggler fails the boot instead.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::TEST_MIGRATOR")]
     async fn boot_probe_catches_an_unopenable_row_at_the_end_of_the_family(pool: PgPool) {
         let keys = keys();
         let unknown = PickupKeys::from_hex(OTHER_KEY, None).expect("other key parses");

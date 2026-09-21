@@ -87,7 +87,7 @@ async fn read_listing(app: &TestApp, token: &str, aggregate_id: &str) -> (Status
     .await
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_buyer_sync_registers_an_unregistered_listing(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -145,7 +145,7 @@ async fn a_buyer_sync_registers_an_unregistered_listing(pool: PgPool) {
     assert_eq!(actor_pubky, buyer.pubky);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn re_syncing_the_same_record_is_a_no_op_success(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -178,7 +178,7 @@ async fn re_syncing_the_same_record_is_a_no_op_success(pool: PgPool) {
     assert_eq!(events, 1, "the no-op re-sync must not append events");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_stale_record_never_regresses_a_newer_aggregate(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -225,7 +225,7 @@ async fn a_stale_record_never_regresses_a_newer_aggregate(pool: PgPool) {
     assert_eq!(body["event_ids"], json!([]));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_newer_record_refreshes_the_aggregate(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -246,7 +246,7 @@ async fn a_newer_record_refreshes_the_aggregate(pool: PgPool) {
     assert_eq!(body["result"]["listing"]["total_quantity"], json!(4));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_missing_homeserver_record_is_a_definitive_not_found(pool: PgPool) {
     let (app, _homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -267,7 +267,7 @@ async fn a_missing_homeserver_record_is_a_definitive_not_found(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_unreachable_homeserver_is_a_distinct_retriable_failure(pool: PgPool) {
     // Nothing listens on this client's target port.
     let unreachable =
@@ -290,7 +290,7 @@ async fn an_unreachable_homeserver_is_a_distinct_retriable_failure(pool: PgPool)
     assert_eq!(body["error"]["code"], json!("UPSTREAM_UNAVAILABLE"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sync_is_refused_where_no_homeserver_is_configured(pool: PgPool) {
     let app = test_app_without_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -313,7 +313,7 @@ async fn sync_is_refused_where_no_homeserver_is_configured(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sync_still_enforces_the_committed_inventory_invariant(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -366,7 +366,7 @@ async fn sync_still_enforces_the_committed_inventory_invariant(pool: PgPool) {
 // the sync with a static error: the service must distinguish absent
 // metadata (no lock) from invalid metadata, and never heal a listing's
 // existing lock away (Sol Wave 1A review, P2-4).
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_malformed_digital_lock_refuses_the_sync_without_healing(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;

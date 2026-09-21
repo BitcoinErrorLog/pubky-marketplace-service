@@ -5,6 +5,8 @@ use sqlx::migrate::Migrator;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+mod common;
+
 static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 
 #[test]
@@ -43,6 +45,7 @@ async fn migration_0035_upgrades_the_exact_0034_catalog_and_preserves_sessions(p
         ),
         ..Migrator::DEFAULT
     };
+    common::restore_0032_retention_connlimit(&pool).await;
     through_0034
         .run(&pool)
         .await
@@ -80,7 +83,7 @@ async fn migration_0035_upgrades_the_exact_0034_catalog_and_preserves_sessions(p
     assert_eq!(row.3, None);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn automation_schema_is_additive_and_constrained(pool: PgPool) {
     for table in [
         "webhook_endpoints",

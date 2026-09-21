@@ -35,7 +35,7 @@ async fn delivered_notifications(app: &TestApp) -> Vec<(String, String, serde_js
 }
 
 // Proxy bidding never exposes reserve-derived status to either bidder.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn applies_deterministic_proxy_bidding_without_reserve_status(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -80,7 +80,7 @@ async fn applies_deterministic_proxy_bidding_without_reserve_status(pool: PgPool
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM bids").await, 2);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bid_history_shows_the_visible_price_progression_and_never_the_maximums(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -152,7 +152,7 @@ async fn bid_history_shows_the_visible_price_progression_and_never_the_maximums(
 }
 
 // TS case: "uses first accepted sequence as the proxy-bid tie breaker"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn uses_first_accepted_sequence_as_proxy_bid_tie_breaker(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -189,7 +189,7 @@ async fn uses_first_accepted_sequence_as_proxy_bid_tie_breaker(pool: PgPool) {
 }
 
 // TS case: "rejects seller, low, stale, and post-close bids"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_seller_low_stale_and_post_close_bids(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -276,7 +276,7 @@ async fn rejects_seller_low_stale_and_post_close_bids(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("AUCTION_CLOSED"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn personal_minimum_is_the_exact_bid_acceptance_boundary(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -380,7 +380,7 @@ async fn personal_minimum_is_the_exact_bid_acceptance_boundary(pool: PgPool) {
 }
 
 // The prototype rejects bids on non-auction listings as INVALID_STATE.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_bids_on_fixed_price_listings(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -403,7 +403,7 @@ async fn rejects_bids_on_fixed_price_listings(pool: PgPool) {
 }
 
 // TS case: "extends an auction when a valid bid lands inside the anti-sniping window"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn extends_auction_when_bid_lands_inside_anti_sniping_window(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -433,7 +433,7 @@ async fn extends_auction_when_bid_lands_inside_anti_sniping_window(pool: PgPool)
 
 // TS case: "closes a reserve-met auction with one winner and reservation".
 // The Rust service also creates exactly one winning order + sandbox payment.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn closes_reserve_met_auction_with_one_winner_and_reservation(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -536,7 +536,7 @@ async fn closes_reserve_met_auction_with_one_winner_and_reservation(pool: PgPool
 }
 
 // TS case: "closes an auction without a reserve-met leader as unsold"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn closes_auction_without_reserve_met_leader_as_unsold(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -572,7 +572,7 @@ async fn closes_auction_without_reserve_met_leader_as_unsold(pool: PgPool) {
 }
 
 // Prototype closeAuction: "The auction has not ended yet."
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_closing_an_auction_before_its_end_time(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -602,7 +602,7 @@ async fn rejects_closing_an_auction_before_its_end_time(pool: PgPool) {
 // displaced leader) learns the auction closed, with the closing visible
 // price riding the payload per ADR-0019 §8 (the figure is already on the
 // listing projection every bidder reads).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn close_notifies_every_bidder_except_the_winner(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -694,7 +694,7 @@ async fn close_notifies_every_bidder_except_the_winner(pool: PgPool) {
 
 // An unsold close (reserve never met) still tells the bidders the auction
 // is over — nobody "wins" silence.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unsold_close_notifies_the_bidders(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
