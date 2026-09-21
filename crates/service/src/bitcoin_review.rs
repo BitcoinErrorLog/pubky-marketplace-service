@@ -1407,29 +1407,35 @@ pub(crate) async fn apply_late_money(
             )
             .await?;
             if order.state == "pending_payment" {
-                sqlx::query(
-                    "UPDATE orders SET state = 'cancelled', \
-                     cancellation_reason = 'payment window elapsed', updated_at = $2 \
-                     WHERE id = $1 AND state = 'pending_payment'",
+                // Same revision-bumping path as `expire_held_order`: the
+                // event revision is the `RETURNING` value, never in-memory
+                // `order.revision + 1` against an unbumped row.
+                let cas: Option<(i64,)> = sqlx::query_as(
+                    "UPDATE orders SET state = 'cancelled', revision = revision + 1, \
+                     cancellation_reason = 'payment window elapsed', stock_held = false, \
+                     hold_expires_at = NULL, updated_at = $2 \
+                     WHERE id = $1 AND state = 'pending_payment' RETURNING revision",
                 )
                 .bind(order.id)
                 .bind(now)
-                .execute(&mut **tx)
+                .fetch_optional(&mut **tx)
                 .await
                 .map_err(|e| ResolutionFailure::Internal("late cancel".into(), e.to_string()))?;
-                insert_event(
-                    tx,
-                    command_id,
-                    &ids::order_aggregate_id(order.id),
-                    order.revision + 1,
-                    event_actor,
-                    "order.cancelled",
-                    now,
-                )
-                .await
-                .map_err(|e| {
-                    ResolutionFailure::Internal("late cancel event".into(), e.to_string())
-                })?;
+                if let Some((order_revision,)) = cas {
+                    insert_event(
+                        tx,
+                        command_id,
+                        &ids::order_aggregate_id(order.id),
+                        order_revision,
+                        event_actor,
+                        "order.cancelled",
+                        now,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ResolutionFailure::Internal("late cancel event".into(), e.to_string())
+                    })?;
+                }
             }
             for recipient in [&order.buyer_pubky, &order.seller_pubky] {
                 insert_notification_intent(

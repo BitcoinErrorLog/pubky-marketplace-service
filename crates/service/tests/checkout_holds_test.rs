@@ -587,6 +587,115 @@ async fn bitcoin_refund_required_when_second_buyer_holds(pool: PgPool) {
     assert!(n >= 2, "refund_required notifies both parties: {n}");
 }
 
+/// Unheld `pending_payment` (the bound-zombie class the sweep skips) with
+/// stock gone: late-cancel must bump `orders.revision` so
+/// `refund.record_external` can write the next event instead of colliding
+/// on `events_one_per_aggregate_revision`.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn late_cancel_then_record_external_keeps_revision_monotonic(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, reference) =
+        bound_sat_qty_one(&app, &paykit, &seller, &buyer, "exclusive").await;
+    let order_uuid = Uuid::parse_str(&order_id).unwrap();
+
+    sqlx::query("UPDATE orders SET stock_held = false, hold_expires_at = NULL WHERE id = $1")
+        .bind(order_uuid)
+        .execute(&pool)
+        .await
+        .expect("force unheld zombie");
+    sqlx::query(
+        "UPDATE listings SET available_quantity = 0, reserved_quantity = 0, \
+         sold_quantity = total_quantity, state = 'sold' WHERE aggregate_id = $1",
+    )
+    .bind(listing_aggregate(&seller.pubky))
+    .execute(&pool)
+    .await
+    .expect("deplete stock");
+
+    let after = app.clock.now() + chrono::Duration::seconds(7300);
+    assert_eq!(
+        expire_due_payment_windows(&app.state, after)
+            .await
+            .expect("expire skips unheld"),
+        0,
+        "unheld pending_payment is not expire_held_order"
+    );
+
+    let mut late = status_confirmed("exclusive", true, 2);
+    late["late_settlement"] = json!(true);
+    paykit.set_status(&reference, late);
+    assert!(poll_now(&app, after + chrono::Duration::seconds(60)).await >= 1);
+
+    let (order_state, payment_state, reason, order_revision, total_minor): (
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT o.state, p.state, p.review_reason, o.revision, o.total_minor \
+         FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
+    )
+    .bind(order_uuid)
+    .fetch_one(&pool)
+    .await
+    .expect("facts");
+    assert_eq!(order_state, "cancelled");
+    assert_eq!(payment_state, "manual_review");
+    assert_eq!(reason.as_deref(), Some("refund_required"));
+    assert_order_event_revisions_match(&pool, &order_id, order_revision).await;
+
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &order_command(
+            "refund.record_external",
+            &order_id,
+            order_revision,
+            json!({
+                "amount_minor": total_minor,
+                "transaction_id": "bitcoin-tx-evidence-123",
+            }),
+            1_501,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["order"]["state"], json!("refunded_external"));
+
+    let (final_revision,): (i64,) = sqlx::query_as("SELECT revision FROM orders WHERE id = $1")
+        .bind(order_uuid)
+        .fetch_one(&pool)
+        .await
+        .expect("final revision");
+    assert!(
+        final_revision > order_revision,
+        "record_external must bump past the late-cancel revision"
+    );
+    assert_order_event_revisions_match(&pool, &order_id, final_revision).await;
+}
+
+async fn assert_order_event_revisions_match(pool: &PgPool, order_id: &str, order_revision: i64) {
+    let aggregate = format!("order:{order_id}");
+    let (max_event, event_count): (Option<i64>, i64) =
+        sqlx::query_as("SELECT MAX(revision), COUNT(*) FROM events WHERE aggregate_id = $1")
+            .bind(&aggregate)
+            .fetch_one(pool)
+            .await
+            .expect("event revisions");
+    assert_eq!(
+        max_event,
+        Some(order_revision),
+        "orders.revision must equal max(events.revision) for {aggregate}"
+    );
+    assert_eq!(
+        event_count, order_revision,
+        "order event revisions must be contiguous 1..={order_revision}"
+    );
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn live_test_cap_refuses_before_rearm(pool: PgPool) {
     let mut config = Config::for_tests();
