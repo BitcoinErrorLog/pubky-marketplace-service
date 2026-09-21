@@ -479,7 +479,10 @@ fn live_test_amount_exceeds_cap(
     quoted_sats: Option<u64>,
 ) -> bool {
     if let Some(max) = config.live_test_max_usd_minor {
-        if order.currency == "USD" && order.exponent == 2 && order.total_minor > max {
+        // Listing-currency minor units for every fiat code (USD cents, EUR
+        // cents, JPY yen, …). No FX conversion: Blocktank is BTCUSD-only.
+        // Env name `LIVE_TEST_MAX_USD_MINOR` is historical.
+        if is_fiat_currency(order) && order.total_minor > max {
             return true;
         }
     }
@@ -549,13 +552,6 @@ pub async fn bind_payment_method(
             "The payment method must be bitcoin, stripe, or paypal.",
         );
     }
-    if state.config.payment_rails_disabled.contains(method) {
-        return method_error(
-            ErrorCode::InvalidState,
-            "method_unavailable",
-            "This payment rail is disabled on this deployment.",
-        );
-    }
     let now = state.clock.now();
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
@@ -590,16 +586,24 @@ pub async fn bind_payment_method(
             "Only the buyer may bind the payment method.",
         );
     }
-    if !state.config.live_test_seller_allowlist.is_empty()
-        && !state
-            .config
-            .live_test_seller_allowlist
-            .contains(&order.seller_pubky)
+    if !state
+        .config
+        .live_test_seller_allowlist
+        .permits(&order.seller_pubky)
     {
         return method_error(
             ErrorCode::InvalidState,
             "live_test_seller_not_allowlisted",
             "This seller is not on the live-test allow-list.",
+        );
+    }
+    // Buyer and allow-list run first so a disabled rail does not leak
+    // `method_unavailable` to a non-buyer or a seller outside the list.
+    if state.config.payment_rails_disabled.contains(method) {
+        return method_error(
+            ErrorCode::InvalidState,
+            "method_unavailable",
+            "This payment rail is disabled on this deployment.",
         );
     }
     if let Some(bound) = &order.payment_method {
