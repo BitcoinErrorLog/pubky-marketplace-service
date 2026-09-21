@@ -1,9 +1,13 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use axum::http::HeaderValue;
 use url::Url;
 
 use crate::refusal_audit::AuditKeys;
+
+/// Default PayPal Website Payments Standard checkout (`_xclick`).
+pub const DEFAULT_PAYPAL_CHECKOUT_URL: &str = "https://www.paypal.com/cgi-bin/webscr";
 
 /// Default `DELIVERY_ASSUME_DAYS` when the env var is unset.
 pub const DEFAULT_DELIVERY_ASSUME_DAYS: i64 = 14;
@@ -155,6 +159,26 @@ pub struct Config {
     /// scripted double before building `AppState`); that seam is not
     /// reachable from any environment variable.
     pub fx_feed_url: String,
+    /// Seller pubkys allowed to bind `bitcoin|stripe|paypal` when
+    /// `LIVE_TEST_SELLER_ALLOWLIST` is set. Empty means no restriction
+    /// (current production). When non-empty, bind is fail-closed to the
+    /// listed 52-character z-base-32 pubkys.
+    pub live_test_seller_allowlist: HashSet<String>,
+    /// Optional USD (exponent 2) bind cap in minor units
+    /// (`LIVE_TEST_MAX_USD_MINOR`). Unset means no extra USD cap.
+    pub live_test_max_usd_minor: Option<i64>,
+    /// Optional satoshi bind cap (`LIVE_TEST_MAX_SATS`). Unset means no
+    /// extra sats cap. Applies to SAT/BTC orders and to the quoted sats of
+    /// a USD bitcoin bind.
+    pub live_test_max_sats: Option<i64>,
+    /// Payment methods refused at bind (`PAYMENT_RAILS_DISABLED`, comma
+    /// list of `bitcoin`/`stripe`/`paypal`). Empty means all rails stay
+    /// available.
+    pub payment_rails_disabled: HashSet<String>,
+    /// PayPal `_xclick` checkout base (`PAYPAL_CHECKOUT_URL`). Default is
+    /// live `www.paypal.com`; `www.sandbox.paypal.com` is the only other
+    /// allowed host.
+    pub paypal_checkout_url: String,
 }
 
 impl Config {
@@ -278,6 +302,15 @@ impl Config {
         let fx_feed_url = crate::fx::FX_URL.to_string();
         let public_app_origin = env_origin("PUBLIC_APP_ORIGIN")?;
         let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
+        let live_test_seller_allowlist = parse_live_test_seller_allowlist(
+            std::env::var("LIVE_TEST_SELLER_ALLOWLIST").ok().as_deref(),
+        )?;
+        let live_test_max_usd_minor = env_optional_positive_i64("LIVE_TEST_MAX_USD_MINOR")?;
+        let live_test_max_sats = env_optional_positive_i64("LIVE_TEST_MAX_SATS")?;
+        let payment_rails_disabled =
+            parse_payment_rails_disabled(std::env::var("PAYMENT_RAILS_DISABLED").ok().as_deref())?;
+        let paypal_checkout_url =
+            parse_paypal_checkout_url(std::env::var("PAYPAL_CHECKOUT_URL").ok().as_deref())?;
         Ok(Self {
             bind_addr,
             database_url,
@@ -320,6 +353,11 @@ impl Config {
             pickup_dispute_retention_days,
             locks_snapshot_retention_days,
             fx_feed_url,
+            live_test_seller_allowlist,
+            live_test_max_usd_minor,
+            live_test_max_sats,
+            payment_rails_disabled,
+            paypal_checkout_url,
         })
     }
 
@@ -371,6 +409,11 @@ impl Config {
             pickup_dispute_retention_days: 30,
             locks_snapshot_retention_days: 90,
             fx_feed_url: crate::fx::FX_URL.to_string(),
+            live_test_seller_allowlist: HashSet::new(),
+            live_test_max_usd_minor: None,
+            live_test_max_sats: None,
+            payment_rails_disabled: HashSet::new(),
+            paypal_checkout_url: DEFAULT_PAYPAL_CHECKOUT_URL.to_string(),
         }
     }
 }
@@ -530,12 +573,90 @@ fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
     }
 }
 
+fn env_optional_positive_i64(name: &str) -> anyhow::Result<Option<i64>> {
+    match std::env::var(name) {
+        Err(_) => Ok(None),
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => {
+            let parsed: i64 = value
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{name} must be an integer"))?;
+            if parsed < 1 {
+                anyhow::bail!("{name} must be at least 1");
+            }
+            Ok(Some(parsed))
+        }
+    }
+}
+
+fn parse_live_test_seller_allowlist(raw: Option<&str>) -> anyhow::Result<HashSet<String>> {
+    let mut allowlist = HashSet::new();
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(allowlist);
+    };
+    for token in raw.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let z32 = trimmed.strip_prefix("pubky").unwrap_or(trimmed);
+        let key = pubky_common::crypto::PublicKey::try_from_z32(z32).map_err(|_| {
+            anyhow::anyhow!(
+                "LIVE_TEST_SELLER_ALLOWLIST entries must be 52-character z-base-32 pubkys"
+            )
+        })?;
+        allowlist.insert(key.z32());
+    }
+    Ok(allowlist)
+}
+
+fn parse_payment_rails_disabled(raw: Option<&str>) -> anyhow::Result<HashSet<String>> {
+    let mut disabled = HashSet::new();
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(disabled);
+    };
+    for token in raw.split(',') {
+        let method = token.trim().to_ascii_lowercase();
+        if method.is_empty() {
+            continue;
+        }
+        if !matches!(method.as_str(), "bitcoin" | "stripe" | "paypal") {
+            anyhow::bail!("PAYMENT_RAILS_DISABLED entries must be bitcoin, stripe, or paypal");
+        }
+        disabled.insert(method);
+    }
+    Ok(disabled)
+}
+
+fn parse_paypal_checkout_url(raw: Option<&str>) -> anyhow::Result<String> {
+    let value = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_PAYPAL_CHECKOUT_URL);
+    let parsed = Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("PAYPAL_CHECKOUT_URL must be a valid URL"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("PAYPAL_CHECKOUT_URL must be https");
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if !matches!(host, "www.paypal.com" | "www.sandbox.paypal.com") {
+        anyhow::bail!("PAYPAL_CHECKOUT_URL host must be www.paypal.com or www.sandbox.paypal.com");
+    }
+    if parsed.path() != "/cgi-bin/webscr" {
+        anyhow::bail!("PAYPAL_CHECKOUT_URL path must be /cgi-bin/webscr");
+    }
+    Ok(format!("https://{host}/cgi-bin/webscr"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        automation_rate_capacity, parse_days, refusal_audit_keys_from_env, reject_audit_url_reuse,
-        required_postgres_url, validate_postgres_url, Config, AUTOMATION_RATE_LIMIT_MAX_TOKENS,
-        DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS,
+        automation_rate_capacity, parse_days, parse_live_test_seller_allowlist,
+        parse_payment_rails_disabled, parse_paypal_checkout_url, refusal_audit_keys_from_env,
+        reject_audit_url_reuse, required_postgres_url, validate_postgres_url, Config,
+        AUTOMATION_RATE_LIMIT_MAX_TOKENS, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS,
+        DEFAULT_PAYPAL_CHECKOUT_URL,
     };
 
     /// Serializes the environment-mutating test (env is process-global).
@@ -815,5 +936,76 @@ mod tests {
                 None => std::env::remove_var(name),
             }
         }
+    }
+
+    #[test]
+    fn live_test_seller_allowlist_parses_canonical_z32_and_rejects_malformed() {
+        assert!(parse_live_test_seller_allowlist(None)
+            .expect("unset")
+            .is_empty());
+        assert!(parse_live_test_seller_allowlist(Some("  "))
+            .expect("blank")
+            .is_empty());
+        let pubky = pubky_common::crypto::Keypair::random().public_key().z32();
+        let prefixed = format!("pubky{pubky}");
+        let parsed = parse_live_test_seller_allowlist(Some(&format!(" {pubky}, {prefixed} ")))
+            .expect("valid pubkys");
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.contains(&pubky));
+        let error = parse_live_test_seller_allowlist(Some("not-a-pubky")).expect_err("malformed");
+        assert!(
+            error.to_string().contains("52-character"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn payment_rails_disabled_accepts_known_methods_and_rejects_unknown() {
+        assert!(parse_payment_rails_disabled(None)
+            .expect("unset")
+            .is_empty());
+        let disabled = parse_payment_rails_disabled(Some(" stripe,BITCOIN ")).expect("list");
+        assert!(disabled.contains("stripe"));
+        assert!(disabled.contains("bitcoin"));
+        assert!(!disabled.contains("paypal"));
+        let error = parse_payment_rails_disabled(Some("wire")).expect_err("unknown");
+        assert!(
+            error.to_string().contains("bitcoin, stripe, or paypal"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn paypal_checkout_url_defaults_to_live_and_allows_sandbox_host() {
+        assert_eq!(
+            parse_paypal_checkout_url(None).expect("default"),
+            DEFAULT_PAYPAL_CHECKOUT_URL
+        );
+        assert_eq!(
+            parse_paypal_checkout_url(Some("https://www.sandbox.paypal.com/cgi-bin/webscr"))
+                .expect("sandbox"),
+            "https://www.sandbox.paypal.com/cgi-bin/webscr"
+        );
+        for value in [
+            "http://www.paypal.com/cgi-bin/webscr",
+            "https://paypal.com/cgi-bin/webscr",
+            "https://www.paypal.com/other",
+            "https://evil.example/cgi-bin/webscr",
+        ] {
+            assert!(
+                parse_paypal_checkout_url(Some(value)).is_err(),
+                "{value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn for_tests_leaves_live_test_gates_unset() {
+        let config = Config::for_tests();
+        assert!(config.live_test_seller_allowlist.is_empty());
+        assert_eq!(config.live_test_max_usd_minor, None);
+        assert_eq!(config.live_test_max_sats, None);
+        assert!(config.payment_rails_disabled.is_empty());
+        assert_eq!(config.paypal_checkout_url, DEFAULT_PAYPAL_CHECKOUT_URL);
     }
 }

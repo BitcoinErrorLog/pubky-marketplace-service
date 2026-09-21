@@ -2610,6 +2610,16 @@ pub async fn test_app_with_shippo(pool: PgPool) -> (TestApp, FakeShippo) {
 pub async fn test_app_with_payments_full(
     pool: PgPool,
 ) -> (TestApp, FakeStripe, FakePaykit, FakePaypalIpn, FakeShippo) {
+    test_app_with_payments_config(pool, Config::for_tests()).await
+}
+
+/// [`test_app_with_payments_full`] with a caller-supplied `Config` so bind
+/// gates (allow-list, amount caps, disabled rails, PayPal checkout host)
+/// can be set in-process.
+pub async fn test_app_with_payments_config(
+    pool: PgPool,
+    config: Config,
+) -> (TestApp, FakeStripe, FakePaykit, FakePaypalIpn, FakeShippo) {
     let stripe = spawn_fake_stripe().await;
     let paykit = spawn_fake_paykit().await;
     let ipn = spawn_fake_paypal_ipn().await;
@@ -2627,7 +2637,7 @@ pub async fn test_app_with_payments_full(
     });
     let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
-    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
+    let state = AppState::new(pool.clone(), clock.clone(), config)
         .with_payments(Some(runtime))
         .with_homeserver(Some(Arc::new(CommandMirrorHomeserver)));
     (

@@ -407,6 +407,7 @@ pub struct BindPaymentMethodBody {
 /// instead of back on their order. `no_shipping`/`no_note` are set because
 /// the marketplace collects its own delivery address and messages.
 fn paypal_checkout_url(
+    checkout_base: &str,
     merchant_email: &str,
     order: &OrderRow,
     return_origin: Option<&str>,
@@ -423,7 +424,7 @@ fn paypal_checkout_url(
         width = order.exponent as usize
     );
     let mut url =
-        url::Url::parse("https://www.paypal.com/cgi-bin/webscr").expect("static PayPal URL parses");
+        url::Url::parse(checkout_base).map_err(|_| "the PayPal checkout URL is invalid")?;
     url.query_pairs_mut()
         .append_pair("cmd", "_xclick")
         .append_pair("business", merchant_email)
@@ -470,6 +471,28 @@ fn bitcoin_amount_sats(order: &OrderRow) -> Option<u64> {
     u64::try_from(order.total_minor)
         .ok()
         .filter(|sats| *sats > 0)
+}
+
+fn live_test_amount_exceeds_cap(
+    config: &crate::config::Config,
+    order: &OrderRow,
+    quoted_sats: Option<u64>,
+) -> bool {
+    if let Some(max) = config.live_test_max_usd_minor {
+        if order.currency == "USD" && order.exponent == 2 && order.total_minor > max {
+            return true;
+        }
+    }
+    if let Some(max) = config.live_test_max_sats {
+        let max_sats = u64::try_from(max).unwrap_or(0);
+        if quoted_sats
+            .or_else(|| bitcoin_amount_sats(order))
+            .is_some_and(|sats| sats > max_sats)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn fx_error_response(error: crate::fx::FxError) -> Response {
@@ -526,6 +549,13 @@ pub async fn bind_payment_method(
             "The payment method must be bitcoin, stripe, or paypal.",
         );
     }
+    if state.config.payment_rails_disabled.contains(method) {
+        return method_error(
+            ErrorCode::InvalidState,
+            "method_unavailable",
+            "This payment rail is disabled on this deployment.",
+        );
+    }
     let now = state.clock.now();
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
@@ -558,6 +588,18 @@ pub async fn bind_payment_method(
             ErrorCode::Unauthorized,
             "not_buyer",
             "Only the buyer may bind the payment method.",
+        );
+    }
+    if !state.config.live_test_seller_allowlist.is_empty()
+        && !state
+            .config
+            .live_test_seller_allowlist
+            .contains(&order.seller_pubky)
+    {
+        return method_error(
+            ErrorCode::InvalidState,
+            "live_test_seller_not_allowlisted",
+            "This seller is not on the live-test allow-list.",
         );
     }
     if let Some(bound) = &order.payment_method {
@@ -657,6 +699,15 @@ pub async fn bind_payment_method(
         None
     };
 
+    let quoted_sats = bitcoin_quote.as_ref().map(|(_, sats)| *sats);
+    if live_test_amount_exceeds_cap(&state.config, &order, quoted_sats) {
+        return method_error(
+            ErrorCode::InvalidState,
+            "live_test_amount_capped",
+            "The order total exceeds the live-test amount cap.",
+        );
+    }
+
     // The bind lock point: choosing a real rail is the payment start, so it
     // acquires the order's inventory hold and arms the fiat payment window
     // (all three rails; the paykit worker and both fiat verification legs
@@ -728,6 +779,7 @@ pub async fn bind_payment_method(
                     );
                 }
                 match paypal_checkout_url(
+                    &state.config.paypal_checkout_url,
                     &email,
                     &order,
                     state.config.public_app_origin.as_deref(),
