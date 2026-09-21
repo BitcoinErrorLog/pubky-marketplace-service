@@ -76,9 +76,19 @@ pub async fn test_app_with_attestor(pool: PgPool) -> TestApp {
 }
 
 pub async fn test_app_with_grant(pool: PgPool) -> (TestApp, GrantTestAuthority) {
+    test_app_with_grant_authority(
+        pool,
+        GrantTestAuthority::generate(Config::for_tests().session_ttl_seconds),
+    )
+    .await
+}
+
+pub async fn test_app_with_grant_authority(
+    pool: PgPool,
+    authority: GrantTestAuthority,
+) -> (TestApp, GrantTestAuthority) {
     let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
-    let authority = GrantTestAuthority::generate(Config::for_tests().session_ttl_seconds);
     let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
         .with_homeserver(Some(Arc::new(CommandMirrorHomeserver)))
         .with_grant(Some(authority.runtime.clone()));
