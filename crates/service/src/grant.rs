@@ -24,8 +24,8 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use pubky::deep_links::DeepLink;
 use pubky::{
-    AuthFlowKind, Capabilities, ClientId, EncryptedHttpRelayInboxChannel, GrantAuthFlowState,
-    GrantClaims, PubkyGrantAuthFlow, PubkyHttpClient, PublicKey,
+    AuthFlowKind, Capabilities, Capability, ClientId, EncryptedHttpRelayInboxChannel,
+    GrantAuthFlowState, GrantClaims, PubkyGrantAuthFlow, PubkyHttpClient, PublicKey,
 };
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -55,8 +55,94 @@ const RESULT_AAD_DOMAIN: &[u8] = b"marketplace/grant-flow-result/v1";
 const POP_DOMAIN: &str = "marketplace/grant-result-pop/v1";
 const RESULT_DENIED: &str = "result_denied";
 const GRANT_STATE_VERSION: u8 = 1;
+/// Design §26.2 marketplace grant. Never `/:rw` — Ring/Bitkit must not see
+/// a homeserver root-write request.
+const GRANT_REQUEST_CAPABILITIES: &str = "/pub/pubky.app/marketplace-service/v1/:rw";
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantCapabilityError {
+    Disallowed,
+    WiderThanRequested,
+}
+
+fn allowlisted_capability(capability: &Capability) -> bool {
+    capability
+        .scope()
+        .as_str()
+        .starts_with(auth::INVENTORY_SERVICE_SCOPE)
+}
+
+fn allowlisted(capabilities: &Capabilities) -> bool {
+    capabilities.iter().all(allowlisted_capability)
+}
+
+fn capability_covers(requested: &Capability, granted: &Capability) -> bool {
+    requested.scope_covers_path(granted.scope())
+        && granted
+            .actions()
+            .iter()
+            .all(|action| requested.actions().contains(action))
+}
+
+fn granted_subseteq_requested(granted: &Capabilities, requested: &Capabilities) -> bool {
+    granted.iter().all(|granted| {
+        requested
+            .iter()
+            .any(|requested| capability_covers(requested, granted))
+    })
+}
+
+/// Empty is identity-only (§3). Anything else must sit under
+/// `/pub/pubky.app/marketplace-service/v1/`. Root `/:rw` is rejected.
+pub(crate) fn capabilities_for_grant_url(raw: &str) -> Result<Capabilities, GrantCapabilityError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(Capabilities::default());
+    }
+    let Ok(parsed) = raw.parse::<Capabilities>() else {
+        return Err(GrantCapabilityError::Disallowed);
+    };
+    let normalized = parsed.normalize();
+    if !allowlisted(&normalized) {
+        return Err(GrantCapabilityError::Disallowed);
+    }
+    Ok(normalized)
+}
+
+fn grant_url_capabilities() -> Capabilities {
+    capabilities_for_grant_url(GRANT_REQUEST_CAPABILITIES)
+        .expect("design §26.2 grant request is allow-listed")
+}
+
+/// Persist the homeserver-verified token caps (`AuthToken::verify` /
+/// `session.info().capabilities()`), never the unsigned GrantClaims
+/// payload. Requested caps only bound the set: granted ⊆ requested.
+/// Empty verified stays empty (§3). Root or any scope outside the
+/// inventory prefix is rejected.
+pub(crate) fn session_capabilities_for_grant(
+    verified: &str,
+    requested: &str,
+) -> Result<String, GrantCapabilityError> {
+    let requested = capabilities_for_grant_url(requested)?;
+    let verified = verified.trim();
+    let verified = if verified.is_empty() {
+        Capabilities::default()
+    } else {
+        let Ok(parsed) = verified.parse::<Capabilities>() else {
+            return Err(GrantCapabilityError::Disallowed);
+        };
+        parsed.normalize()
+    };
+    if !allowlisted(&verified) {
+        return Err(GrantCapabilityError::Disallowed);
+    }
+    if !granted_subseteq_requested(&verified, &requested) {
+        return Err(GrantCapabilityError::WiderThanRequested);
+    }
+    Ok(verified.to_string())
+}
 
 #[derive(Clone, Debug)]
 pub struct GrantConfig {
@@ -800,13 +886,100 @@ pub mod test_support {
                 version: 1,
                 expires_at: now + Duration::seconds(300),
             };
-            let first = settle_verified(state, &self.runtime, &lease, approved_pubky, now)
-                .await
-                .expect("first settlement");
-            let replay = settle_verified(state, &self.runtime, &lease, approved_pubky, now)
-                .await
-                .expect("replay settlement");
+            let (first, _) =
+                settle_verified(state, &self.runtime, &lease, approved_pubky, "", "", now)
+                    .await
+                    .expect("first settlement");
+            let (replay, _) =
+                settle_verified(state, &self.runtime, &lease, approved_pubky, "", "", now)
+                    .await
+                    .expect("replay settlement");
             (flow_id, first, replay)
+        }
+
+        pub async fn settle_grant_caps(
+            &self,
+            state: &AppState,
+            pubky: &str,
+            requested_capabilities: &str,
+            verified_capabilities: &str,
+        ) -> (Uuid, bool, Option<[u8; 32]>, Option<String>) {
+            let flow_id = Uuid::new_v4();
+            let lease_owner = Uuid::new_v4();
+            let now = state.clock.now();
+            let cpk = "y".repeat(52);
+            sqlx::query(
+                "INSERT INTO grant_flows (flow_id,expected_pubky,assertion_jti,client_id,cpk,\
+                 relay_url,grant_state_sealed,key_epoch,result_hash_epoch,status,\
+                 version,lease_owner,lease_until,result_delivery_id_hash,result_cpk,created_at,expires_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,1,1,'verifying',1,$8,$9,$10,$11,$12,$13)",
+            )
+            .bind(flow_id)
+            .bind(pubky)
+            .bind(Uuid::new_v4())
+            .bind(&self.runtime.config.client_id)
+            .bind(&cpk)
+            .bind(self.runtime.config.relay_url.as_str())
+            .bind(vec![1u8; 80])
+            .bind(lease_owner)
+            .bind(now + Duration::seconds(30))
+            .bind(vec![2u8; 32])
+            .bind(&cpk)
+            .bind(now)
+            .bind(now + Duration::seconds(300))
+            .execute(&state.pool)
+            .await
+            .expect("seed verifying flow");
+            let lease = FlowLease {
+                flow_id,
+                expected_pubky: pubky.to_string(),
+                client_id: self.runtime.config.client_id.clone(),
+                cpk,
+                grant_state_sealed: vec![1u8; 80],
+                key_epoch: 1,
+                result_hash_epoch: 1,
+                result_cpk: "y".repeat(52),
+                lease_owner,
+                lease_until: now + Duration::seconds(30),
+                version: 1,
+                expires_at: now + Duration::seconds(300),
+            };
+            let (applied, bearer) = settle_verified(
+                state,
+                &self.runtime,
+                &lease,
+                pubky,
+                requested_capabilities,
+                verified_capabilities,
+                now,
+            )
+            .await
+            .expect("grant settlement");
+            let stored =
+                sqlx::query_scalar("SELECT capabilities FROM auth_sessions WHERE pubky = $1")
+                    .bind(pubky)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .expect("grant session lookup");
+            (flow_id, applied, bearer, stored)
+        }
+
+        pub async fn settle_matching_grant(
+            &self,
+            state: &AppState,
+            pubky: &str,
+            requested_capabilities: &str,
+            verified_capabilities: &str,
+        ) -> (Uuid, [u8; 32], String) {
+            let (flow_id, applied, bearer, stored) = self
+                .settle_grant_caps(state, pubky, requested_capabilities, verified_capabilities)
+                .await;
+            assert!(applied, "matching settlement must apply");
+            (
+                flow_id,
+                bearer.expect("matching settlement mints a bearer"),
+                stored.expect("matching settlement persists a session"),
+            )
         }
     }
 }
@@ -1187,14 +1360,11 @@ pub async fn create_flow(
         Ok(client_id) => client_id,
         Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
     };
-    let flow = match PubkyGrantAuthFlow::builder(
-        &Capabilities::default(),
-        AuthFlowKind::signin(),
-        client_id,
-    )
-    .relay(runtime.config.relay_url.clone())
-    .client(runtime.client.clone())
-    .start()
+    let requested_caps = grant_url_capabilities();
+    let flow = match PubkyGrantAuthFlow::builder(&requested_caps, AuthFlowKind::signin(), client_id)
+        .relay(runtime.config.relay_url.clone())
+        .client(runtime.client.clone())
+        .start()
     {
         Ok(flow) => flow,
         Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
@@ -1618,6 +1788,7 @@ struct ResultFlowRow {
     key_epoch: i16,
     result_hash_epoch: i16,
     expected_pubky: String,
+    result_auth_session_id: Option<Uuid>,
 }
 
 fn flow_prefix(flow_id: Uuid) -> String {
@@ -1803,7 +1974,8 @@ pub async fn result_ticket(
     let row: Option<ResultFlowRow> = match sqlx::query_as(
         "SELECT status, result_delivery_id_hash, result_cpk, result_token_hash, \
          result_token_expires_at, result_token_delivered_at, result_payload_sealed, \
-         result_claimed_at, key_epoch, result_hash_epoch, expected_pubky \
+         result_claimed_at, key_epoch, result_hash_epoch, expected_pubky, \
+         result_auth_session_id \
          FROM grant_flows WHERE flow_id = $1 FOR UPDATE",
     )
     .bind(flow_id)
@@ -1940,7 +2112,8 @@ pub async fn claim_result(
     let row: Option<ResultFlowRow> = match sqlx::query_as(
         "SELECT status, result_delivery_id_hash, result_cpk, result_token_hash, \
          result_token_expires_at, result_token_delivered_at, result_payload_sealed, \
-         result_claimed_at, key_epoch, result_hash_epoch, expected_pubky \
+         result_claimed_at, key_epoch, result_hash_epoch, expected_pubky, \
+         result_auth_session_id \
          FROM grant_flows WHERE flow_id = $1 FOR UPDATE",
     )
     .bind(flow_id)
@@ -2003,6 +2176,19 @@ pub async fn claim_result(
         Ok(result) => result,
         Err(_) => return result_denied(flow_id, principal),
     };
+    let capabilities: String = match row.result_auth_session_id {
+        Some(session_id) => {
+            match sqlx::query_scalar("SELECT capabilities FROM auth_sessions WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await
+            {
+                Ok(Some(capabilities)) => capabilities,
+                _ => return result_denied(flow_id, principal),
+            }
+        }
+        None => String::new(),
+    };
     let consumed = match sqlx::query(
         "UPDATE grant_flows SET result_claimed_at = $2, result_token_hash = NULL, \
          result_payload_sealed = NULL WHERE flow_id = $1 AND status = 'complete' \
@@ -2023,7 +2209,7 @@ pub async fn claim_result(
         (
             StatusCode::OK,
             Json(json!({
-                "capabilities": "",
+                "capabilities": capabilities,
                 "expires_at": format_timestamp(result.session_expires_at),
                 "pubky": row.expected_pubky,
                 "token": URL_SAFE_NO_PAD.encode(result.bearer),
@@ -2412,8 +2598,9 @@ async fn complete_owned(
     runtime: &GrantRuntime,
     lease: &FlowLease,
     approved_pubky: &str,
+    capabilities: &str,
     now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, Option<[u8; 32]>)> {
     let mut bearer = [0u8; 32];
     let mut result_token = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bearer);
@@ -2444,14 +2631,15 @@ async fn complete_owned(
     .await?;
     if !owns {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok((false, None));
     }
     let session_id: Uuid = sqlx::query_scalar(
         "INSERT INTO auth_sessions (token_hash, pubky, capabilities, created_at, expires_at) \
-         VALUES ($1,$2,'',$3,$4) RETURNING session_id",
+         VALUES ($1,$2,$3,$4,$5) RETURNING session_id",
     )
     .bind(auth::hash_token(&bearer))
     .bind(approved_pubky)
+    .bind(capabilities)
     .bind(now)
     .bind(session_expires_at)
     .fetch_one(&mut *tx)
@@ -2476,10 +2664,10 @@ async fn complete_owned(
     .await?;
     if updated.rows_affected() != 1 {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok((false, None));
     }
     tx.commit().await?;
-    Ok(true)
+    Ok((true, Some(bearer)))
 }
 
 async fn settle_verified(
@@ -2487,10 +2675,12 @@ async fn settle_verified(
     runtime: &GrantRuntime,
     lease: &FlowLease,
     approved_pubky: &str,
+    requested_capabilities: &str,
+    verified_capabilities: &str,
     now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, Option<[u8; 32]>)> {
     if approved_pubky != lease.expected_pubky {
-        terminalize_owned(
+        let applied = terminalize_owned(
             state,
             lease,
             "mismatch",
@@ -2498,9 +2688,25 @@ async fn settle_verified(
             Some(approved_pubky),
             now,
         )
-        .await
-    } else {
-        complete_owned(state, runtime, lease, approved_pubky, now).await
+        .await?;
+        return Ok((applied, None));
+    }
+    match session_capabilities_for_grant(verified_capabilities, requested_capabilities) {
+        Ok(capabilities) => {
+            complete_owned(state, runtime, lease, approved_pubky, &capabilities, now).await
+        }
+        Err(_) => {
+            let applied = terminalize_owned(
+                state,
+                lease,
+                "invalid",
+                "grant_invalid",
+                Some(approved_pubky),
+                now,
+            )
+            .await?;
+            Ok((applied, None))
+        }
     }
 }
 
@@ -2626,6 +2832,11 @@ async fn process_lease(
             return Ok(());
         }
     };
+    let requested_capabilities = Capabilities::from(claims.caps.clone())
+        .normalize()
+        .to_string();
+    // Unsigned GrantClaims caps are a requested-set bound only. Persist
+    // uses the homeserver-verified session after restore.
     let approved_pubky = claims.iss.z32();
     require_applied(
         enter_exchanging(
@@ -2703,15 +2914,21 @@ async fn process_lease(
     drop(heartbeat);
     match outcome {
         Ok(session) => {
+            let verified_capabilities = Capabilities::from(session.info().capabilities().to_vec())
+                .normalize()
+                .to_string();
             require_applied(
                 settle_verified(
                     state,
                     runtime,
                     &lease,
                     &session.public_key().z32(),
+                    &requested_capabilities,
+                    &verified_capabilities,
                     state.clock.now(),
                 )
-                .await?,
+                .await?
+                .0,
                 "settle",
                 lease.flow_id,
             )?;
@@ -2920,4 +3137,92 @@ pub fn spawn(state: AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod capability_persist_tests {
+    use super::{
+        capabilities_for_grant_url, grant_url_capabilities, session_capabilities_for_grant,
+        GrantCapabilityError, GRANT_REQUEST_CAPABILITIES,
+    };
+
+    #[test]
+    fn grant_url_requests_inventory_rw() {
+        assert_eq!(
+            grant_url_capabilities().to_string(),
+            GRANT_REQUEST_CAPABILITIES
+        );
+        assert_eq!(
+            GRANT_REQUEST_CAPABILITIES,
+            "/pub/pubky.app/marketplace-service/v1/:rw"
+        );
+    }
+
+    #[test]
+    fn root_request_is_rejected_at_url_build() {
+        assert_eq!(
+            capabilities_for_grant_url("/:rw"),
+            Err(GrantCapabilityError::Disallowed)
+        );
+    }
+
+    #[test]
+    fn empty_verified_stays_identity_only() {
+        assert_eq!(
+            session_capabilities_for_grant("", GRANT_REQUEST_CAPABILITIES),
+            Ok(String::new())
+        );
+        assert_eq!(session_capabilities_for_grant("", ""), Ok(String::new()));
+    }
+
+    #[test]
+    fn inventory_rw_persists_when_verified() {
+        assert_eq!(
+            session_capabilities_for_grant(GRANT_REQUEST_CAPABILITIES, GRANT_REQUEST_CAPABILITIES),
+            Ok(GRANT_REQUEST_CAPABILITIES.to_string())
+        );
+    }
+
+    #[test]
+    fn insufficient_read_is_not_widened() {
+        assert_eq!(
+            session_capabilities_for_grant(
+                "/pub/pubky.app/marketplace-service/v1/:r",
+                GRANT_REQUEST_CAPABILITIES
+            ),
+            Ok("/pub/pubky.app/marketplace-service/v1/:r".to_string())
+        );
+    }
+
+    #[test]
+    fn root_verified_is_rejected_at_settle() {
+        assert_eq!(
+            session_capabilities_for_grant("/:rw", GRANT_REQUEST_CAPABILITIES),
+            Err(GrantCapabilityError::Disallowed)
+        );
+        assert_eq!(
+            session_capabilities_for_grant("/:rw", "/:rw"),
+            Err(GrantCapabilityError::Disallowed)
+        );
+    }
+
+    #[test]
+    fn wider_than_requested_fails_closed() {
+        assert_eq!(
+            session_capabilities_for_grant(GRANT_REQUEST_CAPABILITIES, ""),
+            Err(GrantCapabilityError::WiderThanRequested)
+        );
+    }
+
+    #[test]
+    fn malformed_fails_closed() {
+        assert_eq!(
+            session_capabilities_for_grant("not-a-capability", GRANT_REQUEST_CAPABILITIES),
+            Err(GrantCapabilityError::Disallowed)
+        );
+        assert_eq!(
+            capabilities_for_grant_url("not-a-capability"),
+            Err(GrantCapabilityError::Disallowed)
+        );
+    }
 }
