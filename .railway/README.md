@@ -3,10 +3,11 @@
 This project defines its Railway infrastructure in code.
 
 ```txt
-.railway/railway.ts
+.railway/railway.ts            # dual graph: staging vs production
+.railway/railway.staging.ts    # staging-only graph; refuse any other project
 ```
 
-Use this file to describe the Railway project you want: services, databases, buckets, custom domains, replicas, groups, and environment variables.
+Use these files to describe the Railway project you want: services, databases, buckets, custom domains, replicas, groups, and environment variables.
 
 The TypeScript file imports `railway/iac`. Install the SDK from the repository root:
 
@@ -52,13 +53,33 @@ configuration.
 - `pubky-marketplace-staging` (`c991d768-4a3c-42ea-b5ed-eaa22d4916ed`)
 - `pubky-marketplace-production` (`75faa4fe-466c-4277-977f-1d8e4e31df8c`)
 
-The format is one authoring file per repository, evaluated against the
-**linked** project. Railway does not let one `defineRailway` return two
-projects at once. Branch on `ctx.projectId` (not `ctx.environment`): both
-projects name their Railway environment `production`. Docs:
-[Infrastructure as Code reference — Environment context](https://docs.railway.com/infrastructure-as-code/reference)
-and [railway config](https://docs.railway.com/cli/config) (`plan`/`apply` use
-the directory link; `--file` only overrides the authoring path).
+`railway config plan` / `apply` have **no `--project` flag**. Targeting is:
+
+1. Ambient `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID`, and
+   `RAILWAY_SERVICE_ID` when set. These override `railway link`.
+2. Otherwise the directory entry in `~/.railway/config.json`.
+3. `--file` only changes the authoring path, not the live project.
+
+`createRailwayContext` in `railway/dist/iac` does not read those env vars.
+The CLI injects `ctx.projectId` / `ctx.environmentId` from (1) then (2).
+A worker that still has production IDs in the environment will plan
+**production** even after `railway link` prints staging. Pin both staging
+UUIDs, or `env -u` all three, before any plan.
+
+Both Railway projects name their environment `production`. Branch on
+`ctx.projectId`, never `ctx.environment`. `.railway/railway.ts` throws if
+the project UUID is unknown or the environment UUID does not match that
+project. `.railway/railway.staging.ts` throws unless
+`RAILWAY_PROJECT_ID=c991d768-4a3c-42ea-b5ed-eaa22d4916ed` and
+`RAILWAY_ENVIRONMENT_ID=c67a6435-bb23-453b-9169-764bfa0312e1`.
+
+Each graph pins the live GHCR digest (`source: image(...)`). Omitting
+`source` plans `source.image → null`. Omitting `build` is required: the
+live IMAGE-connected service has no Dockerfile builder, and declaring
+one would add it.
+
+Docs: [Infrastructure as Code reference — Environment context](https://docs.railway.com/infrastructure-as-code/reference)
+and [railway config](https://docs.railway.com/cli/config).
 
 `export const partial = "marketplace-service"` remains required. Each Railway
 project also has other services this repo must not omit=delete.
@@ -75,16 +96,35 @@ Do this once per project, after `railway config plan` shows **no variable
 deletes** and only the intended build/deploy updates. Never apply from an
 unreviewed plan.
 
-1. **Staging first.** From this repo (already linked to staging in typical
-   checkouts): `railway status` must show `pubky-marketplace-staging`. Run
-   `railway config plan`, then `railway config apply` only if the plan is
-   limited to `marketplace-service` build/deploy fields.
-2. **Production second.** Link a scratch directory (do not flip this worktree
-   back and forth): `mkdir -p /tmp/marketplace-service-prod && cd` there,
+1. **Staging first, from `.railway/railway.staging.ts` only.** Export the
+   staging UUIDs (do not rely on `railway link` alone):
+
+   ```bash
+   export RAILWAY_PROJECT_ID=c991d768-4a3c-42ea-b5ed-eaa22d4916ed
+   export RAILWAY_ENVIRONMENT_ID=c67a6435-bb23-453b-9169-764bfa0312e1
+   export RAILWAY_SERVICE_ID=3e98e363-f9a7-4711-b668-d714acee6e32
+   railway status --json   # id must be c991d768…, name pubky-marketplace-staging
+   railway config plan --file .railway/railway.staging.ts
+   ```
+
+   Apply only when the header is `Project pubky-marketplace-staging`, the
+   plan has **zero** variable deletes, **zero** domain deletes, does **not**
+   null `source.image`, and the only changes are deploy overlap/drain
+   (`overlapSeconds: 60`, `drainingSeconds: 15`) plus healthcheck/restart
+   reconcile if they appear:
+
+   ```bash
+   railway config apply --file .railway/railway.staging.ts --yes
+   ```
+
+2. **Production second.** Do not apply production until a staging overlap
+   proof has already passed. Link a scratch directory (do not flip this
+   worktree back and forth): `mkdir -p /tmp/marketplace-service-prod && cd` there,
    `railway link -p 75faa4fe-466c-4277-977f-1d8e4e31df8c -e production -s marketplace-service`,
-   then `railway config plan --file /path/to/this/repo/.railway/railway.ts`.
-   Apply from that same scratch directory with the same `--file` only if the
-   plan has zero deletes.
+   then `railway config plan --file /path/to/this/repo/.railway/railway.ts`
+   with production UUIDs exported (or `env -u` the staging trio). Apply from
+   that same scratch directory with the same `--file` only if the plan has
+   zero deletes and does not null `source.image`.
 3. **Restore** this worktree's link to staging if you had to change it:
    `railway link -p c991d768-4a3c-42ea-b5ed-eaa22d4916ed -e production -s marketplace-service`.
 4. **Do not delete `railway.toml` until both projects have been applied** and
