@@ -472,12 +472,10 @@ async fn seller_order_export_uses_the_private_safe_allowlist(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001001"),
-    )
-    .await;
+    let mut second =
+        checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001001");
+    second["payload"]["lines"][0]["expected_revision"] = json!(2);
+    let (status, body) = execute(&app, &buyer.token, &second).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     let path = format!("/v1/sellers/{}/orders?limit=1", seller.pubky);

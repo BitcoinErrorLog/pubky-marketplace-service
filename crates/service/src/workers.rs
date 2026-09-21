@@ -52,6 +52,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
+use crate::bitcoin_review::{apply_late_money, LateMoneyOutcome};
 use crate::handlers::auction::{close_locked_auction, parse_auction};
 use crate::handlers::payment::confirm_order;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
@@ -1282,14 +1283,48 @@ async fn apply_completed_lifecycle(
             }
         }
         "expired" => {
-            tx.rollback().await?;
-            tracing::info!(
-                payment_id = %payment.id,
-                correlation_id = %row.id,
-                "verified locks completion arrived after the payment window; routing to manual review"
-            );
-            apply_manual_review(pool, row, "expired", now).await
+            let Some(order) = fetch_order_for_update(&mut tx, payment.order_id).await? else {
+                anyhow::bail!("correlation {} references a missing order", row.id);
+            };
+            match apply_late_money(
+                &mut tx,
+                pickup,
+                &payment,
+                &order,
+                row.id,
+                &payment.buyer_pubky,
+                now,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    let correlation_outcome = match outcome {
+                        LateMoneyOutcome::Completed => "payment_confirmed",
+                        LateMoneyOutcome::RefundRequired | LateMoneyOutcome::HeldLateSettlement => {
+                            "manual_review"
+                        }
+                    };
+                    mark_correlation_completed(&mut tx, row.id, correlation_outcome, now).await?;
+                    tx.commit().await?;
+                    tracing::info!(
+                        payment_id = %payment.id,
+                        correlation_id = %row.id,
+                        ?outcome,
+                        "verified locks completion after the payment window; applied late-money fork"
+                    );
+                    Ok(true)
+                }
+                Err(failure) => {
+                    tx.rollback().await?;
+                    anyhow::bail!(
+                        "late locks completion for {} failed: {:?}",
+                        row.id,
+                        std::mem::discriminant(&failure)
+                    );
+                }
+            }
         }
+
         _ => {
             // Already confirmed or under review: a duplicate or reordered
             // completion has no further effect.
@@ -1493,33 +1528,6 @@ async fn apply_confirmed_paykit_payment(
             );
             return Ok(false);
         }
-        // The settlement is real but cannot auto-pay: either the hold
-        // window already elapsed (the sweep released the stock and
-        // cancelled the order), or the producer flagged the settlement as
-        // LATE — outside the invoice's settlement window, so no automatic
-        // paid effect and no seller-confirmation entry is ever valid.
-        // Retain the fact under manual review, exactly like a late Locks
-        // completion. A replay finds the payment already advanced and
-        // changes nothing (the guard below); a terminal paid order never
-        // reaches this branch and never un-pays.
-        let (revision,): (i64,) = sqlx::query_as(
-            "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-             manual_review_entered_at = $2, updated_at = $2 WHERE id = $1 RETURNING revision",
-        )
-        .bind(payment.id)
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await?;
-        crate::executor::insert_event(
-            &mut tx,
-            row.id,
-            &ids::payment_aggregate_id(payment.id),
-            revision,
-            &row.buyer_pubky,
-            "payment.manual_review",
-            now,
-        )
-        .await?;
         sqlx::query(
             "UPDATE orders SET paykit_request_state = 'confirmed', \
              paykit_seller_confirmation_entered_at = NULL, \
@@ -1538,14 +1546,43 @@ async fn apply_confirmed_paykit_payment(
         .execute(&mut *tx)
         .await?;
         freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
-        tx.commit().await?;
-        tracing::warn!(
-            order_id = %row.id,
-            late_settlement,
-            local_expired = payment.state == "expired",
-            "paykit settlement confirmed too late to auto-pay; routing to manual review"
-        );
-        return Ok(true);
+        let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
+            anyhow::bail!(
+                "paykit order {} is missing after observation freeze",
+                row.id
+            );
+        };
+        match apply_late_money(
+            &mut tx,
+            pickup,
+            &payment,
+            &order,
+            row.id,
+            &row.buyer_pubky,
+            now,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                tx.commit().await?;
+                tracing::warn!(
+                    order_id = %row.id,
+                    late_settlement,
+                    local_expired = payment.state == "expired",
+                    ?outcome,
+                    "applied late-money fork for paykit settlement"
+                );
+                return Ok(true);
+            }
+            Err(failure) => {
+                tx.rollback().await?;
+                anyhow::bail!(
+                    "late paykit settlement for {} failed: {:?}",
+                    row.id,
+                    std::mem::discriminant(&failure)
+                );
+            }
+        }
     }
     if payment.state != "awaiting_entitlement" {
         tx.rollback().await?;
@@ -1555,7 +1592,8 @@ async fn apply_confirmed_paykit_payment(
         // Money arrived but not the required amount: never silently confirm.
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-             manual_review_entered_at = $2, updated_at = $2 WHERE id = $1 RETURNING revision",
+             review_reason = 'amount_mismatch', manual_review_entered_at = $2, updated_at = $2 \
+             WHERE id = $1 RETURNING revision",
         )
         .bind(payment.id)
         .bind(now)
@@ -1606,7 +1644,8 @@ async fn apply_confirmed_paykit_payment(
     if observed_amount_mismatch {
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-             manual_review_entered_at = $2, updated_at = $2 WHERE id = $1 RETURNING revision",
+             review_reason = 'amount_mismatch', manual_review_entered_at = $2, updated_at = $2 \
+             WHERE id = $1 RETURNING revision",
         )
         .bind(payment.id)
         .bind(now)

@@ -322,7 +322,7 @@ async fn a_failed_commit_after_phase_one_rolls_back_and_voids(pool: PgPool) {
     let (status, _body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
-    // Nothing persisted: no bind, no hold, no outbox rows at all.
+    // Bind rolled back: no method, no reference. Checkout hold remains.
     let (payment_method, reference, adapter, stock_held): (
         Option<String>,
         Option<String>,
@@ -339,7 +339,7 @@ async fn a_failed_commit_after_phase_one_rolls_back_and_voids(pool: PgPool) {
     assert_eq!(payment_method, None);
     assert_eq!(reference, None);
     assert_eq!(adapter, "sandbox");
-    assert!(!stock_held);
+    assert!(stock_held, "checkout hold survives a rolled-back bind");
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM outbox").await,
         outbox_before,
@@ -492,7 +492,7 @@ async fn a_failure_at_the_outbox_insert_leaves_neither_bind_nor_row(pool: PgPool
     assert_eq!(payment_method, None, "the bind rolled back");
     assert_eq!(invoice, None, "the pin rolled back");
     assert_eq!(adapter, "sandbox");
-    assert!(!stock_held);
+    assert!(stock_held, "checkout hold survives a rolled-back bind");
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM outbox").await,
         outbox_before,

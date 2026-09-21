@@ -1,28 +1,22 @@
-//! Payment-time inventory holds: "only a payment should lock an item."
+//! Exclusive inventory holds: checkout parks a unit; a payment re-arms the
+//! window.
 //!
-//! Checkout no longer moves inventory for ordinary listings — it creates
-//! the immutable order snapshot with NO hold. The hold is acquired at a
-//! **payment lock point**, each of which calls [`acquire_payment_hold`]
-//! inside its own command/request transaction:
+//! Ordinary `checkout.create` acquires a bounded hold
+//! (`CHECKOUT_HOLD_WINDOW_SECONDS`) inside the checkout transaction. Sibling
+//! checkout is refused until that hold pays, cancels, or expires. Bind,
+//! Locks registration, and sandbox first-advance **re-arm**
+//! `hold_expires_at` to the rail window (they never double-decrement).
 //!
-//! - `payment.register_locks` — window `LOCKS_PAYMENT_WINDOW_SECONDS` (the
-//!   correlation window IS the hold window; one window concept, not two);
-//! - the payment-method bind (`POST /v0/orders/{id}/payment-method`, all
-//!   three rails) — window `FIAT_PAYMENT_WINDOW_SECONDS`;
-//! - `payment.sandbox_advance` transitioning OUT of `awaiting_entitlement`
-//!   (the first transition) — window `SANDBOX_PAYMENT_WINDOW_SECONDS`.
+//! - `checkout.create` — window `CHECKOUT_HOLD_WINDOW_SECONDS` (default 900);
+//! - `payment.register_locks` — window `LOCKS_PAYMENT_WINDOW_SECONDS`;
+//! - payment-method bind — fiat `FIAT_PAYMENT_WINDOW_SECONDS`, bitcoin
+//!   `BITCOIN_PAYMENT_WINDOW_SECONDS`;
+//! - `payment.sandbox_advance` leaving `awaiting_entitlement` — window
+//!   `SANDBOX_PAYMENT_WINDOW_SECONDS`.
 //!
-//! The acquisition atomically moves `available → reserved` for the order's
-//! quantities under the listing row lock, failing with
-//! `INSUFFICIENT_INVENTORY` ([`SOLD_OUT_BEFORE_PAYMENT`]) when stock is
-//! gone, and arms `orders.hold_expires_at`. A lock point on an order that
-//! ALREADY holds stock never double-decrements: it re-arms the window for a
-//! drop-bound order (the claim window extends to the payment window once a
-//! payment starts) and is a no-op otherwise.
-//!
-//! Auction orders are excluded entirely: their hold is the winning
-//! `reservations` row, taken at close and governed by reservation expiry.
-//! Drop-bound checkout keeps lock-at-claim (the FCFS race is the product)
+//! Live-test allow-list, `PAYMENT_RAILS_DISABLED`, and amount caps still run
+//! **before** the bind re-arm. Auction orders are excluded: their hold is
+//! the winning `reservations` row. Drop-bound checkout keeps lock-at-claim
 //! and arms `DROP_CLAIM_WINDOW_SECONDS` at checkout.
 //!
 //! The payment-window worker ([`crate::workers::expire_due_payment_windows`])
@@ -41,6 +35,12 @@ use crate::result::CommandFailure;
 /// Refusal copy for a lock point that finds the stock already gone, pinned
 /// by the client contract tests.
 pub const SOLD_OUT_BEFORE_PAYMENT: &str = "The listing sold out before this payment started.";
+
+pub const HOLD_SOURCE_CHECKOUT: &str = "checkout";
+pub const HOLD_SOURCE_LOCKS: &str = "locks";
+pub const HOLD_SOURCE_BIND: &str = "bind";
+pub const HOLD_SOURCE_SANDBOX: &str = "sandbox";
+pub const HOLD_SOURCE_DROP_CLAIM: &str = "drop_claim";
 
 /// Which listing quantity column an order's lines currently occupy:
 /// `reserved` before payment confirmation, `sold` after it.
@@ -112,16 +112,14 @@ pub(crate) async fn release_lines(
     Ok(Ok(()))
 }
 
-/// The payment lock point: acquires (or re-arms) the order's inventory hold
-/// inside the caller's transaction. Returns the order with its hold columns
-/// current.
+/// Acquires (or re-arms) the order's inventory hold inside the caller's
+/// transaction. Returns the order with its hold columns current.
 ///
 /// - An auction order is untouched: its hold is the winning reservation.
 /// - An order that is no longer `pending_payment` refuses the lock point —
 ///   a cancelled or already-paid order must never grab stock.
-/// - An order that already holds stock never double-decrements; a
-///   drop-bound one re-arms its window to this lock point's (longer) span,
-///   an ordinary one re-arms nothing.
+/// - An order that already holds stock never double-decrements; it re-arms
+///   `hold_expires_at` and `hold_source` to this lock point's window.
 /// - Otherwise each line atomically moves `available → reserved` under the
 ///   listing row lock (`INSUFFICIENT_INVENTORY` with
 ///   [`SOLD_OUT_BEFORE_PAYMENT`] when the stock is gone) and the hold
@@ -130,6 +128,7 @@ pub async fn acquire_payment_hold(
     tx: &mut Transaction<'_, Postgres>,
     order: OrderRow,
     window_seconds: i64,
+    hold_source: &str,
     now: DateTime<Utc>,
 ) -> Result<Result<OrderRow, CommandFailure>, sqlx::Error> {
     if order.auction_aggregate_id.is_some() {
@@ -144,17 +143,13 @@ pub async fn acquire_payment_hold(
     }
     let hold_expires_at = now + chrono::Duration::seconds(window_seconds);
     if order.stock_held {
-        if order.drop_aggregate_id.is_none() {
-            return Ok(Ok(order));
-        }
-        // A drop claim's window extends to the payment window once a
-        // payment starts; the stock itself was already debited at claim.
         let rearmed: OrderRow = sqlx::query_as(&format!(
-            "UPDATE orders SET hold_expires_at = $2, updated_at = $3 \
+            "UPDATE orders SET hold_expires_at = $2, hold_source = $3, updated_at = $4 \
              WHERE id = $1 RETURNING {ORDER_COLUMNS}"
         ))
         .bind(order.id)
         .bind(hold_expires_at)
+        .bind(hold_source)
         .bind(now)
         .fetch_one(&mut **tx)
         .await?;
@@ -193,8 +188,6 @@ pub async fn acquire_payment_hold(
             &listing.state,
             new_state
         ));
-        // The row is locked above, so the guarded UPDATE cannot lose a
-        // race; the guard plus the CHECK constraints are the backstop.
         let updated = sqlx::query(
             "UPDATE listings SET server_revision = server_revision + 1, state = $2, \
              available_quantity = available_quantity - $3, \
@@ -217,11 +210,12 @@ pub async fn acquire_payment_hold(
     }
 
     let held: OrderRow = sqlx::query_as(&format!(
-        "UPDATE orders SET stock_held = true, hold_expires_at = $2, updated_at = $3 \
-         WHERE id = $1 RETURNING {ORDER_COLUMNS}"
+        "UPDATE orders SET stock_held = true, hold_expires_at = $2, hold_source = $3, \
+         updated_at = $4 WHERE id = $1 RETURNING {ORDER_COLUMNS}"
     ))
     .bind(order.id)
     .bind(hold_expires_at)
+    .bind(hold_source)
     .bind(now)
     .fetch_one(&mut **tx)
     .await?;

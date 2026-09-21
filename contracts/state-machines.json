@@ -600,6 +600,10 @@
             {
               "trigger": "server",
               "name": "paykit_resolution"
+            },
+            {
+              "trigger": "server",
+              "name": "late_completion"
             }
           ]
         }
@@ -657,6 +661,10 @@
             {
               "trigger": "server",
               "name": "locks_verification"
+            },
+            {
+              "trigger": "server",
+              "name": "late_completion"
             }
           ]
         },
@@ -685,6 +693,10 @@
             {
               "trigger": "server",
               "name": "locks_verification"
+            },
+            {
+              "trigger": "server",
+              "name": "late_completion"
             }
           ]
         },
@@ -715,6 +727,20 @@
             {
               "trigger": "server",
               "name": "locks_late_completion"
+            },
+            {
+              "trigger": "server",
+              "name": "late_completion"
+            }
+          ]
+        },
+        {
+          "from": "expired",
+          "to": "confirmed",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "late_completion"
             }
           ]
         },

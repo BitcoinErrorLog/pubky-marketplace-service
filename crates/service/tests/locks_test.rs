@@ -1103,9 +1103,11 @@ async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    // Checkout moves no inventory, so the second checkout sees the listing
-    // still at revision 1.
-    let second = checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001001");
+    // Checkout holds a unit and bumps listing revision, so the second
+    // checkout must carry the current revision.
+    let mut second =
+        checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001001");
+    second["payload"]["lines"][0]["expected_revision"] = json!(2);
     let (status, second_checkout) = execute(&app, &buyer.token, &second).await;
     assert_eq!(status, StatusCode::OK, "{second_checkout}");
     let first_payment = first_checkout["result"]["payments"][0]["id"]
@@ -1458,10 +1460,10 @@ async fn upstream_failure_is_separate_from_marketplace_expiry(pool: PgPool) {
 }
 
 // The marketplace payment window expires a still-pending payment; a
-// completion verified after that expiry moves the payment to manual review
-// with its history retained — never a confirmation, never dropped.
+// completion verified after that expiry with stock free completes the
+// order. History is retained — never dropped.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn late_completion_after_window_expiry_goes_to_manual_review(pool: PgPool) {
+async fn late_completion_after_window_expiry_completes_when_stock_is_free(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
@@ -1513,7 +1515,7 @@ async fn late_completion_after_window_expiry_goes_to_manual_review(pool: PgPool)
         "an expired window keeps polling so a late completion still surfaces"
     );
 
-    // The completion arrives late: manual review, retained, no receipt.
+    // The completion arrives late with stock free: late_completion pays.
     fake.set_outcome(
         TEST_BUNDLE_ID,
         LocksLookupOutcome::Status(LocksTaskStatus::Completed),
@@ -1524,21 +1526,13 @@ async fn late_completion_after_window_expiry_goes_to_manual_review(pool: PgPool)
         .expect("worker pass runs");
     assert_eq!(summary.locks_completions_applied, 1);
     let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
-    assert_eq!(state, "manual_review");
+    assert_eq!(state, "confirmed");
     assert_eq!(
         order_state(&app.pool, &order.order_id).await,
-        "cancelled",
-        "the window sweep already cancelled the order"
+        "paid",
+        "late_completion pays when the unit is free"
     );
-    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
-    assert_eq!(
-        count(
-            &app.pool,
-            "SELECT COUNT(*) FROM events WHERE kind = 'payment.manual_review'"
-        )
-        .await,
-        1
-    );
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 1);
     let history: Vec<(String, String)> = sqlx::query_as(
         "SELECT observed_status, outcome FROM payment_locks_observations ORDER BY id",
     )
@@ -1550,7 +1544,7 @@ async fn late_completion_after_window_expiry_goes_to_manual_review(pool: PgPool)
         vec![
             ("pending".to_string(), "none".to_string()),
             ("window_elapsed".to_string(), "payment_expired".to_string()),
-            ("completed".to_string(), "manual_review".to_string()),
+            ("completed".to_string(), "payment_confirmed".to_string()),
         ],
         "the late completion and its reconciliation history are retained"
     );

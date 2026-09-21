@@ -538,6 +538,7 @@ pub async fn close_locked_auction(
             resolved_at: None,
             resolved_by_pubky: None,
             refund_reference: None,
+            review_reason: None,
             created_at: now,
             updated_at: now,
         };

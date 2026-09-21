@@ -485,7 +485,7 @@ async fn lifecycle_prepare_activate_void_and_expiry_keep_the_quote(pool: PgPool)
 
     // The payment window lapses on the activated order: the order cancels
     // and the quote evidence is retained.
-    let later = now + Duration::seconds(3700);
+    let later = now + Duration::seconds(7300);
     assert!(
         expire_due_payment_windows(&fixture.app.state, later)
             .await
@@ -596,7 +596,7 @@ async fn shared_manual_extension_and_late_settlement_retain_the_quote(pool: PgPo
         .await
         .paykit_total_sats
         .expect("invoice total");
-    let after_window = now + Duration::seconds(3700);
+    let after_window = now + Duration::seconds(7300);
     assert!(
         expire_due_payment_windows(&fixture.app.state, after_window)
             .await
@@ -616,8 +616,8 @@ async fn shared_manual_extension_and_late_settlement_retain_the_quote(pool: PgPo
     fixture.paykit.set_status(&reference, late);
     assert!(poll_now(&fixture.app, after_window + Duration::seconds(60)).await >= 1);
     let facts = order_facts(&pool, &order.order_id).await;
-    assert_eq!(facts.state, "cancelled");
-    assert_eq!(payment_state(&pool, &order.order_id).await, "manual_review");
+    assert_eq!(facts.state, "paid");
+    assert_eq!(payment_state(&pool, &order.order_id).await, "confirmed");
     assert_eq!(
         facts.bitcoin_quoted_sats,
         Some(expected as i64),
@@ -789,7 +789,7 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
         total_sats, quoted_sats,
         "the invoice total carries the nonce"
     );
-    let after_window = now + Duration::seconds(3700);
+    let after_window = now + Duration::seconds(7300);
     assert!(
         expire_due_payment_windows(&fixture.app.state, after_window)
             .await
@@ -806,6 +806,14 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
         Some(2),
     );
     late["late_settlement"] = json!(true);
+    sqlx::query(
+        "UPDATE listings SET available_quantity = 0, reserved_quantity = 0, \
+         sold_quantity = total_quantity, state = 'sold' WHERE aggregate_id = $1",
+    )
+    .bind(listing_aggregate(&fixture.seller.pubky))
+    .execute(&pool)
+    .await
+    .expect("sold-out so late money cannot complete");
     fixture.paykit.set_status(&reference, late);
     assert!(poll_now(&fixture.app, after_window + Duration::seconds(60)).await >= 1);
     let facts = order_facts(&pool, &order.order_id).await;
@@ -846,7 +854,7 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
     let (status, body) = bind_bitcoin(&fixture.app, &fixture.buyer.token, &order.order_id).await;
     assert_eq!(status, StatusCode::OK, "bind failed: {body}");
     activate_bound(&fixture).await;
-    let after_window = now + Duration::seconds(3700);
+    let after_window = now + Duration::seconds(7300);
     assert!(
         expire_due_payment_windows(&fixture.app.state, after_window)
             .await
@@ -856,6 +864,14 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
     let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
     let mut late = bitcoin_status_v2("confirmed", true, "exclusive", None, None, None);
     late["late_settlement"] = json!(true);
+    sqlx::query(
+        "UPDATE listings SET available_quantity = 0, reserved_quantity = 0, \
+         sold_quantity = total_quantity, state = 'sold' WHERE aggregate_id = $1",
+    )
+    .bind(listing_aggregate(&fixture.seller.pubky))
+    .execute(&pool)
+    .await
+    .expect("sold-out so late money cannot complete");
     fixture.paykit.set_status(&reference, late);
     assert!(poll_now(&fixture.app, after_window + Duration::seconds(60)).await >= 1);
     let facts = order_facts(&pool, &order.order_id).await;

@@ -886,6 +886,14 @@ pub async fn resolve_bitcoin_payment(
             ReviewReason::NotInManualReview,
             "This order's payment is not awaiting manual resolution.",
         ),
+        Err(ResolutionFailure::RefundRequired) => audited_resolve_refusal(
+            &state,
+            &actor.0,
+            Some(resolution_id),
+            ErrorCode::InvalidState,
+            ReviewReason::RefundRequired,
+            REFUND_REQUIRED_PAID_MESSAGE,
+        ),
         Err(ResolutionFailure::StockUnavailable) => audited_resolve_refusal(
             &state,
             &actor.0,
@@ -930,6 +938,8 @@ pub(crate) enum ResolutionFailure {
     /// The `paid` branch could not hold or reacquire the inventory
     /// (sold-out / drop / auction late cases): named 409, nothing changed.
     StockUnavailable,
+    /// `review_reason=refund_required`: Paid is disabled.
+    RefundRequired,
     /// The resolution cannot emit a `paykit.resolve` without bind-time pins.
     MissingPin,
     Internal(String, String),
@@ -982,6 +992,10 @@ pub(crate) async fn apply_manual_review_resolution(
             "order row missing".into(),
         ));
     };
+    if input.outcome == "paid" && payment.review_reason.as_deref() == Some("refund_required") {
+        let _ = tx.rollback().await;
+        return Err(ResolutionFailure::RefundRequired);
+    }
     let exit_state = match input.outcome {
         "paid" | "refunded" => "confirmed",
         _ => "expired",
@@ -1231,7 +1245,7 @@ async fn hold_present(
 /// (drop row, then listing rows), for the late-settlement `paid` branch.
 /// Failure is always `stock_unavailable`: sold-out, drop-exhausted, and
 /// auction-lapsed cases all land on the same named error.
-async fn reacquire_hold(
+pub(crate) async fn reacquire_hold(
     tx: &mut Transaction<'_, Postgres>,
     order: &OrderRow,
     now: DateTime<Utc>,
@@ -1336,6 +1350,230 @@ async fn reacquire_hold(
             .map_err(|e| ResolutionFailure::Internal("order hold flag".into(), e.to_string()))?;
     }
     Ok(())
+}
+
+pub const REFUND_REQUIRED_PAID_MESSAGE: &str =
+    "This payment cannot complete the order. Return the funds, then record the refund.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LateMoneyOutcome {
+    Completed,
+    RefundRequired,
+    HeldLateSettlement,
+}
+
+/// Late money observed after the hold window: one transaction, listing
+/// `FOR UPDATE` via [`reacquire_hold`]. Stock free completes the order
+/// (`late_completion`). Stock gone stamps `refund_required` and never
+/// pays. A still-held pending order keeps the existing `manual_review`
+/// path with `review_reason=late_settlement` and does not reacquire.
+pub(crate) async fn apply_late_money(
+    tx: &mut Transaction<'_, Postgres>,
+    pickup: Option<&crate::pickup::PickupKeys>,
+    payment: &PaymentRow,
+    order: &OrderRow,
+    command_id: Uuid,
+    event_actor: &str,
+    now: DateTime<Utc>,
+) -> Result<LateMoneyOutcome, ResolutionFailure> {
+    let still_held = order.state == "pending_payment" && order.stock_held;
+    if still_held {
+        stamp_review_reason(
+            tx,
+            payment,
+            "late_settlement",
+            "manual_review",
+            command_id,
+            event_actor,
+            now,
+        )
+        .await?;
+        return Ok(LateMoneyOutcome::HeldLateSettlement);
+    }
+
+    match reacquire_hold(tx, order, now).await {
+        Ok(()) => complete_late_order(tx, pickup, payment, order, command_id, event_actor, now)
+            .await
+            .map(|_| LateMoneyOutcome::Completed),
+        Err(ResolutionFailure::StockUnavailable) => {
+            let event_id = stamp_review_reason(
+                tx,
+                payment,
+                "refund_required",
+                "manual_review",
+                command_id,
+                event_actor,
+                now,
+            )
+            .await?;
+            if order.state == "pending_payment" {
+                sqlx::query(
+                    "UPDATE orders SET state = 'cancelled', \
+                     cancellation_reason = 'payment window elapsed', updated_at = $2 \
+                     WHERE id = $1 AND state = 'pending_payment'",
+                )
+                .bind(order.id)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| ResolutionFailure::Internal("late cancel".into(), e.to_string()))?;
+                insert_event(
+                    tx,
+                    command_id,
+                    &ids::order_aggregate_id(order.id),
+                    order.revision + 1,
+                    event_actor,
+                    "order.cancelled",
+                    now,
+                )
+                .await
+                .map_err(|e| {
+                    ResolutionFailure::Internal("late cancel event".into(), e.to_string())
+                })?;
+            }
+            for recipient in [&order.buyer_pubky, &order.seller_pubky] {
+                insert_notification_intent(
+                    tx,
+                    event_id,
+                    "payment_refund_required",
+                    recipient,
+                    event_actor,
+                    &ids::order_aggregate_id(order.id),
+                    None,
+                    now,
+                )
+                .await
+                .map_err(|e| {
+                    ResolutionFailure::Internal("refund notification".into(), e.to_string())
+                })?;
+            }
+            Ok(LateMoneyOutcome::RefundRequired)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+async fn complete_late_order(
+    tx: &mut Transaction<'_, Postgres>,
+    pickup: Option<&crate::pickup::PickupKeys>,
+    payment: &PaymentRow,
+    order: &OrderRow,
+    command_id: Uuid,
+    event_actor: &str,
+    now: DateTime<Utc>,
+) -> Result<(), ResolutionFailure> {
+    let cas: Option<(i64,)> = sqlx::query_as(
+        "UPDATE payments SET state = 'confirmed', revision = revision + 1, \
+         review_reason = NULL, updated_at = $2 \
+         WHERE id = $1 AND state IN ('expired', 'awaiting_entitlement', 'manual_review') \
+         AND resolution_outcome IS NULL RETURNING revision",
+    )
+    .bind(payment.id)
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| ResolutionFailure::Internal("late payment confirm".into(), e.to_string()))?;
+    let Some((revision,)) = cas else {
+        return Err(ResolutionFailure::Internal(
+            "late payment confirm".into(),
+            "payment could not enter confirmed".into(),
+        ));
+    };
+    let event_id = insert_event(
+        tx,
+        command_id,
+        &ids::payment_aggregate_id(payment.id),
+        revision,
+        event_actor,
+        "payment.confirmed",
+        now,
+    )
+    .await
+    .map_err(|e| ResolutionFailure::Internal("late confirm event".into(), e.to_string()))?;
+    let order_for_confirm = fetch_order_for_update(tx, order.id)
+        .await
+        .map_err(|e| ResolutionFailure::Internal("late order re-read".into(), e.to_string()))?
+        .ok_or_else(|| {
+            ResolutionFailure::Internal("late order re-read".into(), "order missing".into())
+        })?;
+    match crate::handlers::payment::confirm_order(
+        tx,
+        event_actor,
+        command_id,
+        payment,
+        order_for_confirm,
+        pickup,
+        now,
+    )
+    .await
+    .map_err(|e| ResolutionFailure::Internal("late confirmation".into(), e.to_string()))?
+    {
+        Ok((confirmed, _receipt, _event)) => {
+            for recipient in [&confirmed.buyer_pubky, &confirmed.seller_pubky] {
+                insert_notification_intent(
+                    tx,
+                    event_id,
+                    "payment_confirmed",
+                    recipient,
+                    event_actor,
+                    &ids::order_aggregate_id(confirmed.id),
+                    None,
+                    now,
+                )
+                .await
+                .map_err(|e| {
+                    ResolutionFailure::Internal("late confirm notification".into(), e.to_string())
+                })?;
+            }
+            Ok(())
+        }
+        Err(failure) => Err(ResolutionFailure::Internal(
+            "late confirmation".into(),
+            failure.message().to_string(),
+        )),
+    }
+}
+
+async fn stamp_review_reason(
+    tx: &mut Transaction<'_, Postgres>,
+    payment: &PaymentRow,
+    reason: &str,
+    target_state: &str,
+    command_id: Uuid,
+    event_actor: &str,
+    now: DateTime<Utc>,
+) -> Result<Uuid, ResolutionFailure> {
+    let cas: Option<(i64,)> = sqlx::query_as(
+        "UPDATE payments SET state = $2, revision = revision + 1, review_reason = $3, \
+         manual_review_entered_at = CASE WHEN $2 = 'manual_review' THEN $4 ELSE manual_review_entered_at END, \
+         updated_at = $4 \
+         WHERE id = $1 AND state IN ('expired', 'awaiting_entitlement', 'manual_review', 'detected') \
+         AND resolution_outcome IS NULL RETURNING revision",
+    )
+    .bind(payment.id)
+    .bind(target_state)
+    .bind(reason)
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| ResolutionFailure::Internal("stamp review_reason".into(), e.to_string()))?;
+    let Some((revision,)) = cas else {
+        return Err(ResolutionFailure::Internal(
+            "stamp review_reason".into(),
+            "payment could not enter review".into(),
+        ));
+    };
+    insert_event(
+        tx,
+        command_id,
+        &ids::payment_aggregate_id(payment.id),
+        revision,
+        event_actor,
+        "payment.manual_review",
+        now,
+    )
+    .await
+    .map_err(|e| ResolutionFailure::Internal("review event".into(), e.to_string()))
 }
 
 /// A drop transition needs a command id for its event; reacquisition emits

@@ -2130,7 +2130,7 @@ async fn refusal_audit_d26_2_precedence_and_personal_minimum_categories_are_exac
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPool) {
-    use common::paykit_review::{bound_order, into_manual_review_held, into_manual_review_late};
+    use common::paykit_review::{bound_order, into_manual_review_held};
 
     fn command_case(
         kind: RefusalKind,
@@ -2586,7 +2586,7 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         serde_json::json!({"outcome":"paid"}),
     ));
     let (stock_id, _) =
-        into_manual_review_late(&manual_app, &paykit, &manual_seller, &manual_buyer).await;
+        into_manual_review_held(&manual_app, &paykit, &manual_seller, &manual_buyer).await;
     sqlx::query("UPDATE listings SET state='sold',available_quantity=0,reserved_quantity=0,sold_quantity=total_quantity WHERE seller_pubky=$1")
         .bind(&manual_seller.pubky).execute(&pool).await.expect("sold-out stock fixture");
     cases.push(resolve_case(

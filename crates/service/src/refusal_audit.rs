@@ -1209,6 +1209,7 @@ pub const fn refusal_kind_for_review_reason(
         ReviewReason::AlreadyResolved => Some(RefusalKind::ManualResolveAlreadyResolved),
         ReviewReason::NotInManualReview => Some(RefusalKind::ManualResolveNotInReview),
         ReviewReason::StockUnavailable => Some(RefusalKind::ManualResolveStockUnavailable),
+        ReviewReason::RefundRequired => Some(RefusalKind::InvalidState),
     }
 }
 

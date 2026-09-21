@@ -57,7 +57,7 @@ pub const ORDER_COLUMNS: &str =
          OR seller_config.paypal_merchant_email IS NOT NULL)) AS seller_has_rail, revision, \
      state, lines, delivery_address, subtotal_minor, shipping_minor, total_minor, \
      currency, exponent, guarantee_policy_version, payment_id, receipt_id, edition, \
-     cancellation_reason, stock_held, hold_expires_at, \
+     cancellation_reason, stock_held, hold_expires_at, hold_source, \
      shipment, delivery_assumed, return_request, external_refund, payment_method, fiat_checkout_url, \
      payment_reported_at, fiat_transaction_ref, fiat_verified_by, shipping_label, paykit_request_reference, paykit_request_state, \
      paykit_last_checked_at, paykit_invoice_id, paykit_stack_id, paykit_stack_endpoint, \
@@ -75,7 +75,7 @@ pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revi
      merchandise_amount_minor, merchandise_currency, merchandise_exponent, \
      manual_review_entered_at, manual_review_sla_alerted_at, \
      resolution_id, resolution_outcome, resolution_basis, resolved_at, resolved_by_pubky, \
-     refund_reference, created_at, updated_at";
+     refund_reference, review_reason, created_at, updated_at";
 
 pub async fn seller_has_rail(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

@@ -99,11 +99,17 @@ pub struct Config {
     /// failure — Locks v1 leaves transport/status failures pending
     /// (ADR-0019 §7).
     pub locks_payment_window_seconds: i64,
-    /// Hold window armed by the payment-method bind
-    /// (`POST /v0/orders/{id}/payment-method`), which is the lock point for
-    /// the fiat and bitcoin rails (`FIAT_PAYMENT_WINDOW_SECONDS`, default
-    /// 3600, minimum 60).
+    /// Hold window armed at ordinary `checkout.create`
+    /// (`CHECKOUT_HOLD_WINDOW_SECONDS`, default 900, minimum 60). Bind /
+    /// Locks / sandbox re-arm this to the rail window.
+    pub checkout_hold_window_seconds: i64,
+    /// Hold window re-armed by a fiat payment-method bind
+    /// (`FIAT_PAYMENT_WINDOW_SECONDS`, default 3600, minimum 60).
     pub fiat_payment_window_seconds: i64,
+    /// Hold window re-armed by a bitcoin payment-method bind
+    /// (`BITCOIN_PAYMENT_WINDOW_SECONDS`, default 7200, minimum 60). Do not
+    /// reuse the fiat window: a 1-conf can exceed 3600 s.
+    pub bitcoin_payment_window_seconds: i64,
     /// Hold window armed by `payment.sandbox_advance`'s first transition
     /// out of `awaiting_entitlement`, the sandbox lock point
     /// (`SANDBOX_PAYMENT_WINDOW_SECONDS`, default 900, minimum 60).
@@ -282,9 +288,17 @@ impl Config {
         if locks_payment_window_seconds < 60 {
             anyhow::bail!("LOCKS_PAYMENT_WINDOW_SECONDS must be at least 60");
         }
+        let checkout_hold_window_seconds = env_i64("CHECKOUT_HOLD_WINDOW_SECONDS", 900)?;
+        if checkout_hold_window_seconds < 60 {
+            anyhow::bail!("CHECKOUT_HOLD_WINDOW_SECONDS must be at least 60");
+        }
         let fiat_payment_window_seconds = env_i64("FIAT_PAYMENT_WINDOW_SECONDS", 3_600)?;
         if fiat_payment_window_seconds < 60 {
             anyhow::bail!("FIAT_PAYMENT_WINDOW_SECONDS must be at least 60");
+        }
+        let bitcoin_payment_window_seconds = env_i64("BITCOIN_PAYMENT_WINDOW_SECONDS", 7_200)?;
+        if bitcoin_payment_window_seconds < 60 {
+            anyhow::bail!("BITCOIN_PAYMENT_WINDOW_SECONDS must be at least 60");
         }
         let sandbox_payment_window_seconds = env_i64("SANDBOX_PAYMENT_WINDOW_SECONDS", 900)?;
         if sandbox_payment_window_seconds < 60 {
@@ -369,7 +383,9 @@ impl Config {
             worker_interval_seconds,
             worker_lease_seconds,
             locks_payment_window_seconds,
+            checkout_hold_window_seconds,
             fiat_payment_window_seconds,
+            bitcoin_payment_window_seconds,
             sandbox_payment_window_seconds,
             drop_claim_window_seconds,
             locks_poll_seconds,
@@ -425,7 +441,9 @@ impl Config {
             worker_interval_seconds: 3_600,
             worker_lease_seconds: 30,
             locks_payment_window_seconds: 3_600,
+            checkout_hold_window_seconds: 900,
             fiat_payment_window_seconds: 3_600,
+            bitcoin_payment_window_seconds: 7_200,
             sandbox_payment_window_seconds: 900,
             drop_claim_window_seconds: 600,
             locks_poll_seconds: 30,

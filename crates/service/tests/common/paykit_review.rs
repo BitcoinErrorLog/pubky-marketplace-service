@@ -207,28 +207,43 @@ pub async fn into_manual_review_late(
 ) -> (String, String) {
     let (order_id, payment_id, reference) =
         bound_shared_manual_order(app, paykit, seller, buyer).await;
-    let after_window = app.clock.now() + chrono::Duration::seconds(3700);
+    let after_window = app.clock.now() + chrono::Duration::seconds(7300);
     assert!(
         expire_due_payment_windows(&app.state, after_window)
             .await
             .expect("payment-window reaper runs")
             >= 1
     );
+    sqlx::query(
+        "UPDATE listings SET available_quantity = 0, reserved_quantity = 0, \
+         sold_quantity = total_quantity, state = 'sold' \
+         WHERE aggregate_id = $1",
+    )
+    .bind(format!("listing:{}_boots_01", seller.pubky))
+    .execute(&app.pool)
+    .await
+    .expect("sold-out stock so late money cannot reacquire");
     let mut late_status = status_confirmed("shared_manual", true, 2);
     late_status["late_settlement"] = json!(true);
     paykit.set_status(&reference, late_status);
     assert!(poll_now(app, after_window + chrono::Duration::seconds(60)).await >= 1);
-    let (request_state, payment_state, stock_held): (String, String, bool) = sqlx::query_as(
-        "SELECT o.state, p.state, o.stock_held \
+    let (order_state, payment_state, stock_held, review_reason): (
+        String,
+        String,
+        bool,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT o.state, p.state, o.stock_held, p.review_reason \
          FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
     )
     .bind(Uuid::parse_str(&order_id).expect("order uuid"))
     .fetch_one(&app.pool)
     .await
     .expect("target late order");
-    assert_eq!(request_state, "cancelled");
+    assert_eq!(order_state, "cancelled");
     assert_eq!(payment_state, "manual_review");
     assert!(!stock_held);
+    assert_eq!(review_reason.as_deref(), Some("refund_required"));
     let manual_review_events: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events e JOIN payments p \
          ON e.aggregate_id = ('payment:' || p.id::text) \
