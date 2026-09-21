@@ -6,7 +6,7 @@ use common::{create_pending_order, new_actor, test_app};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn fx_schema_has_constraints_and_single_assignment_trigger(pool: PgPool) {
     let columns: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM information_schema.columns \
@@ -39,7 +39,7 @@ async fn fx_schema_has_constraints_and_single_assignment_trigger(pool: PgPool) {
     assert!(unique_index.0);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paykit_observed_sats_is_single_assignment_at_the_database_boundary(pool: PgPool) {
     let app = test_app(pool.clone()).await;
     let seller = new_actor(&app).await;

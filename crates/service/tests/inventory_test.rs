@@ -128,7 +128,7 @@ async fn inventory_event_count(pool: &PgPool, aggregate_id: &str) -> i64 {
     .expect("event count")
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn genuine_auth_path_enforces_semantic_inventory_capability(pool: PgPool) {
     let app = test_app(pool).await;
 
@@ -199,7 +199,7 @@ async fn genuine_auth_path_enforces_semantic_inventory_capability(pool: PgPool) 
     assert_eq!(body["error"]["code"], json!("seller_ownership_required"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn exact_replay_returns_original_result_before_rate_accounting(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -242,7 +242,7 @@ async fn exact_replay_returns_original_result_before_rate_accounting(pool: PgPoo
     assert_eq!(results, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn changed_body_replay_is_quarantined_without_mutation(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -268,7 +268,7 @@ async fn changed_body_replay_is_quarantined_without_mutation(pool: PgPool) {
     assert_eq!(conflicts, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn changed_replay_conflict_evidence_is_capped_per_successful_key(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -315,7 +315,7 @@ async fn changed_replay_conflict_evidence_is_capped_per_successful_key(pool: PgP
     assert_eq!(results, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn exhausted_rate_bucket_cannot_delay_or_suppress_changed_replay_quarantine(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -419,7 +419,7 @@ async fn exhausted_rate_bucket_cannot_delay_or_suppress_changed_replay_quarantin
     assert_eq!(after_results, results);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn revision_negative_stock_and_spoof_refusals_mutate_nothing(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -572,7 +572,7 @@ async fn spawn_counting_unavailable_listing_server() -> (String, Arc<AtomicUsize
     (format!("http://{address}"), fetch_count)
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unavailable_variant_lookups_consume_rate_before_remote_io_and_stop_at_429(pool: PgPool) {
     let (base_url, fetch_count) = spawn_counting_unavailable_listing_server().await;
     let client = Arc::new(HttpHomeserverClient::new(&base_url).expect("HTTP client builds"));
@@ -617,7 +617,7 @@ async fn unavailable_variant_lookups_consume_rate_before_remote_io_and_stop_at_4
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn variant_fetch_uses_prefetch_clock_for_rate_and_fresh_clock_for_mutation(pool: PgPool) {
     let (keypair, seller_pubky) = random_keypair();
     let record = homeserver_record(
@@ -703,7 +703,7 @@ async fn variant_fetch_uses_prefetch_clock_for_rate_and_fresh_clock_for_mutation
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sole_enabled_variant_is_an_assertion_and_multi_variant_is_refused(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -757,7 +757,7 @@ async fn sole_enabled_variant_is_an_assertion_and_multi_variant_is_refused(pool:
     assert_eq!(inventory_event_count(&app.pool, &aggregate).await, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn delayed_variant_lookup_holds_no_transaction_and_revision_binding_refuses_mismatch(
     pool: PgPool,
 ) {
@@ -860,7 +860,7 @@ async fn delayed_variant_lookup_holds_no_transaction_and_revision_binding_refuse
     assert_eq!(after_results, results);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_same_revision_adjustments_have_one_winner(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -908,7 +908,7 @@ async fn concurrent_same_revision_adjustments_have_one_winner(pool: PgPool) {
     assert_eq!(results, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn external_references_are_bounded_private_and_seller_scoped(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -971,7 +971,7 @@ async fn external_references_are_bounded_private_and_seller_scoped(pool: PgPool)
     assert_eq!(body["error"]["code"], json!("invalid_request"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn named_rate_limit_defaults_and_replay_bypass_are_enforced(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;

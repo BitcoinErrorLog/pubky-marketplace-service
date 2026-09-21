@@ -130,7 +130,7 @@ async fn sync_drop_over_boots_01(
 
 // === 1. drop.sync: registration, missing listings, announced-only updates ===
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn drop_sync_registers_updates_while_announced_and_locks_terms_at_launch(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -316,7 +316,7 @@ async fn drop_sync_registers_updates_while_announced_and_locks_terms_at_launch(p
 
 // === 2. Schedule gating with pinned copy ====================================
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn gating_refuses_before_start_after_end_and_after_cancel(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -409,7 +409,7 @@ async fn gating_refuses_before_start_after_end_and_after_cancel(pool: PgPool) {
 
 // === 3. Cart shape: a drop order is exactly one line of one unit ============
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn mixed_carts_and_multi_unit_lines_are_refused(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -470,7 +470,7 @@ async fn mixed_carts_and_multi_unit_lines_are_refused(pool: PgPool) {
     assert_eq!(remaining, 5);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_two_line_drop_checkout_is_refused(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -543,7 +543,7 @@ async fn a_two_line_drop_checkout_is_refused(pool: PgPool) {
 
 // === 4. Oversell proof: 100 concurrent checkouts, total 10 ==================
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn hundred_concurrent_checkouts_sell_exactly_the_drop_total(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -638,7 +638,7 @@ async fn hundred_concurrent_checkouts_sell_exactly_the_drop_total(pool: PgPool) 
 
 // === 5. Per-buyer cap: one buyer, limit 2, 10 parallel attempts =============
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn one_buyer_cannot_exceed_the_per_buyer_limit_under_concurrency(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -715,7 +715,7 @@ async fn one_buyer_cannot_exceed_the_per_buyer_limit_under_concurrency(pool: PgP
 
 // === 6. Expiry restock: a lapsed hold returns its drop unit =================
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_expired_reservation_restocks_the_drop_and_frees_the_buyer_cap(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let holder = Uuid::new_v4();
@@ -788,7 +788,7 @@ async fn an_expired_reservation_restocks_the_drop_and_frees_the_buyer_cap(pool: 
 
 // === 7. drop.cancel ==========================================================
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_seller_cancels_a_live_drop_and_new_holds_are_refused(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -862,7 +862,7 @@ async fn the_seller_cancels_a_live_drop_and_new_holds_are_refused(pool: PgPool) 
 
 // === 8. Worker sweep: server-time transitions without traffic ===============
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_sweep_worker_starts_and_closes_untouched_drops_on_server_time(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let holder = Uuid::new_v4();
@@ -1001,7 +1001,7 @@ async fn the_sweep_worker_starts_and_closes_untouched_drops_on_server_time(pool:
 
 // === 9. Cancellation release paths credit the drop ==========================
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancelling_orders_credits_the_drop_for_unpaid_and_paid_holds(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -1099,7 +1099,7 @@ async fn cancelling_orders_credits_the_drop_for_unpaid_and_paid_holds(pool: PgPo
 
 // === 10. Editions: gapless 1..=N under concurrent confirms ===================
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_confirms_assign_gapless_editions(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -1171,7 +1171,7 @@ async fn concurrent_confirms_assign_gapless_editions(pool: PgPool) {
 
 // === 11. Sell-out: terminal ended_sold_out + seller notification =============
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn selling_out_ends_the_drop_terminally_and_notifies_the_seller(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let holder = Uuid::new_v4();
@@ -1371,7 +1371,7 @@ async fn set_remaining(pool: &PgPool, aggregate_id: &str, remaining: i64) {
         .expect("remaining update succeeds");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_public_drop_projection_redacts_stock_server_side(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -1506,7 +1506,7 @@ async fn the_public_drop_projection_redacts_stock_server_side(pool: PgPool) {
 
 // === 13. Seller projection + buyer ready-check ===============================
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_seller_projection_and_ready_check_are_role_scoped(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -1602,7 +1602,7 @@ async fn the_seller_projection_and_ready_check_are_role_scoped(pool: PgPool) {
 
 // === 14. drop.release_listings ================================================
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn release_listings_returns_ended_drop_listings_to_open_sale(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -1712,7 +1712,7 @@ async fn release_listings_returns_ended_drop_listings_to_open_sale(pool: PgPool)
 // claimed-but-never-paid drop order expires through the payment-window
 // worker, restocking the drop AND the listing and freeing the buyer's
 // per-drop cap.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_lapsed_claim_window_restocks_the_drop_and_frees_the_buyer_cap(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let holder = Uuid::new_v4();
@@ -1787,7 +1787,7 @@ async fn a_lapsed_claim_window_restocks_the_drop_and_frees_the_buyer_cap(pool: P
 // A claim whose payment started survives the claim window: the payment lock
 // point re-arms the hold window to its own (longer) span without a second
 // decrement, and the order confirms with an edition.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_claim_whose_payment_started_survives_the_claim_window_and_confirms(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let holder = Uuid::new_v4();

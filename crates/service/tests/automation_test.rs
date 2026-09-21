@@ -46,7 +46,7 @@ async fn get_with_etag(router: Router, uri: &str, token: &str, etag: &str) -> (S
     (status, body)
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sessions_can_be_listed_labeled_and_revoked(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -135,7 +135,7 @@ async fn sessions_can_be_listed_labeled_and_revoked(pool: PgPool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn session_admin_cors_preflight_allows_patch_and_delete(pool: PgPool) {
     let app = test_app(pool).await;
     let session_id = Uuid::nil();
@@ -169,7 +169,7 @@ async fn session_admin_cors_preflight_allows_patch_and_delete(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn listing_export_event_cursor_and_sync_many_are_seller_scoped(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -341,7 +341,7 @@ async fn listing_export_event_cursor_and_sync_many_are_seller_scoped(pool: PgPoo
     assert_eq!(body["error"]["code"], json!("cursor_expired"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn webhook_lifecycle_returns_each_secret_once_and_deletion_fences_delivery(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -433,7 +433,7 @@ async fn webhook_lifecycle_returns_each_secret_once_and_deletion_fences_delivery
     assert!(!active);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn endpoint_classes_use_service_clock_rate_limits(pool: PgPool) {
     let mut config = marketplace_service::config::Config::for_tests();
     config.automation_rate_limit_per_minute = 1;
@@ -463,7 +463,7 @@ async fn endpoint_classes_use_service_clock_rate_limits(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("rate_limited"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn seller_order_export_uses_the_private_safe_allowlist(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -532,7 +532,7 @@ async fn seller_order_export_uses_the_private_safe_allowlist(pool: PgPool) {
     assert_ne!(body["orders"][0]["id"], first_id);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unsafe_delivery_retries_then_dead_letters_without_connecting(pool: PgPool) {
     let mut config = marketplace_service::config::Config::for_tests();
     config.webhook_max_attempts = 2;
@@ -625,7 +625,7 @@ async fn unsafe_delivery_retries_then_dead_letters_without_connecting(pool: PgPo
     assert_eq!(terminal_rows, 0);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn webhook_enqueue_is_cursor_bounded_and_applies_per_seller_backpressure(pool: PgPool) {
     let mut config = marketplace_service::config::Config::for_tests();
     config.webhook_enqueue_batch_size = 1;
@@ -689,7 +689,7 @@ async fn webhook_enqueue_is_cursor_bounded_and_applies_per_seller_backpressure(p
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn webhook_endpoint_quota_is_atomic_and_new_endpoints_do_not_backfill(pool: PgPool) {
     let mut config = marketplace_service::config::Config::for_tests();
     config.webhook_max_endpoints_per_seller = 1;
@@ -752,7 +752,7 @@ async fn webhook_endpoint_quota_is_atomic_and_new_endpoints_do_not_backfill(pool
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_failed_webhook_retry_can_recover_to_delivered(pool: PgPool) {
     let mut config = marketplace_service::config::Config::for_tests();
     config.webhook_retry_base_seconds = 1;

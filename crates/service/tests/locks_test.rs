@@ -292,7 +292,7 @@ async fn order_state(pool: &PgPool, order_id: &str) -> String {
 // performs no lookup and no claim stamp for the prepared row, and still
 // processes other registered rows; attaching afterwards resumes ordinary
 // polling for the prepared payment.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_prepared_row_survives_a_worker_pass_untouched(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -421,7 +421,7 @@ async fn a_prepared_row_survives_a_worker_pass_untouched(pool: PgPool) {
 // INVALID_STATE even when the expiry sweep has not run yet; the sweep then
 // terminalises the preparation (payment expired, order cancelled, hold
 // restocked). A cancelled order likewise refuses attachment.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn registration_after_window_expiry_before_the_sweep_is_refused(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -507,7 +507,7 @@ async fn registration_after_window_expiry_before_the_sweep_is_refused(pool: PgPo
 
 // A buyer-cancelled order no longer holds the prepared window: attachment
 // is refused even though the payment itself is still awaiting entitlement.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn registration_after_order_cancellation_is_refused(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -563,7 +563,7 @@ async fn registration_after_order_cancellation_is_refused(pool: PgPool) {
 // The minted client reference is plaintext only in the authenticated
 // response: the durable command_results row stores it sealed to the payment
 // and buyer, and an exact replay unseals it back to the same buyer.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_prepare_result_is_sealed_at_rest_and_unsealed_on_replay(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -614,7 +614,7 @@ async fn the_prepare_result_is_sealed_at_rest_and_unsealed_on_replay(pool: PgPoo
 // immediately after prepare — before any bundle attaches — the payment
 // adapter is `locks`, the revision has advanced, and the sandbox command
 // can no longer drive the payment.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_pins_the_locks_adapter_atomically(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -659,7 +659,7 @@ async fn prepare_pins_the_locks_adapter_atomically(pool: PgPool) {
 // append to the audit table in the transaction that performs the state
 // change. Refusals record NOTHING (the round-cap cut): a refusing command
 // rolls back whole, so the audit holds exactly the two success outcomes.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -765,7 +765,7 @@ async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
 // preparation never replayed. The worker-pass-between-prepare-and-register
 // interleaving is pinned by `a_prepared_row_survives_a_worker_pass_untouched`,
 // and prepare-after-registration by `prepare_after_registration_is_a_stable_invalid_state`.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_replay_returns_the_same_reference_only_to_the_buyer(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -812,7 +812,7 @@ async fn prepare_replay_returns_the_same_reference_only_to_the_buyer(pool: PgPoo
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_double_prepare_mints_exactly_one_reference(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -861,7 +861,7 @@ async fn concurrent_double_prepare_mints_exactly_one_reference(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_elapsed_preparation_is_never_replayed(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -914,7 +914,7 @@ async fn an_elapsed_preparation_is_never_replayed(pool: PgPool) {
 // Prepare after registration is a stable INVALID_STATE — it must never
 // fall through to a second insert and surface a uniqueness conflict
 // (Sol Wave 1A review, P3-2).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_after_registration_is_a_stable_invalid_state(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -954,7 +954,7 @@ async fn prepare_after_registration_is_a_stable_invalid_state(pool: PgPool) {
 // participants, amount, asset, policy version, and lock resource hash; the
 // payment flips to the 'locks' adapter and the bundle id appears nowhere in
 // plaintext.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn registration_stores_an_encrypted_bound_correlation(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -1014,7 +1014,7 @@ async fn registration_stores_an_encrypted_bound_correlation(pool: PgPool) {
 // The registration guards: only the buyer, only the right aggregate and
 // revision, only a payment awaiting entitlement, and only a lock resource
 // created by the order's seller.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn registration_enforces_participant_state_and_creator_guards(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -1081,7 +1081,7 @@ async fn registration_enforces_participant_state_and_creator_guards(pool: PgPool
 // payload under the same command id conflicts; a second registration for
 // the same payment is refused; the same lifecycle identity can never
 // correlate a second order (unique HMAC lookup token).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -1165,7 +1165,7 @@ async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
 
 // Once a payment is correlated to a real Locks lifecycle, the sandbox
 // command — a client claim — can no longer advance it.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sandbox_advance_is_refused_for_a_locks_correlated_payment(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -1192,7 +1192,7 @@ async fn sandbox_advance_is_refused_for_a_locks_correlated_payment(pool: PgPool)
 
 // Without the Locks runtime (sandbox-only deployment) the registration
 // command is refused outright: fail closed, no correlation is stored.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn registration_is_refused_when_locks_is_not_configured(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1224,7 +1224,7 @@ async fn registration_is_refused_when_locks_is_not_configured(pool: PgPool) {
 // issued, inventory converted, seller notified. Repeats and simulated
 // redeliveries are harmless — the unique payment-confirmed event index and
 // the payment-state compare-and-swap decide, not application logic.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn worker_confirms_a_verified_completion_exactly_once(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -1327,7 +1327,7 @@ async fn worker_confirms_a_verified_completion_exactly_once(pool: PgPool) {
 // Pending, in-progress, not-found, and unavailable lookups leave the
 // payment untouched and the correlation pending; polling is rate-limited by
 // the poll interval and history rows are appended only on status change.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn non_terminal_lifecycles_stay_pending_and_poll_boundedly(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -1402,7 +1402,7 @@ async fn non_terminal_lifecycles_stay_pending_and_poll_boundedly(pool: PgPool) {
 // An upstream terminal failure is recorded and stops polling, but is NOT a
 // marketplace expiry: the payment stays awaiting entitlement until the
 // marketplace's own payment window elapses (ADR-0019 §7).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn upstream_failure_is_separate_from_marketplace_expiry(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -1460,7 +1460,7 @@ async fn upstream_failure_is_separate_from_marketplace_expiry(pool: PgPool) {
 // The marketplace payment window expires a still-pending payment; a
 // completion verified after that expiry moves the payment to manual review
 // with its history retained — never a confirmation, never dropped.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn late_completion_after_window_expiry_goes_to_manual_review(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -1564,7 +1564,7 @@ async fn late_completion_after_window_expiry_goes_to_manual_review(pool: PgPool)
 // A verified completion whose order can no longer be confirmed (the buyer
 // cancelled while the lifecycle was pending) is retained under manual
 // review instead of confirming a dead order — and instead of vanishing.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -1610,7 +1610,7 @@ async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: Pg
 // The verification task participates in the lease discipline like every
 // other worker task: an instance that does not hold the lease skips it, and
 // the task is recovered after the lease lapses.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn locks_verification_respects_worker_leases(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let instance_a = Uuid::new_v4();
@@ -1663,7 +1663,7 @@ async fn locks_verification_respects_worker_leases(pool: PgPool) {
 // lifecycle work (a verified completion in the same first pass) is never
 // delayed. A young terminal snapshot and an aged but non-terminal one
 // survive.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn terminal_checkout_snapshots_drain_boundedly_under_the_lease(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -1813,7 +1813,7 @@ async fn terminal_checkout_snapshots_drain_boundedly_under_the_lease(pool: PgPoo
 // notification — across the whole checkout-prepare-register-confirm flow.
 // The resource sentinel is the DYNAMICALLY derived seller-authored lock
 // resource planted at checkout, not a fixed constant.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bundle_and_lock_resource_never_leave_the_correlation_store(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -1969,7 +1969,7 @@ async fn bundle_and_lock_resource_never_leave_the_correlation_store(pool: PgPool
 // Locks policies is refused at prepare with the static copy, and so is a
 // cart whose lines carry two DISTINCT locks (multi-lock aggregation is a
 // future design, never an implicit pick).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_refuses_orders_with_zero_or_multiple_distinct_locks(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -2076,7 +2076,7 @@ async fn prepare_refuses_orders_with_zero_or_multiple_distinct_locks(pool: PgPoo
 // Identity validation through the handler (not only the pure function): a
 // document served at the seller-authoritative path whose bytes no longer
 // hash to that path is refused at prepare, and no correlation is created.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_refuses_a_lock_document_with_changed_bytes(pool: PgPool) {
     let seller_key = common::random_keypair();
     let seller_pubky = seller_key.1.clone();
@@ -2127,7 +2127,7 @@ async fn prepare_refuses_a_lock_document_with_changed_bytes(pool: PgPool) {
 // at its OWN content-addressed path — upstream rejects both
 // (`PaykitPaymentPolicyValidationError::InvalidParams(UnknownField)` /
 // `InvalidLockLogic`), and so does the mirror.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_refuses_policy_invalid_documents_at_their_own_path(pool: PgPool) {
     for (case, mutate) in [
         (
@@ -2206,7 +2206,7 @@ async fn prepare_refuses_policy_invalid_documents_at_their_own_path(pool: PgPool
 // here an equal-revision `listing.sync` healing lock A to lock B, which is
 // expressly permitted — must NOT move an existing order's authority.
 // Prepare seals the checkout-time snapshot (A), never the healed row (B).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_seals_the_checkout_snapshot_not_a_post_checkout_lock_mutation(pool: PgPool) {
     let homeserver = Arc::new(SyncableLocksHomeserver::default());
     let app = test_app_with_homeserver(pool, homeserver.clone()).await;
@@ -2308,7 +2308,7 @@ async fn prepare_seals_the_checkout_snapshot_not_a_post_checkout_lock_mutation(p
 // digital-lock listing record carries that addressed form (production
 // 2026-09-17). The service must accept it, persist only the canonical bare
 // form, and never treat the respelling of the SAME lock as a change.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sync_accepts_the_pubky_scheme_policy_uri_and_persists_the_canonical_bare_form(
     pool: PgPool,
 ) {
@@ -2386,7 +2386,7 @@ async fn sync_accepts_the_pubky_scheme_policy_uri_and_persists_the_canonical_bar
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sync_canonicalizes_a_lowercase_z32_lock_id(pool: PgPool) {
     let homeserver = Arc::new(SyncableLocksHomeserver::default());
     let app = test_app_with_homeserver(pool, homeserver.clone()).await;
@@ -2424,7 +2424,7 @@ async fn sync_canonicalizes_a_lowercase_z32_lock_id(pool: PgPool) {
 // Legacy orders — and carts whose checkout saw zero or multiple distinct
 // locks — carry no snapshot row: prepare refuses them statically rather
 // than falling back to the mutable listing rows.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_refuses_a_payment_without_a_checkout_snapshot(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -2466,7 +2466,7 @@ async fn prepare_refuses_a_payment_without_a_checkout_snapshot(pool: PgPool) {
 // economics drifted from the sealed checkout snapshot is refused
 // statically BEFORE any authority row is created — here the exponent, the
 // field a SAT/0 rail rebind rewrites.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_refuses_a_payment_whose_exponent_drifts_from_the_snapshot(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -2507,7 +2507,7 @@ async fn prepare_refuses_a_payment_whose_exponent_drifts_from_the_snapshot(pool:
 
 // The asset comparison, same authority rule: a payment whose asset no
 // longer equals the sealed checkout snapshot is refused statically.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_refuses_a_payment_whose_asset_drifts_from_the_snapshot(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -2542,7 +2542,7 @@ async fn prepare_refuses_a_payment_whose_asset_drifts_from_the_snapshot(pool: Pg
 // the bitcoin bind marked the order and rewrote the payment to SAT/0, so
 // the checkout snapshot no longer prices it. The refusal is static and
 // creates no authority row.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_refuses_a_payment_prebound_to_the_bitcoin_rail(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -2591,7 +2591,7 @@ async fn prepare_refuses_a_payment_prebound_to_the_bitcoin_rail(pool: PgPool) {
 // order, reader (buyer), recipient (creator/seller), amount, asset,
 // exponent, criterion, and resource hash — and the sealed resource opens
 // to exactly the snapshotted bytes.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_prepared_correlation_copies_the_verified_snapshot_byte_for_byte(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -2664,7 +2664,7 @@ async fn the_prepared_correlation_copies_the_verified_snapshot_byte_for_byte(poo
 
 // The creator swap: a document naming a different creator served at the
 // seller's path is an identity mismatch and is refused at prepare.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prepare_refuses_a_lock_document_with_a_swapped_creator(pool: PgPool) {
     let seller_key = common::random_keypair();
     let seller_pubky = seller_key.1.clone();
@@ -2803,7 +2803,7 @@ async fn order_facts(
 // the rollback leaves every listing, order, payment, correlation, and
 // outcome fact exactly as it was. (The round-cap cut removed the
 // commit-on-refusal path that could persist that partial mutation.)
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_failed_hold_acquisition_rolls_back_every_mutation(pool: PgPool) {
     let seller_key = common::random_keypair();
     let seller_pubky = seller_key.1.clone();
@@ -2925,7 +2925,7 @@ async fn a_failed_hold_acquisition_rolls_back_every_mutation(pool: PgPool) {
 // auditing is removed) and NO partial listing mutation survives, even
 // though hold acquisition updates line one's listing before line two
 // fails. Afterwards a fresh prepare succeeds.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
     let seller_key = common::random_keypair();
     let seller_pubky = seller_key.1.clone();

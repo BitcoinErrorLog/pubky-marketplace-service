@@ -95,7 +95,7 @@ async fn clear_resolution_pins(pool: &PgPool, order_id: &str) {
 // The entry×outcome matrix, held entry (24-hour seller-window route)
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn held_entry_resolves_paid_refunded_and_abandoned(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
 
@@ -236,7 +236,7 @@ async fn held_entry_resolves_paid_refunded_and_abandoned(pool: PgPool) {
 // Late-settlement entry: cancelled order, stock released
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn late_entry_resolves_paid_refunded_and_abandoned(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
 
@@ -323,7 +323,7 @@ async fn late_entry_resolves_paid_refunded_and_abandoned(pool: PgPool) {
     assert_eq!(order_state, "cancelled");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn late_paid_against_sold_out_stock_is_named_stock_unavailable(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -395,7 +395,7 @@ async fn late_paid_against_sold_out_stock_is_named_stock_unavailable(pool: PgPoo
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn mismatch_entry_resolves_paid_with_the_held_stock(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -441,7 +441,7 @@ async fn mismatch_entry_resolves_paid_with_the_held_stock(pool: PgPool) {
 // different key after resolution is already_resolved
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn resolve_idempotency_replay_conflict_and_already_resolved(pool: PgPool) {
     install_log_capture();
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
@@ -528,7 +528,7 @@ async fn resolve_idempotency_replay_conflict_and_already_resolved(pool: PgPool) 
 // Authorisation and validation
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn resolve_authorises_before_idempotency_and_validates(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -620,7 +620,7 @@ async fn resolve_authorises_before_idempotency_and_validates(pool: PgPool) {
 
 /// A Locks-correlated payment driven to manual_review through the REAL
 /// lifecycle worker (verified completion after the window elapsed).
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn resolve_refuses_a_locks_manual_review(pool: PgPool) {
     let (app, locks) = test_app_with_locks(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -687,7 +687,7 @@ async fn resolve_refuses_a_locks_manual_review(pool: PgPool) {
 
 /// A PayPal payment driven to manual_review through the REAL
 /// seller-attested path (confirm-received after the window elapsed).
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn resolve_refuses_a_paypal_manual_review(pool: PgPool) {
     let (app, _stripe, _paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -746,7 +746,7 @@ async fn resolve_refuses_a_paypal_manual_review(pool: PgPool) {
 
 /// A Stripe payment driven to manual_review through the REAL processor
 /// verification path (a paid session matched after the window elapsed).
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn resolve_refuses_a_stripe_manual_review(pool: PgPool) {
     let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -821,7 +821,7 @@ async fn resolve_refuses_a_stripe_manual_review(pool: PgPool) {
     assert_eq!(body["error"]["reason"], json!("resolution_not_applicable"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn resolve_refuses_a_missing_pin_and_a_non_review_payment(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -864,7 +864,7 @@ async fn resolve_refuses_a_missing_pin_and_a_non_review_payment(pool: PgPool) {
     assert_eq!(body["error"]["reason"], json!("not_in_manual_review"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unpinned_manual_review_api_refuses_without_creating_outbox(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -886,7 +886,7 @@ async fn unpinned_manual_review_api_refuses_without_creating_outbox(pool: PgPool
     assert!(outbox_facts(&pool, &order_id).await.is_empty());
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unpinned_shared_resolution_refuses_before_outbox(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -911,7 +911,7 @@ async fn unpinned_shared_resolution_refuses_before_outbox(pool: PgPool) {
     assert!(outbox_facts(&pool, &order_id).await.is_empty());
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unpinned_reviews_are_not_selected_by_the_sla_watcher(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -954,7 +954,7 @@ async fn unpinned_reviews_are_not_selected_by_the_sla_watcher(pool: PgPool) {
 // The seven-day inactivity reaper
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn seven_day_inactivity_records_seller_unresponsive(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1032,7 +1032,7 @@ async fn seven_day_inactivity_records_seller_unresponsive(pool: PgPool) {
 
 /// Seller and seven-day reaper at exactly T+7d: deterministic orderings
 /// plus barrier-overlapped transactions, exactly one winner throughout.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn seller_and_reaper_share_one_cas(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
 
@@ -1177,7 +1177,7 @@ async fn seller_and_reaper_share_one_cas(pool: PgPool) {
 // Condition 7 lifecycle and the omit-payment-update calibration
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn condition_seven_blocks_until_resolution_and_needs_the_payment_side(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1274,6 +1274,7 @@ async fn cas_removal_calibration_yields_duplicate_outcomes() {
         .connect_with(base.clone().database(&name))
         .await
         .expect("connect to scratch database");
+    common::restore_0032_retention_connlimit(&admin).await;
     // Full schema, then the backstops REMOVED (the calibration isolates
     // the CAS predicate's role).
     let migrations_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
@@ -1414,7 +1415,7 @@ async fn cas_removal_calibration_yields_duplicate_outcomes() {
 /// overlapping real transactions: the resolve either lands after the entry
 /// (and resolves) or before it (the named not_in_manual_review, with the
 /// seller free to retry) — never a double outcome, never a lost one.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn resolution_racing_the_late_observer_is_consistent(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     // Deterministic orderings.
@@ -1561,7 +1562,7 @@ async fn resolution_racing_the_late_observer_is_consistent(pool: PgPool) {
 // Nothing un-pays an already-paid order
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn no_path_unpays_a_paid_order(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     // An exclusive order paid the ordinary way, then a resolve attempt:
@@ -1704,7 +1705,7 @@ async fn naive_resolution_write(
 
 /// A drop-stamped order late-paid: reacquisition re-debits the drop only
 /// when units remain; an exhausted drop is the named `stock_unavailable`.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
     let (app, _stripe, paykit, _ipn, _shippo, homeserver) = {
         let stripe = spawn_fake_stripe().await;
@@ -2038,7 +2039,7 @@ async fn auction_winning_order(
 /// Auction cells: the reservation is extended at entry and PRESERVED
 /// through manual_review; a paid resolution converts it; an abandoned one
 /// releases it. The lapsed-reservation entry class reacquires or 409s.
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
 

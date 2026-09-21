@@ -21,7 +21,7 @@ impl std::io::Write for Buffer {
     }
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn command_events_are_structured_and_privacy_safe(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;

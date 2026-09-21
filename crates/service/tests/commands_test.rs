@@ -18,7 +18,7 @@ use common::{
 };
 
 // TS case: "registers seller-owned inventory at revision one"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn registers_seller_owned_inventory_at_revision_one(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -42,7 +42,7 @@ async fn registers_seller_owned_inventory_at_revision_one(pool: PgPool) {
 }
 
 // TS case: "rejects registration by anyone other than the public listing seller"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_registration_by_non_seller(pool: PgPool) {
     let app = test_app(pool).await;
     let buyer = new_actor(&app).await;
@@ -64,7 +64,7 @@ async fn rejects_registration_by_non_seller(pool: PgPool) {
 }
 
 // TS case: "returns the exact stored result for an idempotent replay"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn returns_exact_stored_result_for_idempotent_replay(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -79,7 +79,7 @@ async fn returns_exact_stored_result_for_idempotent_replay(pool: PgPool) {
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM events").await, 1);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn checkout_fresh_and_legacy_replays_redact_delivery_address(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -118,7 +118,7 @@ async fn checkout_fresh_and_legacy_replays_redact_delivery_address(pool: PgPool)
 }
 
 // TS case: "rejects changed input under an already accepted command id"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_changed_input_under_accepted_command_id(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -140,7 +140,7 @@ async fn rejects_changed_input_under_accepted_command_id(pool: PgPool) {
 }
 
 // TS case: "allows exactly one of 100 concurrent buyers to reserve one unit"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn allows_exactly_one_of_100_concurrent_buyers_to_reserve_one_unit(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -190,7 +190,7 @@ async fn allows_exactly_one_of_100_concurrent_buyers_to_reserve_one_unit(pool: P
 }
 
 // TS case: "uses server time for reservation expiry"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn uses_server_time_for_reservation_expiry(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -213,7 +213,7 @@ async fn uses_server_time_for_reservation_expiry(pool: PgPool) {
 }
 
 // TS case: "rejects seller self-reservation and stale buyer revisions"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_seller_self_reservation_and_stale_revisions(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -237,7 +237,7 @@ async fn rejects_seller_self_reservation_and_stale_revisions(pool: PgPool) {
 }
 
 // TS case: "prevents a seller update from reducing total quantity below reservations"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn prevents_seller_update_reducing_quantity_below_reservations(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -258,7 +258,7 @@ async fn prevents_seller_update_reducing_quantity_below_reservations(pool: PgPoo
 }
 
 // TS case: "returns redacted validation issues for malformed commands"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn returns_redacted_validation_issues_for_malformed_commands(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -276,7 +276,7 @@ async fn returns_redacted_validation_issues_for_malformed_commands(pool: PgPool)
 
 // New in the Rust service: unsupported versions and unported command kinds
 // are rejected by the envelope contract (ADR-0019 §3).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_unsupported_versions_and_unported_kinds(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -299,7 +299,7 @@ async fn rejects_unsupported_versions_and_unported_kinds(pool: PgPool) {
 // inventory — the listing stays untouched at revision 1 (sandbox payment
 // advancement, where the hold is acquired, is covered in
 // post_purchase_test.rs and payment_holds_test.rs).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -369,7 +369,7 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
 // TS case: "rejects duplicate checkout lines, stale stock, self-purchase, and
 // invalid payment transitions" (the payment-transition half lives in
 // post_purchase_test.rs).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_duplicate_lines_self_purchase_stale_stock_and_oversell(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -415,7 +415,7 @@ async fn rejects_duplicate_lines_self_purchase_stale_stock_and_oversell(pool: Pg
 
 // TS case: checkout of a fully reserved listing is rejected as INVALID_STATE
 // with the state-specific truth — another buyer's hold may lapse and restock.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_checkout_of_a_reserved_listing(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -444,7 +444,7 @@ async fn rejects_checkout_of_a_reserved_listing(pool: PgPool) {
 
 // Server-time reservation expiry (slice requirement; the prototype engine
 // stores `expires_at` but never sweeps it — see README divergences).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn expires_due_reservations_and_releases_inventory(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -500,7 +500,7 @@ async fn expires_due_reservations_and_releases_inventory(pool: PgPool) {
 }
 
 // The released unit is purchasable again after expiry.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn released_inventory_is_purchasable_after_expiry(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -525,7 +525,7 @@ async fn released_inventory_is_purchasable_after_expiry(pool: PgPool) {
 // variant (id + at most three option dimensions) for fulfillment display.
 // The order line echoes it verbatim; variant-less checkouts stay
 // byte-identical to before the field existed.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn checkout_snapshots_the_variant_onto_the_order_line(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -574,7 +574,7 @@ async fn checkout_snapshots_the_variant_onto_the_order_line(pool: PgPool) {
 // Deployment boundary: `payment.sandbox_advance` must be rejected outright
 // when SANDBOX_PAYMENTS_ENABLED is off (the production default). The
 // client-side transport allowlist is not a security boundary; this is.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_sandbox_advance_when_sandbox_payments_disabled(pool: PgPool) {
     let mut config = marketplace_service::config::Config::for_tests();
     config.sandbox_payments_enabled = false;

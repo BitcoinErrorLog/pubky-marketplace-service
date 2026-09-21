@@ -1,5 +1,7 @@
 mod common;
 
+use std::borrow::Cow;
+
 use chrono::{Duration, Timelike, Utc};
 use marketplace_service::refusal_audit::{
     AuditKeys, CommandKind, RefusalAuditRuntime, RefusalKind, SurfaceKind,
@@ -12,6 +14,7 @@ use marketplace_service::{
     locks::LocksRuntime,
     AppState,
 };
+use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
@@ -19,11 +22,24 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
-static WRITER_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
 static ADMIN_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
+static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
+
+fn migrator_through(version: i64) -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(
+            ALL_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= version)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    }
+}
 
 type AttackBucketRow = (i16, i64, Vec<u8>, bool, Option<Vec<u8>>);
 
@@ -157,19 +173,16 @@ struct ActualWriterFixture {
     runtime: Arc<RefusalAuditRuntime>,
     pool: PgPool,
     keys: AuditKeys,
-    login_guard: Option<MutexGuard<'static, ()>>,
+    login: Option<common::RefusalAuditWriterLogin>,
 }
 
 impl Drop for ActualWriterFixture {
     fn drop(&mut self) {
         let pool = self.pool.clone();
-        let login_guard = self
-            .login_guard
-            .take()
-            .expect("writer fixture guard is present");
+        let login = self.login.take();
         tokio::spawn(async move {
             pool.close().await;
-            drop(login_guard);
+            drop(login);
         });
     }
 }
@@ -275,38 +288,12 @@ async fn insert_bucket(
 }
 
 async fn actual_writer_fixture(pool: &PgPool) -> ActualWriterFixture {
-    let login_guard = WRITER_LOGIN_FIXTURE.lock().await;
-    let database: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(pool)
-        .await
-        .expect("database name");
-    let password = format!("test-only-{}", Uuid::new_v4());
-    sqlx::query(&format!(
-        "ALTER ROLE marketplace_refusal_audit_writer_login PASSWORD '{}'",
-        password.replace('\'', "''")
-    ))
-    .execute(pool)
-    .await
-    .expect("set isolated test login password");
-    let quoted_database = format!("\"{}\"", database.replace('"', "\"\""));
-    sqlx::query(&format!(
-        "GRANT CONNECT ON DATABASE {quoted_database} TO marketplace_refusal_audit_writer_login"
-    ))
-    .execute(pool)
-    .await
-    .expect("grant test database connect");
-    let url = format!(
-        "postgres://marketplace_refusal_audit_writer_login:{}@localhost:5432/{}",
-        password, database
-    );
-    let writer_pool = PgPoolOptions::new()
-        .max_connections(2)
-        .min_connections(0)
-        .acquire_timeout(StdDuration::from_millis(100))
-        .idle_timeout(Some(StdDuration::from_secs(60)))
-        .connect(&url)
-        .await
-        .expect("actual writer login connects");
+    let login = common::claim_refusal_audit_writer_login(pool).await;
+    let writer_pool = common::pool_with_limit(
+        &login.url,
+        marketplace_service::refusal_audit::WRITER_POOL_MAX_CONNECTIONS,
+    )
+    .await;
     let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8; 32]);
     let keys = AuditKeys::parse(&root, "1", None, None).expect("keys");
     let runtime = Arc::new(RefusalAuditRuntime::spawn(
@@ -319,7 +306,7 @@ async fn actual_writer_fixture(pool: &PgPool) -> ActualWriterFixture {
                 runtime,
                 pool: writer_pool,
                 keys,
-                login_guard: Some(login_guard),
+                login: Some(login),
             };
         }
         tokio::time::sleep(StdDuration::from_millis(10)).await;
@@ -327,7 +314,7 @@ async fn actual_writer_fixture(pool: &PgPool) -> ActualWriterFixture {
     panic!("online least-authority probe did not become ready");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_summary_is_actor_aggregated_and_access_audited(pool: PgPool) {
     let now = hour(Utc::now());
     insert_bucket(&pool, now - Duration::hours(2), 1, 2).await;
@@ -354,7 +341,7 @@ async fn refusal_audit_summary_is_actor_aggregated_and_access_audited(pool: PgPo
     assert_eq!(access_count, 1, "operator read must be audited first");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_operator_quota_is_bounded_and_fail_closed(pool: PgPool) {
     let day = Utc::now()
         .date_naive()
@@ -402,7 +389,7 @@ async fn refusal_audit_operator_quota_is_bounded_and_fail_closed(pool: PgPool) {
     assert_eq!(overflow, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_operator_cursor_is_validated_and_keyset(pool: PgPool) {
     let now = hour(Utc::now());
     insert_bucket(&pool, now - Duration::hours(3), 1, 1).await;
@@ -489,7 +476,7 @@ async fn refusal_audit_operator_cursor_is_validated_and_keyset(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_objects_have_hardened_owners_and_acls(pool: PgPool) {
     let catalog: Vec<(i16, String)> =
         sqlx::query_as("SELECT id, name FROM command_refusal_kinds ORDER BY id")
@@ -535,8 +522,9 @@ async fn refusal_audit_objects_have_hardened_owners_and_acls(pool: PgPool) {
          AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls \
               OR rolinherit OR rolconnlimit <> CASE \
                 WHEN rolname = 'marketplace_refusal_audit_writer_login' THEN 2 \
-                WHEN rolname IN ('marketplace_refusal_audit_retention', \
-                  'marketplace_refusal_audit_admin_login') THEN 1 ELSE -1 END \
+                WHEN rolname = 'marketplace_refusal_audit_retention' THEN 2 \
+                WHEN rolname = 'marketplace_refusal_audit_admin_login' THEN 1 \
+                ELSE -1 END \
               OR rolcanlogin <> (rolname IN (\
                 'marketplace_refusal_audit_writer_login', 'marketplace_refusal_audit_retention', \
                 'marketplace_refusal_audit_admin_login')))",
@@ -694,7 +682,7 @@ fn refusal_audit_command_failure_formation_is_compile_closed() {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_default_public_execute_is_red_then_green_denied(pool: PgPool) {
     let role = format!("refusal_unprivileged_{}", Uuid::new_v4().simple());
     sqlx::query(&format!("CREATE ROLE \"{role}\" NOLOGIN NOINHERIT"))
@@ -827,7 +815,7 @@ async fn refusal_audit_default_public_execute_is_red_then_green_denied(pool: PgP
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_operator_roles_enforce_aggregate_and_raw_capabilities(pool: PgPool) {
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&pool)
@@ -895,7 +883,7 @@ async fn refusal_audit_operator_roles_enforce_aggregate_and_raw_capabilities(poo
     assert_eq!(access_actor, login);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_access_log_failure_prevents_operator_read(pool: PgPool) {
     let now = hour(Utc::now());
     insert_bucket(&pool, now - Duration::hours(1), 1, 5).await;
@@ -920,8 +908,17 @@ async fn refusal_audit_access_log_failure_prevents_operator_read(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrations = false)]
 async fn refusal_audit_migration_0032_direct_rerun_is_idempotent(pool: PgPool) {
+    common::restore_0032_retention_connlimit(&pool).await;
+    migrator_through(36)
+        .run(&pool)
+        .await
+        .expect("catalog through 0036");
+    sqlx::query("ALTER ROLE marketplace_refusal_audit_retention CONNECTION LIMIT 1")
+        .execute(&pool)
+        .await
+        .expect("restore 0032-era retention limit before 0032 rerun");
     sqlx::raw_sql(include_str!("../migrations/0032_refusal_audit.sql"))
         .execute(&pool)
         .await
@@ -937,10 +934,19 @@ async fn refusal_audit_migration_0032_direct_rerun_is_idempotent(pool: PgPool) {
     assert_eq!(counts, (2, 35, 37));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrations = false)]
 async fn refusal_audit_migration_least_authority_rerun_is_blocked_without_admin_option(
     pool: PgPool,
 ) {
+    common::restore_0032_retention_connlimit(&pool).await;
+    migrator_through(36)
+        .run(&pool)
+        .await
+        .expect("catalog through 0036");
+    sqlx::query("ALTER ROLE marketplace_refusal_audit_retention CONNECTION LIMIT 1")
+        .execute(&pool)
+        .await
+        .expect("restore 0032-era retention limit before 0032 rerun");
     let role = format!("refusal_migrator_{}", Uuid::new_v4().simple());
     sqlx::query(&format!(
         "CREATE ROLE \"{role}\" LOGIN INHERIT NOSUPERUSER NOCREATEDB CREATEROLE \
@@ -976,7 +982,7 @@ async fn refusal_audit_migration_least_authority_rerun_is_blocked_without_admin_
         .expect("reset migration role");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_retention_is_oldest_first_bounded_and_resumable(pool: PgPool) {
     let now = hour(Utc::now());
     let holder_a = Uuid::new_v4();
@@ -1074,7 +1080,7 @@ async fn refusal_audit_retention_is_oldest_first_bounded_and_resumable(pool: PgP
     .expect("retention lease recovers"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_retention_registry_bounds_access_tables(pool: PgPool) {
     let now = hour(Utc::now());
     let day = now - Duration::days(31);
@@ -1124,7 +1130,7 @@ async fn refusal_audit_retention_registry_bounds_access_tables(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_retention_actual_login_is_probed_before_purge(pool: PgPool) {
     let now = hour(Utc::now());
     insert_bucket(&pool, now - Duration::days(31), 1, 1).await;
@@ -1165,7 +1171,7 @@ async fn refusal_audit_retention_actual_login_is_probed_before_purge(pool: PgPoo
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_rotation_verifies_old_epoch_until_destroyed(pool: PgPool) {
     let previous_root =
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
@@ -1253,7 +1259,7 @@ async fn refusal_audit_rotation_verifies_old_epoch_until_destroyed(pool: PgPool)
     assert!(keys.assert_database_epochs_supported(&pool).await.is_err());
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_admin_path_erases_actor_and_gates_key_destruction(pool: PgPool) {
     use marketplace_service::refusal_audit_admin::{run, AdminConfig, AdminOperation};
     use std::io::Cursor;
@@ -1400,12 +1406,15 @@ async fn refusal_audit_admin_path_erases_actor_and_gates_key_destruction(pool: P
         .contains("authority verification failed"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_uses_separate_least_privilege_pool(pool: PgPool) {
     let writer = actual_writer_fixture(&pool).await;
     let runtime = &writer.runtime;
     let writer_pool = &writer.pool;
-    assert_eq!(writer_pool.options().get_max_connections(), 2);
+    assert_eq!(
+        writer_pool.options().get_max_connections(),
+        marketplace_service::refusal_audit::WRITER_POOL_MAX_CONNECTIONS
+    );
     assert_eq!(writer_pool.options().get_min_connections(), 0);
     assert_eq!(
         writer_pool.options().get_acquire_timeout(),
@@ -1473,7 +1482,7 @@ async fn refusal_audit_uses_separate_least_privilege_pool(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_writer_identity_mismatch_blocks_readiness_and_drops_delivery(pool: PgPool) {
     let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8; 32]);
     let keys = AuditKeys::parse(&root, "1", None, None).expect("keys");
@@ -1509,7 +1518,7 @@ async fn refusal_audit_writer_identity_mismatch_blocks_readiness_and_drops_deliv
     assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_writer_failure_never_changes_command_outcome(pool: PgPool) {
     let app = common::test_app(pool.clone()).await;
     let actor = common::new_actor(&app).await;
@@ -1538,19 +1547,15 @@ async fn refusal_audit_writer_failure_never_changes_command_outcome(pool: PgPool
     assert_eq!(outcomes, 0);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_exhausted_writer_pool_never_starves_domain_pool(pool: PgPool) {
     let writer = actual_writer_fixture(&pool).await;
     let runtime = &writer.runtime;
     let writer_pool = &writer.pool;
-    let held_one = writer_pool
+    let held_writer = writer_pool
         .acquire()
         .await
-        .expect("first writer connection");
-    let held_two = writer_pool
-        .acquire()
-        .await
-        .expect("second writer connection");
+        .expect("only writer slot on a pool of 1");
     let app = common::test_app(pool.clone()).await;
     let seller = common::new_actor(&app).await;
     let bidder = common::new_actor(&app).await;
@@ -1595,10 +1600,10 @@ async fn refusal_audit_exhausted_writer_pool_never_starves_domain_pool(pool: PgP
     let metrics = runtime.metrics();
     assert!(metrics.retries_acquire_timeout >= 3);
     assert!(metrics.dropped_after_retries >= 1);
-    drop((held_one, held_two));
+    drop(held_writer);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_ambiguous_commit_is_not_retried_and_discards_connection(pool: PgPool) {
     sqlx::raw_sql(
         "CREATE FUNCTION terminate_refusal_writer_on_commit() RETURNS trigger \
@@ -1647,7 +1652,7 @@ async fn refusal_audit_ambiguous_commit_is_not_retried_and_discards_connection(p
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_writer_panic_restarts_and_flushes_gap(pool: PgPool) {
     let writer = actual_writer_fixture(&pool).await;
     let runtime = &writer.runtime;
@@ -1703,7 +1708,7 @@ async fn refusal_audit_writer_panic_restarts_and_flushes_gap(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_identity_spoof_and_command_id_attacks_do_not_change_bucket_keys(
     pool: PgPool,
 ) {
@@ -1771,7 +1776,7 @@ async fn refusal_audit_identity_spoof_and_command_id_attacks_do_not_change_bucke
     }
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_concurrent_delivery_obeys_bounds(pool: PgPool) {
     let writer = actual_writer_fixture(&pool).await;
     let runtime = &writer.runtime;
@@ -1826,7 +1831,7 @@ async fn refusal_audit_concurrent_delivery_obeys_bounds(pool: PgPool) {
     assert_eq!(occurrences, 200);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_forbidden_plaintext_inverse_scan(pool: PgPool) {
     let writer = actual_writer_fixture(&pool).await;
     let runtime = &writer.runtime;
@@ -1895,7 +1900,7 @@ async fn refusal_audit_forbidden_plaintext_inverse_scan(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_manual_resolve_missing_pin_is_recorded_after_domain_release(pool: PgPool) {
     use common::paykit_review::{into_manual_review_held, resolve_call};
 
@@ -1941,7 +1946,7 @@ async fn refusal_audit_manual_resolve_missing_pin_is_recorded_after_domain_relea
     panic!("manual-resolution refusal was not recorded");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_enqueue_happens_after_domain_rollback_release(pool: PgPool) {
     let seller_key = common::random_keypair();
     let seller_pubky = seller_key.1.clone();
@@ -2065,7 +2070,7 @@ async fn refusal_audit_enqueue_happens_after_domain_rollback_release(pool: PgPoo
     panic!("rollback-first refusal was not delivered after connection release");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_d26_2_precedence_and_personal_minimum_categories_are_exact(pool: PgPool) {
     let mut app = common::test_app(pool.clone()).await;
     let writer = actual_writer_fixture(&pool).await;
@@ -2123,7 +2128,7 @@ async fn refusal_audit_d26_2_precedence_and_personal_minimum_categories_are_exac
     panic!("D26.2 refusal categories were not delivered");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPool) {
     use common::paykit_review::{bound_order, into_manual_review_held, into_manual_review_late};
 
@@ -2684,8 +2689,11 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     sqlx::raw_sql("DROP TRIGGER refusal_audit_timeout_fixture ON command_refusal_audit_buckets; DROP FUNCTION refusal_audit_timeout_fixture();")
         .execute(&pool).await.expect("remove timeout fixture");
 
-    let held_one = writer.pool.acquire().await.expect("first held writer");
-    let held_two = writer.pool.acquire().await.expect("second held writer");
+    let held_writer = writer
+        .pool
+        .acquire()
+        .await
+        .expect("only writer slot on a pool of 1");
     let exhausted_drops_before = writer.runtime.metrics().dropped_after_retries;
     for (case, expected) in cases.iter().zip(&golden) {
         let actual = tokio::time::timeout(
@@ -2714,7 +2722,7 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     })
     .await
     .expect("every exhausted envelope exhausts three attempts");
-    drop((held_one, held_two));
+    drop(held_writer);
 
     let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8; 32]);
     let failed_runtime = Arc::new(RefusalAuditRuntime::spawn(
@@ -2741,7 +2749,7 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_retention_outage_does_not_abort_domain_worker_pass(pool: PgPool) {
     use sqlx::postgres::PgConnectOptions;
 

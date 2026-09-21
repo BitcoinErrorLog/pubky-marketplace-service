@@ -34,7 +34,7 @@ const SENSITIVE_SNAPSHOT_COLUMNS: [(&str, &str); 2] = [
     ("expected_resource_hash", "text"),
 ];
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0029_adds_the_checkout_lock_snapshot(pool: PgPool) {
     let mut columns: Vec<(String,)> = sqlx::query_as(
         "SELECT column_name FROM information_schema.columns \

@@ -49,7 +49,7 @@ async fn seed_event(pool: &PgPool, aggregate: &str, seller: &str, revision: i64)
     event_id
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0034_enforces_inventory_evidence_constraints(pool: PgPool) {
     let seller = "y".repeat(52);
     let second_seller = "b".repeat(52);
@@ -174,7 +174,7 @@ async fn migration_0034_enforces_inventory_evidence_constraints(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0034_caps_conflicts_and_indexes_the_count_prefix(pool: PgPool) {
     let seller = "y".repeat(52);
     let aggregate = seed_listing(&pool, &seller, "bounded").await;
@@ -243,7 +243,7 @@ async fn migration_0034_caps_conflicts_and_indexes_the_count_prefix(pool: PgPool
 }
 
 #[test]
-fn migration_catalog_is_contiguous_through_0036() {
+fn migration_catalog_is_contiguous_through_0037() {
     let mut numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -254,5 +254,5 @@ fn migration_catalog_is_contiguous_through_0036() {
         })
         .collect();
     numbers.sort_unstable();
-    assert_eq!(numbers, (1..=36).collect::<Vec<_>>());
+    assert_eq!(numbers, (1..=37).collect::<Vec<_>>());
 }

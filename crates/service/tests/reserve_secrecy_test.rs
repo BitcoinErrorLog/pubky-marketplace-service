@@ -130,7 +130,7 @@ async fn listing_get(
     .await
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn seller_only_projection_and_all_non_seller_boundaries_remain_secret_after_close(
     pool: PgPool,
 ) {
@@ -253,7 +253,7 @@ async fn seller_only_projection_and_all_non_seller_boundaries_remain_secret_afte
     }
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn register_edit_uses_dual_cas_and_command_body_idempotency(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -348,7 +348,7 @@ async fn register_edit_uses_dual_cas_and_command_body_idempotency(pool: PgPool) 
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM events").await, 2);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn auction_sync_is_reserve_blind_mutation_free_and_rejects_public_reserve_keys(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -510,7 +510,7 @@ async fn auction_sync_is_reserve_blind_mutation_free_and_rejects_public_reserve_
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM events").await, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn two_same_base_reserve_edits_have_one_dual_cas_winner(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -576,7 +576,7 @@ async fn two_same_base_reserve_edits_have_one_dual_cas_winner(pool: PgPool) {
     assert_eq!(revisions, (2, 2));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn forbidden_reserve_edits_and_stale_aggregate_write_nothing(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -655,7 +655,7 @@ async fn forbidden_reserve_edits_and_stale_aggregate_write_nothing(pool: PgPool)
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM events").await, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn close_checks_secret_money_asset_and_missing_row_before_settlement(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -760,7 +760,7 @@ async fn close_checks_secret_money_asset_and_missing_row_before_settlement(pool:
     );
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reserve_cannot_be_added_after_null_or_changed_after_a_bid(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;

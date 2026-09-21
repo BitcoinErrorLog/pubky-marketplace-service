@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("database migrations applied");
     let audit_writer_options: PgConnectOptions = config.refusal_audit_database_url.parse()?;
     let audit_writer_pool = PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(marketplace_service::refusal_audit::WRITER_POOL_MAX_CONNECTIONS)
         .min_connections(0)
         .acquire_timeout(Duration::from_millis(100))
         .idle_timeout(Some(Duration::from_secs(60)))
@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     let audit_retention_options: PgConnectOptions =
         config.refusal_audit_retention_database_url.parse()?;
     let audit_retention_pool = PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(marketplace_service::refusal_audit::RETENTION_POOL_MAX_CONNECTIONS)
         .min_connections(0)
         .acquire_timeout(Duration::from_millis(100))
         .idle_timeout(Some(Duration::from_secs(60)))

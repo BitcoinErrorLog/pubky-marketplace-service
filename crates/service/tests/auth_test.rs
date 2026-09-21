@@ -28,7 +28,7 @@ async fn post_token(app: &TestApp, bytes: Vec<u8>) -> (StatusCode, Value) {
     result
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_valid_auth_token_mints_a_session(pool: PgPool) {
     let app = test_app(pool).await;
     let (keypair, pubky) = random_keypair();
@@ -54,7 +54,7 @@ async fn a_valid_auth_token_mints_a_session(pool: PgPool) {
     assert_eq!(stored, "/:rw");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_session_from_a_valid_token_authorizes_commands(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -65,7 +65,7 @@ async fn a_session_from_a_valid_token_authorizes_commands(pool: PgPool) {
     assert_eq!(body["ok"], json!(true));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_tampered_and_corrupted_tokens(pool: PgPool) {
     let app = test_app(pool).await;
     let (keypair, _) = random_keypair();
@@ -106,7 +106,7 @@ async fn rejects_tampered_and_corrupted_tokens(pool: PgPool) {
     assert_eq!(status, StatusCode::CREATED);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_replayed_token_is_rejected(pool: PgPool) {
     let app = test_app(pool).await;
     let (keypair, _) = random_keypair();
@@ -119,7 +119,7 @@ async fn a_replayed_token_is_rejected(pool: PgPool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "replay accepted: {body}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_expired_token_is_rejected_on_server_time(pool: PgPool) {
     let app = test_app(pool).await;
     let (keypair, _) = random_keypair();
@@ -137,7 +137,7 @@ async fn an_expired_token_is_rejected_on_server_time(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_token_from_the_future_is_rejected_on_server_time(pool: PgPool) {
     let app = test_app(pool).await;
     let (keypair, _) = random_keypair();
@@ -154,7 +154,7 @@ async fn a_token_from_the_future_is_rejected_on_server_time(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_token_for_pubky_a_cannot_act_as_pubky_b(pool: PgPool) {
     let app = test_app(pool).await;
     let alice = new_actor(&app).await;
@@ -173,7 +173,7 @@ async fn a_token_for_pubky_a_cannot_act_as_pubky_b(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sessions_expire_on_server_time(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -187,7 +187,7 @@ async fn sessions_expire_on_server_time(pool: PgPool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn commands_require_a_bearer_session(pool: PgPool) {
     let app = test_app(pool).await;
     let (_, pubky) = random_keypair();
@@ -213,7 +213,7 @@ async fn commands_require_a_bearer_session(pool: PgPool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_challenge_endpoint_is_gone(pool: PgPool) {
     let app = test_app(pool).await;
     let (_, pubky) = random_keypair();
@@ -230,7 +230,7 @@ async fn the_challenge_endpoint_is_gone(pool: PgPool) {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn verified_capabilities_are_returned_and_stored_canonically(pool: PgPool) {
     let app = test_app(pool).await;
     let (keypair, pubky) = random_keypair();
@@ -264,7 +264,7 @@ async fn verified_capabilities_are_returned_and_stored_canonically(pool: PgPool)
     assert_eq!(stored, presented);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn health_and_readiness_endpoints_respond(pool: PgPool) {
     let app = test_app(pool).await;
 

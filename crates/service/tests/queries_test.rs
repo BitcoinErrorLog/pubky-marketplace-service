@@ -42,7 +42,7 @@ fn offer_with_id(seller_pubky: &str, command_id: &str) -> Value {
     command
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn listing_projection_is_public_catalog_data_for_authenticated_users(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -93,7 +93,7 @@ async fn listing_projection_is_public_catalog_data_for_authenticated_users(pool:
     assert_not_found(status, &body);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn auction_projection_exposes_the_leader_but_no_other_bidder_data(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -197,7 +197,7 @@ async fn auction_projection_exposes_the_leader_but_no_other_bidder_data(pool: Pg
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn offers_are_readable_only_by_their_participants(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -252,7 +252,7 @@ async fn offers_are_readable_only_by_their_participants(pool: PgPool) {
     assert_ne!(offers[0]["id"], offer_id);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn orders_and_payments_are_participant_scoped_and_redacted(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -371,7 +371,7 @@ async fn orders_and_payments_are_participant_scoped_and_redacted(pool: PgPool) {
     assert!(payment.get("locks_bundle_id").is_none());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn notifications_are_readable_only_by_their_recipient(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -418,7 +418,7 @@ async fn notifications_are_readable_only_by_their_recipient(pool: PgPool) {
     assert_eq!(notifications[0]["actor_pubky"], json!(other_buyer.pubky));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn list_limits_are_bounded_and_ordering_is_newest_first(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;

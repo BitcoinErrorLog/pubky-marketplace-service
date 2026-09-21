@@ -104,7 +104,7 @@ fn parcel_body() -> Value {
     json!({ "weight_grams": 900, "length_mm": 300, "width_mm": 200, "height_mm": 150 })
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn shipping_config_upserts_and_never_returns_the_token(pool: PgPool) {
     let (app, _shippo) = test_app_with_shippo(pool).await;
     let seller = new_actor(&app).await;
@@ -162,7 +162,7 @@ async fn shipping_config_upserts_and_never_returns_the_token(pool: PgPool) {
     assert_eq!(body["error"]["reason"], json!("invalid_ship_from"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rates_are_quoted_with_the_sellers_token_and_real_order_address(pool: PgPool) {
     let (app, shippo) = test_app_with_shippo(pool).await;
     let seller = new_actor(&app).await;
@@ -203,7 +203,7 @@ async fn rates_are_quoted_with_the_sellers_token_and_real_order_address(pool: Pg
     assert_eq!(requests[0]["parcels"][0]["length"], json!("30.0"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn label_purchase_stores_the_label_seller_only_and_is_idempotent(pool: PgPool) {
     let (app, shippo) = test_app_with_shippo(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -282,7 +282,7 @@ async fn label_purchase_stores_the_label_seller_only_and_is_idempotent(pool: PgP
     }
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn processing_allows_shipping_disclosures_and_denied_states_redact_label(pool: PgPool) {
     let (app, shippo) = test_app_with_shippo(pool).await;
     let seller = new_actor(&app).await;
@@ -378,7 +378,7 @@ async fn processing_allows_shipping_disclosures_and_denied_states_redact_label(p
     assert_eq!(status, StatusCode::CONFLICT, "pickup cached label");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn shippo_failures_surface_honestly(pool: PgPool) {
     let (app, shippo) = test_app_with_shippo(pool).await;
     let seller = new_actor(&app).await;
@@ -405,7 +405,7 @@ async fn shippo_failures_surface_honestly(pool: PgPool) {
     assert!(!body.to_string().contains("Insufficient funds"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn shipping_requires_a_paid_order(pool: PgPool) {
     let (app, shippo) = test_app_with_shippo(pool).await;
     let seller = new_actor(&app).await;
@@ -428,7 +428,7 @@ async fn shipping_requires_a_paid_order(pool: PgPool) {
     assert_eq!(body["error"]["reason"], json!("not_shippable"));
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn shipping_requires_seller_configuration(pool: PgPool) {
     let (app, shippo) = test_app_with_shippo(pool).await;
     let seller = new_actor(&app).await;

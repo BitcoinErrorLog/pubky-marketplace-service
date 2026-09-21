@@ -56,7 +56,7 @@ async fn notification_types(app: &TestApp, token: &str) -> Vec<String> {
 // "Only a payment locks an item": an unpaid order with no payment activity
 // holds nothing, so cancelling it releases nothing — the CHECK-constrained
 // quantity ledger never moves and never goes negative.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancelling_an_unheld_pending_order_releases_nothing(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -95,7 +95,7 @@ async fn cancelling_an_unheld_pending_order_releases_nothing(pool: PgPool) {
 // acquired the hold, so the immediate cancel releases it exactly once — the
 // replay proves the "once": the stored result comes back without
 // re-executing the release.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancels_a_held_unpaid_order_and_releases_the_hold_once(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -178,7 +178,7 @@ async fn cancels_a_held_unpaid_order_and_releases_the_hold_once(pool: PgPool) {
 // returns the sold quantities to available (the listing machine's
 // sold -> available transition). The confirmed payment and its receipt are
 // never discarded — the money path out is refund.record_external.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn approves_cancellation_of_a_paid_order_without_discarding_the_payment(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -319,7 +319,7 @@ async fn approves_cancellation_of_a_paid_order_without_discarding_the_payment(po
 // New in the Rust service: role scoping. Only the buyer requests, only the
 // seller approves, and a non-participant is refused outright (403), never
 // handed an empty or not-found answer that hides the refusal.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn enforces_cancellation_roles_and_refuses_non_participants(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -376,7 +376,7 @@ async fn enforces_cancellation_roles_and_refuses_non_participants(pool: PgPool) 
 // New in the Rust service: ineligible states and stale revisions. A shipped
 // order can no longer be cancelled, approval without a pending request is
 // refused, and a stale cancel conflicts with the current revision.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refuses_cancellation_in_ineligible_states_and_on_stale_revisions(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -448,7 +448,7 @@ async fn refuses_cancellation_in_ineligible_states_and_on_stale_revisions(pool: 
 // New in the Rust service: cancellation is terminal for the purchase. A
 // cancelled order refuses payment confirmation, fulfillment, returns, and a
 // second cancellation.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancelled_order_refuses_payment_fulfillment_and_return_commands(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -540,7 +540,7 @@ async fn cancelled_order_refuses_payment_fulfillment_and_return_commands(pool: P
 
 // New in the Rust service: an auction winner's unpaid order releases the
 // winning hold through the reservation compare-and-swap.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancels_an_auction_winners_unpaid_order_and_releases_the_hold(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -610,7 +610,7 @@ async fn cancels_an_auction_winners_unpaid_order_and_releases_the_hold(pool: PgP
 // New in the Rust service: when the winner's 30-minute hold has already
 // lapsed on server time, the expiry sweep returned the unit — the cancel
 // still succeeds but must not release the same unit twice.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancelling_after_the_hold_lapsed_does_not_release_twice(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;

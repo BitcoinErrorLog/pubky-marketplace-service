@@ -82,7 +82,7 @@ impl HomeserverListingClient for MutatingListingSnapshotSource {
 }
 
 // TS case: "supports private offer, counteroffer, and atomic acceptance history"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn supports_private_offer_counteroffer_and_atomic_acceptance_history(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -173,7 +173,7 @@ async fn supports_private_offer_counteroffer_and_atomic_acceptance_history(pool:
 }
 
 // TS case: "enforces participant roles for counter, reject, and withdraw"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn enforces_participant_roles_for_counter_reject_and_withdraw(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -313,7 +313,7 @@ async fn accepted_offer_fixture(
     )
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn offer_checkout_transfers_the_accepted_hold_and_preserves_merchandise_terms(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -386,7 +386,7 @@ async fn offer_checkout_transfers_the_accepted_hold_and_preserves_merchandise_te
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn accepted_award_projection_totals_match_converted_order_for_participants(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -492,7 +492,7 @@ async fn accepted_award_projection_totals_match_converted_order_for_participants
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn offer_checkout_uses_injected_clock_and_longest_configured_hold_window(pool: PgPool) {
     let mut config = config_durable();
     config.locks_payment_window_seconds = 4_200;
@@ -528,7 +528,7 @@ async fn offer_checkout_uses_injected_clock_and_longest_configured_hold_window(p
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn offer_checkout_refuses_at_the_injected_award_deadline(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -552,7 +552,7 @@ async fn offer_checkout_refuses_at_the_injected_award_deadline(pool: PgPool) {
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 0);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn offer_checkout_refusal_contract_is_exact_and_refusals_do_not_write(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -650,7 +650,7 @@ async fn offer_checkout_refusal_contract_is_exact_and_refusals_do_not_write(pool
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 0);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn offer_checkout_success_replay_is_idempotent(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -690,7 +690,7 @@ async fn offer_checkout_success_replay_is_idempotent(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("AWARD_ALREADY_CONVERTED"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn offer_checkout_rejects_non_accepted_state_with_exact_contract(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -717,7 +717,7 @@ async fn offer_checkout_rejects_non_accepted_state_with_exact_contract(pool: PgP
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn expired_award_releases_inventory(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -763,7 +763,7 @@ async fn expired_award_releases_inventory(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("AWARD_EXPIRED"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn poisoned_award_does_not_roll_back_other_award_expiries(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -832,7 +832,7 @@ async fn poisoned_award_does_not_roll_back_other_award_expiries(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn offer_checkout_rejects_variant_mismatch_with_exact_contract(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -859,7 +859,7 @@ async fn offer_checkout_rejects_variant_mismatch_with_exact_contract(pool: PgPoo
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 0);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reservation_expiry_sweeps_only_generic_reservations(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -940,7 +940,7 @@ async fn reservation_expiry_sweeps_only_generic_reservations(pool: PgPool) {
     assert_eq!(final_quantities, (2, 0));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn legacy_accepted_offer_is_refused_as_unconvertible(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -975,7 +975,7 @@ async fn legacy_accepted_offer_is_refused_as_unconvertible(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_checkout_and_expiry_paths_complete_without_deadlock(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1044,7 +1044,7 @@ async fn concurrent_checkout_and_expiry_paths_complete_without_deadlock(pool: Pg
     assert_eq!(states.1 + states.2 + states.3, initial_total);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn award_expiry_retries_after_a_real_postgres_deadlock(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1123,7 +1123,7 @@ async fn award_expiry_retries_after_a_real_postgres_deadlock(pool: PgPool) {
     assert_eq!(state, "expired");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn award_expiry_worker_retries_when_it_is_the_deadlock_victim(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1227,7 +1227,7 @@ async fn award_expiry_worker_retries_when_it_is_the_deadlock_victim(pool: PgPool
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn changed_listing_snapshot_between_fetch_and_offer_lock_is_refused(pool: PgPool) {
     let source = Arc::new(MutatingListingSnapshotSource::new(
         pool.clone(),
@@ -1269,7 +1269,7 @@ async fn changed_listing_snapshot_between_fetch_and_offer_lock_is_refused(pool: 
     assert_eq!(state, "pending");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn raw_listing_snapshot_bounds_and_money_shape_are_refused(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -1464,7 +1464,7 @@ async fn raw_listing_snapshot_bounds_and_money_shape_are_refused(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn counter_offer_refreshes_negotiated_terms_from_the_homeserver(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -1517,7 +1517,7 @@ async fn counter_offer_refreshes_negotiated_terms_from_the_homeserver(pool: PgPo
 }
 
 // TS case: "supports rejection by the recipient and withdrawal by the current author"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn supports_rejection_by_recipient_and_withdrawal_by_current_author(pool: PgPool) {
     let app = test_app(pool).await;
 
@@ -1562,7 +1562,7 @@ async fn supports_rejection_by_recipient_and_withdrawal_by_current_author(pool: 
 }
 
 // TS case: "does not accept an offer after another buyer reserves the inventory"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn does_not_accept_offer_after_another_buyer_reserves_inventory(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1594,7 +1594,7 @@ async fn does_not_accept_offer_after_another_buyer_reserves_inventory(pool: PgPo
 }
 
 // TS case: "rejects actions after server-time offer expiry"
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_actions_after_server_time_offer_expiry(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1611,7 +1611,7 @@ async fn rejects_actions_after_server_time_offer_expiry(pool: PgPool) {
 }
 
 // Prototype createOffer semantics: the offer must use the listing asset.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_offers_in_a_different_asset_and_stale_listing_revisions(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1651,7 +1651,7 @@ async fn rejects_offers_in_a_different_asset_and_stale_listing_revisions(pool: P
 }
 
 // ADR-0019 §3 idempotency applies to every ported command.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn replays_offer_commands_idempotently(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1685,7 +1685,7 @@ async fn replays_offer_commands_idempotently(pool: PgPool) {
 // Offer notifications carry the offer amount (ADR-0019 §8: both parties
 // already read it on the offer projection). The counter carries the
 // countered amount; the acceptance carries the amount that was accepted.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn offer_notifications_carry_the_offer_amount(pool: PgPool) {
     use marketplace_service::clock::Clock;
     use marketplace_service::workers::drain_outbox;

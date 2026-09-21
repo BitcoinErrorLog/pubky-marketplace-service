@@ -31,6 +31,13 @@ pub const QUEUE_CAPACITY: usize = 4_096;
 pub const MAX_ADMITTED_ROWS_PER_HOUR: i32 = 10_000;
 pub const WRITER_LOGIN: &str = "marketplace_refusal_audit_writer_login";
 pub const RETENTION_LOGIN: &str = "marketplace_refusal_audit_retention";
+/// Per-replica writer pool cap. Role `CONNECTION LIMIT` stays 2 so two
+/// overlapping replicas (1+1) fit without a third leftover backend.
+pub const WRITER_POOL_MAX_CONNECTIONS: u32 = 1;
+pub const WRITER_LOGIN_CONN_LIMIT: i32 = 2;
+pub const RETENTION_POOL_MAX_CONNECTIONS: u32 = 1;
+/// First rolling image: require LIMIT 2 after 0037.
+pub const RETENTION_CONN_LIMIT_MIN: i32 = 2;
 const DELIVERY_ATTEMPTS: usize = 3;
 const DELIVERY_DEADLINE: Duration = Duration::from_millis(250);
 const CONNECTION_CLEANUP_DEADLINE: Duration = Duration::from_millis(50);
@@ -55,7 +62,7 @@ pub const fn deployment_metadata() -> RefusalAuditDeploymentMetadata {
         retention_days: RETENTION_DAYS,
         queue_capacity: QUEUE_CAPACITY,
         hourly_row_limit: MAX_ADMITTED_ROWS_PER_HOUR,
-        writer_pool_limit: 2,
+        writer_pool_limit: WRITER_POOL_MAX_CONNECTIONS,
         delivery_attempts: DELIVERY_ATTEMPTS,
         transaction_deadline_ms: 250,
         statement_deadline_ms: 200,
@@ -918,7 +925,7 @@ async fn retention_authority_probe(
         "SELECT session_user = $1 AND current_user = $1 \
          AND r.rolcanlogin AND NOT r.rolinherit AND NOT r.rolsuper \
          AND NOT r.rolcreatedb AND NOT r.rolcreaterole AND NOT r.rolreplication \
-         AND NOT r.rolbypassrls AND r.rolconnlimit = 1 \
+         AND NOT r.rolbypassrls AND r.rolconnlimit >= $2 \
          AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m WHERE m.member = r.oid) \
          AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c \
               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -937,6 +944,7 @@ async fn retention_authority_probe(
          FROM pg_catalog.pg_roles r WHERE r.rolname = session_user",
     )
     .bind(RETENTION_LOGIN)
+    .bind(RETENTION_CONN_LIMIT_MIN)
     .fetch_one(&mut **connection)
     .await?;
     if verified {
@@ -946,6 +954,18 @@ async fn retention_authority_probe(
             "refusal audit retention authority verification failed".into(),
         ))
     }
+}
+
+pub async fn probe_writer_authority(
+    connection: &mut PoolConnection<Postgres>,
+) -> Result<(), sqlx::Error> {
+    bounded_authority_probe(connection).await
+}
+
+pub async fn probe_retention_authority(
+    connection: &mut PoolConnection<Postgres>,
+) -> Result<(), sqlx::Error> {
+    retention_authority_probe(connection).await
 }
 
 pub async fn purge_once(pool: &PgPool, reference_time: DateTime<Utc>) -> Result<i32, sqlx::Error> {
@@ -1482,7 +1502,17 @@ fn tag(key: &[u8; 32], input: Vec<u8>) -> anyhow::Result<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+
+    #[test]
+    fn refusal_audit_migration_0032_bytes_are_immutable() {
+        let bytes = include_bytes!("../migrations/0032_refusal_audit.sql");
+        assert_eq!(
+            hex::encode(Sha256::digest(bytes)),
+            "e771c5ef7bbbb04b571701710e0a6ed05eaf601165c473e82cabce552509eacf"
+        );
+    }
 
     #[test]
     fn refusal_audit_hkdf_hmac_vectors_are_stable_and_separated() {
@@ -1627,7 +1657,7 @@ mod tests {
                 .parse()
                 .unwrap();
         let pool = PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(WRITER_POOL_MAX_CONNECTIONS)
             .acquire_timeout(Duration::from_millis(5))
             .connect_lazy_with(options);
         let metrics = RefusalAuditMetrics::default();
@@ -1657,7 +1687,7 @@ mod tests {
                 .parse()
                 .unwrap();
         let pool = PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(WRITER_POOL_MAX_CONNECTIONS)
             .acquire_timeout(Duration::from_millis(5))
             .connect_lazy_with(options);
         let root = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
@@ -1712,7 +1742,7 @@ mod tests {
                 retention_days: 30,
                 queue_capacity: 4_096,
                 hourly_row_limit: 10_000,
-                writer_pool_limit: 2,
+                writer_pool_limit: WRITER_POOL_MAX_CONNECTIONS,
                 delivery_attempts: 3,
                 transaction_deadline_ms: 250,
                 statement_deadline_ms: 200,
@@ -1743,7 +1773,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrations = "./migrations")]
+    #[sqlx::test(migrator = "crate::TEST_MIGRATOR")]
     async fn refusal_audit_10000_row_concurrent_admission_bound(pool: PgPool) {
         let occurred_at = Utc::now();
         let bucket = occurred_at

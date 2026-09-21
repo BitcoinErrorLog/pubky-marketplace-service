@@ -21,7 +21,7 @@ use common::{
 
 // Reservation TTL 600 s, offer TTL 3600 s, auction ends at +600 s — all on
 // server time, drained by one worker pass per deadline.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn worker_expires_reservations_and_offers_and_closes_auctions_on_server_time(pool: PgPool) {
     let app = test_app(pool).await;
     let holder = Uuid::new_v4();
@@ -133,7 +133,7 @@ async fn worker_expires_reservations_and_offers_and_closes_auctions_on_server_ti
 
 // Two instances cannot hold the same task lease at the same time; the lease
 // is recoverable after it lapses.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn leases_exclude_concurrent_instances_and_lapse_over_time(pool: PgPool) {
     let app = test_app(pool).await;
     let instance_a = Uuid::new_v4();
@@ -191,7 +191,7 @@ async fn leases_exclude_concurrent_instances_and_lapse_over_time(pool: PgPool) {
 // A worker that claims outbox rows and dies mid-lease loses nothing: the
 // rows are redelivered by another instance after the claim lapses, exactly
 // once in effect.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn crashed_outbox_claim_is_recovered_without_loss_or_duplication(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -241,7 +241,7 @@ async fn crashed_outbox_claim_is_recovered_without_loss_or_duplication(pool: PgP
 // At-least-once delivery: a redelivered intent (lost acknowledgement) marks
 // the outbox row again but cannot duplicate the notification, which dedups
 // by (event id, recipient).
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn outbox_redelivery_does_not_duplicate_notification_effects(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -285,7 +285,7 @@ async fn outbox_redelivery_does_not_duplicate_notification_effects(pool: PgPool)
 
 // Offer and bid commands write their notification intents through the same
 // outbox, so one worker pass delivers them all.
-#[sqlx::test]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn worker_delivers_offer_and_auction_notifications(pool: PgPool) {
     let app = test_app(pool).await;
     let holder = Uuid::new_v4();
