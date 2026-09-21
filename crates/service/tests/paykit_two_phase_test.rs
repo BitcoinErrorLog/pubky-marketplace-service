@@ -49,11 +49,8 @@ async fn create_sat_order(app: &TestApp, seller: &TestActor, buyer: &TestActor) 
     // A unique SAT listing per call so sequential checkouts in one test
     // never collide with the 900s exclusive hold.
     let listing_id = format!("sat_{}", Uuid::new_v4().simple());
-    let command_number = u64::from_le_bytes(
-        Uuid::new_v4().as_bytes()[8..16]
-            .try_into()
-            .expect("uuid tail"),
-    );
+    // indexed_command_id pads the index to 12 decimal digits.
+    let command_number = (Uuid::new_v4().as_u128() % 1_000_000_000_000) as u64;
     let mut register = register_listing_command(&seller.pubky, &listing_id, 1, command_number);
     register["payload"]["unit_price"] =
         json!({ "amount_minor": 50_000, "currency": "SAT", "exponent": 0 });

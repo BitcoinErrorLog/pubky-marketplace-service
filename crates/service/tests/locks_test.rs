@@ -2782,6 +2782,7 @@ async fn listing_facts(pool: &PgPool, aggregate_id: &str) -> (String, i64, i64, 
 }
 
 /// The order hold facts a refusing prepare must never mutate.
+#[allow(dead_code)]
 async fn order_facts(
     pool: &PgPool,
     order_id: &str,
