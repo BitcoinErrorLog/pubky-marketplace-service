@@ -413,14 +413,17 @@ async fn wrong_verified_signer_is_terminal_without_an_identity_oracle_and_mints_
     assert_eq!(row, (true, true));
 }
 
+const INVENTORY_RW: &str = "/pub/pubky.app/marketplace-service/v1/:rw";
+const INVENTORY_R: &str = "/pub/pubky.app/marketplace-service/v1/:r";
+
 #[sqlx::test(migrations = "./migrations")]
 async fn grant_settle_with_shop_caps_opens_inventory(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool).await;
     let pubky = "y".repeat(52);
     let (_flow_id, bearer, stored) = authority
-        .settle_matching_grant(&app.state, &pubky, "/:rw")
+        .settle_matching_grant(&app.state, &pubky, INVENTORY_RW, INVENTORY_RW)
         .await;
-    assert_eq!(stored, "/:rw");
+    assert_eq!(stored, INVENTORY_RW);
     let token = URL_SAFE_NO_PAD.encode(bearer);
     let (status, body) = execute(&app, &token, &register_command(&pubky, 3)).await;
     assert_eq!(status, StatusCode::OK, "listing registration: {body}");
@@ -441,13 +444,9 @@ async fn grant_settle_with_insufficient_caps_is_not_widened(pool: sqlx::PgPool) 
     let (app, authority) = test_app_with_grant(pool).await;
     let pubky = "o".repeat(52);
     let (_flow_id, bearer, stored) = authority
-        .settle_matching_grant(
-            &app.state,
-            &pubky,
-            "/pub/pubky.app/marketplace-service/v1/:r",
-        )
+        .settle_matching_grant(&app.state, &pubky, INVENTORY_RW, INVENTORY_R)
         .await;
-    assert_eq!(stored, "/pub/pubky.app/marketplace-service/v1/:r");
+    assert_eq!(stored, INVENTORY_R);
     let token = URL_SAFE_NO_PAD.encode(bearer);
     let (status, body) = send(
         app.router,
@@ -459,6 +458,81 @@ async fn grant_settle_with_insufficient_caps_is_not_widened(pool: sqlx::PgPool) 
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"]["code"], json!("capability_required"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn grant_settle_forged_claims_cannot_mint_inventory_caps(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool).await;
+    let pubky = "f".repeat(52);
+    let (_flow_id, bearer, stored) = authority
+        .settle_matching_grant(&app.state, &pubky, INVENTORY_RW, "")
+        .await;
+    assert_eq!(stored, "");
+    let token = URL_SAFE_NO_PAD.encode(bearer);
+    let (status, body) = send(
+        app.router,
+        "GET",
+        &format!("/v1/inventory/listings/{}", listing_aggregate(&pubky)),
+        Some(&token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], json!("capability_required"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn grant_settle_wider_than_requested_is_rejected(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool).await;
+    let pubky = "w".repeat(52);
+    let (flow_id, applied, bearer, stored) = authority
+        .settle_grant_caps(&app.state, &pubky, INVENTORY_R, INVENTORY_RW)
+        .await;
+    assert!(applied);
+    assert!(bearer.is_none());
+    assert!(stored.is_none());
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0);
+    let (status, body) = send(
+        app.router,
+        "GET",
+        &format!("/v1/auth/grant-flows/{flow_id}"),
+        None,
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body, json!({"status":"terminal"}));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn grant_settle_root_request_is_rejected(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool).await;
+    let pubky = "r".repeat(52);
+    let (flow_id, applied, bearer, stored) = authority
+        .settle_grant_caps(&app.state, &pubky, "/:rw", "/:rw")
+        .await;
+    assert!(applied);
+    assert!(bearer.is_none());
+    assert!(stored.is_none());
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0);
+    let (status, body) = send(
+        app.router,
+        "GET",
+        &format!("/v1/auth/grant-flows/{flow_id}"),
+        None,
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body, json!({"status":"terminal"}));
 }
 
 struct ProofInput<'a> {
