@@ -1,23 +1,24 @@
-import { defineRailway, preserve, project, service } from "railway/iac";
+import { defineRailway, image, preserve, project, service } from "railway/iac";
 
 // Last resort for a per-service CaC repo. Prefer one .railway file for the
 // project and drop this if you later combine services into that file.
 export const partial = "marketplace-service";
 
 const STAGING_PROJECT_ID = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed";
+const STAGING_ENVIRONMENT_ID = "c67a6435-bb23-453b-9169-764bfa0312e1";
 const PRODUCTION_PROJECT_ID = "75faa4fe-466c-4277-977f-1d8e4e31df8c";
+const PRODUCTION_ENVIRONMENT_ID = "404919ad-fb95-4621-9f45-b7f993dfa8ae";
+
+const STAGING_IMAGE =
+  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:b29e0c4f5c68a16c13459f32ffbf823cc50573243e33a2e4a44e82936e2ed65a";
+const PRODUCTION_IMAGE =
+  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:f3a691e262fab56da0da78289084cbc7c4f0748bb67a2f5a7bb70e681a94e587";
 
 const sharedServiceConfig = {
-  build: {
-    builder: "DOCKERFILE" as const,
-    dockerfilePath: "Dockerfile",
-  },
   deploy: {
     healthcheckPath: "/ready",
     healthcheckTimeout: 120,
     restartPolicyType: "ON_FAILURE" as const,
-    // Apply only after the 0037 image is SUCCESS. Dual-replica bound is
-    // healthcheckTimeout 120 + overlapSeconds 60 + drainingSeconds 15.
     overlapSeconds: 60,
     drainingSeconds: 15,
   },
@@ -51,13 +52,7 @@ const sharedEnv = {
   STRIPE_KEY_ENCRYPTION_KEY: preserve(),
 };
 
-const stagingEnv = {
-  ...sharedEnv,
-  AUTH_SESSION_TTL_SECONDS: preserve(),
-};
-
-const productionEnv = {
-  ...sharedEnv,
+const grantAndGatewayEnv = {
   GRANT_FLOW_ENCRYPTION_KEY_B64: preserve(),
   GRANT_FLOW_KEY_EPOCH: preserve(),
   GRANT_RESULT_HMAC_KEY_EPOCH: preserve(),
@@ -84,25 +79,56 @@ const productionEnv = {
   STRIPE_API_BASE: preserve(),
 };
 
+const stagingEnv = {
+  ...sharedEnv,
+  ...grantAndGatewayEnv,
+  AUTH_SESSION_TTL_SECONDS: preserve(),
+};
+
+const productionEnv = {
+  ...sharedEnv,
+  ...grantAndGatewayEnv,
+};
+
+function resolvedProjectId(ctx: { projectId?: string }): string | undefined {
+  return ctx.projectId ?? process.env.RAILWAY_PROJECT_ID;
+}
+
+function resolvedEnvironmentId(ctx: { environmentId?: string }): string | undefined {
+  return ctx.environmentId ?? process.env.RAILWAY_ENVIRONMENT_ID;
+}
+
 export default defineRailway((ctx) => {
-  const isProduction = ctx.projectId === PRODUCTION_PROJECT_ID;
-  const isStaging = ctx.projectId === STAGING_PROJECT_ID;
+  const projectId = resolvedProjectId(ctx);
+  const environmentId = resolvedEnvironmentId(ctx);
+  const isProduction = projectId === PRODUCTION_PROJECT_ID;
+  const isStaging = projectId === STAGING_PROJECT_ID;
   if (!isProduction && !isStaging) {
     throw new Error(
-      `Unknown Railway project ${ctx.projectId ?? "(none)"}. This file covers pubky-marketplace-staging (${STAGING_PROJECT_ID}) and pubky-marketplace-production (${PRODUCTION_PROJECT_ID}).`,
+      `Unknown Railway project ${projectId ?? "(none)"}. This file covers pubky-marketplace-staging (${STAGING_PROJECT_ID}) and pubky-marketplace-production (${PRODUCTION_PROJECT_ID}).`,
+    );
+  }
+  if (isStaging && environmentId && environmentId !== STAGING_ENVIRONMENT_ID) {
+    throw new Error(
+      `Refuse to evaluate the staging graph against environment ${environmentId}. Set RAILWAY_ENVIRONMENT_ID=${STAGING_ENVIRONMENT_ID}.`,
+    );
+  }
+  if (isProduction && environmentId && environmentId !== PRODUCTION_ENVIRONMENT_ID) {
+    throw new Error(
+      `Refuse to evaluate the production graph against environment ${environmentId}. Set RAILWAY_ENVIRONMENT_ID=${PRODUCTION_ENVIRONMENT_ID}.`,
     );
   }
 
   const marketplace_service = service("marketplace-service", {
     ...sharedServiceConfig,
-    env: isProduction ? productionEnv : stagingEnv,
-    // Staging custom host is CLI-attached. Rolling-deploys IaC must not omit
-    // this list or apply will delete it. Generated *.up.railway.app stays CLI.
+    source: image(isStaging ? STAGING_IMAGE : PRODUCTION_IMAGE),
+    env: isStaging ? stagingEnv : productionEnv,
+    // Staging custom host is CLI-attached. Omitting this list deletes it.
+    // Generated *.up.railway.app stays CLI.
     domains: isStaging ? ["staging-api.pubky.app"] : [],
   });
 
-  return project(
-    isProduction ? "pubky-marketplace-production" : "pubky-marketplace-staging",
-    { resources: [marketplace_service] },
-  );
+  return project(isStaging ? "pubky-marketplace-staging" : "pubky-marketplace-production", {
+    resources: [marketplace_service],
+  });
 });
