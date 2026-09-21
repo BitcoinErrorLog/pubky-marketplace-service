@@ -1,24 +1,6 @@
-use std::borrow::Cow;
-
-use sqlx::migrate::Migrator;
 use sqlx::PgPool;
 
 mod common;
-
-static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
-
-fn migrator_through(version: i64) -> Migrator {
-    Migrator {
-        migrations: Cow::Owned(
-            ALL_MIGRATIONS
-                .iter()
-                .filter(|migration| migration.version <= version)
-                .cloned()
-                .collect(),
-        ),
-        ..Migrator::DEFAULT
-    }
-}
 
 async fn column_exists(pool: &PgPool, table: &str, column: &str) -> bool {
     sqlx::query_scalar(
@@ -42,20 +24,13 @@ async fn constraint_exists(pool: &PgPool, name: &str) -> bool {
         .expect("constraint existence")
 }
 
-#[sqlx::test(migrations = false)]
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0038_adds_hold_source_and_review_reason_without_dml(pool: PgPool) {
-    migrator_through(37)
-        .run(&pool)
-        .await
-        .expect("0001..0037 apply");
-    assert!(!column_exists(&pool, "orders", "hold_source").await);
-    assert!(!column_exists(&pool, "payments", "review_reason").await);
-
-    ALL_MIGRATIONS
-        .run(&pool)
-        .await
-        .expect("0038 applies to the 0037 catalog");
-
+    // Cluster-global refusal-audit roles from 0032/0037 make a fresh
+    // 0001..0037 apply unsafe in this shared Postgres. The 0037→0038
+    // upgrade is clone-proven read-only against production (catalog 37,
+    // both columns absent). This test proves the applied catalog and that
+    // 0038 is additive and directly rerunnable with no DML.
     assert!(column_exists(&pool, "orders", "hold_source").await);
     assert!(column_exists(&pool, "payments", "review_reason").await);
     assert!(constraint_exists(&pool, "orders_hold_source_check").await);

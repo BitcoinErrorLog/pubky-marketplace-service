@@ -309,14 +309,17 @@ async fn a_prepared_row_survives_a_worker_pass_untouched(pool: PgPool) {
     let (status, body) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let mut payments = Vec::new();
-    for command_id in [
+    for (index, command_id) in [
         "00000000-0000-4000-8000-000000000100",
         "00000000-0000-4000-8000-000000000101",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (status, checkout) = execute(
             &app,
             &buyer.token,
-            &checkout_command_with_id(&seller.pubky, command_id),
+            &checkout_at_listing_revision(&seller.pubky, command_id, 1 + index as i64),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{checkout}");
@@ -2708,6 +2711,7 @@ async fn prepare_refuses_a_lock_document_with_a_swapped_creator(pool: PgPool) {
 /// prepare's snapshot and criterion checks pass and ONLY hold acquisition
 /// can fail. Returns the order and the two listing aggregate ids in line
 /// order.
+#[allow(dead_code)]
 async fn two_line_locks_order(
     app: &TestApp,
     seller: &TestActor,
@@ -2791,12 +2795,65 @@ async fn order_facts(
     .expect("order row exists")
 }
 
-// The rollback proof (Sol Wave 1A review round 3): a two-line order whose
-// FIRST line is available and SECOND line is sold out fails hold
-// acquisition only AFTER the first line's listing row was updated — and
-// the rollback leaves every listing, order, payment, correlation, and
-// outcome fact exactly as it was. (The round-cap cut removed the
-// commit-on-refusal path that could persist that partial mutation.)
+fn two_line_checkout_json(
+    command_id: &str,
+    listing_a: &str,
+    listing_b: &str,
+    rev_a: i64,
+    rev_b: i64,
+) -> Value {
+    json!({
+        "version": 1,
+        "command_id": command_id,
+        "aggregate_id": format!("checkout:{command_id}"),
+        "expected_revision": 0,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "checkout.create",
+        "payload": {
+            "lines": [
+                { "listing_aggregate_id": listing_a, "expected_revision": rev_a, "quantity": 1 },
+                { "listing_aggregate_id": listing_b, "expected_revision": rev_b, "quantity": 1 },
+            ],
+            "delivery_address": {
+                "name": "Alice Buyer",
+                "line1": "1 Market Street",
+                "line2": "",
+                "city": "New York",
+                "region": "NY",
+                "postal_code": "10001",
+                "country_code": "US",
+            },
+            "guarantee_policy_version": 1,
+        },
+    })
+}
+
+async fn mark_listing_held(pool: &PgPool, aggregate_id: &str) {
+    sqlx::query(
+        "UPDATE listings SET state = 'reserved', available_quantity = 0, reserved_quantity = 1, \
+         server_revision = server_revision + 1, updated_at = now() WHERE aggregate_id = $1",
+    )
+    .bind(aggregate_id)
+    .execute(pool)
+    .await
+    .expect("listing reserved");
+}
+
+async fn restock_held_listing(pool: &PgPool, aggregate_id: &str) {
+    sqlx::query(
+        "UPDATE listings SET state = 'available', available_quantity = 1, reserved_quantity = 0, \
+         server_revision = server_revision + 1, updated_at = now() WHERE aggregate_id = $1",
+    )
+    .bind(aggregate_id)
+    .execute(pool)
+    .await
+    .expect("listing restocks");
+}
+
+// Checkout now acquires the hold. A two-line cart whose SECOND line is
+// already reserved refuses before any listing mutation, and the rollback
+// leaves every listing, order, payment, correlation, and outcome fact
+// exactly as it was.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_failed_hold_acquisition_rolls_back_every_mutation(pool: PgPool) {
     let seller_key = common::random_keypair();
@@ -2820,54 +2877,51 @@ async fn a_failed_hold_acquisition_rolls_back_every_mutation(pool: PgPool) {
         pubky: seller_pubky,
     };
     let buyer = new_actor(&app).await;
-    let (order, listing_a, listing_b) = two_line_locks_order(
-        &app,
-        &seller,
-        &buyer,
-        &common::indexed_command_id(0x8004, 1),
-    )
-    .await;
+    for (listing_id, command_number) in [("boots_01", 1_u64), ("cap_01", 2)] {
+        let mut listing = register_listing_command(&seller.pubky, listing_id, 1, command_number);
+        listing["payload"]["digital_lock"] = json!({
+            "policyUri": resource,
+            "criterionId": "paykit",
+        });
+        let (status, body) = execute(&app, &seller.token, &listing).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let listing_a = format!("listing:{}_boots_01", seller.pubky);
+    let listing_b = format!("listing:{}_cap_01", seller.pubky);
+    mark_listing_held(&app.pool, &listing_b).await;
 
-    // Line two sells out before the buyer prepares (another buyer's hold
-    // took the unit): line one's listing stays available, so hold
-    // acquisition updates IT before failing on line two.
-    sqlx::query(
-        "UPDATE listings SET state = 'reserved', available_quantity = 0, reserved_quantity = 1, \
-         server_revision = server_revision + 1, updated_at = now() WHERE aggregate_id = $1",
-    )
-    .bind(&listing_b)
-    .execute(&app.pool)
-    .await
-    .expect("line two sells out");
-
-    // Every fact the refusing prepare must leave untouched.
     let listing_a_before = listing_facts(&app.pool, &listing_a).await;
     let listing_b_before = listing_facts(&app.pool, &listing_b).await;
-    let order_before = order_facts(&app.pool, &order.order_id).await;
-    let payment_before = payment_state(&app.pool, &order.payment_id).await;
 
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &common::prepare_locks_command(&order.payment_id, 640),
+        &two_line_checkout_json(
+            &common::indexed_command_id(0x8004, 1),
+            &listing_a,
+            &listing_b,
+            1,
+            listing_b_before.3,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["code"], json!("INSUFFICIENT_INVENTORY"));
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
     assert_eq!(
         body["error"]["message"],
-        json!("The listing sold out before this payment started.")
+        json!("Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.")
     );
-
-    // The rollback: every fact is identical — no partial listing
-    // mutation, no order hold, no payment advance, no correlation, no
-    // outcome row; the checkout snapshot is untouched.
     assert_eq!(listing_facts(&app.pool, &listing_a).await, listing_a_before);
     assert_eq!(listing_facts(&app.pool, &listing_b).await, listing_b_before);
-    assert_eq!(order_facts(&app.pool, &order.order_id).await, order_before);
     assert_eq!(
-        payment_state(&app.pool, &order.payment_id).await,
-        payment_before
+        count(&app.pool, "SELECT COUNT(*) FROM orders").await,
+        0,
+        "no order"
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payments").await,
+        0,
+        "no payment"
     );
     assert_eq!(
         count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
@@ -2881,7 +2935,7 @@ async fn a_failed_hold_acquisition_rolls_back_every_mutation(pool: PgPool) {
         )
         .await,
         0,
-        "no outcome row: refusal auditing is removed"
+        "no outcome row"
     );
     assert_eq!(
         count(
@@ -2889,36 +2943,42 @@ async fn a_failed_hold_acquisition_rolls_back_every_mutation(pool: PgPool) {
             "SELECT COUNT(*) FROM payment_locks_checkout_snapshots"
         )
         .await,
-        1,
-        "the checkout snapshot is untouched"
+        0,
+        "no checkout snapshot"
     );
 
-    // Restock line two: a fresh prepare succeeds, proving the refusal
-    // stranded nothing.
-    sqlx::query(
-        "UPDATE listings SET state = 'available', available_quantity = 1, reserved_quantity = 0, \
-         updated_at = now() WHERE aggregate_id = $1",
-    )
-    .bind(&listing_b)
-    .execute(&app.pool)
-    .await
-    .expect("line two restocks");
+    restock_held_listing(&app.pool, &listing_b).await;
+    let listing_b_restocked = listing_facts(&app.pool, &listing_b).await;
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &common::prepare_locks_command(&order.payment_id, 641),
+        &two_line_checkout_json(
+            &common::indexed_command_id(0x8004, 3),
+            &listing_a,
+            &listing_b,
+            listing_a_before.3,
+            listing_b_restocked.3,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "checkout after restock: {body}");
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&payment_id, 641),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "prepare after restock: {body}");
 }
 
-// The pool-exhaustion P1 re-proven under the round-cap cut: twenty-five
-// concurrent REFUSING commands against a pool capped at TWENTY
-// connections all complete — no acquisition timeout, no starvation — and
-// every one rolls back whole: NO outcome rows are written (refusal
-// auditing is removed) and NO partial listing mutation survives, even
-// though hold acquisition updates line one's listing before line two
-// fails. Afterwards a fresh prepare succeeds.
+// Twenty-five concurrent REFUSING checkouts against a pool capped at
+// TWENTY connections all complete — no acquisition timeout, no starvation —
+// and every one rolls back whole. Afterwards a fresh checkout+prepare
+// succeeds.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
     let seller_key = common::random_keypair();
@@ -2949,30 +3009,31 @@ async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
         pubky: seller_pubky,
     };
     let buyer = new_actor(&app).await;
-    let (order, listing_a, listing_b) = two_line_locks_order(
-        &app,
-        &seller,
-        &buyer,
-        &common::indexed_command_id(0x8004, 2),
-    )
-    .await;
-
-    // Line two is sold out: every prepare fails hold acquisition AFTER
-    // updating line one's listing row.
-    sqlx::query(
-        "UPDATE listings SET state = 'reserved', available_quantity = 0, reserved_quantity = 1, \
-         server_revision = server_revision + 1, updated_at = now() WHERE aggregate_id = $1",
-    )
-    .bind(&listing_b)
-    .execute(&app.pool)
-    .await
-    .expect("line two sells out");
+    for (listing_id, command_number) in [("boots_01", 1_u64), ("cap_01", 2)] {
+        let mut listing = register_listing_command(&seller.pubky, listing_id, 1, command_number);
+        listing["payload"]["digital_lock"] = json!({
+            "policyUri": resource,
+            "criterionId": "paykit",
+        });
+        let (status, body) = execute(&app, &seller.token, &listing).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let listing_a = format!("listing:{}_boots_01", seller.pubky);
+    let listing_b = format!("listing:{}_cap_01", seller.pubky);
+    mark_listing_held(&app.pool, &listing_b).await;
+    let listing_b_rev = listing_facts(&app.pool, &listing_b).await.3;
 
     let mut tasks = Vec::new();
     for command_number in 600..625u64 {
         let router = app.router.clone();
         let token = buyer.token.clone();
-        let command = common::prepare_locks_command(&order.payment_id, command_number);
+        let command = two_line_checkout_json(
+            &common::indexed_command_id(0x8004, command_number),
+            &listing_a,
+            &listing_b,
+            1,
+            listing_b_rev,
+        );
         tasks.push(tokio::spawn(async move {
             send(router, "POST", "/v1/commands", Some(&token), &command).await
         }));
@@ -2980,15 +3041,9 @@ async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
     for task in tasks {
         let (status, body) = task.await.expect("command task joins");
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(
-            body["error"]["code"],
-            json!("INSUFFICIENT_INVENTORY"),
-            "{body}"
-        );
+        assert_eq!(body["error"]["code"], json!("INVALID_STATE"), "{body}");
     }
 
-    // Every refusing command rolled back whole: no audit rows, no
-    // correlation, no payment advance, and line one's listing untouched.
     assert_eq!(
         count(
             &app.pool,
@@ -2996,7 +3051,7 @@ async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
         )
         .await,
         0,
-        "refusal auditing is removed: refusing commands write no rows"
+        "refusing commands write no rows"
     );
     assert_eq!(
         count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
@@ -3008,25 +3063,35 @@ async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
         ("available".to_string(), 1, 0, 1),
         "no partial listing mutation: line one was never debited"
     );
-    let (state, adapter, revision) = payment_state(&app.pool, &order.payment_id).await;
-    assert_eq!(state, "awaiting_entitlement");
-    assert_ne!(adapter, "locks");
-    assert_eq!(revision, 1, "no refusing command advanced the payment");
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM orders").await,
+        0,
+        "no order survived the storm"
+    );
 
-    // Restock line two: a fresh prepare succeeds — the payment is still
-    // usable after the storm.
-    sqlx::query(
-        "UPDATE listings SET state = 'available', available_quantity = 1, reserved_quantity = 0, \
-         updated_at = now() WHERE aggregate_id = $1",
-    )
-    .bind(&listing_b)
-    .execute(&app.pool)
-    .await
-    .expect("line two restocks");
+    restock_held_listing(&app.pool, &listing_b).await;
+    let listing_b_restocked = listing_facts(&app.pool, &listing_b).await;
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &common::prepare_locks_command(&order.payment_id, 700),
+        &two_line_checkout_json(
+            &common::indexed_command_id(0x8004, 700),
+            &listing_a,
+            &listing_b,
+            1,
+            listing_b_restocked.3,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "checkout after the storm: {body}");
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&payment_id, 701),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "prepare after the storm: {body}");

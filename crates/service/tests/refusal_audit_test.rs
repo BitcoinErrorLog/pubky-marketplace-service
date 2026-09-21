@@ -1970,6 +1970,20 @@ async fn refusal_audit_enqueue_happens_after_domain_rollback_release(pool: PgPoo
     }
     let listing_a = format!("listing:{}_boots_01", seller.pubky);
     let listing_b = format!("listing:{}_cap_01", seller.pubky);
+    sqlx::query(
+        "UPDATE listings SET state='reserved', available_quantity=0, reserved_quantity=1, \
+         server_revision=server_revision+1, updated_at=clock_timestamp() WHERE aggregate_id=$1",
+    )
+    .bind(&listing_b)
+    .execute(&pool)
+    .await
+    .expect("second line reserved");
+    let listing_b_revision: i64 =
+        sqlx::query_scalar("SELECT server_revision FROM listings WHERE aggregate_id=$1")
+            .bind(&listing_b)
+            .fetch_one(&pool)
+            .await
+            .expect("listing b revision");
     let checkout_id = Uuid::new_v4();
     let checkout = serde_json::json!({
         "version": 1,
@@ -1981,7 +1995,7 @@ async fn refusal_audit_enqueue_happens_after_domain_rollback_release(pool: PgPoo
         "payload": {
             "lines": [
                 { "listing_aggregate_id": listing_a.clone(), "expected_revision": 1, "quantity": 1 },
-                { "listing_aggregate_id": listing_b.clone(), "expected_revision": 1, "quantity": 1 }
+                { "listing_aggregate_id": listing_b.clone(), "expected_revision": listing_b_revision, "quantity": 1 }
             ],
             "delivery_address": {
                 "name": "Alice Buyer", "line1": "1 Market Street", "line2": "",
@@ -1991,22 +2005,6 @@ async fn refusal_audit_enqueue_happens_after_domain_rollback_release(pool: PgPoo
             "guarantee_policy_version": 1
         }
     });
-    let (status, body) = common::execute(&app, &buyer.token, &checkout).await;
-    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-    let order_id = body["result"]["orders"][0]["id"]
-        .as_str()
-        .expect("order id");
-    let payment_id = body["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("payment id");
-    sqlx::query(
-        "UPDATE listings SET state='reserved', available_quantity=0, reserved_quantity=1, \
-         server_revision=server_revision+1, updated_at=clock_timestamp() WHERE aggregate_id=$1",
-    )
-    .bind(&listing_b)
-    .execute(&pool)
-    .await
-    .expect("second line sold out");
 
     let writer = actual_writer_fixture(&pool).await;
     let runtime = &writer.runtime;
@@ -2024,14 +2022,9 @@ async fn refusal_audit_enqueue_happens_after_domain_rollback_release(pool: PgPoo
     .fetch_one(&pool)
     .await
     .expect("domain facts before refusal");
-    let (status, body) = common::execute(
-        &app,
-        &buyer.token,
-        &common::prepare_locks_command(payment_id, 640),
-    )
-    .await;
+    let (status, body) = common::execute(&app, &buyer.token, &checkout).await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["code"], "INSUFFICIENT_INVENTORY");
+    assert_eq!(body["error"]["code"], "INVALID_STATE");
     let after: serde_json::Value = sqlx::query_scalar(
         "SELECT jsonb_build_object(\
           'listings',(SELECT jsonb_agg(row_to_json(x) ORDER BY aggregate_id) FROM listings x),\
@@ -2045,19 +2038,11 @@ async fn refusal_audit_enqueue_happens_after_domain_rollback_release(pool: PgPoo
     .await
     .expect("released domain connection is immediately reusable");
     assert_eq!(after, before, "the complete domain transaction rolled back");
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT state FROM orders WHERE id=$1::uuid")
-            .bind(order_id)
-            .fetch_one(&pool)
-            .await
-            .expect("order remains readable"),
-        "pending_payment"
-    );
     for _ in 0..100 {
         let count: i64 = sqlx::query_scalar(
             "SELECT COALESCE(sum(occurrence_count),0)::bigint \
              FROM command_refusal_audit_buckets \
-             WHERE surface_kind=1 AND command_kind=17 AND refusal_kind=7",
+             WHERE surface_kind=1 AND command_kind=7 AND refusal_kind=10",
         )
         .fetch_one(&pool)
         .await

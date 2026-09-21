@@ -598,12 +598,14 @@ async fn resolve_refuses_a_locks_manual_review(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "locks register failed: {body}");
-    // The window lapses, then the completion verifies late: manual_review.
-    let after_window = app.clock.now() + chrono::Duration::seconds(7300);
-    let expired = expire_due_payment_windows(&app.state, after_window)
+    // Payment expires while the checkout hold is still live: late money
+    // keeps `manual_review` / `late_settlement` and does not reacquire.
+    sqlx::query("UPDATE payments SET state = 'expired' WHERE id = $1::uuid")
+        .bind(&order.payment_id)
+        .execute(&pool)
         .await
-        .expect("sweep runs");
-    assert_eq!(expired, 1);
+        .expect("payment marked expired without releasing the hold");
+    let after_window = app.clock.now() + chrono::Duration::seconds(60);
     locks.set_outcome(
         TEST_BUNDLE_ID,
         marketplace_service::locks::LocksLookupOutcome::Status(
@@ -659,11 +661,11 @@ async fn resolve_refuses_a_paypal_manual_review(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind failed: {body}");
-    app.clock.advance_seconds(3700);
-    let expired = expire_due_payment_windows(&app.state, app.clock.now())
+    sqlx::query("UPDATE payments SET state = 'expired' WHERE order_id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&pool)
         .await
-        .expect("sweep runs");
-    assert_eq!(expired, 1);
+        .expect("payment marked expired without releasing the hold");
     let (status, body) = send(
         app.router.clone(),
         "POST",
@@ -724,11 +726,11 @@ async fn resolve_refuses_a_stripe_manual_review(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind failed: {body}");
-    app.clock.advance_seconds(3700);
-    let expired = expire_due_payment_windows(&app.state, app.clock.now())
+    sqlx::query("UPDATE payments SET state = 'expired' WHERE order_id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&pool)
         .await
-        .expect("sweep runs");
-    assert_eq!(expired, 1);
+        .expect("payment marked expired without releasing the hold");
     let total_minor: i64 = sqlx::query_scalar("SELECT total_minor FROM orders WHERE id = $1")
         .bind(Uuid::parse_str(&order.order_id).unwrap())
         .fetch_one(&pool)

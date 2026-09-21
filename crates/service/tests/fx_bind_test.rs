@@ -50,13 +50,14 @@ struct FxOrderFacts {
     paykit_observed_sats: Option<i64>,
     paykit_observation: Option<Value>,
     hold_expires_at: Option<DateTime<Utc>>,
+    hold_source: Option<String>,
 }
 
 async fn order_facts(pool: &PgPool, order_id: &str) -> FxOrderFacts {
     sqlx::query_as(
         "SELECT state, payment_method, stock_held, paykit_request_state, bitcoin_quoted_sats, \
          bitcoin_quote_source, bitcoin_quote_expires_at, paykit_total_sats, paykit_expires_at, \
-         paykit_observed_sats, paykit_observation, hold_expires_at FROM orders WHERE id = $1",
+         paykit_observed_sats, paykit_observation, hold_expires_at, hold_source FROM orders WHERE id = $1",
     )
     .bind(Uuid::parse_str(order_id).expect("order uuid"))
     .fetch_one(pool)
@@ -181,12 +182,29 @@ fn quoted_sats() -> u128 {
 
 fn assert_no_side_effects(facts: &FxOrderFacts, paykit: &FakePaykit, context: &str) {
     assert_eq!(facts.payment_method, None, "{context}: no method bound");
-    assert!(!facts.stock_held, "{context}: no inventory hold");
+    assert!(facts.stock_held, "{context}: checkout hold remains");
+    assert_eq!(
+        facts.hold_source.as_deref(),
+        Some("checkout"),
+        "{context}: bind refusal must not re-arm hold_source"
+    );
     assert_eq!(facts.bitcoin_quoted_sats, None, "{context}: no quote row");
     assert!(
         paykit.requests().is_empty(),
         "{context}: no Paykit request left the process"
     );
+}
+
+async fn restock_listing(pool: &PgPool, seller_pubky: &str) {
+    sqlx::query(
+        "UPDATE listings SET available_quantity = total_quantity, reserved_quantity = 0, \
+         sold_quantity = 0, state = 'available', server_revision = server_revision + 1 \
+         WHERE aggregate_id = $1",
+    )
+    .bind(listing_aggregate(seller_pubky))
+    .execute(pool)
+    .await
+    .expect("restock listing");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -850,6 +868,7 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
     );
 
     // A NULL frozen observation blocks the automatic refund entirely.
+    restock_listing(&pool, &fixture.seller.pubky).await;
     let order = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
     let (status, body) = bind_bitcoin(&fixture.app, &fixture.buyer.token, &order.order_id).await;
     assert_eq!(status, StatusCode::OK, "bind failed: {body}");
@@ -903,6 +922,7 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
     // is assigned at ENTRY (A1) and is single-assignment (the shared-manual
     // status-only refresh path).
     fixture.paykit.set_allocation_mode("shared_manual");
+    restock_listing(&pool, &fixture.seller.pubky).await;
     let order = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
     fixture.app.clock.set(now);
     let (status, body) = bind_bitcoin(&fixture.app, &fixture.buyer.token, &order.order_id).await;
