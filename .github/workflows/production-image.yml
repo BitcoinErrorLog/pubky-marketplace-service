@@ -1,0 +1,106 @@
+name: Production image
+
+on:
+  push:
+    branches:
+      - "cursor/marketplace-image-*"
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character git SHA to build (must be on origin/main)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-image-${{ github.event.inputs.source_sha || github.sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/bitcoinerrorlog/pubky-marketplace-service
+  SOURCE_SHA: ${{ github.event.inputs.source_sha || '2f844c1084c432d8dd6d7e66c320dcaeeb9eb02e' }}
+
+jobs:
+  publish:
+    name: Publish immutable production image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out exact source SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.source_sha || '2f844c1084c432d8dd6d7e66c320dcaeeb9eb02e' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Publish linux/amd64 image
+        env:
+          SOURCE_SHA: ${{ env.SOURCE_SHA }}
+        run: |
+          set -eu
+          case "$SOURCE_SHA" in
+            *[!0-9a-fA-F]*|'') echo "SOURCE_SHA must be hex" >&2; exit 1 ;;
+          esac
+          test "${#SOURCE_SHA}" -eq 40
+          test "$SOURCE_SHA" = "$(git rev-parse HEAD)"
+          git fetch -q origin main
+          git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main
+          test -f Dockerfile
+          metadata_file="$RUNNER_TEMP/production-image-push-metadata.json"
+          mkdir -p "$(dirname "$metadata_file")" "$RUNNER_TEMP/production-image"
+          docker buildx build \
+            --file Dockerfile \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.revision=$SOURCE_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/BitcoinErrorLog/pubky-marketplace-service" \
+            --tag "$IMAGE:sha-$SOURCE_SHA" \
+            --provenance=true \
+            --sbom=true \
+            --push \
+            --metadata-file "$metadata_file" \
+            .
+          digest="$(jq -r '."containerimage.digest" // empty' "$metadata_file")"
+          case "$digest" in sha256:*) ;; *) echo "missing image digest" >&2; exit 1 ;; esac
+          docker pull --platform linux/amd64 "$IMAGE@$digest"
+          revision="$(docker image inspect "$IMAGE@$digest" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+          arch="$(docker image inspect "$IMAGE@$digest" --format '{{.Architecture}}')"
+          test "$revision" = "$SOURCE_SHA"
+          test "$arch" = amd64
+          {
+            echo "### Published production image"
+            echo "- source SHA: \`$SOURCE_SHA\`"
+            echo "- platform: linux/amd64"
+            echo "- immutable image: \`$IMAGE@$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -n \
+            --arg immutable_image "$IMAGE@$digest" \
+            --arg digest "$digest" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg architecture "$arch" \
+            --slurpfile buildx_push_metadata "$metadata_file" \
+            '{
+              immutable_image: $immutable_image,
+              digest: $digest,
+              source_sha: $source_sha,
+              architecture: $architecture,
+              buildx_push_metadata: $buildx_push_metadata[0]
+            }' > "$RUNNER_TEMP/production-image/publish-evidence.json"
+
+      - name: Upload publish evidence
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: marketplace-service-production-image-publish-${{ env.SOURCE_SHA }}
+          path: ${{ runner.temp }}/production-image/publish-evidence.json
+          retention-days: 14
