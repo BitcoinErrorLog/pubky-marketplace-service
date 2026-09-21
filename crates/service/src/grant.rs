@@ -55,8 +55,34 @@ const RESULT_AAD_DOMAIN: &[u8] = b"marketplace/grant-flow-result/v1";
 const POP_DOMAIN: &str = "marketplace/grant-result-pop/v1";
 const RESULT_DENIED: &str = "result_denied";
 const GRANT_STATE_VERSION: u8 = 1;
+/// Same capability set Shop `POST /v1/auth/sessions` persists for a genuine
+/// AuthToken (`Capability::root()` → `/:rw`). Grant settle stores this only
+/// when the signed GrantClaims requested it (coverage). An empty requested
+/// list stays empty: design §3 empty-capability `signin_grant` is identity
+/// proof only and must not be widened.
+const SHOP_SIGNIN_CAPABILITIES: &str = "/:rw";
 
 type HmacSha256 = Hmac<Sha256>;
+
+fn shop_signin_capabilities() -> Capabilities {
+    SHOP_SIGNIN_CAPABILITIES
+        .parse()
+        .expect("shop sign-in capability string is canonical")
+}
+
+/// Persist the grant's requested caps, never a broader set. Shop sign-in
+/// `/:rw` is stored only when GrantClaims asked for that root grant.
+/// Empty requested caps stay empty (design §3 identity-only signin_grant).
+pub(crate) fn session_capabilities_for_grant(requested: &str) -> String {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return String::new();
+    }
+    let Ok(requested) = requested.parse::<Capabilities>() else {
+        return String::new();
+    };
+    requested.normalize().to_string()
+}
 
 #[derive(Clone, Debug)]
 pub struct GrantConfig {
@@ -800,13 +826,81 @@ pub mod test_support {
                 version: 1,
                 expires_at: now + Duration::seconds(300),
             };
-            let first = settle_verified(state, &self.runtime, &lease, approved_pubky, now)
+            let (first, _) = settle_verified(state, &self.runtime, &lease, approved_pubky, "", now)
                 .await
                 .expect("first settlement");
-            let replay = settle_verified(state, &self.runtime, &lease, approved_pubky, now)
-                .await
-                .expect("replay settlement");
+            let (replay, _) =
+                settle_verified(state, &self.runtime, &lease, approved_pubky, "", now)
+                    .await
+                    .expect("replay settlement");
             (flow_id, first, replay)
+        }
+
+        pub async fn settle_matching_grant(
+            &self,
+            state: &AppState,
+            pubky: &str,
+            requested_capabilities: &str,
+        ) -> (Uuid, [u8; 32], String) {
+            let flow_id = Uuid::new_v4();
+            let lease_owner = Uuid::new_v4();
+            let now = state.clock.now();
+            let cpk = "y".repeat(52);
+            sqlx::query(
+                "INSERT INTO grant_flows (flow_id,expected_pubky,assertion_jti,client_id,cpk,\
+                 relay_url,grant_state_sealed,key_epoch,result_hash_epoch,status,\
+                 version,lease_owner,lease_until,result_delivery_id_hash,result_cpk,created_at,expires_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,1,1,'verifying',1,$8,$9,$10,$11,$12,$13)",
+            )
+            .bind(flow_id)
+            .bind(pubky)
+            .bind(Uuid::new_v4())
+            .bind(&self.runtime.config.client_id)
+            .bind(&cpk)
+            .bind(self.runtime.config.relay_url.as_str())
+            .bind(vec![1u8; 80])
+            .bind(lease_owner)
+            .bind(now + Duration::seconds(30))
+            .bind(vec![2u8; 32])
+            .bind(&cpk)
+            .bind(now)
+            .bind(now + Duration::seconds(300))
+            .execute(&state.pool)
+            .await
+            .expect("seed verifying flow");
+            let lease = FlowLease {
+                flow_id,
+                expected_pubky: pubky.to_string(),
+                client_id: self.runtime.config.client_id.clone(),
+                cpk,
+                grant_state_sealed: vec![1u8; 80],
+                key_epoch: 1,
+                result_hash_epoch: 1,
+                result_cpk: "y".repeat(52),
+                lease_owner,
+                lease_until: now + Duration::seconds(30),
+                version: 1,
+                expires_at: now + Duration::seconds(300),
+            };
+            let (applied, bearer) = settle_verified(
+                state,
+                &self.runtime,
+                &lease,
+                pubky,
+                requested_capabilities,
+                now,
+            )
+            .await
+            .expect("matching settlement");
+            assert!(applied, "matching settlement must apply");
+            let bearer = bearer.expect("matching settlement mints a bearer");
+            let stored: String =
+                sqlx::query_scalar("SELECT capabilities FROM auth_sessions WHERE pubky = $1")
+                    .bind(pubky)
+                    .fetch_one(&state.pool)
+                    .await
+                    .expect("persisted grant session");
+            (flow_id, bearer, stored)
         }
     }
 }
@@ -1187,14 +1281,11 @@ pub async fn create_flow(
         Ok(client_id) => client_id,
         Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
     };
-    let flow = match PubkyGrantAuthFlow::builder(
-        &Capabilities::default(),
-        AuthFlowKind::signin(),
-        client_id,
-    )
-    .relay(runtime.config.relay_url.clone())
-    .client(runtime.client.clone())
-    .start()
+    let requested_caps = shop_signin_capabilities();
+    let flow = match PubkyGrantAuthFlow::builder(&requested_caps, AuthFlowKind::signin(), client_id)
+        .relay(runtime.config.relay_url.clone())
+        .client(runtime.client.clone())
+        .start()
     {
         Ok(flow) => flow,
         Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable"),
@@ -1618,6 +1709,7 @@ struct ResultFlowRow {
     key_epoch: i16,
     result_hash_epoch: i16,
     expected_pubky: String,
+    result_auth_session_id: Option<Uuid>,
 }
 
 fn flow_prefix(flow_id: Uuid) -> String {
@@ -1803,7 +1895,8 @@ pub async fn result_ticket(
     let row: Option<ResultFlowRow> = match sqlx::query_as(
         "SELECT status, result_delivery_id_hash, result_cpk, result_token_hash, \
          result_token_expires_at, result_token_delivered_at, result_payload_sealed, \
-         result_claimed_at, key_epoch, result_hash_epoch, expected_pubky \
+         result_claimed_at, key_epoch, result_hash_epoch, expected_pubky, \
+         result_auth_session_id \
          FROM grant_flows WHERE flow_id = $1 FOR UPDATE",
     )
     .bind(flow_id)
@@ -1940,7 +2033,8 @@ pub async fn claim_result(
     let row: Option<ResultFlowRow> = match sqlx::query_as(
         "SELECT status, result_delivery_id_hash, result_cpk, result_token_hash, \
          result_token_expires_at, result_token_delivered_at, result_payload_sealed, \
-         result_claimed_at, key_epoch, result_hash_epoch, expected_pubky \
+         result_claimed_at, key_epoch, result_hash_epoch, expected_pubky, \
+         result_auth_session_id \
          FROM grant_flows WHERE flow_id = $1 FOR UPDATE",
     )
     .bind(flow_id)
@@ -2003,6 +2097,19 @@ pub async fn claim_result(
         Ok(result) => result,
         Err(_) => return result_denied(flow_id, principal),
     };
+    let capabilities: String = match row.result_auth_session_id {
+        Some(session_id) => {
+            match sqlx::query_scalar("SELECT capabilities FROM auth_sessions WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await
+            {
+                Ok(Some(capabilities)) => capabilities,
+                _ => return result_denied(flow_id, principal),
+            }
+        }
+        None => String::new(),
+    };
     let consumed = match sqlx::query(
         "UPDATE grant_flows SET result_claimed_at = $2, result_token_hash = NULL, \
          result_payload_sealed = NULL WHERE flow_id = $1 AND status = 'complete' \
@@ -2023,7 +2130,7 @@ pub async fn claim_result(
         (
             StatusCode::OK,
             Json(json!({
-                "capabilities": "",
+                "capabilities": capabilities,
                 "expires_at": format_timestamp(result.session_expires_at),
                 "pubky": row.expected_pubky,
                 "token": URL_SAFE_NO_PAD.encode(result.bearer),
@@ -2412,8 +2519,9 @@ async fn complete_owned(
     runtime: &GrantRuntime,
     lease: &FlowLease,
     approved_pubky: &str,
+    capabilities: &str,
     now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, Option<[u8; 32]>)> {
     let mut bearer = [0u8; 32];
     let mut result_token = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bearer);
@@ -2444,14 +2552,15 @@ async fn complete_owned(
     .await?;
     if !owns {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok((false, None));
     }
     let session_id: Uuid = sqlx::query_scalar(
         "INSERT INTO auth_sessions (token_hash, pubky, capabilities, created_at, expires_at) \
-         VALUES ($1,$2,'',$3,$4) RETURNING session_id",
+         VALUES ($1,$2,$3,$4,$5) RETURNING session_id",
     )
     .bind(auth::hash_token(&bearer))
     .bind(approved_pubky)
+    .bind(capabilities)
     .bind(now)
     .bind(session_expires_at)
     .fetch_one(&mut *tx)
@@ -2476,10 +2585,10 @@ async fn complete_owned(
     .await?;
     if updated.rows_affected() != 1 {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok((false, None));
     }
     tx.commit().await?;
-    Ok(true)
+    Ok((true, Some(bearer)))
 }
 
 async fn settle_verified(
@@ -2487,10 +2596,11 @@ async fn settle_verified(
     runtime: &GrantRuntime,
     lease: &FlowLease,
     approved_pubky: &str,
+    requested_capabilities: &str,
     now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, Option<[u8; 32]>)> {
     if approved_pubky != lease.expected_pubky {
-        terminalize_owned(
+        let applied = terminalize_owned(
             state,
             lease,
             "mismatch",
@@ -2498,9 +2608,18 @@ async fn settle_verified(
             Some(approved_pubky),
             now,
         )
-        .await
+        .await?;
+        Ok((applied, None))
     } else {
-        complete_owned(state, runtime, lease, approved_pubky, now).await
+        complete_owned(
+            state,
+            runtime,
+            lease,
+            approved_pubky,
+            &session_capabilities_for_grant(requested_capabilities),
+            now,
+        )
+        .await
     }
 }
 
@@ -2626,6 +2745,9 @@ async fn process_lease(
             return Ok(());
         }
     };
+    let requested_capabilities = Capabilities::from(claims.caps.clone())
+        .normalize()
+        .to_string();
     let approved_pubky = claims.iss.z32();
     require_applied(
         enter_exchanging(
@@ -2709,9 +2831,11 @@ async fn process_lease(
                     runtime,
                     &lease,
                     &session.public_key().z32(),
+                    &requested_capabilities,
                     state.clock.now(),
                 )
-                .await?,
+                .await?
+                .0,
                 "settle",
                 lease.flow_id,
             )?;
@@ -2920,4 +3044,44 @@ pub fn spawn(state: AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod capability_persist_tests {
+    use super::{session_capabilities_for_grant, SHOP_SIGNIN_CAPABILITIES};
+
+    #[test]
+    fn empty_grant_stays_empty() {
+        assert_eq!(session_capabilities_for_grant(""), "");
+        assert_eq!(session_capabilities_for_grant("   "), "");
+    }
+
+    #[test]
+    fn shop_root_is_persisted() {
+        assert_eq!(
+            session_capabilities_for_grant(SHOP_SIGNIN_CAPABILITIES),
+            SHOP_SIGNIN_CAPABILITIES
+        );
+    }
+
+    #[test]
+    fn inventory_scope_is_not_widened_to_root() {
+        assert_eq!(
+            session_capabilities_for_grant("/pub/pubky.app/marketplace-service/v1/:rw"),
+            "/pub/pubky.app/marketplace-service/v1/:rw"
+        );
+    }
+
+    #[test]
+    fn insufficient_read_is_not_widened() {
+        assert_eq!(
+            session_capabilities_for_grant("/pub/pubky.app/marketplace-service/v1/:r"),
+            "/pub/pubky.app/marketplace-service/v1/:r"
+        );
+    }
+
+    #[test]
+    fn malformed_fails_closed() {
+        assert_eq!(session_capabilities_for_grant("not-a-capability"), "");
+    }
 }

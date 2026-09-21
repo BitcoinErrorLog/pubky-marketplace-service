@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use common::{send, test_app_with_grant, NOW};
+use common::{execute, listing_aggregate, register_command, send, test_app_with_grant, NOW};
 
 const RC55_CAPTURE_ATTESTATION_KEY: &str = "RJWeSyXMVeBbAFV_Q-FKGqipnh-JC65BII65MV-a894";
 
@@ -411,6 +411,54 @@ async fn wrong_verified_signer_is_terminal_without_an_identity_oracle_and_mints_
     .await
     .unwrap();
     assert_eq!(row, (true, true));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn grant_settle_with_shop_caps_opens_inventory(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool).await;
+    let pubky = "y".repeat(52);
+    let (_flow_id, bearer, stored) = authority
+        .settle_matching_grant(&app.state, &pubky, "/:rw")
+        .await;
+    assert_eq!(stored, "/:rw");
+    let token = URL_SAFE_NO_PAD.encode(bearer);
+    let (status, body) = execute(&app, &token, &register_command(&pubky, 3)).await;
+    assert_eq!(status, StatusCode::OK, "listing registration: {body}");
+    let aggregate = listing_aggregate(&pubky);
+    let (status, body) = send(
+        app.router,
+        "GET",
+        &format!("/v1/inventory/listings/{aggregate}"),
+        Some(&token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "inventory projection: {body}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn grant_settle_with_insufficient_caps_is_not_widened(pool: sqlx::PgPool) {
+    let (app, authority) = test_app_with_grant(pool).await;
+    let pubky = "o".repeat(52);
+    let (_flow_id, bearer, stored) = authority
+        .settle_matching_grant(
+            &app.state,
+            &pubky,
+            "/pub/pubky.app/marketplace-service/v1/:r",
+        )
+        .await;
+    assert_eq!(stored, "/pub/pubky.app/marketplace-service/v1/:r");
+    let token = URL_SAFE_NO_PAD.encode(bearer);
+    let (status, body) = send(
+        app.router,
+        "GET",
+        &format!("/v1/inventory/listings/{}", listing_aggregate(&pubky)),
+        Some(&token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], json!("capability_required"));
 }
 
 struct ProofInput<'a> {
