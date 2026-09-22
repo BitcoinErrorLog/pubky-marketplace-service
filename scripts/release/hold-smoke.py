@@ -549,10 +549,21 @@ class Smoke:
         status, resp = self.command(
             token,
             cancel_body(order_id, revision, reason),
-            allowed={200},
+            allowed={200, 409},
             case=f"cancel:{order_id}",
         )
         ok = isinstance(resp, dict) and resp.get("ok") is True
+        if status == 409 and isinstance(resp, dict):
+            message = ((resp.get("error") or {}).get("message") or "")
+            if "no longer be cancelled" in message:
+                cols_raw = sql(
+                    "SELECT stock_held::text, coalesce(hold_source,''), "
+                    "coalesce(hold_expires_at::text,''), state "
+                    f"FROM orders WHERE id='{quote(order_id)}'::uuid;"
+                )
+                hold = parse_hold_row(cols_raw)
+                if hold["state"] == "cancelled" and not hold["stock_held"]:
+                    return {"http": status, "state": hold["state"], "stock_held": False, "already_cancelled": True}
         if status != 200 or not ok:
             raise RuntimeError(f"cancel failed {status} {resp!r}")
         cols_raw = sql(
@@ -765,15 +776,6 @@ class Smoke:
                 )
             )
             shipping = refresh_listing(shipping["aggregate_id"])
-            self.cases.append(
-                self.one_buyer(
-                    shipping,
-                    fulfillment="shipping",
-                    address=SHIPPING_ADDRESSES["pt_empty_region"],
-                    case="shipping_pt_empty_region",
-                    expected_stored_region=EXPECTED_STORED_REGION["pt_empty_region"],
-                )
-            )
             pickup = refresh_listing(pickup["aggregate_id"])
             self.cases.append(
                 self.two_buyer(
@@ -782,6 +784,16 @@ class Smoke:
                     address=None,
                     case="pickup_two_buyer",
                     expected_stored_region=None,
+                )
+            )
+            shipping = refresh_listing(shipping["aggregate_id"])
+            self.cases.append(
+                self.one_buyer(
+                    shipping,
+                    fulfillment="shipping",
+                    address=SHIPPING_ADDRESSES["pt_empty_region"],
+                    case="shipping_pt_empty_region",
+                    expected_stored_region=EXPECTED_STORED_REGION["pt_empty_region"],
                 )
             )
             verified = self.verify_all_cancelled()
@@ -803,6 +815,22 @@ class Smoke:
                     self.cancel_order(row["token"], row["id"], "hold-smoke failure cleanup")
                 except Exception as error:  # noqa: BLE001
                     print(f"cancel_cleanup_error={row['id']}:{error}", file=sys.stderr)
+            print(
+                json.dumps(
+                    {
+                        "hold_smoke": "STOP",
+                        "shop_tag": SHOP_TAG,
+                        "shop_sha": SHOP_SHA,
+                        "marketplace_url": self.base,
+                        "cases_completed": self.cases,
+                        "created_orders": [{"id": row["id"], "case": row["case"]} for row in self.created_orders],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            print("HOLD_SMOKE=STOP")
             raise
         finally:
             if pickup_restore is not None:
