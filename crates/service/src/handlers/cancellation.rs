@@ -119,10 +119,22 @@ pub async fn request(
             }
         } else if order.stock_held {
             if let Err(failure) = credit_order_drop(tx, &order, now).await? {
-                return Ok(Err(failure));
+                if !legacy_null_expiry_unaccounted(&order, &failure) {
+                    return Ok(Err(failure));
+                }
+                tracing::warn!(
+                    order_id = %order.id,
+                    "legacy null-expiry hold: drop units unaccounted; still cancelling"
+                );
             }
             if let Err(failure) = release_lines(tx, &order, HeldQuantity::Reserved, now).await? {
-                return Ok(Err(failure));
+                if !legacy_null_expiry_unaccounted(&order, &failure) {
+                    return Ok(Err(failure));
+                }
+                tracing::warn!(
+                    order_id = %order.id,
+                    "legacy null-expiry hold: listing unaccounted; still cancelling"
+                );
             }
         }
     } else if unilateral {
@@ -234,6 +246,13 @@ pub async fn approve(
         now,
     )
     .await
+}
+
+/// Pre-#50 held rows can carry `stock_held` with a NULL window. Releasing
+/// them is best-effort: an unaccounted listing must not park the cancel in
+/// `cancel_requested`.
+fn legacy_null_expiry_unaccounted(order: &OrderRow, failure: &CommandFailure) -> bool {
+    order.hold_expires_at.is_none() && failure.code() == ErrorCode::InvariantViolation
 }
 
 /// Credits a drop-stamped order's units back to its drop before the listing

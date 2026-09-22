@@ -932,3 +932,148 @@ async fn bitcoin_exclusive_confirm_inside_window_pays(pool: PgPool) {
         .await
         .ok();
 }
+
+async fn listing_qty(pool: &PgPool, seller_pubky: &str) -> (i64, i64, i64, String) {
+    sqlx::query_as(
+        "SELECT available_quantity, reserved_quantity, sold_quantity, state \
+         FROM listings WHERE aggregate_id = $1",
+    )
+    .bind(listing_aggregate(seller_pubky))
+    .fetch_one(pool)
+    .await
+    .expect("listing")
+}
+
+async fn null_the_hold_window(pool: &PgPool, order_id: &str) {
+    sqlx::query("UPDATE orders SET hold_expires_at = NULL WHERE id = $1::uuid")
+        .bind(order_id)
+        .execute(pool)
+        .await
+        .expect("null the window");
+}
+
+/// Pre-#50: a held unpaid order with no `hold_expires_at` is already
+/// elapsed. The next worker tick restocks and cancels it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn legacy_null_expiry_hold_expires_on_the_next_worker_tick(pool: PgPool) {
+    let app = test_app(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    let (_, body) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id")
+        .to_string();
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &payment_command(&payment_id, 1, "detected", 0, 1_219),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        listing_qty(&app.pool, &seller.pubky).await,
+        (0, 1, 0, "reserved".to_string())
+    );
+    assert_eq!(
+        expire_due_payment_windows(&app.state, app.clock.now())
+            .await
+            .expect("armed window"),
+        0,
+        "a future hold_expires_at is not due at now"
+    );
+
+    null_the_hold_window(&app.pool, &order_id).await;
+    assert_eq!(
+        hold_row(&app.pool, &order_id).await,
+        (true, None, Some("sandbox".into()))
+    );
+
+    let expired = expire_due_payment_windows(&app.state, app.clock.now())
+        .await
+        .expect("null window is due");
+    assert_eq!(expired, 1);
+    let (state, stock_held, reason): (String, bool, Option<String>) = sqlx::query_as(
+        "SELECT state, stock_held, cancellation_reason FROM orders WHERE id = $1::uuid",
+    )
+    .bind(&order_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("order");
+    assert_eq!(state, "cancelled");
+    assert!(!stock_held);
+    assert_eq!(reason.as_deref(), Some("payment window elapsed"));
+    assert_eq!(
+        listing_qty(&app.pool, &seller.pubky).await,
+        (1, 0, 0, "available".to_string())
+    );
+}
+
+/// Pre-#50: buyer cancel of a held unpaid order with no window must land
+/// in `cancelled`, even when the listing no longer accounts the reserved
+/// unit — not hang in `cancel_requested`.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn legacy_null_expiry_hold_cancel_completes(pool: PgPool) {
+    let app = test_app(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    let (_, body) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id")
+        .to_string();
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &payment_command(&payment_id, 1, "detected", 0, 1_219),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    null_the_hold_window(&app.pool, &order_id).await;
+    sqlx::query(
+        "UPDATE listings SET available_quantity = 1, reserved_quantity = 0, state = 'available' \
+         WHERE aggregate_id = $1",
+    )
+    .bind(listing_aggregate(&seller.pubky))
+    .execute(&app.pool)
+    .await
+    .expect("unaccount the reserved unit");
+
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM orders WHERE id = $1::uuid")
+        .bind(&order_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("revision");
+    let (status, cancelled) = execute(
+        &app,
+        &buyer.token,
+        &order_command(
+            "order.cancel_request",
+            &order_id,
+            revision,
+            json!({ "reason": "Changed mind" }),
+            1_220,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cancel failed: {cancelled}");
+    assert_eq!(cancelled["result"]["order"]["state"], json!("cancelled"));
+    assert_ne!(
+        cancelled["result"]["order"]["state"],
+        json!("cancel_requested")
+    );
+    assert_eq!(
+        listing_qty(&app.pool, &seller.pubky).await,
+        (1, 0, 0, "available".to_string())
+    );
+}

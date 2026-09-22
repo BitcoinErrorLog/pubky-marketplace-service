@@ -2153,7 +2153,8 @@ pub async fn verify_due_paykit_payments(
 /// lock order), the payment moves to `expired` (the machine's
 /// `payment_window` edge from `awaiting_entitlement`), and the order is
 /// cancelled with the stored reason "payment window elapsed" — post-expiry
-/// the buyer simply checks out again.
+/// the buyer simply checks out again. A held order with `hold_expires_at`
+/// NULL (pre-#50 rows the 0012 backfill missed) is already elapsed.
 ///
 /// This is a marketplace policy transition, independent of upstream state; a
 /// Locks correlation keeps polling (bounded by the Lock Server's own task
@@ -2182,11 +2183,12 @@ pub async fn expire_due_payment_windows(
     let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
         "SELECT o.id, p.id, p.state, o.buyer_pubky \
          FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE o.state = 'pending_payment' AND o.stock_held AND o.hold_expires_at <= $1 \
+         WHERE o.state = 'pending_payment' AND o.stock_held \
+         AND (o.hold_expires_at IS NULL OR o.hold_expires_at <= $1) \
          AND p.state IN ('awaiting_entitlement', 'detected', 'expired') \
          AND o.paykit_activation_state IS DISTINCT FROM 'preparing' \
          AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation' \
-         ORDER BY o.hold_expires_at FOR UPDATE OF o, p SKIP LOCKED",
+         ORDER BY o.hold_expires_at NULLS FIRST FOR UPDATE OF o, p SKIP LOCKED",
     )
     .bind(now)
     .fetch_all(&mut *tx)
@@ -2214,9 +2216,10 @@ pub async fn expire_due_payment_windows(
     // HTTP call rides the batch transaction.
     let preparing: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE o.state = 'pending_payment' AND o.stock_held AND o.hold_expires_at <= $1 \
+         WHERE o.state = 'pending_payment' AND o.stock_held \
+         AND (o.hold_expires_at IS NULL OR o.hold_expires_at <= $1) \
          AND p.state = 'awaiting_entitlement' AND o.paykit_activation_state = 'preparing' \
-         ORDER BY o.hold_expires_at",
+         ORDER BY o.hold_expires_at NULLS FIRST",
     )
     .bind(now)
     .fetch_all(pool)
@@ -2316,7 +2319,15 @@ async fn expire_held_order(
         )
         .await?
         {
-            anyhow::bail!("expired order {order_id} could not credit drop {drop_aggregate_id}");
+            if order.hold_expires_at.is_none() {
+                tracing::warn!(
+                    order_id = %order_id,
+                    drop_aggregate_id = %drop_aggregate_id,
+                    "legacy null-expiry hold: drop units unaccounted; still expiring"
+                );
+            } else {
+                anyhow::bail!("expired order {order_id} could not credit drop {drop_aggregate_id}");
+            }
         }
     }
     if let Err(failure) = crate::handlers::holds::release_lines(
@@ -2327,7 +2338,15 @@ async fn expire_held_order(
     )
     .await?
     {
-        anyhow::bail!("expired order {order_id} could not release its hold: {failure:?}");
+        if order.hold_expires_at.is_none() {
+            tracing::warn!(
+                order_id = %order_id,
+                error = ?failure,
+                "legacy null-expiry hold: listing unaccounted; still expiring"
+            );
+        } else {
+            anyhow::bail!("expired order {order_id} could not release its hold: {failure:?}");
+        }
     }
 
     debug_assert!(marketplace_domain::state_machines::can_transition(
