@@ -299,17 +299,24 @@ impl ShippoDestination {
     }
 
     fn as_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut address = serde_json::json!({
             "name": self.name,
             "street1": self.street1,
-            "street2": self.street2,
             "city": self.city,
-            "state": self.state,
             "zip": self.zip,
             "country": self.country,
-            "phone": self.phone,
-            "email": self.email,
-        })
+        });
+        for (key, value) in [
+            ("street2", self.street2.as_str()),
+            ("state", self.state.as_str()),
+            ("phone", self.phone.as_str()),
+            ("email", self.email.as_str()),
+        ] {
+            if !value.is_empty() {
+                address[key] = serde_json::Value::String(value.to_string());
+            }
+        }
+        address
     }
 }
 

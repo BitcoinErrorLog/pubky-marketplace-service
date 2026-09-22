@@ -168,20 +168,28 @@ impl ShipFromAddress {
 }
 
 /// A stored address (ship-from or the order's delivery address) as Shippo's
-/// address object.
+/// address object. Empty optional fields are omitted so a missing region
+/// cannot render as `"undefined"` or a blank state line on the label.
 fn shippo_address(stored: &Value) -> Value {
     let field = |name: &str| stored.get(name).and_then(Value::as_str).unwrap_or_default();
-    json!({
+    let mut address = json!({
         "name": field("name"),
         "street1": field("line1"),
-        "street2": field("line2"),
         "city": field("city"),
-        "state": field("region"),
         "zip": field("postal_code"),
         "country": field("country_code"),
-        "phone": field("phone"),
-        "email": field("email"),
-    })
+    });
+    for (key, value) in [
+        ("street2", field("line2")),
+        ("state", field("region")),
+        ("phone", field("phone")),
+        ("email", field("email")),
+    ] {
+        if !value.is_empty() {
+            address[key] = json!(value);
+        }
+    }
+    address
 }
 
 fn validate_shippo_api_key(value: &str) -> Result<(), &'static str> {
@@ -649,5 +657,49 @@ pub async fn get_shipping_label(
             "label_not_found",
             "No shipping label has been purchased for this order.",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shippo_address_omits_empty_region() {
+        let stored = json!({
+            "name": "Buyer",
+            "line1": "10 Downing Street",
+            "line2": "",
+            "city": "London",
+            "region": "",
+            "postal_code": "SW1A 2AA",
+            "country_code": "GB",
+            "phone": "",
+            "email": "",
+        });
+        let address = shippo_address(&stored);
+        assert_eq!(address["city"], json!("London"));
+        assert_eq!(address["country"], json!("GB"));
+        assert!(address.get("state").is_none());
+        assert!(address.get("street2").is_none());
+        let rendered = address.to_string();
+        assert!(!rendered.contains("undefined"));
+        assert!(!rendered.contains("null"));
+    }
+
+    #[test]
+    fn shippo_address_includes_region_when_present() {
+        let stored = json!({
+            "name": "Buyer",
+            "line1": "1 Market Street",
+            "line2": "Apt 2",
+            "city": "New York",
+            "region": "NY",
+            "postal_code": "10001",
+            "country_code": "US",
+        });
+        let address = shippo_address(&stored);
+        assert_eq!(address["state"], json!("NY"));
+        assert_eq!(address["street2"], json!("Apt 2"));
     }
 }

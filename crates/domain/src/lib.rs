@@ -11,6 +11,7 @@ pub mod commands;
 pub mod error;
 pub mod ids;
 pub mod money;
+pub mod postal;
 pub mod pubky;
 pub mod state_machines;
 

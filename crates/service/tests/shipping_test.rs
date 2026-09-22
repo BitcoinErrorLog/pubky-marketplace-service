@@ -197,7 +197,14 @@ async fn rates_are_quoted_with_the_sellers_token_and_real_order_address(pool: Pg
     let requests = shippo.shipment_requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["address_from"]["city"], json!("Split"));
+    assert!(
+        requests[0]["address_from"].get("state").is_none(),
+        "empty ship-from region must not become a state line: {}",
+        requests[0]["address_from"]
+    );
+    assert!(!requests[0].to_string().contains("undefined"));
     assert_eq!(requests[0]["address_to"]["zip"], json!("10001"));
+    assert_eq!(requests[0]["address_to"]["state"], json!("NY"));
     assert_eq!(requests[0]["parcels"][0]["weight"], json!("900"));
     assert_eq!(requests[0]["parcels"][0]["mass_unit"], json!("g"));
     assert_eq!(requests[0]["parcels"][0]["length"], json!("30.0"));
