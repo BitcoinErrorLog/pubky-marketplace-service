@@ -480,7 +480,7 @@ async fn same_ms_paypal_pipelines_one_winner(pool: PgPool) {
     execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
-    let (token, order_id, _payment_id) =
+    let (_token, order_id, _payment_id) =
         race_qty_one_binds(&app, &seller.pubky, &first, &second, 0xb101, "paypal").await;
     let (status, _) = send_bytes(
         app.router.clone(),
@@ -507,7 +507,7 @@ async fn same_ms_bitcoin_exclusive_pipelines_one_winner(pool: PgPool) {
     paykit.set_allocation_mode("exclusive");
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
-    let (token, order_id, _payment_id) =
+    let (_token, order_id, _payment_id) =
         race_qty_one_binds(&app, &seller.pubky, &first, &second, 0xb102, "bitcoin").await;
     let client = app
         .state
@@ -537,7 +537,7 @@ async fn same_ms_bitcoin_ln_pipelines_one_winner(pool: PgPool) {
     paykit.set_allocation_mode("exclusive");
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
-    let (token, order_id, _payment_id) =
+    let (_token, order_id, _payment_id) =
         race_qty_one_binds(&app, &seller.pubky, &first, &second, 0xb103, "bitcoin").await;
     let client = app
         .state
@@ -566,17 +566,11 @@ async fn same_ms_sandbox_pipelines_one_winner(pool: PgPool) {
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
     let pair = two_unheld_qty_one_checkouts(&app, &seller.pubky, &first, &second, 0xb104).await;
+    let cmd_a = payment_command(&pair[0].2, 1, "confirmed", 1, 601);
+    let cmd_b = payment_command(&pair[1].2, 1, "confirmed", 1, 602);
     let (res_a, res_b) = tokio::join!(
-        execute(
-            &app,
-            &pair[0].0,
-            &payment_command(&pair[0].2, 1, "confirmed", 1, 601),
-        ),
-        execute(
-            &app,
-            &pair[1].0,
-            &payment_command(&pair[1].2, 1, "confirmed", 1, 602),
-        ),
+        execute(&app, &pair[0].0, &cmd_a),
+        execute(&app, &pair[1].0, &cmd_b),
     );
     let mut paid = 0;
     for (status, body) in [res_a, res_b] {
