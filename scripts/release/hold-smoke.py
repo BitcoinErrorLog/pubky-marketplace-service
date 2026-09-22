@@ -403,7 +403,7 @@ def parse_listing_rows(raw: str) -> list[dict[str, Any]]:
     return rows
 
 
-def pick_listing(*, shipping: bool) -> dict[str, Any]:
+def pick_listing(*, shipping: bool, exclude: set[str] | None = None) -> dict[str, Any]:
     if shipping:
         clause = "AND fulfillment_methods::text LIKE '%shipping%'"
         label = "shipping"
@@ -413,13 +413,17 @@ def pick_listing(*, shipping: bool) -> dict[str, Any]:
             "AND fulfillment_methods::text NOT LIKE '%shipping%'"
         )
         label = "pickup-only"
+    excluded = ""
+    if exclude:
+        ids = ",".join(f"'{quote(item)}'" for item in sorted(exclude))
+        excluded = f"AND aggregate_id NOT IN ({ids}) "
     raw = sql(
         "SELECT aggregate_id || '|' || seller_pubky || '|' || server_revision::text "
         "|| '|' || available_quantity::text || '|' || fulfillment_methods::text "
         "FROM listings "
         "WHERE sale_format='fixed_price' AND state='available' AND available_quantity=1 "
         "AND reserved_quantity=0 "
-        f"{clause} "
+        f"{clause} {excluded}"
         "ORDER BY updated_at DESC NULLS LAST LIMIT 5;"
     )
     rows = parse_listing_rows(raw)
@@ -432,6 +436,50 @@ def pick_listing(*, shipping: bool) -> dict[str, Any]:
     if not shipping and ("pickup" not in methods or "shipping" in methods):
         raise RuntimeError(f"picked listing is not pickup-only: {methods!r}")
     return listing
+
+
+def restore_listing_methods(aggregate_id: str, methods: str) -> None:
+    raw = sql(
+        "UPDATE listings SET fulfillment_methods = "
+        f"'{quote(methods)}'::text[], updated_at = now() "
+        f"WHERE aggregate_id='{quote(aggregate_id)}' "
+        "RETURNING fulfillment_methods::text;"
+    )
+    restored = sql_scalar(raw)
+    if restored != methods:
+        raise RuntimeError(f"restore fulfillment_methods {restored!r} != {methods!r}")
+
+
+def ensure_pickup_listing(exclude: set[str]) -> tuple[dict[str, Any], dict[str, str] | None]:
+    """Return a pickup-only qty-1 listing.
+
+    Staging today has shipping-only rows. If no pickup-only listing exists,
+    temporarily retarget a second shipping listing to `{pickup}` and restore
+    the original methods in the caller's finally.
+    """
+    try:
+        return pick_listing(shipping=False, exclude=exclude), None
+    except RuntimeError as error:
+        if "no qty-1 available pickup-only listing" not in str(error):
+            raise
+    donor = pick_listing(shipping=True, exclude=exclude)
+    original = donor["fulfillment_methods"]
+    raw = sql(
+        "UPDATE listings SET fulfillment_methods = '{pickup}'::text[], updated_at = now() "
+        f"WHERE aggregate_id='{quote(donor['aggregate_id'])}' "
+        "AND state='available' AND available_quantity=1 AND reserved_quantity=0 "
+        "AND fulfillment_methods::text NOT LIKE '%pickup%' "
+        "RETURNING aggregate_id || '|' || seller_pubky || '|' || server_revision::text "
+        "|| '|' || available_quantity::text || '|' || fulfillment_methods::text;"
+    )
+    rows = parse_listing_rows(raw)
+    if not rows:
+        raise RuntimeError(f"failed to retarget donor listing for pickup\n{raw!r}")
+    listing = rows[0]
+    if "pickup" not in listing["fulfillment_methods"] or "shipping" in listing["fulfillment_methods"]:
+        restore_listing_methods(donor["aggregate_id"], original)
+        raise RuntimeError(f"donor is not pickup-only after retarget: {listing!r}")
+    return listing, {"aggregate_id": donor["aggregate_id"], "methods": original}
 
 
 def sql_scalar(raw: str) -> str:
@@ -693,9 +741,10 @@ class Smoke:
                 print(f"session_cleanup_error={error}", file=sys.stderr)
 
     def run(self) -> dict[str, Any]:
-        shipping = pick_listing(shipping=True)
-        pickup = pick_listing(shipping=False)
+        pickup_restore: dict[str, str] | None = None
         try:
+            shipping = pick_listing(shipping=True)
+            pickup, pickup_restore = ensure_pickup_listing({shipping["aggregate_id"]})
             self.cases.append(
                 self.two_buyer(
                     shipping,
@@ -725,6 +774,7 @@ class Smoke:
                     expected_stored_region=EXPECTED_STORED_REGION["pt_empty_region"],
                 )
             )
+            pickup = refresh_listing(pickup["aggregate_id"])
             self.cases.append(
                 self.two_buyer(
                     pickup,
@@ -740,6 +790,7 @@ class Smoke:
                 "shop_sha": SHOP_SHA,
                 "marketplace_url": self.base,
                 "railway_project": self.project,
+                "pickup_methods_retargeted": pickup_restore is not None,
                 "cases": self.cases,
                 "orders_verified_cancelled": verified,
             }
@@ -754,6 +805,11 @@ class Smoke:
                     print(f"cancel_cleanup_error={row['id']}:{error}", file=sys.stderr)
             raise
         finally:
+            if pickup_restore is not None:
+                try:
+                    restore_listing_methods(pickup_restore["aggregate_id"], pickup_restore["methods"])
+                except Exception as error:  # noqa: BLE001
+                    print(f"pickup_restore_error={error}", file=sys.stderr)
             self.cleanup_sessions()
 
 
