@@ -14,7 +14,7 @@ const PRODUCTION_ENVIRONMENT_ID = "404919ad-fb95-4621-9f45-b7f993dfa8ae";
 // of git, not of the operator's shell. The release train MUST bump each
 // constant in the same PR as the IMAGE connect for that seat.
 const LIVE_IMAGE =
-  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:52197d8b9059e43dc4cc8ff9262d02526381076e2b19e685c8245af7918d292f";
+  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:b023c780c2311283bdb6df6f5517da05098ac170f00ff7ec829ea52131873537";
 const STAGING_IMAGE = LIVE_IMAGE;
 const PRODUCTION_IMAGE = LIVE_IMAGE;
 
