@@ -430,12 +430,12 @@ async fn list_limits_are_bounded_and_ordering_is_newest_first(pool: PgPool) {
     let (status, body) = execute(&app, &buyer.token, &checkout(&seller.pubky, 1)).await;
     assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
     // The second order is created one second later so the newest-first
-    // ordering is observable. Checkout holds a unit and bumps listing
-    // revision, so the line must carry the current revision.
+    // ordering is observable. Ordinary checkout does not hold or bump
+    // listing revision.
     app.clock
         .set(app.clock.now() + chrono::Duration::seconds(1));
     let mut second_checkout = checkout(&seller.pubky, 2);
-    second_checkout["payload"]["lines"][0]["expected_revision"] = json!(2);
+    second_checkout["payload"]["lines"][0]["expected_revision"] = json!(1);
     let (status, body) = execute(&app, &buyer.token, &second_checkout).await;
     assert_eq!(status, StatusCode::OK, "second checkout failed: {body}");
     let newest_order_id = body["result"]["orders"][0]["id"].clone();

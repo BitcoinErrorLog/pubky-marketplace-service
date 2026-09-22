@@ -2,6 +2,8 @@
 //! 100 concurrent checkouts against a qty-1 listing all succeed unheld;
 //! 100 concurrent binds then yield exactly one held order. Losers are 409
 //! `INVALID_STATE` with the holding copy. Qty-10 yields ten held binds.
+//! Two binders on a one-connection pool must return 200/409, never 5xx
+//! (nested pool checkout during the bind transaction used to INTERNAL 500).
 //! A duplicate checkout with the same command id still returns the identical
 //! stored result without creating a second order.
 
@@ -196,6 +198,83 @@ async fn hundred_concurrent_binds_against_qty_ten_yield_ten_holds(pool: PgPool) 
     .await
     .expect("listing row exists");
     assert_eq!((available, reserved, state.as_str()), (0, 10, "reserved"));
+}
+
+/// Nested `state.pool` checkout while the bind transaction holds the only
+/// connection used to `PoolTimedOut` → HTTP 500. Bind must stay on that
+/// connection so both callers see 200 or 409.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn two_concurrent_binds_on_one_connection_never_return_5xx(pool: PgPool) {
+    let tight = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .expect("one-connection pool");
+    let (app, _stripe, _paykit) = test_app_with_payments(tight).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, _) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK);
+    put_stripe_config(&app, &seller.token).await;
+
+    let mut order_ids = Vec::with_capacity(2);
+    for index in 1..=2u64 {
+        let command = checkout_command_with_id(&seller.pubky, &indexed_command_id(0x8003, index));
+        let (status, body) = execute(&app, &buyer.token, &command).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "checkout must succeed unheld: {body}"
+        );
+        assert_eq!(body["result"]["orders"][0]["stock_held"], json!(false));
+        order_ids.push(
+            body["result"]["orders"][0]["id"]
+                .as_str()
+                .expect("order id")
+                .to_string(),
+        );
+    }
+
+    let left = bind_stripe(
+        app.router.clone(),
+        buyer.token.clone(),
+        order_ids[0].clone(),
+    );
+    let right = bind_stripe(
+        app.router.clone(),
+        buyer.token.clone(),
+        order_ids[1].clone(),
+    );
+    let (left, right) = tokio::join!(left, right);
+    let results = [left, right];
+    let mut wins = 0;
+    let mut holding = 0;
+    for (status, body) in results {
+        assert!(
+            status.as_u16() < 500,
+            "bind must not 5xx under a one-connection pool: {status} {body}"
+        );
+        assert!(
+            status == StatusCode::OK || status == StatusCode::CONFLICT,
+            "bind must be 200 or 409: {status} {body}"
+        );
+        if status == StatusCode::OK {
+            assert_eq!(body["ok"], json!(true), "winner: {body}");
+            assert_eq!(body["order"]["stock_held"], json!(true));
+            wins += 1;
+        } else {
+            assert_eq!(
+                body["error"]["code"],
+                json!("INVALID_STATE"),
+                "loser: {body}"
+            );
+            assert_eq!(body["error"]["message"], json!(HOLDING_COPY));
+            holding += 1;
+        }
+    }
+    assert_eq!(wins, 1, "exactly one bind holds the unit");
+    assert_eq!(holding, 1);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
