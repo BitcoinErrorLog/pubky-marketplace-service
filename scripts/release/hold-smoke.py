@@ -242,6 +242,11 @@ def self_check() -> None:
         raise RuntimeError("PT empty region missing from payload")
     if pt["payload"]["delivery_address"]["country_code"] != "PT":
         raise RuntimeError("PT country_code")
+    chatter = 'Output format is unaligned.\nField separator is "|".\n'
+    if sql_scalar(chatter + "region=\n") != "region=":
+        raise RuntimeError("empty stored region marker must survive psql chatter")
+    if sql_scalar(chatter + "region=CA\n") != "region=CA":
+        raise RuntimeError("CA stored region marker")
     pickup = checkout_body(pickup_listing, str(uuid.uuid4()), fulfillment="pickup", address=None)
     assert_shape(pickup, shipping=False)
     fixture_path = Path(__file__).with_name("shop-v0.6.17-checkout.create.json")
@@ -495,6 +500,23 @@ def sql_scalar(raw: str) -> str:
     raise RuntimeError(f"scalar unparseable {raw!r}")
 
 
+def stored_region_of(order_id: str) -> str:
+    """Read orders.delivery_address.region, including the empty PT value.
+
+    psql tuples_only unaligned prints nothing for '' so sql_scalar cannot
+    see it. Prefix a non-empty marker; a missing row still raises.
+    """
+    token = sql_scalar(
+        sql(
+            "SELECT 'region=' || coalesce(delivery_address->>'region','') "
+            f"FROM orders WHERE id='{quote(order_id)}'::uuid;"
+        )
+    )
+    if not token.startswith("region="):
+        raise RuntimeError(f"stored region marker missing {token!r}")
+    return token[len("region=") :]
+
+
 def parse_hold_row(raw: str) -> dict[str, Any]:
     for line in raw.splitlines():
         token = line.strip().strip('"')
@@ -643,12 +665,7 @@ class Smoke:
             raise RuntimeError(f"{case}: ttl {ttl}")
         stored_region = None
         if expected_stored_region is not None:
-            stored_region = sql_scalar(
-                sql(
-                    "SELECT coalesce(delivery_address->>'region','') "
-                    f"FROM orders WHERE id='{quote(winner_order)}'::uuid;"
-                )
-            )
+            stored_region = stored_region_of(winner_order)
             if stored_region not in expected_stored_region:
                 raise RuntimeError(
                     f"{case}: stored region {stored_region!r} not in {sorted(expected_stored_region)!r}"
@@ -702,12 +719,7 @@ class Smoke:
         self.created_orders.append({"id": order_id, "token": token, "case": case})
         stored_region = None
         if expected_stored_region is not None:
-            stored_region = sql_scalar(
-                sql(
-                    "SELECT coalesce(delivery_address->>'region','') "
-                    f"FROM orders WHERE id='{quote(order_id)}'::uuid;"
-                )
-            )
+            stored_region = stored_region_of(order_id)
             if stored_region not in expected_stored_region:
                 raise RuntimeError(
                     f"{case}: stored region {stored_region!r} not in {sorted(expected_stored_region)!r}"
