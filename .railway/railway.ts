@@ -29,6 +29,7 @@ const sharedEnv = {
   ALLOWED_ORIGINS: preserve(),
   BITCOIN_PAYMENT_WINDOW_SECONDS: preserve(),
   CHECKOUT_HOLD_WINDOW_SECONDS: preserve(),
+  FIAT_PAYMENT_WINDOW_SECONDS: preserve(),
   ATTESTOR_ORDER_SALT: preserve(),
   ATTESTOR_SECRET_KEY: preserve(),
   DATABASE_URL: preserve(),

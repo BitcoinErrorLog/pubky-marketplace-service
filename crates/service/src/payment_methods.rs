@@ -659,8 +659,9 @@ pub async fn bind_payment_method(
         None
     };
 
-    // The bind lock point: choosing a real rail re-arms the checkout hold
-    // to the rail window.
+    // The bind lock point: first ordinary acquire (or a re-arm when a drop
+    // claim / prior lock point already holds). Fiat uses the 10-minute
+    // listing hold; bitcoin uses the invoice window the buyer is shown.
     let bind_window = if method == "bitcoin" {
         state.config.bitcoin_payment_window_seconds
     } else {
@@ -677,7 +678,9 @@ pub async fn bind_payment_method(
     {
         Ok(Ok(order)) => order,
         Ok(Err(failure)) => {
-            let reason = if failure.code() == ErrorCode::InsufficientInventory {
+            let reason = if failure.message() == crate::handlers::holds::HOLDING_COPY {
+                "held"
+            } else if failure.code() == ErrorCode::InsufficientInventory {
                 "sold_out"
             } else {
                 "hold_unavailable"
@@ -833,7 +836,7 @@ pub async fn bind_payment_method(
             .expect("checked above");
         let endpoint = paykit.base_url().to_string();
         let expires_at = updated_order.hold_expires_at.unwrap_or_else(|| {
-            now + chrono::Duration::seconds(state.config.fiat_payment_window_seconds)
+            now + chrono::Duration::seconds(state.config.bitcoin_payment_window_seconds)
         });
         let idempotency_key = format!("{reference}:{}", updated_order.paykit_bind_attempt);
         let phase1 = paykit

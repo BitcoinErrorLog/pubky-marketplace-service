@@ -182,11 +182,14 @@ fn quoted_sats() -> u128 {
 
 fn assert_no_side_effects(facts: &FxOrderFacts, paykit: &FakePaykit, context: &str) {
     assert_eq!(facts.payment_method, None, "{context}: no method bound");
-    assert!(facts.stock_held, "{context}: checkout hold remains");
+    assert!(
+        !facts.stock_held,
+        "{context}: bind refusal must not acquire a hold"
+    );
     assert_eq!(
         facts.hold_source.as_deref(),
-        Some("checkout"),
-        "{context}: bind refusal must not re-arm hold_source"
+        None,
+        "{context}: bind refusal must not write hold_source"
     );
     assert_eq!(facts.bitcoin_quoted_sats, None, "{context}: no quote row");
     assert!(

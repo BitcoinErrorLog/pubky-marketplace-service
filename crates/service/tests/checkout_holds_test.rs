@@ -1,4 +1,4 @@
-//! Exclusive checkout hold (#50): 900 s park, rail re-arm, late_completion /
+//! Exclusive inventory hold at payment-method bind: per-rail TTL, late_completion /
 //! refund_required fork, operator SQL, and same-ms per-rail pipelines.
 
 mod common;
@@ -91,49 +91,129 @@ fn ipn_body(order_id: &str) -> String {
     serializer.finish()
 }
 
-/// Two buyers race `checkout.create` on a qty-1 listing. Exactly one holds;
-/// the loser is 409 with the holding copy and never receives an order.
-async fn race_qty_one_checkouts(
+/// Two buyers each `checkout.create` on a qty-1 listing. Both succeed
+/// unheld. Then they race payment-method bind: exactly one holds; the
+/// loser is 409 with the holding copy.
+async fn race_qty_one_binds(
     app: &TestApp,
     seller_pubky: &str,
     first: &TestActor,
     second: &TestActor,
     prefix: u16,
+    method: &str,
 ) -> (String, String, String) {
-    let token_a = first.token.clone();
-    let token_b = second.token.clone();
-    let router_a = app.router.clone();
-    let router_b = app.router.clone();
     let cmd_a = checkout_command_with_id(seller_pubky, &indexed_command_id(prefix, 1));
     let cmd_b = checkout_command_with_id(seller_pubky, &indexed_command_id(prefix, 2));
     let (res_a, res_b) = tokio::join!(
-        common::send(router_a, "POST", "/v1/commands", Some(&token_a), &cmd_a),
-        common::send(router_b, "POST", "/v1/commands", Some(&token_b), &cmd_b),
+        common::send(
+            app.router.clone(),
+            "POST",
+            "/v1/commands",
+            Some(&first.token),
+            &cmd_a
+        ),
+        common::send(
+            app.router.clone(),
+            "POST",
+            "/v1/commands",
+            Some(&second.token),
+            &cmd_b
+        ),
+    );
+    assert_eq!(res_a.0, StatusCode::OK, "{:?}", res_a.1);
+    assert_eq!(res_b.0, StatusCode::OK, "{:?}", res_b.1);
+    assert_eq!(res_a.1["result"]["orders"][0]["stock_held"], json!(false));
+    assert_eq!(res_b.1["result"]["orders"][0]["stock_held"], json!(false));
+    let order_a = res_a.1["result"]["orders"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let payment_a = res_a.1["result"]["payments"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let order_b = res_b.1["result"]["orders"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let payment_b = res_b.1["result"]["payments"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (bind_a, bind_b) = tokio::join!(
+        bind_method(app, &first.token, &order_a, method),
+        bind_method(app, &second.token, &order_b, method),
     );
     let mut wins = 0;
     let mut winner: Option<(String, String, String)> = None;
-    for (actor, (status, body)) in [(first, res_a), (second, res_b)] {
+    for (actor, order_id, payment_id, (status, body)) in [
+        (first, order_a, payment_a, bind_a),
+        (second, order_b, payment_b, bind_b),
+    ] {
         if body["ok"] == json!(true) {
-            assert_eq!(status, StatusCode::OK);
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["order"]["stock_held"], json!(true));
             wins += 1;
-            winner = Some((
-                actor.token.clone(),
-                body["result"]["orders"][0]["id"]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-                body["result"]["payments"][0]["id"]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-            ));
+            winner = Some((actor.token.clone(), order_id, payment_id));
         } else {
             assert_eq!(status, StatusCode::CONFLICT, "{body}");
             assert_eq!(body["error"]["message"], json!(HOLDING_COPY));
         }
     }
     assert_eq!(wins, 1);
-    winner.expect("one winner")
+    winner.expect("one bind winner")
+}
+
+/// Two unheld checkouts on a qty-1 listing (sandbox exclusivity is the
+/// first-advance lock point, not bind).
+async fn two_unheld_qty_one_checkouts(
+    app: &TestApp,
+    seller_pubky: &str,
+    first: &TestActor,
+    second: &TestActor,
+    prefix: u16,
+) -> [(String, String, String); 2] {
+    let cmd_a = checkout_command_with_id(seller_pubky, &indexed_command_id(prefix, 1));
+    let cmd_b = checkout_command_with_id(seller_pubky, &indexed_command_id(prefix, 2));
+    let (res_a, res_b) = tokio::join!(
+        common::send(
+            app.router.clone(),
+            "POST",
+            "/v1/commands",
+            Some(&first.token),
+            &cmd_a
+        ),
+        common::send(
+            app.router.clone(),
+            "POST",
+            "/v1/commands",
+            Some(&second.token),
+            &cmd_b
+        ),
+    );
+    assert_eq!(res_a.0, StatusCode::OK, "{:?}", res_a.1);
+    assert_eq!(res_b.0, StatusCode::OK, "{:?}", res_b.1);
+    let order_a = res_a.1["result"]["orders"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let payment_a = res_a.1["result"]["payments"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let order_b = res_b.1["result"]["orders"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let payment_b = res_b.1["result"]["payments"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    [
+        (first.token.clone(), order_a, payment_a),
+        (second.token.clone(), order_b, payment_b),
+    ]
 }
 
 async fn listing_revision(pool: &PgPool, seller_pubky: &str) -> i64 {
@@ -195,15 +275,17 @@ async fn qty_two_second_checkout_succeeds(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{first_body}");
-    assert_eq!(first_body["result"]["orders"][0]["stock_held"], json!(true));
+    assert_eq!(
+        first_body["result"]["orders"][0]["stock_held"],
+        json!(false)
+    );
 
-    let mut second_cmd = checkout_command_with_id(&seller.pubky, &indexed_command_id(0xb000, 2));
-    second_cmd["payload"]["lines"][0]["expected_revision"] = json!(2);
+    let second_cmd = checkout_command_with_id(&seller.pubky, &indexed_command_id(0xb000, 2));
     let (status, second_body) = execute(&app, &second.token, &second_cmd).await;
     assert_eq!(status, StatusCode::OK, "{second_body}");
     assert_eq!(
         second_body["result"]["orders"][0]["stock_held"],
-        json!(true)
+        json!(false)
     );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 2);
 }
@@ -217,7 +299,7 @@ async fn bind_rearms_fiat_and_bitcoin_windows(pool: PgPool) {
     let order = create_pending_order(&app, &seller, &buyer).await;
     assert_eq!(
         hold_row(&app.pool, &order.order_id).await,
-        (true, Some(ts_after(900)), Some("checkout".into()))
+        (false, None, None)
     );
 
     let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "stripe").await;
@@ -233,7 +315,7 @@ async fn bind_rearms_fiat_and_bitcoin_windows(pool: PgPool) {
     let sat = common::paykit_review::create_sat_order(&app, &seller_btc, &buyer_btc).await;
     assert_eq!(
         hold_row(&app.pool, &sat.order_id).await,
-        (true, Some(ts_after(900)), Some("checkout".into()))
+        (false, None, None)
     );
     let (status, body) = bind_method(&app, &buyer_btc.token, &sat.order_id, "bitcoin").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -244,7 +326,7 @@ async fn bind_rearms_fiat_and_bitcoin_windows(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn checkout_hold_expires_at_901_and_restocks(pool: PgPool) {
+async fn unbound_checkout_idle_cancels_at_901_without_moving_stock(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -275,7 +357,18 @@ async fn checkout_hold_expires_at_901_and_restocks(pool: PgPool) {
     .expect("order");
     assert_eq!(state, "cancelled");
     assert!(!stock_held);
-    assert_eq!(reason.as_deref(), Some("payment window elapsed"));
+    assert_eq!(reason.as_deref(), Some("checkout idle elapsed"));
+    let (available, reserved, listing_state): (i64, i64, String) = sqlx::query_as(
+        "SELECT available_quantity, reserved_quantity, state FROM listings WHERE aggregate_id = $1",
+    )
+    .bind(listing_aggregate(&seller.pubky))
+    .fetch_one(&app.pool)
+    .await
+    .expect("listing");
+    assert_eq!(
+        (available, reserved, listing_state.as_str()),
+        (1, 0, "available")
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -348,12 +441,12 @@ async fn same_ms_stripe_pipelines_one_winner(pool: PgPool) {
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
     let (token, order_id, _payment_id) =
-        race_qty_one_checkouts(&app, &seller.pubky, &first, &second, 0xb100).await;
+        race_qty_one_binds(&app, &seller.pubky, &first, &second, 0xb100, "stripe").await;
 
-    let (status, body) = bind_method(&app, &token, &order_id, "stripe").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let total = body["order"]["total"]["amount_minor"]
-        .as_i64()
+    let total: i64 = sqlx::query_scalar("SELECT total_minor FROM orders WHERE id = $1::uuid")
+        .bind(&order_id)
+        .fetch_one(&app.pool)
+        .await
         .expect("total");
     stripe.add_session(FakeStripeSession {
         id: "cs_paid_match".into(),
@@ -388,9 +481,7 @@ async fn same_ms_paypal_pipelines_one_winner(pool: PgPool) {
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
     let (token, order_id, _payment_id) =
-        race_qty_one_checkouts(&app, &seller.pubky, &first, &second, 0xb101).await;
-    let (status, body) = bind_method(&app, &token, &order_id, "paypal").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+        race_qty_one_binds(&app, &seller.pubky, &first, &second, 0xb101, "paypal").await;
     let (status, _) = send_bytes(
         app.router.clone(),
         "POST",
@@ -417,9 +508,7 @@ async fn same_ms_bitcoin_exclusive_pipelines_one_winner(pool: PgPool) {
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
     let (token, order_id, _payment_id) =
-        race_qty_one_checkouts(&app, &seller.pubky, &first, &second, 0xb102).await;
-    let (status, body) = bind_method(&app, &token, &order_id, "bitcoin").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+        race_qty_one_binds(&app, &seller.pubky, &first, &second, 0xb102, "bitcoin").await;
     let client = app
         .state
         .payments
@@ -449,9 +538,7 @@ async fn same_ms_bitcoin_ln_pipelines_one_winner(pool: PgPool) {
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
     let (token, order_id, _payment_id) =
-        race_qty_one_checkouts(&app, &seller.pubky, &first, &second, 0xb103).await;
-    let (status, body) = bind_method(&app, &token, &order_id, "bitcoin").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+        race_qty_one_binds(&app, &seller.pubky, &first, &second, 0xb103, "bitcoin").await;
     let client = app
         .state
         .payments
@@ -478,16 +565,30 @@ async fn same_ms_sandbox_pipelines_one_winner(pool: PgPool) {
     execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
-    let (token, _order_id, payment_id) =
-        race_qty_one_checkouts(&app, &seller.pubky, &first, &second, 0xb104).await;
-    let (status, body) = execute(
-        &app,
-        &token,
-        &payment_command(&payment_id, 1, "confirmed", 1, 601),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["result"]["order"]["state"], json!("paid"));
+    let pair = two_unheld_qty_one_checkouts(&app, &seller.pubky, &first, &second, 0xb104).await;
+    let (res_a, res_b) = tokio::join!(
+        execute(
+            &app,
+            &pair[0].0,
+            &payment_command(&pair[0].2, 1, "confirmed", 1, 601),
+        ),
+        execute(
+            &app,
+            &pair[1].0,
+            &payment_command(&pair[1].2, 1, "confirmed", 1, 602),
+        ),
+    );
+    let mut paid = 0;
+    for (status, body) in [res_a, res_b] {
+        if body["ok"] == json!(true) {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["result"]["order"]["state"], json!("paid"));
+            paid += 1;
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        }
+    }
+    assert_eq!(paid, 1, "exactly one sandbox confirm consumes the unit");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -548,7 +649,14 @@ async fn bitcoin_refund_required_when_second_buyer_holds(pool: PgPool) {
         json!(listing_revision(&pool, &seller.pubky).await);
     let (status, body) = execute(&app, &second.token, &checkout).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["result"]["orders"][0]["stock_held"], json!(true));
+    assert_eq!(body["result"]["orders"][0]["stock_held"], json!(false));
+    let second_order = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("second order")
+        .to_string();
+    let (status, body) = bind_method(&app, &second.token, &second_order, "bitcoin").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["order"]["stock_held"], json!(true));
 
     let mut late = status_confirmed("exclusive", true, 2);
     late["late_settlement"] = json!(true);

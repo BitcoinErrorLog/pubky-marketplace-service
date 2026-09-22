@@ -247,7 +247,7 @@ async fn outbox_redelivery_does_not_duplicate_notification_effects(pool: PgPool)
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
-    execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    execute(&app, &buyer.token, &create_offer_command(&seller.pubky, 1)).await;
 
     let delivered = drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
@@ -279,7 +279,7 @@ async fn outbox_redelivery_does_not_duplicate_notification_effects(pool: PgPool)
             .fetch_one(&app.pool)
             .await
             .expect("notification row exists");
-    assert_eq!(notification_type, "order_created");
+    assert_eq!(notification_type, "offer_received");
     assert_eq!(recipient, seller.pubky);
 }
 

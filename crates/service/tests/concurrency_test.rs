@@ -1,8 +1,9 @@
-//! Concurrency proof: exclusive checkout hold. 100 concurrent checkouts
-//! against a qty-1 listing yield exactly one held order; losers are 409
-//! `INVALID_STATE` with the holding copy. Qty-10 retries `REVISION_CONFLICT`
-//! until ten holds exist. A duplicate checkout with the same command id
-//! still returns the identical stored result without creating a second order.
+//! Concurrency proof: exclusive inventory hold at payment-method bind.
+//! 100 concurrent checkouts against a qty-1 listing all succeed unheld;
+//! 100 concurrent binds then yield exactly one held order. Losers are 409
+//! `INVALID_STATE` with the holding copy. Qty-10 yields ten held binds.
+//! A duplicate checkout with the same command id still returns the identical
+//! stored result without creating a second order.
 
 mod common;
 
@@ -12,35 +13,93 @@ use sqlx::PgPool;
 
 use common::{
     checkout_command, checkout_command_with_id, count, execute, indexed_command_id,
-    listing_aggregate, new_actor, register_auction_command, register_command, test_app,
+    listing_aggregate, new_actor, register_auction_command, register_command, send, test_app,
+    test_app_with_payments,
 };
 
 const HOLDING_COPY: &str = "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.";
 
+async fn put_stripe_config(app: &common::TestApp, token: &str) {
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(token),
+        &json!({
+            "bitcoin_enabled": false,
+            "stripe_payment_link": "https://buy.stripe.com/test_abc123",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "config put failed: {body}");
+}
+
+async fn bind_stripe(router: axum::Router, token: String, order_id: String) -> (StatusCode, Value) {
+    send(
+        router,
+        "POST",
+        &format!("/v0/orders/{order_id}/payment-method"),
+        Some(&token),
+        &json!({ "method": "stripe" }),
+    )
+    .await
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn hundred_concurrent_checkouts_against_qty_one_yield_one_hold(pool: PgPool) {
-    let app = test_app(pool).await;
+async fn hundred_concurrent_binds_against_qty_one_yield_one_hold(pool: PgPool) {
+    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (status, _) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
     assert_eq!(status, StatusCode::OK);
+    put_stripe_config(&app, &seller.token).await;
 
-    let mut handles = Vec::with_capacity(100);
+    let mut create_handles = Vec::with_capacity(100);
     for index in 1..=100u64 {
         let router = app.router.clone();
         let token = buyer.token.clone();
         let command = checkout_command_with_id(&seller.pubky, &indexed_command_id(0x8002, index));
-        handles.push(tokio::spawn(async move {
+        create_handles.push(tokio::spawn(async move {
             common::send(router, "POST", "/v1/commands", Some(&token), &command).await
+        }));
+    }
+    let mut order_ids = Vec::with_capacity(100);
+    for handle in create_handles {
+        let (status, body) = handle.await.expect("request task completes");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "checkout must succeed unheld: {body}"
+        );
+        assert_eq!(body["result"]["orders"][0]["stock_held"], json!(false));
+        order_ids.push(
+            body["result"]["orders"][0]["id"]
+                .as_str()
+                .expect("order id")
+                .to_string(),
+        );
+    }
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 100);
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM orders WHERE stock_held").await,
+        0
+    );
+
+    let mut bind_handles = Vec::with_capacity(100);
+    for order_id in order_ids {
+        let router = app.router.clone();
+        let token = buyer.token.clone();
+        bind_handles.push(tokio::spawn(async move {
+            bind_stripe(router, token, order_id).await
         }));
     }
     let mut wins = 0;
     let mut holding = 0;
-    for handle in handles {
-        let (status, body) = handle.await.expect("request task completes");
+    for handle in bind_handles {
+        let (status, body) = handle.await.expect("bind task completes");
         if body["ok"] == json!(true) {
             assert_eq!(status, StatusCode::OK, "winner: {body}");
-            assert_eq!(body["result"]["orders"][0]["stock_held"], json!(true));
+            assert_eq!(body["order"]["stock_held"], json!(true));
             wins += 1;
         } else {
             assert_eq!(status, StatusCode::CONFLICT, "loser: {body}");
@@ -49,9 +108,8 @@ async fn hundred_concurrent_checkouts_against_qty_one_yield_one_hold(pool: PgPoo
             holding += 1;
         }
     }
-    assert_eq!(wins, 1, "exactly one checkout holds the unit");
+    assert_eq!(wins, 1, "exactly one bind holds the unit");
     assert_eq!(holding, 99);
-    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 1);
     assert_eq!(
         count(&app.pool, "SELECT COUNT(*) FROM orders WHERE stock_held").await,
         1
@@ -67,56 +125,55 @@ async fn hundred_concurrent_checkouts_against_qty_one_yield_one_hold(pool: PgPoo
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn hundred_concurrent_checkouts_against_qty_ten_yield_ten_holds(pool: PgPool) {
-    let app = test_app(pool).await;
+async fn hundred_concurrent_binds_against_qty_ten_yield_ten_holds(pool: PgPool) {
+    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (status, _) = execute(&app, &seller.token, &register_command(&seller.pubky, 10)).await;
     assert_eq!(status, StatusCode::OK);
+    put_stripe_config(&app, &seller.token).await;
 
-    let mut handles = Vec::with_capacity(100);
+    let mut create_handles = Vec::with_capacity(100);
     for index in 1..=100u64 {
         let router = app.router.clone();
         let token = buyer.token.clone();
-        let seller_pubky = seller.pubky.clone();
-        handles.push(tokio::spawn(async move {
-            let mut expected_revision = 1i64;
-            for attempt in 0..40u64 {
-                let mut command = checkout_command_with_id(
-                    &seller_pubky,
-                    &indexed_command_id(0x8002, index * 100 + attempt),
-                );
-                command["payload"]["lines"][0]["expected_revision"] = json!(expected_revision);
-                let (status, body) = common::send(
-                    router.clone(),
-                    "POST",
-                    "/v1/commands",
-                    Some(&token),
-                    &command,
-                )
-                .await;
-                if body["ok"] == json!(true) {
-                    return (status, body);
-                }
-                match body["error"]["code"].as_str() {
-                    Some("REVISION_CONFLICT") => {
-                        expected_revision = body["error"]["current_revision"]
-                            .as_i64()
-                            .expect("revision conflicts carry current_revision");
-                    }
-                    _ => return (status, body),
-                }
-            }
-            panic!("checkout {index} did not reach a terminal outcome");
+        let command = checkout_command_with_id(&seller.pubky, &indexed_command_id(0x8002, index));
+        create_handles.push(tokio::spawn(async move {
+            common::send(router, "POST", "/v1/commands", Some(&token), &command).await
+        }));
+    }
+    let mut order_ids = Vec::with_capacity(100);
+    for handle in create_handles {
+        let (status, body) = handle.await.expect("request task completes");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "checkout must succeed unheld: {body}"
+        );
+        assert_eq!(body["result"]["orders"][0]["stock_held"], json!(false));
+        order_ids.push(
+            body["result"]["orders"][0]["id"]
+                .as_str()
+                .expect("order id")
+                .to_string(),
+        );
+    }
+
+    let mut bind_handles = Vec::with_capacity(100);
+    for order_id in order_ids {
+        let router = app.router.clone();
+        let token = buyer.token.clone();
+        bind_handles.push(tokio::spawn(async move {
+            bind_stripe(router, token, order_id).await
         }));
     }
     let mut wins = 0;
     let mut holding = 0;
-    for handle in handles {
-        let (status, body) = handle.await.expect("request task completes");
+    for handle in bind_handles {
+        let (status, body) = handle.await.expect("bind task completes");
         if body["ok"] == json!(true) {
             assert_eq!(status, StatusCode::OK, "winner: {body}");
-            assert_eq!(body["result"]["orders"][0]["stock_held"], json!(true));
+            assert_eq!(body["order"]["stock_held"], json!(true));
             wins += 1;
         } else {
             assert_eq!(status, StatusCode::CONFLICT, "loser: {body}");
@@ -125,7 +182,7 @@ async fn hundred_concurrent_checkouts_against_qty_ten_yield_ten_holds(pool: PgPo
             holding += 1;
         }
     }
-    assert_eq!(wins, 10, "exactly the available stock is held at checkout");
+    assert_eq!(wins, 10, "exactly the available stock is held at bind");
     assert_eq!(holding, 90);
     assert_eq!(
         count(&app.pool, "SELECT COUNT(*) FROM orders WHERE stock_held").await,

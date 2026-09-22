@@ -1,16 +1,16 @@
-//! Exclusive inventory holds: checkout parks a unit; a payment re-arms the
-//! window.
+//! Exclusive inventory holds: a payment lock point parks a unit.
 //!
-//! Ordinary `checkout.create` acquires a bounded hold
-//! (`CHECKOUT_HOLD_WINDOW_SECONDS`) inside the checkout transaction. Sibling
-//! checkout is refused until that hold pays, cancels, or expires. Bind,
-//! Locks registration, and sandbox first-advance **re-arm**
-//! `hold_expires_at` to the rail window (they never double-decrement).
+//! Ordinary `checkout.create` does **not** hold stock. The first acquire for
+//! a buy-now order is the payment-method bind (`hold_source=bind`). Locks
+//! registration and sandbox first-advance acquire (or re-arm) the same way
+//! — they never double-decrement. `CHECKOUT_HOLD_WINDOW_SECONDS` is the
+//! unbound idle cancel, not an inventory hold.
 //!
-//! - `checkout.create` — window `CHECKOUT_HOLD_WINDOW_SECONDS` (default 900);
+//! - `POST /v0/orders/{id}/payment-method` — first ordinary acquire;
+//!   fiat `FIAT_PAYMENT_WINDOW_SECONDS` (default 600), bitcoin
+//!   `BITCOIN_PAYMENT_WINDOW_SECONDS` (default 1800, also Paykit
+//!   `expires_at`);
 //! - `payment.register_locks` — window `LOCKS_PAYMENT_WINDOW_SECONDS`;
-//! - payment-method bind — fiat `FIAT_PAYMENT_WINDOW_SECONDS`, bitcoin
-//!   `BITCOIN_PAYMENT_WINDOW_SECONDS`;
 //! - `payment.sandbox_advance` leaving `awaiting_entitlement` — window
 //!   `SANDBOX_PAYMENT_WINDOW_SECONDS`.
 //!
@@ -19,7 +19,9 @@
 //! `DROP_CLAIM_WINDOW_SECONDS` at checkout.
 //!
 //! The payment-window worker ([`crate::workers::expire_due_payment_windows`])
-//! releases a lapsed hold, expires the payment, and cancels the order.
+//! releases a lapsed hold, expires the payment, and cancels the order. An
+//! unbound leftover (`stock_held=false`, no payment method) is cancelled
+//! after `CHECKOUT_HOLD_WINDOW_SECONDS` with no inventory movement.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::state_machines::{can_transition, listing_machine};
@@ -35,6 +37,14 @@ use crate::result::CommandFailure;
 /// by the client contract tests.
 pub const SOLD_OUT_BEFORE_PAYMENT: &str = "The listing sold out before this payment started.";
 
+/// Refusal copy when another buyer's live payment holds the unit. Sibling
+/// bind (and checkout against an already-reserved listing) return this as
+/// `INVALID_STATE` 409.
+pub const HOLDING_COPY: &str = "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.";
+
+/// Historical `hold_source` written by #50 at `checkout.create`. Ordinary
+/// create no longer writes it; in-flight rows may still carry it until TTL.
+#[allow(dead_code)]
 pub const HOLD_SOURCE_CHECKOUT: &str = "checkout";
 pub const HOLD_SOURCE_LOCKS: &str = "locks";
 pub const HOLD_SOURCE_BIND: &str = "bind";
@@ -171,6 +181,13 @@ pub async fn acquire_payment_hold(
             )));
         };
         if listing.available_quantity < quantity {
+            if listing.state == "reserved" || listing.reserved_quantity > 0 {
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvalidState,
+                    ErrorCode::InvalidState,
+                    HOLDING_COPY,
+                )));
+            }
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InsufficientInventory,
                 ErrorCode::InsufficientInventory,
