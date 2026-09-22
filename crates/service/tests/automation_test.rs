@@ -18,8 +18,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use common::{
-    authenticate, checkout_command, checkout_command_with_id, execute, new_actor, register_command,
-    send, send_with_headers, test_app, test_app_with_config,
+    authenticate, checkout_command, checkout_command_with_id, drop_command_mirror_record, execute,
+    new_actor, register_command, send, send_with_headers, test_app, test_app_with_config,
 };
 
 async fn get_with_etag(router: Router, uri: &str, token: &str, etag: &str) -> (StatusCode, Value) {
@@ -339,6 +339,78 @@ async fn listing_export_event_cursor_and_sync_many_are_seller_scoped(pool: PgPoo
     .await;
     assert_eq!(status, StatusCode::GONE, "{body}");
     assert_eq!(body["error"]["code"], json!("cursor_expired"));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn seller_listing_collection_survives_one_missing_homeserver_record(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 3)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut second = register_command(&seller.pubky, 4);
+    second["command_id"] = json!("00000000-0000-4000-8000-000000000122");
+    second["aggregate_id"] = json!(format!("listing:{}_boots_02", seller.pubky));
+    second["payload"]["listing_id"] = json!("boots_02");
+    let (status, body) = execute(&app, &seller.token, &second).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    drop_command_mirror_record(&seller.pubky, "boots_01");
+
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/sellers/{}/listings?limit=2", seller.pubky),
+        Some(&seller.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["kind"], json!("seller_listing_export"));
+    let listings = body["listings"].as_array().expect("listing page");
+    assert_eq!(listings.len(), 2, "{body}");
+
+    let missing = listings
+        .iter()
+        .find(|listing| listing["projection"]["listing_id"] == json!("boots_01"))
+        .expect("missing homeserver listing remains in the collection");
+    assert_eq!(missing["record_status"], json!("unavailable"));
+    assert!(missing["record"].is_null());
+    assert!(missing["record_bytes_base64"].is_null());
+    assert!(missing["record_sha256"].is_null());
+    assert_eq!(missing["projection"]["available_quantity"], json!(3));
+    assert_eq!(
+        missing["record_uri"],
+        json!(format!(
+            "pubky://{}/pub/pubky.app/marketplace/v1/listings/boots_01",
+            seller.pubky
+        ))
+    );
+
+    let intact = listings
+        .iter()
+        .find(|listing| listing["record"]["listingId"] == json!("boots_02"))
+        .expect("homeserver-backed listing stays intact");
+    assert!(intact["record_status"].is_null());
+    assert_eq!(intact["projection"]["available_quantity"], json!(4));
+    assert!(intact["record_bytes_base64"].as_str().is_some());
+    assert_eq!(
+        intact["record_sha256"]
+            .as_str()
+            .expect("record digest")
+            .len(),
+        64
+    );
+
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/listings/{}/boots_01", seller.pubky),
+        Some(&seller.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"]["code"], json!("listing_record_unavailable"));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

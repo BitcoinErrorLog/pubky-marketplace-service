@@ -1234,6 +1234,13 @@ fn mirror_listing_registration(command: &Value) {
         .insert((seller_pubky.to_string(), listing_id.to_string()), record);
 }
 
+pub fn drop_command_mirror_record(seller_pubky: &str, listing_id: &str) {
+    command_mirror_records()
+        .lock()
+        .expect("command mirror records lock")
+        .remove(&(seller_pubky.to_string(), listing_id.to_string()));
+}
+
 pub fn listing_aggregate(seller_pubky: &str) -> String {
     format!("listing:{seller_pubky}_boots_01")
 }
