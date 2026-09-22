@@ -73,10 +73,17 @@ project. `.railway/railway.staging.ts` throws unless
 `RAILWAY_PROJECT_ID=c991d768-4a3c-42ea-b5ed-eaa22d4916ed` and
 `RAILWAY_ENVIRONMENT_ID=c67a6435-bb23-453b-9169-764bfa0312e1`.
 
-Each graph pins the live GHCR digest (`source: image(...)`). Omitting
-`source` plans `source.image → null`. Omitting `build` is required: the
-live IMAGE-connected service has no Dockerfile builder, and declaring
-one would add it.
+Each graph pins the live GHCR digest with `source: image("<ref>")`. `image()`
+accepts a string only; `preserve()` cannot hold a source. Omitting `source`
+plans `source.image → null`. After every IMAGE cutover, bump `STAGING_IMAGE` /
+`PRODUCTION_IMAGE` in the same PR. `railway config plan` must be 0/0/0 before
+any apply.
+
+Live `build` and `restartPolicyType` are the truth. Staging has no Dockerfile
+builder — omit `build` there (declaring one would add it). Production still
+records `build.builder = DOCKERFILE`; omitting it plans `DOCKERFILE → null`.
+Live `restartPolicyType` is unset; do not author `ON_FAILURE` until a 0/0/0
+plan is otherwise apply-safe and that field is the intended change.
 
 Docs: [Infrastructure as Code reference — Environment context](https://docs.railway.com/infrastructure-as-code/reference)
 and [railway config](https://docs.railway.com/cli/config).
@@ -92,9 +99,8 @@ project's names separately.
 
 ## Applying (operator)
 
-Do this once per project, after `railway config plan` shows **no variable
-deletes** and only the intended build/deploy updates. Never apply from an
-unreviewed plan.
+Do this once per project, after `railway config plan` is **0 add / 0 change / 0
+destroy**. Never apply from an unreviewed plan. A no-op plan needs no apply.
 
 1. **Staging first, from `.railway/railway.staging.ts` only.** Export the
    staging UUIDs (do not rely on `railway link` alone):
