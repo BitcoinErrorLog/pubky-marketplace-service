@@ -9,19 +9,20 @@ const STAGING_ENVIRONMENT_ID = "c67a6435-bb23-453b-9169-764bfa0312e1";
 const PRODUCTION_PROJECT_ID = "75faa4fe-466c-4277-977f-1d8e4e31df8c";
 const PRODUCTION_ENVIRONMENT_ID = "404919ad-fb95-4621-9f45-b7f993dfa8ae";
 
-const STAGING_IMAGE =
-  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:b29e0c4f5c68a16c13459f32ffbf823cc50573243e33a2e4a44e82936e2ed65a";
-const PRODUCTION_IMAGE =
-  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:f3a691e262fab56da0da78289084cbc7c4f0748bb67a2f5a7bb70e681a94e587";
+// `image()` takes a string only. `preserve()` is a variable value, not a
+// source. Do not read this from process.env: a 0/0/0 plan must be a property
+// of git, not of the operator's shell. The release train MUST bump each
+// constant in the same PR as the IMAGE connect for that seat.
+const LIVE_IMAGE =
+  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:52197d8b9059e43dc4cc8ff9262d02526381076e2b19e685c8245af7918d292f";
+const STAGING_IMAGE = LIVE_IMAGE;
+const PRODUCTION_IMAGE = LIVE_IMAGE;
 
-const sharedServiceConfig = {
-  deploy: {
-    healthcheckPath: "/ready",
-    healthcheckTimeout: 120,
-    restartPolicyType: "ON_FAILURE" as const,
-    overlapSeconds: 60,
-    drainingSeconds: 15,
-  },
+const sharedDeploy = {
+  healthcheckPath: "/ready",
+  healthcheckTimeout: 120,
+  overlapSeconds: 60,
+  drainingSeconds: 15,
 };
 
 const sharedEnv = {
@@ -122,8 +123,12 @@ export default defineRailway((ctx) => {
   }
 
   const marketplace_service = service("marketplace-service", {
-    ...sharedServiceConfig,
     source: image(isStaging ? STAGING_IMAGE : PRODUCTION_IMAGE),
+    // Live production still records builder DOCKERFILE (legacy toml).
+    // Omitting it plans `build.builder DOCKERFILE → null`. Staging live has
+    // no builder; declaring one would add it.
+    ...(isProduction ? { build: { builder: "DOCKERFILE" as const } } : {}),
+    deploy: sharedDeploy,
     env: isStaging ? stagingEnv : productionEnv,
     // Staging custom host is CLI-attached. Omitting this list deletes it.
     // Generated *.up.railway.app stays CLI.

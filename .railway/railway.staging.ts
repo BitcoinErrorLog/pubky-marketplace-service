@@ -4,8 +4,9 @@ export const partial = "marketplace-service";
 
 const STAGING_PROJECT_ID = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed";
 const STAGING_ENVIRONMENT_ID = "c67a6435-bb23-453b-9169-764bfa0312e1";
+// `image()` takes a string only. Bump in the same PR as every staging IMAGE connect.
 const STAGING_IMAGE =
-  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:b29e0c4f5c68a16c13459f32ffbf823cc50573243e33a2e4a44e82936e2ed65a";
+  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:52197d8b9059e43dc4cc8ff9262d02526381076e2b19e685c8245af7918d292f";
 
 const stagingEnv = {
   ALLOWED_ORIGINS: preserve(),
@@ -79,7 +80,6 @@ export default defineRailway((ctx) => {
     deploy: {
       healthcheckPath: "/ready",
       healthcheckTimeout: 120,
-      restartPolicyType: "ON_FAILURE",
       overlapSeconds: 60,
       drainingSeconds: 15,
     },
