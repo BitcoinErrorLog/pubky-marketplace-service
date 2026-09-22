@@ -103,15 +103,18 @@ fn payments_runtime(state: &AppState) -> Result<std::sync::Arc<PaymentsRuntime>,
     })
 }
 
-async fn load_config(
-    pool: &sqlx::PgPool,
+async fn load_config<'e, E>(
+    executor: E,
     seller_pubky: &str,
-) -> Result<Option<SellerPaymentConfigRow>, sqlx::Error> {
+) -> Result<Option<SellerPaymentConfigRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
     sqlx::query_as(&format!(
         "SELECT {CONFIG_COLUMNS} FROM seller_payment_configs WHERE seller_pubky = $1"
     ))
     .bind(seller_pubky)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
@@ -597,7 +600,10 @@ pub async fn bind_payment_method(
             "A Locks-correlated payment advances only by server-side verification.",
         );
     }
-    let config = match load_config(&state.pool, &order.seller_pubky).await {
+    // Stay on this transaction. A second pool checkout while other binds
+    // already hold connections can exhaust the pool (PoolTimedOut → INTERNAL
+    // 500) instead of the 409 HOLDING_COPY losers must see.
+    let config = match load_config(&mut *tx, &order.seller_pubky).await {
         Ok(config) => config,
         Err(error) => return internal("payment config read", &error),
     };
@@ -636,7 +642,7 @@ pub async fn bind_payment_method(
             ))
         } else if order.currency == "USD" && order.exponent == 2 {
             let (rate, sample, sats) = match crate::fx::quote_usd(
-                &state.pool,
+                &mut *tx,
                 &state.config.fx_feed_url,
                 order.total_minor,
                 order.exponent,

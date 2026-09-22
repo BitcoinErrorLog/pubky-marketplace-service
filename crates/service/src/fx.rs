@@ -229,19 +229,22 @@ pub fn reference_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
     now - Duration::seconds(REFERENCE_WINDOW_SECS)
 }
 
-pub async fn quote_usd(
-    pool: &sqlx::PgPool,
+pub async fn quote_usd<'e, E>(
+    executor: E,
     feed_url: &str,
     total_minor: i64,
     exponent: i32,
     now: DateTime<Utc>,
-) -> Result<(Decimal, RateSample, u64), FxError> {
+) -> Result<(Decimal, RateSample, u64), FxError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let rates: Vec<(String,)> = sqlx::query_as(
         "SELECT rate::text FROM fx_rate_samples \
          WHERE currency = 'USD' AND accepted_at >= $1 ORDER BY accepted_at",
     )
     .bind(reference_cutoff(now))
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .map_err(|_| FxError::MissingReference)?;
     let median_rate = median(
