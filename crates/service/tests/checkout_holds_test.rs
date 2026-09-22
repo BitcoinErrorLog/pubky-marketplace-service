@@ -11,7 +11,6 @@ use common::paykit_review::{
 use common::*;
 use common::{FakePaykit, FakeStripeSession, TestActor};
 use marketplace_service::clock::Clock;
-use marketplace_service::config::Config;
 use marketplace_service::payments::order_reference;
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
