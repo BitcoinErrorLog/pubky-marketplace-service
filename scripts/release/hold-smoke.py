@@ -390,6 +390,15 @@ def railway_ssh(argv: list[str]) -> str:
             continue
         filtered.append(line)
     if result.returncode != 0:
+        # GNU printenv exits 1 when the named key is unset; that is the
+        # empty-window case (code default 600), not an SSH failure.
+        if (
+            result.returncode == 1
+            and len(argv) == 2
+            and argv[0] == "printenv"
+            and not filtered
+        ):
+            return ""
         err = "\n".join(
             ln
             for ln in (result.stderr or "").splitlines()
