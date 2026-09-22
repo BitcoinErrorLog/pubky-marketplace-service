@@ -287,12 +287,13 @@ pub async fn list_seller_listings(
     for row in rows {
         match exported_listing(&state, &row).await {
             Ok(listing) => listings.push(listing),
-            Err(_) => {
-                return error(
-                    StatusCode::BAD_GATEWAY,
-                    "listing_record_unavailable",
-                    "A canonical listing record could not be exported.",
-                )
+            Err(reason) => {
+                tracing::warn!(
+                    listing_id = %row.listing_id,
+                    reason,
+                    "canonical listing record unavailable; continuing seller listing export"
+                );
+                listings.push(unavailable_listing_export(&row));
             }
         }
     }
@@ -352,6 +353,29 @@ pub async fn get_seller_listing(
     }
 }
 
+fn listing_record_uri(row: &ListingRow) -> String {
+    format!(
+        "pubky://{}/pub/pubky.app/marketplace/v1/listings/{}",
+        row.seller_pubky, row.listing_id
+    )
+}
+
+fn unavailable_listing_export(row: &ListingRow) -> Value {
+    let record_uri = listing_record_uri(row);
+    match row.public_projection() {
+        Ok(projection) => json!({
+            "record_status": "unavailable",
+            "record_uri": record_uri,
+            "projection": projection
+        }),
+        Err(_) => json!({
+            "record_status": "unavailable",
+            "record_uri": record_uri,
+            "listing_id": row.listing_id
+        }),
+    }
+}
+
 async fn exported_listing(state: &AppState, row: &ListingRow) -> Result<Value, &'static str> {
     let homeserver = state.homeserver.as_deref().ok_or("homeserver disabled")?;
     let raw = match homeserver
@@ -367,12 +391,8 @@ async fn exported_listing(state: &AppState, row: &ListingRow) -> Result<Value, &
     let projection = row
         .public_projection()
         .map_err(|_| "projection inconsistent")?;
-    let record_uri = format!(
-        "pubky://{}/pub/pubky.app/marketplace/v1/listings/{}",
-        row.seller_pubky, row.listing_id
-    );
     Ok(json!({
-        "record_uri": record_uri,
+        "record_uri": listing_record_uri(row),
         "record": record,
         "record_bytes_base64": base64::engine::general_purpose::STANDARD.encode(&raw),
         "record_sha256": hex::encode(Sha256::digest(&raw)),
