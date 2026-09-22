@@ -49,6 +49,7 @@ HOLDING_COPY = (
 )
 TTL_SLACK_SECONDS = 45.0
 TTL_OVER_SECONDS = 5.0
+FIAT_WINDOW_DEFAULT = 600
 
 SHOP_TAG = "shop-v0.6.19"
 SHOP_SHA = "c4dfc495a4159f225c83be55739ecaf5ddc69af3"
@@ -270,6 +271,12 @@ def self_check() -> None:
         raise RuntimeError("ttl slack around fiat default")
     if ttl_matches_window(500.0, 600):
         raise RuntimeError("ttl far below window must fail")
+    if parse_fiat_window("") != FIAT_WINDOW_DEFAULT:
+        raise RuntimeError("empty printenv must use fiat default 600")
+    if parse_fiat_window("600") != 600:
+        raise RuntimeError("exact-key 600")
+    if parse_fiat_window("900") != 900:
+        raise RuntimeError("exact-key 900")
     fixture_path = Path(__file__).with_name(FIXTURE_NAME)
     fixture = json.loads(fixture_path.read_text())
     if fixture["captured_from"]["shop_tag"] != SHOP_TAG:
@@ -392,19 +399,29 @@ def railway_ssh(argv: list[str]) -> str:
     return "\n".join(filtered)
 
 
-def fiat_window_seconds() -> int:
-    """Exact-key read of FIAT_PAYMENT_WINDOW_SECONDS from the running service."""
-    raw = railway_ssh(["printenv", "FIAT_PAYMENT_WINDOW_SECONDS"]).strip()
-    token = sql_scalar(raw) if "\n" in raw else raw
+def parse_fiat_window(raw: str) -> int:
+    """Parse an exact-key `printenv FIAT_PAYMENT_WINDOW_SECONDS` payload.
+
+    Empty output means the process is on the service default (600). Staging
+    IaC `preserve()`s the key and does not inject it when unset.
+    """
+    token = sql_scalar(raw) if "\n" in raw else raw.strip()
     if not token:
-        raise RuntimeError("FIAT_PAYMENT_WINDOW_SECONDS missing on staging service")
+        return FIAT_WINDOW_DEFAULT
     try:
         window = int(token)
     except ValueError as error:
-        raise RuntimeError(f"FIAT_PAYMENT_WINDOW_SECONDS not an integer ({len(token)} chars)") from error
+        raise RuntimeError(
+            f"FIAT_PAYMENT_WINDOW_SECONDS not an integer ({len(token)} chars)"
+        ) from error
     if window < 60:
         raise RuntimeError(f"FIAT_PAYMENT_WINDOW_SECONDS {window} is below the 60s floor")
     return window
+
+
+def fiat_window_seconds() -> int:
+    """Exact-key read of FIAT_PAYMENT_WINDOW_SECONDS from the running service."""
+    return parse_fiat_window(railway_ssh(["printenv", "FIAT_PAYMENT_WINDOW_SECONDS"]))
 
 
 def api(base: str, method: str, path: str, bearer: str | None, body: Any = None) -> tuple[int, dict | str]:
