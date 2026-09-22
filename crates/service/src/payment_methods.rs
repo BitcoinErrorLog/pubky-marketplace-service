@@ -474,31 +474,6 @@ fn bitcoin_amount_sats(order: &OrderRow) -> Option<u64> {
         .filter(|sats| *sats > 0)
 }
 
-fn live_test_amount_exceeds_cap(
-    config: &crate::config::Config,
-    order: &OrderRow,
-    quoted_sats: Option<u64>,
-) -> bool {
-    if let Some(max) = config.live_test_max_usd_minor {
-        // Listing-currency minor units for every fiat code (USD cents, EUR
-        // cents, JPY yen, …). No FX conversion: Blocktank is BTCUSD-only.
-        // Env name `LIVE_TEST_MAX_USD_MINOR` is historical.
-        if is_fiat_currency(order) && order.total_minor > max {
-            return true;
-        }
-    }
-    if let Some(max) = config.live_test_max_sats {
-        let max_sats = u64::try_from(max).unwrap_or(0);
-        if quoted_sats
-            .or_else(|| bitcoin_amount_sats(order))
-            .is_some_and(|sats| sats > max_sats)
-        {
-            return true;
-        }
-    }
-    false
-}
-
 fn fx_error_response(error: crate::fx::FxError) -> Response {
     let (reason, message) = match error {
         crate::fx::FxError::MissingReference => (
@@ -585,26 +560,6 @@ pub async fn bind_payment_method(
             ErrorCode::Unauthorized,
             "not_buyer",
             "Only the buyer may bind the payment method.",
-        );
-    }
-    if !state
-        .config
-        .live_test_seller_allowlist
-        .permits(&order.seller_pubky)
-    {
-        return method_error(
-            ErrorCode::InvalidState,
-            "live_test_seller_not_allowlisted",
-            "This seller is not on the live-test allow-list.",
-        );
-    }
-    // Buyer and allow-list run first so a disabled rail does not leak
-    // `method_unavailable` to a non-buyer or a seller outside the list.
-    if state.config.payment_rails_disabled.contains(method) {
-        return method_error(
-            ErrorCode::InvalidState,
-            "method_unavailable",
-            "This payment rail is disabled on this deployment.",
         );
     }
     if let Some(bound) = &order.payment_method {
@@ -704,17 +659,8 @@ pub async fn bind_payment_method(
         None
     };
 
-    let quoted_sats = bitcoin_quote.as_ref().map(|(_, sats)| *sats);
-    if live_test_amount_exceeds_cap(&state.config, &order, quoted_sats) {
-        return method_error(
-            ErrorCode::InvalidState,
-            "live_test_amount_capped",
-            "The order total exceeds the live-test amount cap.",
-        );
-    }
-
     // The bind lock point: choosing a real rail re-arms the checkout hold
-    // to the rail window. Live-test / rail-disabled checks ran above.
+    // to the rail window.
     let bind_window = if method == "bitcoin" {
         state.config.bitcoin_payment_window_seconds
     } else {

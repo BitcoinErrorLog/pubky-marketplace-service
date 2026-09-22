@@ -11,7 +11,6 @@ use common::paykit_review::{
 use common::*;
 use common::{FakePaykit, FakeStripeSession, TestActor};
 use marketplace_service::clock::Clock;
-use marketplace_service::config::Config;
 use marketplace_service::payments::order_reference;
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
@@ -693,29 +692,6 @@ async fn assert_order_event_revisions_match(pool: &PgPool, order_id: &str, order
     assert_eq!(
         event_count, order_revision,
         "order event revisions must be contiguous 1..={order_revision}"
-    );
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn live_test_cap_refuses_before_rearm(pool: PgPool) {
-    let mut config = Config::for_tests();
-    config.live_test_max_usd_minor = Some(100);
-    let (app, _stripe, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-    assert_eq!(
-        hold_row(&app.pool, &order.order_id).await,
-        (true, Some(ts_after(900)), Some("checkout".into()))
-    );
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["reason"], json!("live_test_amount_capped"));
-    assert_eq!(
-        hold_row(&app.pool, &order.order_id).await,
-        (true, Some(ts_after(900)), Some("checkout".into())),
-        "cap refusal must not re-arm"
     );
 }
 
