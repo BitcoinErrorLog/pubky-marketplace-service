@@ -2544,13 +2544,13 @@ mod tests {
 
     #[test]
     fn checkout_region_matrix_matches_postal_table() {
-        // Closed-list countries require a known ISO suffix. Shop sends codes;
-        // names normalize for one release.
+        // Closed-list countries: ISO suffix, full name → suffix, legacy free text stored.
         assert_eq!(parsed_region(&checkout_address("US", "MA")), "MA");
         assert_eq!(
             parsed_region(&checkout_address("US", "Massachusetts")),
             "MA"
         );
+        assert_eq!(parsed_region(&checkout_address("US", "California")), "CA");
         assert_eq!(parsed_region(&checkout_address("CA", "ON")), "ON");
         assert_eq!(parsed_region(&checkout_address("CA", "Ontario")), "ON");
         assert_eq!(parsed_region(&checkout_address("AU", "NSW")), "NSW");
@@ -2558,10 +2558,14 @@ mod tests {
             .expect_err("US requires state")
             .iter()
             .any(|i| i.path == "payload.delivery_address.region"));
-        assert!(parse_command(&checkout_address("US", "XX"))
-            .expect_err("unknown US state")
-            .iter()
-            .any(|i| i.path == "payload.delivery_address.region"));
+        // Shop v0.6.16 always sends region as free text (min 1). That payload
+        // must parse: unknown US/CA values are stored as-is, never 422.
+        assert_eq!(parsed_region(&checkout_address("US", "XX")), "XX");
+        assert_eq!(parsed_region(&checkout_address("US", "Lisboa")), "Lisboa");
+        assert_eq!(
+            parsed_region(&checkout_address("CA", "NotAProvince")),
+            "NotAProvince"
+        );
 
         // Required free-text subdivision countries.
         for country in ["BR", "IN", "MX", "AE", "ZA"] {
@@ -2578,6 +2582,14 @@ mod tests {
             assert_eq!(parsed_region(&checkout_address(country, "  ")), "");
         }
         assert_eq!(parsed_region(&checkout_address("GB", "England")), "England");
+        assert_eq!(parsed_region(&checkout_address("DE", "Bayern")), "Bayern");
+        // PT / IS are absent from postal-region-rules.json.
+        assert_eq!(parsed_region(&checkout_address("PT", "")), "");
+        assert_eq!(parsed_region(&checkout_address("PT", "Lisboa")), "Lisboa");
+        assert_eq!(
+            parsed_region(&checkout_address("IS", "Reykjavik")),
+            "Reykjavik"
+        );
 
         let mut omitted = checkout_address("GB", "");
         omitted["payload"]["delivery_address"]

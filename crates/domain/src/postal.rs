@@ -4,9 +4,11 @@
 //! currently duplicates it in `src/libs/commerce/postal-address.ts`; the
 //! follow-up is to consume this file so the client and this service cannot
 //! drift. Region is required only where a postal system uses a subdivision.
-//! US/CA/AU store ISO 3166-2 suffixes (`NY`, `ON`, `NSW`). Shop sends those
-//! codes; full names are accepted for one release and normalized to the
-//! suffix, with a deprecation log line (no address values).
+//! US/CA/AU store ISO 3166-2 suffixes (`NY`, `ON`, `NSW`) when the client
+//! sends a code or a known full name. Shop v0.6.16 still sends free-text
+//! `region` on every shipping checkout; unknown non-empty values are stored
+//! as-is (legacy) with a warn that names no address values. Empty region is
+//! allowed only when the country does not require a subdivision.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -117,9 +119,10 @@ pub fn is_region_required(country_code: &str) -> bool {
 /// Normalize a region for storage.
 ///
 /// Empty is allowed only when the country does not require a subdivision.
-/// Closed-list countries (US/CA/AU) accept the ISO suffix, or the full name
-/// for one release (normalized to the suffix). Never returns the input when
-/// a closed list applies — unknown values are `Err`.
+/// Countries with a subdivision table (US/CA/AU) accept, in order:
+/// (a) the ISO 3166-2 suffix, (b) the full subdivision name
+/// case-insensitive, stored as the suffix, (c) any other non-empty
+/// free text, stored as-is so Shop v0.6.16 payloads never 422.
 pub fn canonicalize_region(country_code: &str, region: &str) -> Result<String, &'static str> {
     let trimmed = region.trim();
     let rule = postal_country_rule(country_code);
@@ -152,11 +155,15 @@ pub fn canonicalize_region(country_code: &str, region: &str) -> Result<String, &
     {
         tracing::warn!(
             country = %country_code.trim().to_ascii_uppercase(),
-            "delivery_address.region used a subdivision name; ISO 3166-2 suffix is the contract (names accepted for one release)"
+            "delivery_address.region used a subdivision name; ISO 3166-2 suffix is the contract (names accepted)"
         );
         return Ok(code.clone());
     }
-    Err("Expected an ISO 3166-2 subdivision suffix")
+    tracing::warn!(
+        country = %country_code.trim().to_ascii_uppercase(),
+        "delivery_address.region used unstructured text; ISO 3166-2 suffix is the contract (legacy free-text stored)"
+    );
+    Ok(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -198,17 +205,23 @@ mod tests {
     }
 
     #[test]
-    fn closed_list_accepts_codes_and_names() {
+    fn closed_list_accepts_codes_names_and_legacy_free_text() {
+        // (a) ISO 3166-2 suffix
         assert_eq!(canonicalize_region("US", "NY").unwrap(), "NY");
         assert_eq!(canonicalize_region("us", " ma ").unwrap(), "MA");
-        assert_eq!(canonicalize_region("US", "Massachusetts").unwrap(), "MA");
         assert_eq!(canonicalize_region("CA", "ON").unwrap(), "ON");
-        assert_eq!(canonicalize_region("CA", "Ontario").unwrap(), "ON");
         assert_eq!(canonicalize_region("AU", "NSW").unwrap(), "NSW");
+        // (b) full subdivision name → suffix
+        assert_eq!(canonicalize_region("US", "Massachusetts").unwrap(), "MA");
+        assert_eq!(canonicalize_region("US", "California").unwrap(), "CA");
+        assert_eq!(canonicalize_region("CA", "Ontario").unwrap(), "ON");
         assert_eq!(canonicalize_region("AU", "New South Wales").unwrap(), "NSW");
+        // (c) any other non-empty free text → store as-is (Shop v0.6.16)
+        assert_eq!(canonicalize_region("US", "XX").unwrap(), "XX");
+        assert_eq!(canonicalize_region("US", "Lisboa").unwrap(), "Lisboa");
         assert_eq!(
-            canonicalize_region("US", "XX").unwrap_err(),
-            "Expected an ISO 3166-2 subdivision suffix"
+            canonicalize_region("CA", "NotAProvince").unwrap(),
+            "NotAProvince"
         );
         assert_eq!(
             canonicalize_region("US", "").unwrap_err(),
@@ -217,11 +230,20 @@ mod tests {
     }
 
     #[test]
-    fn optional_countries_allow_empty_region() {
+    fn optional_and_table_absent_countries_never_422_on_region() {
         assert_eq!(canonicalize_region("GB", "").unwrap(), "");
         assert_eq!(canonicalize_region("GB", "  ").unwrap(), "");
+        assert_eq!(canonicalize_region("GB", "England").unwrap(), "England");
+        assert_eq!(canonicalize_region("DE", "").unwrap(), "");
         assert_eq!(canonicalize_region("DE", "Bayern").unwrap(), "Bayern");
         assert_eq!(canonicalize_region("JP", "").unwrap(), "");
+        // PT is absent from postal-region-rules.json; default = not required.
+        assert_eq!(canonicalize_region("PT", "").unwrap(), "");
+        assert_eq!(canonicalize_region("PT", "Lisboa").unwrap(), "Lisboa");
+        assert_eq!(
+            canonicalize_region("IS", "Höfuðborgarsvæðið").unwrap(),
+            "Höfuðborgarsvæðið"
+        );
         assert_eq!(canonicalize_region("BR", "SP").unwrap(), "SP");
         assert_eq!(
             canonicalize_region("BR", "").unwrap_err(),
