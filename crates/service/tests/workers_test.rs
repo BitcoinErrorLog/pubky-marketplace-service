@@ -15,8 +15,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use common::{
-    checkout_command, count, create_offer_command, execute, listing_aggregate, new_actor,
-    place_bid_command, register_auction_command, register_command, reserve_command, test_app,
+    count, create_offer_command, execute, listing_aggregate, new_actor, place_bid_command,
+    register_auction_command, register_command, reserve_command, test_app,
 };
 
 // Reservation TTL 600 s, offer TTL 3600 s, auction ends at +600 s — all on
@@ -159,11 +159,12 @@ async fn leases_exclude_concurrent_instances_and_lapse_over_time(pool: PgPool) {
         "the holder may renew its own lease"
     );
 
-    // A run_once by the excluded instance skips the outbox task entirely.
+    // Ordinary checkout no longer enqueues order_created. Seed with an offer,
+    // which still writes a notification outbox row the lease contract can drain.
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
-    execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    execute(&app, &buyer.token, &create_offer_command(&seller.pubky, 1)).await;
     let summary = run_once(&app.state, instance_b, now)
         .await
         .expect("worker pass runs");
@@ -197,7 +198,8 @@ async fn crashed_outbox_claim_is_recovered_without_loss_or_duplication(pool: PgP
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
-    let (status, _) = execute(&app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    // Ordinary checkout does not enqueue order_created; an offer still does.
+    let (status, _) = execute(&app, &buyer.token, &create_offer_command(&seller.pubky, 1)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM outbox").await, 1);
 
