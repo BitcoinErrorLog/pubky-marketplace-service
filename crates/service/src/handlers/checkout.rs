@@ -9,7 +9,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::executor::insert_event;
-use crate::handlers::holds::{self, HOLD_SOURCE_CHECKOUT, HOLD_SOURCE_DROP_CLAIM};
+use crate::handlers::holds::{HOLDING_COPY, HOLD_SOURCE_DROP_CLAIM};
 use crate::handlers::{current_listing_revision, fetch_listing, fetch_listing_for_update};
 use crate::locks::LocksKeys;
 use crate::model::{money_json, ListingRow, OrderRow, PaymentRow, ProjectionContext};
@@ -17,7 +17,6 @@ use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 pub struct CheckoutWindows {
     pub drop_claim_seconds: i64,
-    pub checkout_hold_seconds: i64,
 }
 
 pub async fn handle(
@@ -30,7 +29,6 @@ pub async fn handle(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let drop_claim_window_seconds = windows.drop_claim_seconds;
-    let checkout_hold_window_seconds = windows.checkout_hold_seconds;
     if command.aggregate_id != ids::checkout_aggregate_id(command.command_id)
         || command.expected_revision != 0
     {
@@ -114,9 +112,9 @@ pub async fn handle(
         // the buyer deserves that truth, not a generic unavailability.
         if listing.state == "reserved" {
             return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidState,
-            ErrorCode::InvalidState,
-                "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.",
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                HOLDING_COPY,
             )));
         }
         if listing.state == "sold" {
@@ -294,8 +292,8 @@ pub async fn handle(
         let payment_id = Uuid::new_v4();
         let seller_has_rail = crate::queries::seller_has_rail(tx, seller_pubky).await?;
 
-        // Drop-bound checkout keeps lock-at-claim. Ordinary checkout
-        // acquires the 900 s park after insert in this same transaction.
+        // Drop-bound checkout keeps lock-at-claim. Ordinary checkout does
+        // not hold: bind is the first acquire.
         let stock_held = drop_aggregate_id.is_some();
         let hold_expires_at = drop_aggregate_id
             .is_some()
@@ -468,21 +466,6 @@ pub async fn handle(
             }
         }
 
-        if drop_aggregate_id.is_none() {
-            order = match holds::acquire_payment_hold(
-                tx,
-                order,
-                checkout_hold_window_seconds,
-                HOLD_SOURCE_CHECKOUT,
-                now,
-            )
-            .await?
-            {
-                Ok(order) => order,
-                Err(failure) => return Ok(Err(failure)),
-            };
-        }
-
         let order_aggregate_id = ids::order_aggregate_id(order_id);
         let event_id = insert_event(
             tx,
@@ -496,20 +479,6 @@ pub async fn handle(
         .await?;
         event_ids.push(event_id);
 
-        // Complete notification intent for the seller, delivered by workers
-        // at least once (ADR-0019 §4).
-        crate::handlers::insert_notification_intent(
-            tx,
-            event_id,
-            "order_created",
-            seller_pubky,
-            actor,
-            &order_aggregate_id,
-            None,
-            now,
-        )
-        .await?;
-
         orders.push(order.project(ProjectionContext::CommandResult {
             authenticated_actor: actor,
         }));
@@ -522,8 +491,8 @@ pub async fn handle(
     // Drop-bound checkout keeps lock-at-claim (ADR-0026: the FCFS race IS
     // the product): the purchased unit moves to reserved with a
     // compare-and-swap on the validated line revision, in the same
-    // transaction as the drop debit above. Ordinary checkouts already
-    // acquired their hold after insert.
+    // transaction as the drop debit above. Ordinary checkouts hold nothing
+    // until payment-method bind.
     if drop_aggregate_id.is_some() {
         for (line, listing) in &resolved {
             let new_state = if listing.available_quantity == line.quantity {

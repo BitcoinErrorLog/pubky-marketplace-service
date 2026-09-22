@@ -872,12 +872,13 @@ async fn mixed_cart_splits_per_seller_fulfillment(pool: PgPool) {
     assert!(stored.is_none());
 
     // A pickup choice a listing does not publish is refused with a typed
-    // error — never rewritten to shipping.
+    // error — never rewritten to shipping. Ordinary checkout does not bump
+    // listing revision, so this still CASes expected_revision 1.
     let (status, body) = execute(
         &app,
         &buyer.token,
         &checkout_lines(
-            vec![line(&seller_b.pubky, "boots_01", 2, "pickup")],
+            vec![line(&seller_b.pubky, "boots_01", 1, "pickup")],
             false,
             "00000000-0000-4000-9000-000000000155",
         ),

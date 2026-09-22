@@ -309,17 +309,14 @@ async fn a_prepared_row_survives_a_worker_pass_untouched(pool: PgPool) {
     let (status, body) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let mut payments = Vec::new();
-    for (index, command_id) in [
+    for command_id in [
         "00000000-0000-4000-8000-000000000100",
         "00000000-0000-4000-8000-000000000101",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ] {
         let (status, checkout) = execute(
             &app,
             &buyer.token,
-            &checkout_at_listing_revision(&seller.pubky, command_id, 1 + index as i64),
+            &checkout_at_listing_revision(&seller.pubky, command_id, 1),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{checkout}");
@@ -1106,11 +1103,11 @@ async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    // Checkout holds a unit and bumps listing revision, so the second
-    // checkout must carry the current revision.
+    // Ordinary checkout does not hold or bump listing revision, so the
+    // second checkout still carries expected_revision 1.
     let mut second =
         checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001001");
-    second["payload"]["lines"][0]["expected_revision"] = json!(2);
+    second["payload"]["lines"][0]["expected_revision"] = json!(1);
     let (status, second_checkout) = execute(&app, &buyer.token, &second).await;
     assert_eq!(status, StatusCode::OK, "{second_checkout}");
     let first_payment = first_checkout["result"]["payments"][0]["id"]

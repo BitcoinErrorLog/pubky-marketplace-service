@@ -955,6 +955,8 @@ pub struct PendingOrder {
 
 /// Registers one unit and checks out as the buyer, leaving the order in
 /// `pending_payment` with its payment awaiting entitlement at revision 1.
+/// Ordinary checkout does **not** hold stock; the first acquire is bind,
+/// Locks registration, or sandbox first-advance.
 pub async fn create_pending_order(
     app: &TestApp,
     seller: &TestActor,

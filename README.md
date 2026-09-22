@@ -69,7 +69,9 @@ are kept as-is, while the constraint still enforces
 **no DOWN migration** — dropped tables and
 columns cannot be restored — so production must be empty or backed up
 before applying (it is empty as of 2026-09-05). Configuration is
-environment-based:
+environment-based. Window keys and their defaults also live in
+[`.env.example`](.env.example) (config-parity with `Config::from_env` and
+Railway IaC `preserve()`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -84,7 +86,9 @@ environment-based:
 | `LOCKS_BUNDLE_ENCRYPTION_KEY` | unset | 32-byte hex key encrypting bundle ids at rest (XChaCha20-Poly1305) |
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
 | `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the `payment.register_locks` lock point (≥ 60); the correlation window IS the hold window |
-| `FIAT_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the payment-method bind lock point (`POST /v0/orders/{id}/payment-method`, all three rails) (≥ 60) |
+| `CHECKOUT_HOLD_WINDOW_SECONDS` | `900` | unbound leftover cancel for ordinary `pending_payment` rows with `stock_held=false` and no payment method (≥ 60). Ordinary `checkout.create` does not hold stock |
+| `FIAT_PAYMENT_WINDOW_SECONDS` | `600` | hold window armed by a PayPal/Stripe payment-method bind (`POST /v0/orders/{id}/payment-method`) (≥ 60). Default 10 minutes; live Railway may still preserve a longer override |
+| `BITCOIN_PAYMENT_WINDOW_SECONDS` | `1800` | hold window armed by a bitcoin payment-method bind; the same instant is Paykit `expires_at` — never longer than the invoice the buyer is shown (≥ 60). Honor a deployment value ≥ 60; do not cap below a live Railway override |
 | `SANDBOX_PAYMENT_WINDOW_SECONDS` | `900` | hold window armed by the sandbox lock point (`payment.sandbox_advance`'s first transition out of `awaiting_entitlement`) (≥ 60) |
 | `DROP_CLAIM_WINDOW_SECONDS` | `600` | hold window armed at checkout for drop-bound orders (lock-at-claim) (≥ 60) |
 | `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation |
@@ -522,12 +526,14 @@ and arms a bounded server-time hold window on the order
 | Lock point | Window |
 | --- | --- |
 | `payment.register_locks` | `LOCKS_PAYMENT_WINDOW_SECONDS` (default 3600) — the existing correlation window IS the hold window; one window concept, not two |
-| `POST /v0/orders/{id}/payment-method` (bind, all three rails) | `FIAT_PAYMENT_WINDOW_SECONDS` (default 3600, min 60) |
+| `POST /v0/orders/{id}/payment-method` (PayPal / Stripe) | `FIAT_PAYMENT_WINDOW_SECONDS` (default 600, min 60) |
+| `POST /v0/orders/{id}/payment-method` (bitcoin) | `BITCOIN_PAYMENT_WINDOW_SECONDS` (default 1800, min 60) — equals Paykit `expires_at` |
 | `payment.sandbox_advance` transitioning OUT of `awaiting_entitlement` (the first transition; gated by `SANDBOX_PAYMENTS_ENABLED` as always) | `SANDBOX_PAYMENT_WINDOW_SECONDS` (default 900, min 60) |
 
 A lock point on an order that ALREADY holds stock never double-decrements
 (idempotent by order): a drop-bound order re-arms its window to the lock
-point's own span (see Drops), an ordinary order re-arms nothing. A lock
+point's own span (see Drops). An ordinary order acquires at the first
+lock point (bind / Locks / sandbox) and re-arms nothing on a later one. A lock
 point on an order that is no longer `pending_payment` is refused — a
 cancelled order can never grab stock. Auction orders are outside this
 mechanism entirely: the winner's hold is the winning `reservations` row,

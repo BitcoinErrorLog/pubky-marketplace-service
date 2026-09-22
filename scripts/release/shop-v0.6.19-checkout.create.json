@@ -1,7 +1,7 @@
 {
   "captured_from": {
-    "shop_tag": "shop-v0.6.17",
-    "shop_sha": "852ad0df9558f6514152b27a6facaf2f2da732d3",
+    "shop_tag": "shop-v0.6.19",
+    "shop_sha": "c4dfc495a4159f225c83be55739ecaf5ddc69af3",
     "captured_on": "2026-09-22",
     "files": [
       "src/core/application/commerce/commerce.ts (commitCreateMarketplaceCheckout)",
@@ -12,10 +12,12 @@
       "src/libs/commerce/postal-address.ts (commerceDeliveryAddressValueSchema)"
     ],
     "notes": [
+      "Deployed Shop v0.6.19 checkout.create wire. Keys are unchanged from the v0.6.17 capture.",
       "Wire keys are snake_case. Shop builds camelCase then toSnakeCaseWire at POST /v1/commands.",
       "Shipping line always includes fulfillment=shipping and a delivery_address object with name, line1, line2, city, region, postal_code, country_code.",
       "Pickup-only checkout omits delivery_address entirely and sets fulfillment=pickup. Presenting an address on pickup is rejected.",
-      "v0.6.17 form/schema may canonicalize California→CA before POST. This smoke still posts free-text California because that is the class Shop v0.6.16 sent and that PR #23 422'd. Shape is v0.6.17; region values cover free text, ISO suffix, and PT empty."
+      "This smoke still posts free-text California because that is the class Shop v0.6.16 sent and that PR #23 422'd. Region values cover free text, ISO suffix, and PT empty.",
+      "Option B: checkout.create does not hold; POST /v0/orders/{id}/payment-method acquires hold_source=bind."
     ]
   },
   "shipping_wire_keys": {
@@ -45,5 +47,6 @@
       "country_code"
     ]
   },
-  "pickup_omits": ["delivery_address"]
+  "pickup_omits": ["delivery_address"],
+  "bind_body": { "method": "paypal" }
 }

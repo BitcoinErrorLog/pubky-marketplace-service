@@ -1,8 +1,7 @@
-//! Exclusive checkout hold: `checkout.create` parks a unit for 900 s, bind /
-//! Locks / sandbox re-arm the rail window, and the payment-window worker
-//! releases lapsed holds. Covered here: the two-buyer last-unit race at
-//! checkout, the abandoned checkout that blocks until TTL or Cancel, the
-//! three re-arm points, window expiry with restock, and the 0012 backfill.
+//! Exclusive inventory hold at payment-method bind. Covered here: the
+//! two-buyer last-unit race at bind, the abandoned unbound checkout that
+//! does not block siblings, the three lock points, window expiry with
+//! restock, unbound idle cancel, and the 0012 backfill.
 
 mod common;
 
@@ -47,15 +46,27 @@ async fn order_hold(app: &TestApp, order_id: &str) -> (bool, Option<String>) {
     )
 }
 
-// Two buyers check out the LAST unit: the first parks it; the second is
-// 409 INVALID_STATE with the holding copy and never receives an order.
+// Two buyers check out the LAST unit unheld; the first bind parks it; the
+// second bind is 409 INVALID_STATE with the holding copy.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn both_buyers_check_out_the_last_unit_and_the_first_checkout_wins(pool: PgPool) {
-    let app = test_app(pool).await;
+async fn both_buyers_check_out_the_last_unit_and_the_first_bind_wins(pool: PgPool) {
+    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
     execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({
+            "bitcoin_enabled": false,
+            "stripe_payment_link": "https://buy.stripe.com/test_abc123",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "config put failed: {body}");
 
     let (status, first_checkout) = execute(
         &app,
@@ -70,8 +81,12 @@ async fn both_buyers_check_out_the_last_unit_and_the_first_checkout_wins(pool: P
     );
     assert_eq!(
         first_checkout["result"]["orders"][0]["stock_held"],
-        json!(true)
+        json!(false)
     );
+    let first_order = first_checkout["result"]["orders"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (status, second_checkout) = execute(
         &app,
         &second.token,
@@ -80,22 +95,46 @@ async fn both_buyers_check_out_the_last_unit_and_the_first_checkout_wins(pool: P
     .await;
     assert_eq!(
         status,
-        StatusCode::CONFLICT,
-        "unexpected: {second_checkout}"
+        StatusCode::OK,
+        "second checkout must succeed unheld: {second_checkout}"
     );
-    assert_eq!(second_checkout["error"]["code"], json!("INVALID_STATE"));
-    assert_eq!(second_checkout["error"]["message"], json!(HOLDING_COPY));
-    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 1);
+    let second_order = second_checkout["result"]["orders"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 2);
+
+    let (status, first_bind) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{first_order}/payment-method"),
+        Some(&first.token),
+        &json!({ "method": "stripe" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first bind failed: {first_bind}");
+    assert_eq!(first_bind["order"]["stock_held"], json!(true));
+    let (status, second_bind) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{second_order}/payment-method"),
+        Some(&second.token),
+        &json!({ "method": "stripe" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "unexpected: {second_bind}");
+    assert_eq!(second_bind["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(second_bind["error"]["message"], json!(HOLDING_COPY));
     assert_eq!(
         listing_quantities(&app, &seller.pubky).await,
         (0, 1, 0, "reserved".to_string())
     );
 }
 
-// An abandoned checkout parks the unit until Cancel or TTL: a sibling
-// checkout is 409 with the holding copy.
+// An abandoned unbound checkout does not park the unit: a sibling
+// checkout succeeds. Bind is the exclusive point.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn an_abandoned_checkout_blocks_until_ttl_or_cancel(pool: PgPool) {
+async fn an_abandoned_unbound_checkout_does_not_block_siblings(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let abandoner = new_actor(&app).await;
@@ -111,8 +150,8 @@ async fn an_abandoned_checkout_blocks_until_ttl_or_cancel(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
     assert_eq!(
         listing_quantities(&app, &seller.pubky).await,
-        (0, 1, 0, "reserved".to_string()),
-        "the abandoned checkout holds the unit"
+        (1, 0, 0, "available".to_string()),
+        "the abandoned unbound checkout holds nothing"
     );
 
     let (status, body) = execute(
@@ -121,9 +160,8 @@ async fn an_abandoned_checkout_blocks_until_ttl_or_cancel(pool: PgPool) {
         &checkout_command_with_id(&seller.pubky, &indexed_command_id(0xa001, 2)),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "unexpected: {body}");
-    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
-    assert_eq!(body["error"]["message"], json!(HOLDING_COPY));
+    assert_eq!(status, StatusCode::OK, "sibling checkout failed: {body}");
+    assert_eq!(body["result"]["orders"][0]["stock_held"], json!(false));
 }
 
 // `payment.register_locks` is a lock point: it acquires the hold and arms
@@ -136,10 +174,7 @@ async fn register_locks_acquires_the_hold_and_arms_the_locks_window(pool: PgPool
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let order = create_pending_order(&app, &seller, &buyer).await;
-    assert_eq!(
-        order_hold(&app, &order.order_id).await,
-        (true, Some(ts_after(900)))
-    );
+    assert_eq!(order_hold(&app, &order.order_id).await, (false, None));
 
     let prepare = json!({
         "version": 1,
@@ -215,10 +250,7 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
     .await;
     assert_eq!(status, StatusCode::OK, "config put failed: {body}");
     let order = create_pending_order(&app, &seller, &buyer).await;
-    assert_eq!(
-        order_hold(&app, &order.order_id).await,
-        (true, Some(ts_after(900)))
-    );
+    assert_eq!(order_hold(&app, &order.order_id).await, (false, None));
 
     let second_buyer = new_actor(&app).await;
     let (status, body) = execute(
@@ -227,9 +259,15 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
         &checkout_command_with_id(&seller.pubky, &indexed_command_id(0xa002, 1)),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "unexpected: {body}");
-    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
-    assert_eq!(body["error"]["message"], json!(HOLDING_COPY));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sibling unbound checkout must succeed: {body}"
+    );
+    let sibling_order = body["result"]["orders"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let (status, body) = send(
         app.router.clone(),
@@ -247,6 +285,18 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
         listing_quantities(&app, &seller.pubky).await,
         (0, 1, 0, "reserved".to_string())
     );
+
+    let (status, sibling_bind) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{sibling_order}/payment-method"),
+        Some(&second_buyer.token),
+        &json!({ "method": "stripe" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "unexpected: {sibling_bind}");
+    assert_eq!(sibling_bind["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(sibling_bind["error"]["message"], json!(HOLDING_COPY));
 
     // The idempotent re-bind of the same method does not double-decrement.
     let (status, body) = send(

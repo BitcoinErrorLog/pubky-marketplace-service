@@ -5,15 +5,18 @@ Canonical copy: BitcoinErrorLog/pubky-marketplace-service
 `scripts/release/hold-smoke.py`. The release skill points here; do not keep
 a second live copy under .evidence/.
 
-Exercises checkout.create with the Shop v0.6.17 wire shape
-(shop-v0.6.17 @ 852ad0df9558f6514152b27a6facaf2f2da732d3):
+Exercises checkout.create with the deployed Shop v0.6.19 wire shape
+(shop-v0.6.19 @ c4dfc495a4159f225c83be55739ecaf5ddc69af3). Keys match the
+v0.6.17 capture; hold semantics are Option B:
 
   (a) shipping listing + full delivery_address, region as free text
       ("California"), ISO suffix ("CA"), and empty for PT;
   (b) pickup-only (no delivery_address);
-  (c) two-buyer hold 409 + cancel/restock.
+  (c) two unheld checkout.create 200s, then bind exclusivity (first
+      POST /v0/orders/{id}/payment-method holds; loser 409 HOLDING_COPY);
+  (d) hold TTL equals live FIAT_PAYMENT_WINDOW_SECONDS (exact-key read).
 
-Any HTTP 4xx other than the expected 409 is STOP. Never production.
+Any HTTP 4xx other than the expected bind 409 is STOP. Never production.
 Every created order is cancelled and verified cancelled at the end.
 
     MARKETPLACE_URL=https://staging-api.pubky.app
@@ -44,11 +47,13 @@ from urllib.request import Request, urlopen
 HOLDING_COPY = (
     "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks."
 )
-TTL_MIN = 800
-TTL_MAX = 1000
+TTL_SLACK_SECONDS = 45.0
+TTL_OVER_SECONDS = 5.0
+FIAT_WINDOW_DEFAULT = 600
 
-SHOP_TAG = "shop-v0.6.17"
-SHOP_SHA = "852ad0df9558f6514152b27a6facaf2f2da732d3"
+SHOP_TAG = "shop-v0.6.19"
+SHOP_SHA = "c4dfc495a4159f225c83be55739ecaf5ddc69af3"
+FIXTURE_NAME = "shop-v0.6.19-checkout.create.json"
 
 STAGING_URL = "https://staging-api.pubky.app"
 STAGING_PROJECT = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed"
@@ -134,6 +139,15 @@ def refuse_production(url: str, project: str) -> None:
 
 def issued_at() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def bind_body(method: str) -> dict[str, str]:
+    """Shop payment-method bind: `{ "method": "paypal" | "stripe" | "bitcoin" }`."""
+    return {"method": method}
+
+
+def ttl_matches_window(ttl: float, window: int, *, slack: float = TTL_SLACK_SECONDS) -> bool:
+    return (window - slack) <= ttl <= (window + TTL_OVER_SECONDS)
 
 
 def checkout_body(
@@ -249,7 +263,21 @@ def self_check() -> None:
         raise RuntimeError("CA stored region marker")
     pickup = checkout_body(pickup_listing, str(uuid.uuid4()), fulfillment="pickup", address=None)
     assert_shape(pickup, shipping=False)
-    fixture_path = Path(__file__).with_name("shop-v0.6.17-checkout.create.json")
+    if bind_body("paypal") != {"method": "paypal"}:
+        raise RuntimeError("paypal bind body")
+    if bind_body("stripe") != {"method": "stripe"}:
+        raise RuntimeError("stripe bind body")
+    if not ttl_matches_window(590.0, 600):
+        raise RuntimeError("ttl slack around fiat default")
+    if ttl_matches_window(500.0, 600):
+        raise RuntimeError("ttl far below window must fail")
+    if parse_fiat_window("") != FIAT_WINDOW_DEFAULT:
+        raise RuntimeError("empty printenv must use fiat default 600")
+    if parse_fiat_window("600") != 600:
+        raise RuntimeError("exact-key 600")
+    if parse_fiat_window("900") != 900:
+        raise RuntimeError("exact-key 900")
+    fixture_path = Path(__file__).with_name(FIXTURE_NAME)
     fixture = json.loads(fixture_path.read_text())
     if fixture["captured_from"]["shop_tag"] != SHOP_TAG:
         raise RuntimeError("fixture tag drift")
@@ -264,6 +292,8 @@ def self_check() -> None:
                 "ca_region": ca["payload"]["delivery_address"]["region"],
                 "pt_region": pt["payload"]["delivery_address"]["region"],
                 "pickup_has_address": "delivery_address" in pickup["payload"],
+                "bind_paypal": bind_body("paypal"),
+                "ttl_590_vs_600": ttl_matches_window(590.0, 600),
             },
             indent=2,
             sort_keys=True,
@@ -316,6 +346,91 @@ def sql(statement: str) -> str:
         )
         raise RuntimeError(f"sql failed rc={result.returncode} err={err[:400]!r} out={filtered!r}")
     return "\n".join(filtered)
+
+
+def railway_ssh(argv: list[str]) -> str:
+    """Run one command on the staging marketplace-service instance.
+
+    Used only for an exact-key `printenv FIAT_PAYMENT_WINDOW_SECONDS`. Never
+    list or dump the rest of the environment.
+    """
+    project = os.environ["RAILWAY_PROJECT_ID"]
+    environment = os.environ["RAILWAY_ENVIRONMENT"]
+    refuse_production(os.environ["MARKETPLACE_URL"], project)
+    env = os.environ.copy()
+    env["PATH"] = "/opt/homebrew/bin:" + env.get("PATH", "")
+    for key in ("RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT_ID", "RAILWAY_SERVICE_ID"):
+        env.pop(key, None)
+    result = subprocess.run(
+        [
+            "railway",
+            "ssh",
+            "-p",
+            project,
+            "-e",
+            environment,
+            "-s",
+            STAGING_SERVICE,
+            "--",
+            *argv,
+        ],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    filtered = []
+    for line in (result.stdout or "").splitlines():
+        lower = line.lower()
+        if "postgres://" in lower or "password" in lower:
+            continue
+        if "config as code" in lower or "migrate:" in lower:
+            continue
+        if "ssh tunnel" in lower or "connected to" in lower:
+            continue
+        filtered.append(line)
+    if result.returncode != 0:
+        # GNU printenv exits 1 when the named key is unset; that is the
+        # empty-window case (code default 600), not an SSH failure.
+        if (
+            result.returncode == 1
+            and len(argv) == 2
+            and argv[0] == "printenv"
+            and not filtered
+        ):
+            return ""
+        err = "\n".join(
+            ln
+            for ln in (result.stderr or "").splitlines()
+            if "postgres://" not in ln.lower() and "password" not in ln.lower()
+        )
+        raise RuntimeError(f"ssh failed rc={result.returncode} err={err[:400]!r} out={filtered!r}")
+    return "\n".join(filtered)
+
+
+def parse_fiat_window(raw: str) -> int:
+    """Parse an exact-key `printenv FIAT_PAYMENT_WINDOW_SECONDS` payload.
+
+    Empty output means the process is on the service default (600). Staging
+    IaC `preserve()`s the key and does not inject it when unset.
+    """
+    token = sql_scalar(raw) if "\n" in raw else raw.strip()
+    if not token:
+        return FIAT_WINDOW_DEFAULT
+    try:
+        window = int(token)
+    except ValueError as error:
+        raise RuntimeError(
+            f"FIAT_PAYMENT_WINDOW_SECONDS not an integer ({len(token)} chars)"
+        ) from error
+    if window < 60:
+        raise RuntimeError(f"FIAT_PAYMENT_WINDOW_SECONDS {window} is below the 60s floor")
+    return window
+
+
+def fiat_window_seconds() -> int:
+    """Exact-key read of FIAT_PAYMENT_WINDOW_SECONDS from the running service."""
+    return parse_fiat_window(railway_ssh(["printenv", "FIAT_PAYMENT_WINDOW_SECONDS"]))
 
 
 def api(base: str, method: str, path: str, bearer: str | None, body: Any = None) -> tuple[int, dict | str]:
@@ -396,6 +511,7 @@ def parse_listing_rows(raw: str) -> list[dict[str, Any]]:
         parts = [p.strip().strip('"') for p in token.split("|")]
         if len(parts) < 5:
             continue
+        bind_method = parts[5] if len(parts) > 5 else ""
         rows.append(
             {
                 "aggregate_id": parts[0],
@@ -403,37 +519,51 @@ def parse_listing_rows(raw: str) -> list[dict[str, Any]]:
                 "server_revision": int(parts[2]),
                 "available_quantity": int(parts[3]),
                 "fulfillment_methods": parts[4],
+                "bind_method": bind_method,
             }
         )
     return rows
 
 
-def pick_listing(*, shipping: bool, exclude: set[str] | None = None) -> dict[str, Any]:
+def pick_listing(
+    *, shipping: bool, exclude: set[str] | None = None, require_bind: bool = False
+) -> dict[str, Any]:
     if shipping:
-        clause = "AND fulfillment_methods::text LIKE '%shipping%'"
+        clause = "AND l.fulfillment_methods::text LIKE '%shipping%'"
         label = "shipping"
     else:
         clause = (
-            "AND fulfillment_methods::text LIKE '%pickup%' "
-            "AND fulfillment_methods::text NOT LIKE '%shipping%'"
+            "AND l.fulfillment_methods::text LIKE '%pickup%' "
+            "AND l.fulfillment_methods::text NOT LIKE '%shipping%'"
         )
         label = "pickup-only"
     excluded = ""
     if exclude:
         ids = ",".join(f"'{quote(item)}'" for item in sorted(exclude))
-        excluded = f"AND aggregate_id NOT IN ({ids}) "
+        excluded = f"AND l.aggregate_id NOT IN ({ids}) "
     raw = sql(
-        "SELECT aggregate_id || '|' || seller_pubky || '|' || server_revision::text "
-        "|| '|' || available_quantity::text || '|' || fulfillment_methods::text "
-        "FROM listings "
-        "WHERE sale_format='fixed_price' AND state='available' AND available_quantity=1 "
-        "AND reserved_quantity=0 "
+        "SELECT l.aggregate_id || '|' || l.seller_pubky || '|' || l.server_revision::text "
+        "|| '|' || l.available_quantity::text || '|' || l.fulfillment_methods::text "
+        "|| '|' || CASE "
+        "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 'paypal' "
+        "WHEN c.stripe_payment_link IS NOT NULL AND btrim(c.stripe_payment_link) <> '' THEN 'stripe' "
+        "ELSE '' END "
+        "FROM listings l "
+        "LEFT JOIN seller_payment_configs c ON c.seller_pubky = l.seller_pubky "
+        "WHERE l.sale_format='fixed_price' AND l.state='available' AND l.available_quantity=1 "
+        "AND l.reserved_quantity=0 "
         f"{clause} {excluded}"
-        "ORDER BY updated_at DESC NULLS LAST LIMIT 5;"
+        "ORDER BY (CASE "
+        "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 0 "
+        "WHEN c.stripe_payment_link IS NOT NULL AND btrim(c.stripe_payment_link) <> '' THEN 1 "
+        "ELSE 2 END), l.updated_at DESC NULLS LAST LIMIT 5;"
     )
     rows = parse_listing_rows(raw)
+    if require_bind:
+        rows = [row for row in rows if row.get("bind_method") in {"paypal", "stripe"}]
     if not rows:
-        raise RuntimeError(f"no qty-1 available {label} listing\n{raw!r}")
+        suffix = " with paypal/stripe" if require_bind else ""
+        raise RuntimeError(f"no qty-1 available {label} listing{suffix}\n{raw!r}")
     listing = rows[0]
     methods = listing["fulfillment_methods"]
     if shipping and "shipping" not in methods:
@@ -463,11 +593,11 @@ def ensure_pickup_listing(exclude: set[str]) -> tuple[dict[str, Any], dict[str, 
     the original methods in the caller's finally.
     """
     try:
-        return pick_listing(shipping=False, exclude=exclude), None
+        return pick_listing(shipping=False, exclude=exclude, require_bind=True), None
     except RuntimeError as error:
         if "no qty-1 available pickup-only listing" not in str(error):
             raise
-    donor = pick_listing(shipping=True, exclude=exclude)
+    donor = pick_listing(shipping=True, exclude=exclude, require_bind=True)
     original = donor["fulfillment_methods"]
     raw = sql(
         "UPDATE listings SET fulfillment_methods = '{pickup}'::text[], updated_at = now() "
@@ -481,6 +611,7 @@ def ensure_pickup_listing(exclude: set[str]) -> tuple[dict[str, Any], dict[str, 
     if not rows:
         raise RuntimeError(f"failed to retarget donor listing for pickup\n{raw!r}")
     listing = rows[0]
+    listing["bind_method"] = donor.get("bind_method", "")
     if "pickup" not in listing["fulfillment_methods"] or "shipping" in listing["fulfillment_methods"]:
         restore_listing_methods(donor["aggregate_id"], original)
         raise RuntimeError(f"donor is not pickup-only after retarget: {listing!r}")
@@ -538,9 +669,15 @@ def order_revision(order_id: str) -> int:
 
 def refresh_listing(aggregate_id: str) -> dict[str, Any]:
     raw = sql(
-        "SELECT aggregate_id || '|' || seller_pubky || '|' || server_revision::text "
-        "|| '|' || available_quantity::text || '|' || fulfillment_methods::text "
-        f"FROM listings WHERE aggregate_id='{quote(aggregate_id)}';"
+        "SELECT l.aggregate_id || '|' || l.seller_pubky || '|' || l.server_revision::text "
+        "|| '|' || l.available_quantity::text || '|' || l.fulfillment_methods::text "
+        "|| '|' || CASE "
+        "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 'paypal' "
+        "WHEN c.stripe_payment_link IS NOT NULL AND btrim(c.stripe_payment_link) <> '' THEN 'stripe' "
+        "ELSE '' END "
+        "FROM listings l "
+        "LEFT JOIN seller_payment_configs c ON c.seller_pubky = l.seller_pubky "
+        f"WHERE l.aggregate_id='{quote(aggregate_id)}';"
     )
     rows = parse_listing_rows(raw)
     if not rows:
@@ -560,6 +697,12 @@ class Smoke:
         self.sessions: list[str] = []
         self.created_orders: list[dict[str, Any]] = []
         self.cases: list[dict[str, Any]] = []
+        self.fiat_window: int | None = None
+
+    def load_fiat_window(self) -> int:
+        if self.fiat_window is None:
+            self.fiat_window = fiat_window_seconds()
+        return self.fiat_window
 
     def command(self, token: str, body: dict[str, Any], *, allowed: set[int], case: str) -> tuple[int, dict | str]:
         status, resp = api(self.base, "POST", "/v1/commands", token, body)
@@ -600,6 +743,28 @@ class Smoke:
             raise RuntimeError(f"order {order_id} still stock_held after cancel")
         return {"http": status, "state": hold["state"], "stock_held": hold["stock_held"]}
 
+    def order_hold(self, order_id: str) -> dict[str, Any]:
+        hold_raw = sql(
+            "SELECT stock_held::text, coalesce(hold_source,''), "
+            "coalesce(hold_expires_at::text,''), state "
+            f"FROM orders WHERE id='{quote(order_id)}'::uuid;"
+        )
+        return parse_hold_row(hold_raw)
+
+    def bind_payment(
+        self, token: str, order_id: str, method: str, *, case: str
+    ) -> tuple[int, dict | str]:
+        body = bind_body(method)
+        status, resp = api(
+            self.base,
+            "POST",
+            f"/v0/orders/{order_id}/payment-method",
+            token,
+            body,
+        )
+        stop_on_unexpected_4xx(status, resp, allowed={200, 409}, case=case)
+        return status, resp
+
     def two_buyer(
         self,
         listing: dict[str, Any],
@@ -609,6 +774,10 @@ class Smoke:
         case: str,
         expected_stored_region: set[str] | None,
     ) -> dict[str, Any]:
+        method = listing.get("bind_method") or ""
+        if method not in {"paypal", "stripe"}:
+            raise RuntimeError(f"{case}: listing has no paypal/stripe bind method {listing!r}")
+        window = self.load_fiat_window()
         buyer_a = z32_pubky()
         buyer_b = z32_pubky()
         if buyer_a == listing["seller_pubky"] or buyer_b == listing["seller_pubky"]:
@@ -621,38 +790,47 @@ class Smoke:
         body_a = checkout_body(listing, cmd_a, fulfillment=fulfillment, address=address)
         body_b = checkout_body(listing, cmd_b, fulfillment=fulfillment, address=address)
         assert_shape(body_a, shipping=fulfillment == "shipping")
-        status_a, resp_a = self.command(token_a, body_a, allowed={200, 409}, case=f"{case}.first")
-        status_b, resp_b = self.command(token_b, body_b, allowed={200, 409}, case=f"{case}.second")
+        status_a, resp_a = self.command(token_a, body_a, allowed={200}, case=f"{case}.first_create")
+        status_b, resp_b = self.command(token_b, body_b, allowed={200}, case=f"{case}.second_create")
         first_ok = isinstance(resp_a, dict) and resp_a.get("ok") is True
         second_ok = isinstance(resp_b, dict) and resp_b.get("ok") is True
-        winner_token = None
-        winner_order = None
-        if first_ok:
-            winner_token = token_a
-            winner_order = resp_a["result"]["orders"][0]["id"]  # type: ignore[index]
-        if second_ok:
-            if winner_order:
-                raise RuntimeError(f"{case}: both checkouts succeeded")
-            winner_token = token_b
-            winner_order = resp_b["result"]["orders"][0]["id"]  # type: ignore[index]
-        if winner_order is None or winner_token is None:
-            raise RuntimeError(f"{case}: no winner first={status_a} {resp_a!r} second={status_b} {resp_b!r}")
-        self.created_orders.append({"id": winner_order, "token": winner_token, "case": case})
-        loser_status = status_b if first_ok else status_a
-        loser_body = resp_b if first_ok else resp_a
+        if not first_ok or not second_ok:
+            raise RuntimeError(
+                f"{case}: both checkouts must succeed unheld first={status_a} {resp_a!r} "
+                f"second={status_b} {resp_b!r}"
+            )
+        order_a = resp_a["result"]["orders"][0]["id"]  # type: ignore[index]
+        order_b = resp_b["result"]["orders"][0]["id"]  # type: ignore[index]
+        self.created_orders.append({"id": order_a, "token": token_a, "case": case})
+        self.created_orders.append({"id": order_b, "token": token_b, "case": case})
+        hold_a = self.order_hold(order_a)
+        hold_b = self.order_hold(order_b)
+        if hold_a["stock_held"] or hold_b["stock_held"]:
+            raise RuntimeError(f"{case}: checkout must not hold a={hold_a!r} b={hold_b!r}")
+        if hold_a["hold_source"] or hold_b["hold_source"]:
+            raise RuntimeError(f"{case}: checkout hold_source a={hold_a!r} b={hold_b!r}")
+        bind_a_status, bind_a = self.bind_payment(token_a, order_a, method, case=f"{case}.first_bind")
+        bind_b_status, bind_b = self.bind_payment(token_b, order_b, method, case=f"{case}.second_bind")
+        if bind_a_status == 200 and bind_b_status == 200:
+            raise RuntimeError(f"{case}: both binds succeeded")
+        if bind_a_status == 200:
+            winner_order, winner_token = order_a, token_a
+            loser_status, loser_body = bind_b_status, bind_b
+        elif bind_b_status == 200:
+            winner_order, winner_token = order_b, token_b
+            loser_status, loser_body = bind_a_status, bind_a
+        else:
+            raise RuntimeError(
+                f"{case}: no bind winner first={bind_a_status} {bind_a!r} second={bind_b_status} {bind_b!r}"
+            )
         loser_message = (loser_body.get("error") or {}).get("message") if isinstance(loser_body, dict) else None
         if loser_status != 409:
-            raise RuntimeError(f"{case}: loser http {loser_status} body={loser_body!r}")
+            raise RuntimeError(f"{case}: bind loser http {loser_status} body={loser_body!r}")
         if loser_message != HOLDING_COPY:
-            raise RuntimeError(f"{case}: loser message {loser_message!r}")
-        hold_raw = sql(
-            "SELECT stock_held::text, coalesce(hold_source,''), "
-            "coalesce(hold_expires_at::text,''), state "
-            f"FROM orders WHERE id='{quote(winner_order)}'::uuid;"
-        )
-        hold = parse_hold_row(hold_raw)
-        if not hold["stock_held"] or hold["hold_source"] != "checkout":
-            raise RuntimeError(f"{case}: hold {hold!r}")
+            raise RuntimeError(f"{case}: bind loser message {loser_message!r}")
+        hold = self.order_hold(winner_order)
+        if not hold["stock_held"] or hold["hold_source"] != "bind":
+            raise RuntimeError(f"{case}: hold after bind {hold!r}")
         ttl = float(
             sql_scalar(
                 sql(
@@ -661,8 +839,8 @@ class Smoke:
                 )
             )
         )
-        if not (TTL_MIN <= ttl <= TTL_MAX):
-            raise RuntimeError(f"{case}: ttl {ttl}")
+        if not ttl_matches_window(ttl, window):
+            raise RuntimeError(f"{case}: ttl {ttl} window={window}")
         stored_region = None
         if expected_stored_region is not None:
             stored_region = stored_region_of(winner_order)
@@ -671,6 +849,9 @@ class Smoke:
                     f"{case}: stored region {stored_region!r} not in {sorted(expected_stored_region)!r}"
                 )
         cancel = self.cancel_order(winner_token, winner_order, f"hold-smoke {case} restock")
+        loser_order = order_b if winner_order == order_a else order_a
+        loser_token = token_b if winner_order == order_a else token_a
+        self.cancel_order(loser_token, loser_order, f"hold-smoke {case} loser")
         listing_after = refresh_listing(listing["aggregate_id"])
         if listing_after["available_quantity"] != 1:
             raise RuntimeError(
@@ -683,8 +864,12 @@ class Smoke:
             "shop_sha": SHOP_SHA,
             "fulfillment": fulfillment,
             "delivery_address": address,
+            "bind_method": method,
+            "fiat_window_seconds": window,
             "first_http": status_a,
             "second_http": status_b,
+            "first_bind_http": bind_a_status,
+            "second_bind_http": bind_b_status,
             "loser_http": loser_status,
             "loser_message": loser_message,
             "winner_order_id": winner_order,
@@ -717,6 +902,9 @@ class Smoke:
             raise RuntimeError(f"{case}: not ok {status} {resp!r}")
         order_id = resp["result"]["orders"][0]["id"]  # type: ignore[index]
         self.created_orders.append({"id": order_id, "token": token, "case": case})
+        hold = self.order_hold(order_id)
+        if hold["stock_held"] or hold["hold_source"]:
+            raise RuntimeError(f"{case}: checkout must not hold {hold!r}")
         stored_region = None
         if expected_stored_region is not None:
             stored_region = stored_region_of(order_id)
@@ -737,6 +925,7 @@ class Smoke:
             "delivery_address": address,
             "http": status,
             "order_id": order_id,
+            "hold": hold,
             "stored_region": stored_region,
             "cancel": cancel,
             "listing_qty_after": listing_after["available_quantity"],
@@ -766,7 +955,7 @@ class Smoke:
     def run(self) -> dict[str, Any]:
         pickup_restore: dict[str, str] | None = None
         try:
-            shipping = pick_listing(shipping=True)
+            shipping = pick_listing(shipping=True, require_bind=True)
             pickup, pickup_restore = ensure_pickup_listing({shipping["aggregate_id"]})
             self.cases.append(
                 self.two_buyer(
@@ -814,6 +1003,7 @@ class Smoke:
                 "shop_sha": SHOP_SHA,
                 "marketplace_url": self.base,
                 "railway_project": self.project,
+                "fiat_window_seconds": self.fiat_window,
                 "pickup_methods_retargeted": pickup_restore is not None,
                 "cases": self.cases,
                 "orders_verified_cancelled": verified,

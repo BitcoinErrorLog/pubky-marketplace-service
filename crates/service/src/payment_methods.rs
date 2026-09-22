@@ -103,15 +103,18 @@ fn payments_runtime(state: &AppState) -> Result<std::sync::Arc<PaymentsRuntime>,
     })
 }
 
-async fn load_config(
-    pool: &sqlx::PgPool,
+async fn load_config<'e, E>(
+    executor: E,
     seller_pubky: &str,
-) -> Result<Option<SellerPaymentConfigRow>, sqlx::Error> {
+) -> Result<Option<SellerPaymentConfigRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
     sqlx::query_as(&format!(
         "SELECT {CONFIG_COLUMNS} FROM seller_payment_configs WHERE seller_pubky = $1"
     ))
     .bind(seller_pubky)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
@@ -597,7 +600,10 @@ pub async fn bind_payment_method(
             "A Locks-correlated payment advances only by server-side verification.",
         );
     }
-    let config = match load_config(&state.pool, &order.seller_pubky).await {
+    // Stay on this transaction. A second pool checkout while other binds
+    // already hold connections can exhaust the pool (PoolTimedOut → INTERNAL
+    // 500) instead of the 409 HOLDING_COPY losers must see.
+    let config = match load_config(&mut *tx, &order.seller_pubky).await {
         Ok(config) => config,
         Err(error) => return internal("payment config read", &error),
     };
@@ -636,7 +642,7 @@ pub async fn bind_payment_method(
             ))
         } else if order.currency == "USD" && order.exponent == 2 {
             let (rate, sample, sats) = match crate::fx::quote_usd(
-                &state.pool,
+                &mut *tx,
                 &state.config.fx_feed_url,
                 order.total_minor,
                 order.exponent,
@@ -659,8 +665,9 @@ pub async fn bind_payment_method(
         None
     };
 
-    // The bind lock point: choosing a real rail re-arms the checkout hold
-    // to the rail window.
+    // The bind lock point: first ordinary acquire (or a re-arm when a drop
+    // claim / prior lock point already holds). Fiat uses the 10-minute
+    // listing hold; bitcoin uses the invoice window the buyer is shown.
     let bind_window = if method == "bitcoin" {
         state.config.bitcoin_payment_window_seconds
     } else {
@@ -677,7 +684,9 @@ pub async fn bind_payment_method(
     {
         Ok(Ok(order)) => order,
         Ok(Err(failure)) => {
-            let reason = if failure.code() == ErrorCode::InsufficientInventory {
+            let reason = if failure.message() == crate::handlers::holds::HOLDING_COPY {
+                "held"
+            } else if failure.code() == ErrorCode::InsufficientInventory {
                 "sold_out"
             } else {
                 "hold_unavailable"
@@ -833,7 +842,7 @@ pub async fn bind_payment_method(
             .expect("checked above");
         let endpoint = paykit.base_url().to_string();
         let expires_at = updated_order.hold_expires_at.unwrap_or_else(|| {
-            now + chrono::Duration::seconds(state.config.fiat_payment_window_seconds)
+            now + chrono::Duration::seconds(state.config.bitcoin_payment_window_seconds)
         });
         let idempotency_key = format!("{reference}:{}", updated_order.paykit_bind_attempt);
         let phase1 = paykit

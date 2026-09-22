@@ -78,16 +78,23 @@ pub struct Config {
     /// failure — Locks v1 leaves transport/status failures pending
     /// (ADR-0019 §7).
     pub locks_payment_window_seconds: i64,
-    /// Hold window armed at ordinary `checkout.create`
-    /// (`CHECKOUT_HOLD_WINDOW_SECONDS`, default 900, minimum 60). Bind /
-    /// Locks / sandbox re-arm this to the rail window.
+    /// Unbound leftover cancel (`CHECKOUT_HOLD_WINDOW_SECONDS`, default
+    /// 900, minimum 60). Ordinary `checkout.create` does not hold stock;
+    /// this window cancels `pending_payment` rows with `stock_held=false`
+    /// and no payment method. Bind / Locks / sandbox acquire the inventory
+    /// hold at their own lock point.
     pub checkout_hold_window_seconds: i64,
-    /// Hold window re-armed by a fiat payment-method bind
-    /// (`FIAT_PAYMENT_WINDOW_SECONDS`, default 3600, minimum 60).
+    /// Hold window armed by a fiat payment-method bind
+    /// (`FIAT_PAYMENT_WINDOW_SECONDS`, default 600, minimum 60). PayPal
+    /// `_xclick` and Stripe Payment Link have no matching inventory TTL;
+    /// this is the listing restock clock while those hosted checkouts are
+    /// open.
     pub fiat_payment_window_seconds: i64,
-    /// Hold window re-armed by a bitcoin payment-method bind
-    /// (`BITCOIN_PAYMENT_WINDOW_SECONDS`, default 7200, minimum 60). Do not
-    /// reuse the fiat window: a 1-conf can exceed 3600 s.
+    /// Hold window armed by a bitcoin payment-method bind
+    /// (`BITCOIN_PAYMENT_WINDOW_SECONDS`, default 1800, minimum 60). The
+    /// same instant is Paykit `expires_at` — never longer than the invoice
+    /// the buyer is shown. Honor a deployment value ≥ 60; do not cap below
+    /// a live Railway override.
     pub bitcoin_payment_window_seconds: i64,
     /// Hold window armed by `payment.sandbox_advance`'s first transition
     /// out of `awaiting_entitlement`, the sandbox lock point
@@ -256,11 +263,11 @@ impl Config {
         if checkout_hold_window_seconds < 60 {
             anyhow::bail!("CHECKOUT_HOLD_WINDOW_SECONDS must be at least 60");
         }
-        let fiat_payment_window_seconds = env_i64("FIAT_PAYMENT_WINDOW_SECONDS", 3_600)?;
+        let fiat_payment_window_seconds = env_i64("FIAT_PAYMENT_WINDOW_SECONDS", 600)?;
         if fiat_payment_window_seconds < 60 {
             anyhow::bail!("FIAT_PAYMENT_WINDOW_SECONDS must be at least 60");
         }
-        let bitcoin_payment_window_seconds = env_i64("BITCOIN_PAYMENT_WINDOW_SECONDS", 7_200)?;
+        let bitcoin_payment_window_seconds = env_i64("BITCOIN_PAYMENT_WINDOW_SECONDS", 1_800)?;
         if bitcoin_payment_window_seconds < 60 {
             anyhow::bail!("BITCOIN_PAYMENT_WINDOW_SECONDS must be at least 60");
         }
@@ -383,6 +390,9 @@ impl Config {
             worker_lease_seconds: 30,
             locks_payment_window_seconds: 3_600,
             checkout_hold_window_seconds: 900,
+            // Integration clocks keep the prior 1 h / 2 h rails so bind and
+            // late-money tests stay independent of production 600 / 1800
+            // defaults. Production `from_env` uses 600 / 1800.
             fiat_payment_window_seconds: 3_600,
             bitcoin_payment_window_seconds: 7_200,
             sandbox_payment_window_seconds: 900,
@@ -603,6 +613,9 @@ mod tests {
         let previous_backup = std::env::var("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED").ok();
         let previous_replica = std::env::var("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED").ok();
         let previous_risk = std::env::var("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED").ok();
+        let previous_checkout_hold = std::env::var("CHECKOUT_HOLD_WINDOW_SECONDS").ok();
+        let previous_fiat_window = std::env::var("FIAT_PAYMENT_WINDOW_SECONDS").ok();
+        let previous_bitcoin_window = std::env::var("BITCOIN_PAYMENT_WINDOW_SECONDS").ok();
         std::env::set_var("DATABASE_URL", "postgres://example.invalid/test");
         std::env::set_var(
             "REFUSAL_AUDIT_DATABASE_URL",
@@ -621,6 +634,9 @@ mod tests {
         std::env::set_var("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", "true");
         std::env::set_var("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", "true");
         std::env::set_var("FX_FEED_URL", "https://attacker.example/fx");
+        std::env::remove_var("CHECKOUT_HOLD_WINDOW_SECONDS");
+        std::env::remove_var("FIAT_PAYMENT_WINDOW_SECONDS");
+        std::env::remove_var("BITCOIN_PAYMENT_WINDOW_SECONDS");
         let result = Config::from_env();
         match previous_database_url {
             Some(value) => std::env::set_var("DATABASE_URL", value),
@@ -641,6 +657,9 @@ mod tests {
             ("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", previous_backup),
             ("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", previous_replica),
             ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", previous_risk),
+            ("CHECKOUT_HOLD_WINDOW_SECONDS", previous_checkout_hold),
+            ("FIAT_PAYMENT_WINDOW_SECONDS", previous_fiat_window),
+            ("BITCOIN_PAYMENT_WINDOW_SECONDS", previous_bitcoin_window),
         ] {
             match previous {
                 Some(value) => std::env::set_var(name, value),
@@ -653,6 +672,9 @@ mod tests {
             crate::fx::FX_URL,
             "a release binary cannot be repointed by FX_FEED_URL"
         );
+        assert_eq!(config.checkout_hold_window_seconds, 900);
+        assert_eq!(config.fiat_payment_window_seconds, 600);
+        assert_eq!(config.bitcoin_payment_window_seconds, 1_800);
     }
 
     #[test]

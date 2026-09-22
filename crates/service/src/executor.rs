@@ -430,7 +430,6 @@ async fn dispatch(
                 state.locks.as_deref().map(|runtime| &runtime.keys),
                 crate::handlers::checkout::CheckoutWindows {
                     drop_claim_seconds: state.config.drop_claim_window_seconds,
-                    checkout_hold_seconds: state.config.checkout_hold_window_seconds,
                 },
                 now,
             )

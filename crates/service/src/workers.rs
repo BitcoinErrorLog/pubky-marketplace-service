@@ -2153,7 +2153,8 @@ pub async fn verify_due_paykit_payments(
 /// lock order), the payment moves to `expired` (the machine's
 /// `payment_window` edge from `awaiting_entitlement`), and the order is
 /// cancelled with the stored reason "payment window elapsed" — post-expiry
-/// the buyer simply checks out again.
+/// the buyer simply checks out again. A held order with `hold_expires_at`
+/// NULL (pre-#50 rows the 0012 backfill missed) is already elapsed.
 ///
 /// This is a marketplace policy transition, independent of upstream state; a
 /// Locks correlation keeps polling (bounded by the Lock Server's own task
@@ -2182,11 +2183,12 @@ pub async fn expire_due_payment_windows(
     let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
         "SELECT o.id, p.id, p.state, o.buyer_pubky \
          FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE o.state = 'pending_payment' AND o.stock_held AND o.hold_expires_at <= $1 \
+         WHERE o.state = 'pending_payment' AND o.stock_held \
+         AND (o.hold_expires_at IS NULL OR o.hold_expires_at <= $1) \
          AND p.state IN ('awaiting_entitlement', 'detected', 'expired') \
          AND o.paykit_activation_state IS DISTINCT FROM 'preparing' \
          AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation' \
-         ORDER BY o.hold_expires_at FOR UPDATE OF o, p SKIP LOCKED",
+         ORDER BY o.hold_expires_at NULLS FIRST FOR UPDATE OF o, p SKIP LOCKED",
     )
     .bind(now)
     .fetch_all(&mut *tx)
@@ -2214,9 +2216,10 @@ pub async fn expire_due_payment_windows(
     // HTTP call rides the batch transaction.
     let preparing: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE o.state = 'pending_payment' AND o.stock_held AND o.hold_expires_at <= $1 \
+         WHERE o.state = 'pending_payment' AND o.stock_held \
+         AND (o.hold_expires_at IS NULL OR o.hold_expires_at <= $1) \
          AND p.state = 'awaiting_entitlement' AND o.paykit_activation_state = 'preparing' \
-         ORDER BY o.hold_expires_at",
+         ORDER BY o.hold_expires_at NULLS FIRST",
     )
     .bind(now)
     .fetch_all(pool)
@@ -2234,7 +2237,8 @@ pub async fn expire_due_payment_windows(
             }
         }
     }
-    Ok(expired)
+    let idle = expire_idle_unbound_checkouts(state, now).await?;
+    Ok(expired + idle)
 }
 
 /// The shared expiry effects for one due order, inside the caller's
@@ -2315,7 +2319,15 @@ async fn expire_held_order(
         )
         .await?
         {
-            anyhow::bail!("expired order {order_id} could not credit drop {drop_aggregate_id}");
+            if order.hold_expires_at.is_none() {
+                tracing::warn!(
+                    order_id = %order_id,
+                    drop_aggregate_id = %drop_aggregate_id,
+                    "legacy null-expiry hold: drop units unaccounted; still expiring"
+                );
+            } else {
+                anyhow::bail!("expired order {order_id} could not credit drop {drop_aggregate_id}");
+            }
         }
     }
     if let Err(failure) = crate::handlers::holds::release_lines(
@@ -2326,7 +2338,15 @@ async fn expire_held_order(
     )
     .await?
     {
-        anyhow::bail!("expired order {order_id} could not release its hold: {failure:?}");
+        if order.hold_expires_at.is_none() {
+            tracing::warn!(
+                order_id = %order_id,
+                error = ?failure,
+                "legacy null-expiry hold: listing unaccounted; still expiring"
+            );
+        } else {
+            anyhow::bail!("expired order {order_id} could not release its hold: {failure:?}");
+        }
     }
 
     debug_assert!(marketplace_domain::state_machines::can_transition(
@@ -2360,6 +2380,87 @@ async fn expire_held_order(
         "expired hold window: released stock, expired payment, cancelled order"
     );
     Ok(())
+}
+
+/// Cancels leftover unbound checkouts (`pending_payment`, no hold, no
+/// payment method, not auction/drop) after `CHECKOUT_HOLD_WINDOW_SECONDS`.
+/// No inventory moves: ordinary create never reserved a unit. Bound
+/// invoices are excluded — TTL is their only safety net.
+async fn expire_idle_unbound_checkouts(
+    state: &AppState,
+    now: DateTime<Utc>,
+) -> anyhow::Result<u64> {
+    let cutoff = now - chrono::Duration::seconds(state.config.checkout_hold_window_seconds);
+    let mut tx = state.pool.begin().await?;
+    let due: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "SELECT o.id, p.id, o.buyer_pubky \
+         FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE o.state = 'pending_payment' AND NOT o.stock_held \
+         AND o.payment_method IS NULL \
+         AND o.auction_aggregate_id IS NULL \
+         AND o.drop_aggregate_id IS NULL \
+         AND o.created_at <= $1 \
+         AND p.state = 'awaiting_entitlement' \
+         ORDER BY o.created_at FOR UPDATE OF o, p SKIP LOCKED",
+    )
+    .bind(cutoff)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut cancelled = 0u64;
+    for (order_id, payment_id, buyer_pubky) in due {
+        let command_id = Uuid::new_v4();
+        let (payment_revision,): (i64,) = sqlx::query_as(
+            "UPDATE payments SET state = 'expired', revision = revision + 1, \
+             updated_at = $2 WHERE id = $1 RETURNING revision",
+        )
+        .bind(payment_id)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        crate::executor::insert_event(
+            &mut tx,
+            command_id,
+            &ids::payment_aggregate_id(payment_id),
+            payment_revision,
+            &buyer_pubky,
+            "payment.expired",
+            now,
+        )
+        .await?;
+        debug_assert!(marketplace_domain::state_machines::can_transition(
+            &marketplace_domain::state_machines::order_machine(),
+            "pending_payment",
+            "cancelled"
+        ));
+        let (order_revision,): (i64,) = sqlx::query_as(
+            "UPDATE orders SET state = 'cancelled', revision = revision + 1, \
+             cancellation_reason = 'checkout idle elapsed', stock_held = false, \
+             hold_expires_at = NULL, updated_at = $2 WHERE id = $1 RETURNING revision",
+        )
+        .bind(order_id)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        crate::executor::insert_event(
+            &mut tx,
+            command_id,
+            &ids::order_aggregate_id(order_id),
+            order_revision,
+            &buyer_pubky,
+            "order.cancelled",
+            now,
+        )
+        .await?;
+        tracing::info!(
+            order_id = %order_id,
+            payment_id = %payment_id,
+            "expired unbound checkout idle: cancelled leftover with no hold"
+        );
+        cancelled += 1;
+    }
+    tx.commit().await?;
+    Ok(cancelled)
 }
 
 /// How long past the hold deadline a `preparing` order may wait for an

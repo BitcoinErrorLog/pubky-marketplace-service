@@ -8,7 +8,7 @@ mod common;
 
 use axum::http::StatusCode;
 use marketplace_service::clock::Clock;
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -329,9 +329,9 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
     assert_eq!(payment["state"], json!("awaiting_entitlement"));
     assert_eq!(payment["adapter"], json!("sandbox"));
     assert_eq!(payment["amount"]["amount_minor"], json!(13_700));
-    assert_eq!(order["stock_held"], json!(true));
-    assert_eq!(order["hold_expires_at"], json!(common::ts_after(900)));
-    assert_eq!(order["hold_source"], json!("checkout"));
+    assert_eq!(order["stock_held"], json!(false));
+    assert_eq!(order["hold_expires_at"], Value::Null);
+    assert_eq!(order["hold_source"], Value::Null);
 
     let (available, reserved, revision, state): (i64, i64, i64, String) = sqlx::query_as(
         "SELECT available_quantity, reserved_quantity, server_revision, state \
@@ -343,8 +343,8 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
     .expect("listing row exists");
     assert_eq!(
         (available, reserved, revision, state.as_str()),
-        (0, 1, 2, "reserved"),
-        "checkout parks the unit"
+        (1, 0, 1, "available"),
+        "ordinary checkout does not park the unit"
     );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 1);
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM payments").await, 1);
@@ -354,7 +354,7 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
             "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.order_created'"
         )
         .await,
-        1
+        0
     );
     assert_eq!(
         count(
@@ -558,11 +558,11 @@ async fn checkout_snapshots_the_variant_onto_the_order_line(pool: PgPool) {
             .expect("order row exists");
     assert_eq!(lines[0]["variant_id"], json!("variant_forest_m"));
 
-    // A variant-less checkout line carries no variant keys at all. The
-    // first checkout holds a unit, so the listing is at revision 2.
+    // A variant-less checkout line carries no variant keys at all.
+    // Ordinary checkout does not bump the listing revision.
     let mut plain =
         common::checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001099");
-    plain["payload"]["lines"][0]["expected_revision"] = json!(2);
+    plain["payload"]["lines"][0]["expected_revision"] = json!(1);
     let (status, body) = execute(&app, &buyer.token, &plain).await;
     assert_eq!(status, StatusCode::OK, "plain checkout failed: {body}");
     let plain_line = &body["result"]["orders"][0]["lines"][0];

@@ -11,9 +11,9 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use common::{
-    checkout_command_with_id, create_offer_command, execute, listing_aggregate, new_actor,
-    place_bid_command, register_auction_command, register_command, reserve_command, send, test_app,
-    TestApp,
+    checkout_command_with_id, create_offer_command, execute, indexed_command_id, listing_aggregate,
+    new_actor, place_bid_command, register_auction_command, register_command, reserve_command,
+    send, test_app, TestApp,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::workers::drain_outbox;
@@ -385,8 +385,10 @@ async fn notifications_are_readable_only_by_their_recipient(pool: PgPool) {
         &register_command(&other_seller.pubky, 5),
     )
     .await;
-    execute(&app, &buyer.token, &checkout(&seller.pubky, 1)).await;
-    execute(&app, &other_buyer.token, &checkout(&other_seller.pubky, 2)).await;
+    execute(&app, &buyer.token, &create_offer_command(&seller.pubky, 1)).await;
+    let mut other_offer = create_offer_command(&other_seller.pubky, 1);
+    other_offer["command_id"] = json!(indexed_command_id(0x500, 2));
+    execute(&app, &other_buyer.token, &other_offer).await;
     let delivered = drain_outbox(&app.pool, None, app.clock.now(), 30)
         .await
         .expect("outbox drains");
@@ -400,7 +402,7 @@ async fn notifications_are_readable_only_by_their_recipient(pool: PgPool) {
         .as_array()
         .expect("notifications is an array");
     assert_eq!(notifications.len(), 1);
-    assert_eq!(notifications[0]["type"], json!("order_created"));
+    assert_eq!(notifications[0]["type"], json!("offer_received"));
     assert_eq!(notifications[0]["recipient_pubky"], json!(seller.pubky));
     assert_eq!(notifications[0]["actor_pubky"], json!(buyer.pubky));
     assert_eq!(notifications[0]["read_at"], Value::Null);
@@ -428,12 +430,12 @@ async fn list_limits_are_bounded_and_ordering_is_newest_first(pool: PgPool) {
     let (status, body) = execute(&app, &buyer.token, &checkout(&seller.pubky, 1)).await;
     assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
     // The second order is created one second later so the newest-first
-    // ordering is observable. Checkout holds a unit and bumps listing
-    // revision, so the line must carry the current revision.
+    // ordering is observable. Ordinary checkout does not hold or bump
+    // listing revision.
     app.clock
         .set(app.clock.now() + chrono::Duration::seconds(1));
     let mut second_checkout = checkout(&seller.pubky, 2);
-    second_checkout["payload"]["lines"][0]["expected_revision"] = json!(2);
+    second_checkout["payload"]["lines"][0]["expected_revision"] = json!(1);
     let (status, body) = execute(&app, &buyer.token, &second_checkout).await;
     assert_eq!(status, StatusCode::OK, "second checkout failed: {body}");
     let newest_order_id = body["result"]["orders"][0]["id"].clone();
