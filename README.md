@@ -26,6 +26,9 @@ crates/service     axum HTTP service: Postgres schema (sqlx migrations),
                    verification, payment window — all with leases).
 contracts/         state-machines.json — the machine-readable state machine
                    contract emitted from crates/domain.
+                   postal-region-rules.json — country table for
+                   `delivery_address.region` (required vs optional; US/CA/AU
+                   ISO 3166-2 suffixes). Shop should consume this file.
 docker-compose.yml Dev/test PostgreSQL 17 on port 55432.
 ```
 
@@ -1061,8 +1064,32 @@ tests, per ADR-0022). Any artifact change here fails the client's
 `state-machines.contract.test.ts` until the JSON is re-vendored — and the
 addition of the `return` machine additionally requires the
 client to register it in `commerceAggregateMachines` with matching state
-enums, since that test asserts the aggregate sets match exactly. The
-cancellation port added one listing edge (`sold → available` via
+enums, since that test asserts the aggregate sets match exactly.
+
+## Postal region rules
+
+`delivery_address.region` is required only for countries whose postal
+system uses a subdivision. The table lives in
+[`contracts/postal-region-rules.json`](contracts/postal-region-rules.json)
+and is loaded by `crates/domain/src/postal.rs`.
+
+| Kind | Countries | Stored `region` |
+| --- | --- | --- |
+| Closed ISO list | US, CA, AU | ISO 3166-2 suffix (`NY`, `ON`, `NSW`) |
+| Required free text | AE, AR, BD, BR, CL, CN, CO, EG, ID, IN, KR, MX, MY, NG, PE, PH, PK, SA, TH, TR, VN, ZA | 1–100 characters |
+| Optional | every other ISO 3166-1 alpha-2 code, including GB, DE, NL, FR, JP | empty string allowed; still serialized so clients never see `undefined` |
+
+Shop currently duplicates this table in
+`src/libs/commerce/postal-address.ts` (PR #77). **Shop follow-up:** vendor
+or fetch `contracts/postal-region-rules.json` instead of maintaining a
+second copy. US/CA/AU closed lists accept the suffix from Shop; full names
+are accepted for one release, normalized to the suffix, and logged as
+deprecated (country code only — no address values). `country_code` stays
+required. Ship-from already allowed an empty region; label payloads omit
+an empty `state` so packing slips and Shippo labels do not print a blank
+or `"undefined"` subdivision line.
+
+The cancellation port added one listing edge (`sold → available` via
 `order.cancel_approve`), so re-vendoring for it also requires the client's
 listing transition table to accept that edge.
 

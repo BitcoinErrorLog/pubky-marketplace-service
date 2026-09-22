@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 
 use crate::money::{Money, MAX_SAFE_INTEGER};
+use crate::postal::canonicalize_region;
 use crate::pubky::is_valid_pubky;
 
 /// Command envelope contract version per ADR-0019 §3.
@@ -405,6 +406,10 @@ pub struct DeliveryAddress {
     pub line1: String,
     pub line2: String,
     pub city: String,
+    /// Empty when the destination country does not require a subdivision.
+    /// Always serialized (empty string, never omitted) so clients do not
+    /// see `undefined`.
+    #[serde(default)]
     pub region: String,
     pub postal_code: String,
     pub country_code: String,
@@ -1529,13 +1534,6 @@ fn validate_delivery_address(
     validate_trimmed(&format!("{path}.line2"), &mut address.line2, 0, 200, issues);
     validate_trimmed(&format!("{path}.city"), &mut address.city, 1, 100, issues);
     validate_trimmed(
-        &format!("{path}.region"),
-        &mut address.region,
-        1,
-        100,
-        issues,
-    );
-    validate_trimmed(
         &format!("{path}.postal_code"),
         &mut address.postal_code,
         1,
@@ -1547,6 +1545,18 @@ fn validate_delivery_address(
             &format!("{path}.country_code"),
             "Expected an ISO 3166-1 alpha-2 country code",
         ));
+        address.region = address.region.trim().to_string();
+        if address.region.chars().count() > 100 {
+            issues.push(issue(
+                &format!("{path}.region"),
+                "Expected at most 100 characters",
+            ));
+        }
+        return;
+    }
+    match canonicalize_region(&address.country_code, &address.region) {
+        Ok(region) => address.region = region,
+        Err(message) => issues.push(issue(&format!("{path}.region"), message)),
     }
 }
 
@@ -2221,7 +2231,7 @@ mod tests {
                     "line1": "1 Test Street",
                     "line2": "",
                     "city": "Testville",
-                    "region": "TS",
+                    "region": "NY",
                     "postal_code": "12345",
                     "country_code": "US",
                 },
@@ -2421,7 +2431,7 @@ mod tests {
         let mut mismatch = pickup_set_command_json();
         mismatch["payload"]["details"]["address"] = json!({
             "name": "Seller", "line1": "1 Street", "line2": "", "city": "Town",
-            "region": "TS", "postal_code": "12345", "country_code": "US",
+            "region": "NY", "postal_code": "12345", "country_code": "US",
         });
         let issues = parse_command(&mismatch).expect_err("spot kind cannot carry an address");
         assert!(issues.iter().any(|i| i.path == "payload.details.address"));
@@ -2511,6 +2521,75 @@ mod tests {
             .remove("delivery_address");
         let issues = parse_command(&missing).expect_err("shipped checkout requires an address");
         assert!(issues.iter().any(|i| i.path == "payload.delivery_address"));
+    }
+
+    fn checkout_address(country: &str, region: &str) -> Value {
+        let mut raw = checkout_command_json();
+        raw["payload"]["delivery_address"]["country_code"] = json!(country);
+        raw["payload"]["delivery_address"]["region"] = json!(region);
+        if country == "GB" {
+            raw["payload"]["delivery_address"]["postal_code"] = json!("SW1A 1AA");
+            raw["payload"]["delivery_address"]["city"] = json!("London");
+        }
+        raw
+    }
+
+    fn parsed_region(raw: &Value) -> String {
+        let command = parse_command(raw).expect("valid checkout address");
+        let CommandPayload::CreateCheckout(payload) = command.payload else {
+            panic!("expected checkout payload");
+        };
+        payload.delivery_address.expect("address present").region
+    }
+
+    #[test]
+    fn checkout_region_matrix_matches_postal_table() {
+        // Closed-list countries require a known ISO suffix. Shop sends codes;
+        // names normalize for one release.
+        assert_eq!(parsed_region(&checkout_address("US", "MA")), "MA");
+        assert_eq!(
+            parsed_region(&checkout_address("US", "Massachusetts")),
+            "MA"
+        );
+        assert_eq!(parsed_region(&checkout_address("CA", "ON")), "ON");
+        assert_eq!(parsed_region(&checkout_address("CA", "Ontario")), "ON");
+        assert_eq!(parsed_region(&checkout_address("AU", "NSW")), "NSW");
+        assert!(parse_command(&checkout_address("US", ""))
+            .expect_err("US requires state")
+            .iter()
+            .any(|i| i.path == "payload.delivery_address.region"));
+        assert!(parse_command(&checkout_address("US", "XX"))
+            .expect_err("unknown US state")
+            .iter()
+            .any(|i| i.path == "payload.delivery_address.region"));
+
+        // Required free-text subdivision countries.
+        for country in ["BR", "IN", "MX", "AE", "ZA"] {
+            assert_eq!(parsed_region(&checkout_address(country, "SP")), "SP");
+            assert!(parse_command(&checkout_address(country, ""))
+                .expect_err("required free-text region")
+                .iter()
+                .any(|i| i.path == "payload.delivery_address.region"));
+        }
+
+        // Optional everywhere else, including JP (prefecture label, not required).
+        for country in ["GB", "DE", "NL", "FR", "JP"] {
+            assert_eq!(parsed_region(&checkout_address(country, "")), "");
+            assert_eq!(parsed_region(&checkout_address(country, "  ")), "");
+        }
+        assert_eq!(parsed_region(&checkout_address("GB", "England")), "England");
+
+        let mut omitted = checkout_address("GB", "");
+        omitted["payload"]["delivery_address"]
+            .as_object_mut()
+            .unwrap()
+            .remove("region");
+        assert_eq!(parsed_region(&omitted), "");
+
+        assert!(parse_command(&checkout_address("US", &"x".repeat(101)))
+            .expect_err("region too long")
+            .iter()
+            .any(|i| i.path == "payload.delivery_address.region"));
     }
 
     #[test]
