@@ -537,14 +537,15 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 
 /// The migration catalog is strictly increasing, unique per number, and
 /// contains refusal-audit 0032, reserve-secrecy 0033, inventory 0034,
-/// automation API 0035, grant-flow 0036, and overlap-limits 0037.
+/// automation API 0035, grant-flow 0036, overlap-limits 0037, and
+/// checkout-hold 0038.
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0037() {
+fn migration_catalog_is_gapless_through_0038() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -554,18 +555,18 @@ fn migration_catalog_is_gapless_through_0037() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    let expected = (1..=37).collect::<Vec<_>>();
+    let expected = (1..=38).collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
         expected,
-        "the raw catalog is 0001..=0037, gapless"
+        "the raw catalog is 0001..=0038, gapless"
     );
 }
 
 #[test]
-fn migration_catalog_rejects_a_duplicate_0037_number() {
-    let numbers = (1..=37).chain([37]).collect::<Vec<_>>();
-    let expected = (1..=37).collect::<Vec<_>>();
+fn migration_catalog_rejects_a_duplicate_0038_number() {
+    let numbers = (1..=38).chain([38]).collect::<Vec<_>>();
+    let expected = (1..=38).collect::<Vec<_>>();
     assert_ne!(
         sorted_migration_catalog(numbers),
         expected,
@@ -623,12 +624,13 @@ fn every_manual_review_writer_stamps_the_entry_time() {
             writers.push((file_name.clone(), index));
         }
     }
-    // The enumerated set: Locks apply_manual_review (1), the paykit worker
-    // (4: late settlement, amount mismatch, observed-amount-vs-quote
-    // mismatch on FX-quoted orders, confirm-failure), the fiat
-    // apply_fiat_paid (2: expired, confirm-failure), the sandbox transition
-    // (1), and the shared_manual 24-hour seller-window reaper (1). Any NEW
-    // writer fails here until it is reviewed, stamped, and enumerated.
+    // The enumerated set: Locks apply_manual_review (1 in bitcoin_review),
+    // apply_late_money still-held (1 in bitcoin_review), the paykit worker
+    // (4: amount mismatch, observed-amount-vs-quote mismatch, confirm-failure,
+    // seller-window reaper — late settlement now goes through apply_late_money),
+    // the fiat apply_fiat_paid confirm-failure (1; expired uses apply_late_money),
+    // and the sandbox transition (1). Any NEW writer fails here until it is
+    // reviewed, stamped, and enumerated.
     let mut per_file: std::collections::BTreeMap<String, usize> = Default::default();
     for (file, _) in &writers {
         *per_file.entry(file.clone()).or_default() += 1;
@@ -636,10 +638,10 @@ fn every_manual_review_writer_stamps_the_entry_time() {
     assert_eq!(
         per_file,
         std::collections::BTreeMap::from([
-            ("bitcoin_review.rs".to_string(), 1),
+            ("bitcoin_review.rs".to_string(), 2),
             ("payment.rs".to_string(), 1),
-            ("payment_methods.rs".to_string(), 2),
-            ("workers.rs".to_string(), 5),
+            ("payment_methods.rs".to_string(), 1),
+            ("workers.rs".to_string(), 4),
         ]),
         "the manual_review writer set drifted; stamp and enumerate the new writer"
     );

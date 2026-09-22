@@ -572,8 +572,14 @@ pub async fn prepare(
             "The seller's Locks document does not match the payment.",
         )));
     }
-    if let Err(failure) =
-        holds::acquire_payment_hold(tx, order, payment_window_seconds, now).await?
+    if let Err(failure) = holds::acquire_payment_hold(
+        tx,
+        order,
+        payment_window_seconds,
+        holds::HOLD_SOURCE_LOCKS,
+        now,
+    )
+    .await?
     {
         return Ok(Err(failure));
     }

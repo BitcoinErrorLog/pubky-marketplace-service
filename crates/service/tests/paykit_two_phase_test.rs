@@ -46,16 +46,21 @@ async fn bind_bitcoin(app: &TestApp, token: &str, order_id: &str) -> (StatusCode
 }
 
 async fn create_sat_order(app: &TestApp, seller: &TestActor, buyer: &TestActor) -> PendingOrder {
-    let (status, body) = execute(app, &seller.token, &register_sat_command(&seller.pubky, 1)).await;
+    // A unique SAT listing per call so sequential checkouts in one test
+    // never collide with the 900s exclusive hold.
+    let listing_id = format!("sat_{}", Uuid::new_v4().simple());
+    // indexed_command_id pads the index to 12 decimal digits.
+    let command_number = (Uuid::new_v4().as_u128() % 1_000_000_000_000) as u64;
+    let mut register = register_listing_command(&seller.pubky, &listing_id, 1, command_number);
+    register["payload"]["unit_price"] =
+        json!({ "amount_minor": 50_000, "currency": "SAT", "exponent": 0 });
+    let (status, body) = execute(app, &seller.token, &register).await;
     assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
-    // A unique checkout command id per call: one buyer may place several
-    // orders in a test without tripping command idempotency.
-    let (status, body) = execute(
-        app,
-        &buyer.token,
-        &checkout_command_with_id(&seller.pubky, &Uuid::new_v4().to_string()),
-    )
-    .await;
+    let aggregate = format!("listing:{}_{listing_id}", seller.pubky);
+    let mut checkout = checkout_command_with_id(&seller.pubky, &Uuid::new_v4().to_string());
+    checkout["payload"]["lines"][0]["listing_aggregate_id"] = json!(aggregate);
+    checkout["payload"]["lines"][0]["expected_revision"] = json!(1);
+    let (status, body) = execute(app, &buyer.token, &checkout).await;
     assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
     PendingOrder {
         order_id: body["result"]["orders"][0]["id"]
@@ -322,7 +327,7 @@ async fn a_failed_commit_after_phase_one_rolls_back_and_voids(pool: PgPool) {
     let (status, _body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
-    // Nothing persisted: no bind, no hold, no outbox rows at all.
+    // Bind rolled back: no method, no reference. Checkout hold remains.
     let (payment_method, reference, adapter, stock_held): (
         Option<String>,
         Option<String>,
@@ -339,7 +344,7 @@ async fn a_failed_commit_after_phase_one_rolls_back_and_voids(pool: PgPool) {
     assert_eq!(payment_method, None);
     assert_eq!(reference, None);
     assert_eq!(adapter, "sandbox");
-    assert!(!stock_held);
+    assert!(stock_held, "checkout hold survives a rolled-back bind");
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM outbox").await,
         outbox_before,
@@ -492,7 +497,7 @@ async fn a_failure_at_the_outbox_insert_leaves_neither_bind_nor_row(pool: PgPool
     assert_eq!(payment_method, None, "the bind rolled back");
     assert_eq!(invoice, None, "the pin rolled back");
     assert_eq!(adapter, "sandbox");
-    assert!(!stock_held);
+    assert!(stock_held, "checkout hold survives a rolled-back bind");
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM outbox").await,
         outbox_before,
@@ -1000,9 +1005,11 @@ async fn activation_terminal_errors_void_the_bind(pool: PgPool) {
         assert_eq!(row.4, "sandbox", "{code}: the adapter is pre-bind");
         assert_eq!(row.5, LISTING_SATS, "{code}: the amount is pre-bind");
         let (reserved, available): (i64, i64) = sqlx::query_as(
-            "SELECT reserved_quantity, available_quantity FROM listings WHERE aggregate_id = $1",
+            "SELECT l.reserved_quantity, l.available_quantity FROM listings l \
+             JOIN orders o ON o.lines->0->>'listing_aggregate_id' = l.aggregate_id \
+             WHERE o.id = $1",
         )
-        .bind(listing_aggregate(&seller.pubky))
+        .bind(order_uuid(&order.order_id))
         .fetch_one(&pool)
         .await
         .expect("listing row exists");
@@ -1266,7 +1273,7 @@ async fn hold_expiry_on_a_preparing_order_voids_and_expires(pool: PgPool) {
     let (order_id, _payment_id, invoice_id) =
         bound_preparing_order(&app, &paykit, &seller, &buyer).await;
 
-    app.clock.advance_seconds(3_601);
+    app.clock.advance_seconds(7_201);
     let expired = expire_due_payment_windows(&app.state, app.clock.now())
         .await
         .expect("expiry runs");
@@ -1304,12 +1311,15 @@ async fn hold_expiry_on_a_preparing_order_voids_and_expires(pool: PgPool) {
     assert_eq!(request_state, None);
     assert!(!stock_held);
     assert_eq!(payment_state, "expired");
-    let (available,): (i64,) =
-        sqlx::query_as("SELECT available_quantity FROM listings WHERE aggregate_id = $1")
-            .bind(listing_aggregate(&seller.pubky))
-            .fetch_one(&pool)
-            .await
-            .expect("listing exists");
+    let (available,): (i64,) = sqlx::query_as(
+        "SELECT l.available_quantity FROM listings l \
+             JOIN orders o ON o.lines->0->>'listing_aggregate_id' = l.aggregate_id \
+             WHERE o.id = $1",
+    )
+    .bind(order_uuid(&order_id))
+    .fetch_one(&pool)
+    .await
+    .expect("listing exists");
     assert_eq!(available, 1, "the stock is back");
     assert_eq!(activate_row_undelivered(&pool).await, 0);
     assert_eq!(
@@ -1345,7 +1355,7 @@ async fn hold_expiry_with_invoice_finalized_marks_the_order_active(pool: PgPool)
         vec![FakePaykitReply::Error(409, "invoice_finalized".to_string())],
     );
 
-    app.clock.advance_seconds(3_601);
+    app.clock.advance_seconds(7_201);
     let expired = expire_due_payment_windows(&app.state, app.clock.now())
         .await
         .expect("expiry runs");
@@ -1388,7 +1398,7 @@ async fn hold_expiry_skips_an_order_whose_activation_is_in_flight(pool: PgPool) 
         bound_preparing_order(&app, &paykit, &seller, &buyer).await;
 
     // A delivery is in flight: the row is leased into the future.
-    app.clock.advance_seconds(3_601);
+    app.clock.advance_seconds(7_201);
     let lease_until = app.clock.now() + chrono::Duration::hours(1);
     sqlx::query("UPDATE outbox SET lease_until = $1 WHERE kind = 'paykit.activate'")
         .bind(lease_until)
@@ -1430,7 +1440,7 @@ async fn hold_expiry_unreachable_voids_locally_past_the_grace(pool: PgPool) {
 
     // First the void times out (hang), then every command 500s.
     paykit.script_void(invoice_id, vec![FakePaykitReply::Hang]);
-    app.clock.advance_seconds(3_601);
+    app.clock.advance_seconds(7_201);
     let expired = expire_due_payment_windows(&app.state, app.clock.now())
         .await
         .expect("expiry runs");

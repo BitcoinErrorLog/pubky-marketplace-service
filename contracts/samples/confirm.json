@@ -213,6 +213,7 @@
           "fulfillment": "shipping",
           "guarantee_policy_version": 1,
           "hold_expires_at": null,
+          "hold_source": "bind",
           "id": "<uuid:1>",
           "lines": [
             {

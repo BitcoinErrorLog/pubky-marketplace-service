@@ -870,9 +870,7 @@ async fn resolve_contract_map_executes_every_case(pool: PgPool) {
         response,
     );
 
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let (order_id, _) = into_manual_review_late(&app, &paykit, &seller, &buyer).await;
+    let (seller, _buyer, order_id) = fresh_held(&app, &paykit).await;
     sqlx::query(
         "UPDATE listings SET available_quantity = 0, reserved_quantity = 0, sold_quantity = total_quantity \
          WHERE aggregate_id = $1",
@@ -888,6 +886,23 @@ async fn resolve_contract_map_executes_every_case(pool: PgPool) {
     insert_resolve(
         &mut map,
         "stock_unavailable",
+        &order_id,
+        true,
+        body,
+        status,
+        response,
+    );
+
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _) = into_manual_review_late(&app, &paykit, &seller, &buyer).await;
+    let body = json!({"outcome": "paid"});
+    let (status, response) =
+        resolve_call(&app, &seller.token, &order_id, Some(Uuid::new_v4()), &body).await;
+    assert_reason(status, &response, StatusCode::CONFLICT, "refund_required");
+    insert_resolve(
+        &mut map,
+        "refund_required",
         &order_id,
         true,
         body,
@@ -996,6 +1011,7 @@ async fn resolve_contract_map_executes_every_case(pool: PgPool) {
             "already_resolved",
             "not_in_manual_review",
             "stock_unavailable",
+            "refund_required",
             "resolution_not_applicable",
             "missing_pin",
             "omitted_idempotency_key",

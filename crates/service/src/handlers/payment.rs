@@ -120,6 +120,7 @@ pub async fn advance(
             tx,
             order,
             sandbox_payment_window_seconds,
+            crate::handlers::holds::HOLD_SOURCE_SANDBOX,
             now,
         )
         .await?

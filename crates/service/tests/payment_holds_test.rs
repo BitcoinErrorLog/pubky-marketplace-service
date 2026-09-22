@@ -1,15 +1,8 @@
-//! Payment-time inventory holds ("only a payment should lock an item"):
-//! checkout stops holding stock, each payment lock point acquires the hold
-//! atomically with a bounded server-time window, and the payment-window
-//! worker releases lapsed holds, expires the payment, and cancels the order.
-//!
-//! Covered here: the two-buyer last-unit race decided at the lock points,
-//! the abandoned checkout that blocks nobody, the three lock points and
-//! their windows (Locks registration, fiat/bitcoin bind, sandbox first
-//! advance), idempotent lock points that never double-decrement, window
-//! expiry with restock and re-checkout, the sweep never touching confirmed
-//! orders, and the migration backfill's WHERE-clause behavior over
-//! representative legacy-shaped rows.
+//! Exclusive checkout hold: `checkout.create` parks a unit for 900 s, bind /
+//! Locks / sandbox re-arm the rail window, and the payment-window worker
+//! releases lapsed holds. Covered here: the two-buyer last-unit race at
+//! checkout, the abandoned checkout that blocks until TTL or Cancel, the
+//! three re-arm points, window expiry with restock, and the 0012 backfill.
 
 mod common;
 
@@ -28,7 +21,7 @@ use common::{
     test_app_with_payments, ts_after, TestApp, TEST_BUNDLE_ID,
 };
 
-const SOLD_OUT_COPY: &str = "The listing sold out before this payment started.";
+const HOLDING_COPY: &str = "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.";
 
 async fn listing_quantities(app: &TestApp, seller_pubky: &str) -> (i64, i64, i64, String) {
     sqlx::query_as(
@@ -54,11 +47,10 @@ async fn order_hold(app: &TestApp, order_id: &str) -> (bool, Option<String>) {
     )
 }
 
-// Two buyers check out the LAST unit: both orders are created (checkout no
-// longer contends); the first payment lock point wins the hold; the second
-// fails with the pinned sold-out copy.
+// Two buyers check out the LAST unit: the first parks it; the second is
+// 409 INVALID_STATE with the holding copy and never receives an order.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn both_buyers_check_out_the_last_unit_and_the_first_lock_point_wins(pool: PgPool) {
+async fn both_buyers_check_out_the_last_unit_and_the_first_checkout_wins(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let first = new_actor(&app).await;
@@ -76,6 +68,10 @@ async fn both_buyers_check_out_the_last_unit_and_the_first_lock_point_wins(pool:
         StatusCode::OK,
         "first checkout failed: {first_checkout}"
     );
+    assert_eq!(
+        first_checkout["result"]["orders"][0]["stock_held"],
+        json!(true)
+    );
     let (status, second_checkout) = execute(
         &app,
         &second.token,
@@ -84,53 +80,22 @@ async fn both_buyers_check_out_the_last_unit_and_the_first_lock_point_wins(pool:
     .await;
     assert_eq!(
         status,
-        StatusCode::OK,
-        "second checkout must also succeed: {second_checkout}"
+        StatusCode::CONFLICT,
+        "unexpected: {second_checkout}"
     );
-    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 2);
-
-    let first_payment = first_checkout["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("payment id present");
-    let second_payment = second_checkout["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("payment id present");
-
-    // First payment start wins the hold.
-    let (status, body) = execute(
-        &app,
-        &first.token,
-        &payment_command(first_payment, 1, "detected", 0, 100),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "winning lock point failed: {body}");
+    assert_eq!(second_checkout["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(second_checkout["error"]["message"], json!(HOLDING_COPY));
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 1);
     assert_eq!(
         listing_quantities(&app, &seller.pubky).await,
         (0, 1, 0, "reserved".to_string())
     );
-
-    // The second gets the new pinned copy.
-    let (status, body) = execute(
-        &app,
-        &second.token,
-        &payment_command(second_payment, 1, "detected", 0, 101),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "unexpected: {body}");
-    assert_eq!(body["error"]["code"], json!("INSUFFICIENT_INVENTORY"));
-    assert_eq!(body["error"]["message"], json!(SOLD_OUT_COPY));
-    assert_eq!(
-        listing_quantities(&app, &seller.pubky).await,
-        (0, 1, 0, "reserved".to_string()),
-        "the losing lock point moved nothing"
-    );
 }
 
-// An abandoned checkout — an order with no payment activity — holds
-// nothing: the listing stays buyable and another buyer pays it through
-// immediately.
+// An abandoned checkout parks the unit until Cancel or TTL: a sibling
+// checkout is 409 with the holding copy.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn an_abandoned_checkout_holds_nothing_and_blocks_nobody(pool: PgPool) {
+async fn an_abandoned_checkout_blocks_until_ttl_or_cancel(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let abandoner = new_actor(&app).await;
@@ -146,34 +111,19 @@ async fn an_abandoned_checkout_holds_nothing_and_blocks_nobody(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "checkout failed: {body}");
     assert_eq!(
         listing_quantities(&app, &seller.pubky).await,
-        (1, 0, 0, "available".to_string()),
-        "the abandoned checkout holds nothing"
+        (0, 1, 0, "reserved".to_string()),
+        "the abandoned checkout holds the unit"
     );
 
-    // A second buyer checks out and pays the unit end to end.
     let (status, body) = execute(
         &app,
         &buyer.token,
         &checkout_command_with_id(&seller.pubky, &indexed_command_id(0xa001, 2)),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "second checkout failed: {body}");
-    let payment_id = body["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("payment id present")
-        .to_string();
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &payment_command(&payment_id, 1, "confirmed", 1, 102),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "confirmation failed: {body}");
-    assert_eq!(body["result"]["order"]["state"], json!("paid"));
-    assert_eq!(
-        listing_quantities(&app, &seller.pubky).await,
-        (0, 0, 1, "sold".to_string())
-    );
+    assert_eq!(status, StatusCode::CONFLICT, "unexpected: {body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(body["error"]["message"], json!(HOLDING_COPY));
 }
 
 // `payment.register_locks` is a lock point: it acquires the hold and arms
@@ -186,7 +136,10 @@ async fn register_locks_acquires_the_hold_and_arms_the_locks_window(pool: PgPool
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let order = create_pending_order(&app, &seller, &buyer).await;
-    assert_eq!(order_hold(&app, &order.order_id).await, (false, None));
+    assert_eq!(
+        order_hold(&app, &order.order_id).await,
+        (true, Some(ts_after(900)))
+    );
 
     let prepare = json!({
         "version": 1,
@@ -262,10 +215,11 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
     .await;
     assert_eq!(status, StatusCode::OK, "config put failed: {body}");
     let order = create_pending_order(&app, &seller, &buyer).await;
-    assert_eq!(order_hold(&app, &order.order_id).await, (false, None));
+    assert_eq!(
+        order_hold(&app, &order.order_id).await,
+        (true, Some(ts_after(900)))
+    );
 
-    // A second buyer checks out the same last unit BEFORE any payment
-    // starts: both orders exist; the stock will decide at the lock points.
     let second_buyer = new_actor(&app).await;
     let (status, body) = execute(
         &app,
@@ -273,11 +227,9 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
         &checkout_command_with_id(&seller.pubky, &indexed_command_id(0xa002, 1)),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "second checkout failed: {body}");
-    let second_order = body["result"]["orders"][0]["id"]
-        .as_str()
-        .expect("order id present")
-        .to_string();
+    assert_eq!(status, StatusCode::CONFLICT, "unexpected: {body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(body["error"]["message"], json!(HOLDING_COPY));
 
     let (status, body) = send(
         app.router.clone(),
@@ -310,22 +262,6 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
         listing_quantities(&app, &seller.pubky).await,
         (0, 1, 0, "reserved".to_string())
     );
-
-    // The second buyer's bind against the now sold-out listing fails with
-    // the pinned copy (both orders were created; only one payment can
-    // start).
-    let (status, body) = send(
-        app.router.clone(),
-        "POST",
-        &format!("/v0/orders/{second_order}/payment-method"),
-        Some(&second_buyer.token),
-        &json!({ "method": "stripe" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "unexpected: {body}");
-    assert_eq!(body["error"]["code"], json!("INSUFFICIENT_INVENTORY"));
-    assert_eq!(body["error"]["reason"], json!("sold_out"));
-    assert_eq!(body["error"]["message"], json!(SOLD_OUT_COPY));
 }
 
 // The sandbox lock point arms the sandbox window on the FIRST transition

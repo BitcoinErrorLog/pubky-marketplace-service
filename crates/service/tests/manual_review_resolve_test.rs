@@ -240,7 +240,7 @@ async fn held_entry_resolves_paid_refunded_and_abandoned(pool: PgPool) {
 async fn late_entry_resolves_paid_refunded_and_abandoned(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
 
-    // --- paid: reacquire the released stock, then cancelled -> paid ---
+    // --- paid: refund_required disables Paid ---
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _reference) = into_manual_review_late(&app, &paykit, &seller, &buyer).await;
@@ -252,29 +252,18 @@ async fn late_entry_resolves_paid_refunded_and_abandoned(pool: PgPool) {
         &json!({ "outcome": "paid" }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("refund_required"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("This payment cannot complete the order. Return the funds, then record the refund.")
+    );
     let facts = payment_facts(&pool, &order_id).await;
-    assert_eq!(facts.state, "confirmed");
-    assert_eq!(facts.outcome.as_deref(), Some("paid"));
+    assert_eq!(facts.state, "manual_review");
+    assert!(facts.outcome.is_none());
     let (order_state, stock_held) = order_row_state(&pool, &order_id).await;
-    assert_eq!(
-        order_state, "paid",
-        "the resolution edge is cancelled -> paid"
-    );
-    assert!(!stock_held, "consumed by the sale");
-    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 1);
-    let (available, sold): (i64, i64) = sqlx::query_as(
-        "SELECT available_quantity, sold_quantity FROM listings WHERE aggregate_id = $1",
-    )
-    .bind(format!("listing:{}_boots_01", seller.pubky))
-    .fetch_one(&pool)
-    .await
-    .expect("listing row");
-    assert_eq!(
-        (available, sold),
-        (15, 1),
-        "reacquired then sold, never invented"
-    );
+    assert_eq!(order_state, "cancelled");
+    assert!(!stock_held);
 
     // --- refunded: cancelled -> refunded_external, nothing reacquired ---
     let seller = new_actor(&app).await;
@@ -300,8 +289,8 @@ async fn late_entry_resolves_paid_refunded_and_abandoned(pool: PgPool) {
     .expect("listing row");
     assert_eq!(
         (available, sold),
-        (16, 0),
-        "nothing reacquired for a refund"
+        (0, 16),
+        "refund_required stock stays gone"
     );
 
     // --- abandoned: the cancelled order stays cancelled; payment expires ---
@@ -324,48 +313,12 @@ async fn late_entry_resolves_paid_refunded_and_abandoned(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn late_paid_against_sold_out_stock_is_named_stock_unavailable(pool: PgPool) {
+async fn late_paid_against_sold_out_stock_is_named_refund_required(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _reference) = into_manual_review_late(&app, &paykit, &seller, &buyer).await;
 
-    // Another buyer takes the released stock (all 16 units) through real
-    // checkouts and sandbox payment confirmations.
-    for index in 0..16u64 {
-        let other = new_actor(&app).await;
-        let revision: i64 =
-            sqlx::query_scalar("SELECT server_revision FROM listings WHERE aggregate_id = $1")
-                .bind(format!("listing:{}_boots_01", seller.pubky))
-                .fetch_one(&pool)
-                .await
-                .expect("listing row");
-        let mut checkout = checkout_command_with_id(&seller.pubky, &Uuid::new_v4().to_string());
-        checkout["payload"]["lines"][0]["expected_revision"] = json!(revision);
-        let (status, body) = execute(&app, &other.token, &checkout).await;
-        assert_eq!(status, StatusCode::OK, "checkout {index}: {body}");
-        let payment_id = body["result"]["payments"][0]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let (status, body) = execute(
-            &app,
-            &other.token,
-            &payment_command(&payment_id, 1, "confirmed", 1, 2_000 + index),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "payment {index}: {body}");
-    }
-    let available: i64 =
-        sqlx::query_scalar("SELECT available_quantity FROM listings WHERE aggregate_id = $1")
-            .bind(format!("listing:{}_boots_01", seller.pubky))
-            .fetch_one(&pool)
-            .await
-            .expect("listing row");
-    assert_eq!(available, 0, "the stock is gone");
-
-    // The paid resolution must NOT invent inventory: named 409, and
-    // nothing about the payment or order changed.
     let (status, body) = resolve_call(
         &app,
         &seller.token,
@@ -375,15 +328,10 @@ async fn late_paid_against_sold_out_stock_is_named_stock_unavailable(pool: PgPoo
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["reason"], json!("stock_unavailable"));
+    assert_eq!(body["error"]["reason"], json!("refund_required"));
     let facts = payment_facts(&pool, &order_id).await;
     assert_eq!(facts.state, "manual_review");
     assert!(facts.outcome.is_none());
-    assert!(
-        facts.entered_at.is_some(),
-        "the CAS rolled back with the effects"
-    );
-    // The seller's exit is refunded or abandoned — still available.
     let (status, body) = resolve_call(
         &app,
         &seller.token,
@@ -650,12 +598,14 @@ async fn resolve_refuses_a_locks_manual_review(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "locks register failed: {body}");
-    // The window lapses, then the completion verifies late: manual_review.
-    let after_window = app.clock.now() + chrono::Duration::seconds(3700);
-    let expired = expire_due_payment_windows(&app.state, after_window)
+    // Payment expires while the checkout hold is still live: late money
+    // keeps `manual_review` / `late_settlement` and does not reacquire.
+    sqlx::query("UPDATE payments SET state = 'expired' WHERE id = $1::uuid")
+        .bind(&order.payment_id)
+        .execute(&pool)
         .await
-        .expect("sweep runs");
-    assert_eq!(expired, 1);
+        .expect("payment marked expired without releasing the hold");
+    let after_window = app.clock.now() + chrono::Duration::seconds(60);
     locks.set_outcome(
         TEST_BUNDLE_ID,
         marketplace_service::locks::LocksLookupOutcome::Status(
@@ -711,11 +661,11 @@ async fn resolve_refuses_a_paypal_manual_review(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind failed: {body}");
-    app.clock.advance_seconds(3700);
-    let expired = expire_due_payment_windows(&app.state, app.clock.now())
+    sqlx::query("UPDATE payments SET state = 'expired' WHERE order_id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&pool)
         .await
-        .expect("sweep runs");
-    assert_eq!(expired, 1);
+        .expect("payment marked expired without releasing the hold");
     let (status, body) = send(
         app.router.clone(),
         "POST",
@@ -776,11 +726,11 @@ async fn resolve_refuses_a_stripe_manual_review(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind failed: {body}");
-    app.clock.advance_seconds(3700);
-    let expired = expire_due_payment_windows(&app.state, app.clock.now())
+    sqlx::query("UPDATE payments SET state = 'expired' WHERE order_id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&pool)
         .await
-        .expect("sweep runs");
-    assert_eq!(expired, 1);
+        .expect("payment marked expired without releasing the hold");
     let total_minor: i64 = sqlx::query_scalar("SELECT total_minor FROM orders WHERE id = $1")
         .bind(Uuid::parse_str(&order.order_id).unwrap())
         .fetch_one(&pool)
@@ -1411,25 +1361,35 @@ async fn cas_removal_calibration_yields_duplicate_outcomes() {
 // The resolution/late-observer race
 // ---------------------------------------------------------------------------
 
-/// The late observer's manual_review entry and the seller's resolve are
-/// overlapping real transactions: the resolve either lands after the entry
-/// (and resolves) or before it (the named not_in_manual_review, with the
-/// seller free to retry) — never a double outcome, never a lost one.
+/// Late money after expiry with stock gone stamps refund_required. Seller
+/// Paid is 409 in every observer/seller ordering — never a paid outcome.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn resolution_racing_the_late_observer_is_consistent(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
-    // Deterministic orderings.
+    async fn deplete(pool: &PgPool, seller_pubky: &str) {
+        sqlx::query(
+            "UPDATE listings SET available_quantity = 0, reserved_quantity = 0, \
+             sold_quantity = total_quantity, state = 'sold' WHERE aggregate_id = $1",
+        )
+        .bind(format!("listing:{seller_pubky}_boots_01"))
+        .execute(pool)
+        .await
+        .expect("sold-out");
+    }
     for observer_first in [true, false] {
         let seller = new_actor(&app).await;
         let buyer = new_actor(&app).await;
         let (order_id, _payment_id, reference) =
             bound_order(&app, &paykit, &seller, &buyer, "shared_manual").await;
-        let after_window = app.clock.now() + chrono::Duration::seconds(3700);
+        let after_window = app.clock.now() + chrono::Duration::seconds(7300);
         let expired = expire_due_payment_windows(&app.state, after_window)
             .await
             .expect("sweep runs");
         assert_eq!(expired, 1);
-        paykit.set_status(&reference, status_confirmed("shared_manual", true));
+        deplete(&pool, &seller.pubky).await;
+        let mut late = status_confirmed("shared_manual", true);
+        late["late_settlement"] = json!(true);
+        paykit.set_status(&reference, late);
         let observe_at = after_window + chrono::Duration::seconds(60);
         if observer_first {
             let applied = poll_now(&app, observe_at).await;
@@ -1442,11 +1402,9 @@ async fn resolution_racing_the_late_observer_is_consistent(pool: PgPool) {
                 &json!({ "outcome": "paid" }),
             )
             .await;
-            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["error"]["reason"], json!("refund_required"));
         } else {
-            // The resolve runs BEFORE the observer commits: the named
-            // precondition, no side effects; the observer's entry then
-            // lands and the seller's retry resolves.
             let (status, body) = resolve_call(
                 &app,
                 &seller.token,
@@ -1467,8 +1425,13 @@ async fn resolution_racing_the_late_observer_is_consistent(pool: PgPool) {
                 &json!({ "outcome": "paid" }),
             )
             .await;
-            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["error"]["reason"], json!("refund_required"));
         }
+        let facts = payment_facts(&pool, &order_id).await;
+        assert_eq!(facts.state, "manual_review");
+        let (order_state, _) = order_row_state(&pool, &order_id).await;
+        assert_eq!(order_state, "cancelled");
         let resolutions: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM paykit_manual_resolutions WHERE order_id = $1",
         )
@@ -1476,23 +1439,22 @@ async fn resolution_racing_the_late_observer_is_consistent(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .expect("resolution count");
-        assert_eq!(resolutions, 1, "exactly one resolution either way");
+        assert_eq!(resolutions, 0, "Paid never lands on refund_required");
     }
 
-    // Barrier-overlapped: the observer's poll and the seller's resolve
-    // released together; the outcome is either (observer won → resolve
-    // succeeds) or (resolve saw the pre-entry state → named error), and
-    // after a settle + one retry there is exactly one resolution.
     for _round in 0..3 {
         let seller = new_actor(&app).await;
         let buyer = new_actor(&app).await;
         let (order_id, _payment_id, reference) =
             bound_order(&app, &paykit, &seller, &buyer, "shared_manual").await;
-        let after_window = app.clock.now() + chrono::Duration::seconds(3700);
+        let after_window = app.clock.now() + chrono::Duration::seconds(7300);
         expire_due_payment_windows(&app.state, after_window)
             .await
             .expect("sweep runs");
-        paykit.set_status(&reference, status_confirmed("shared_manual", true));
+        deplete(&pool, &seller.pubky).await;
+        let mut late = status_confirmed("shared_manual", true);
+        late["late_settlement"] = json!(true);
+        paykit.set_status(&reference, late);
         let observe_at = after_window + chrono::Duration::seconds(60);
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let (router, token, oid) = (app.router.clone(), seller.token.clone(), order_id.clone());
@@ -1528,19 +1490,19 @@ async fn resolution_racing_the_late_observer_is_consistent(pool: PgPool) {
             poll_handle.await.expect("poll task"),
         );
         poll_result.expect("poll runs");
-        if resolve_status != StatusCode::OK {
-            // The resolve saw the pre-entry state; the observer's entry is
-            // durable now, so the retry resolves.
-            let (status, body) = resolve_call(
-                &app,
-                &seller.token,
-                &order_id,
-                Some(Uuid::new_v4()),
-                &json!({ "outcome": "paid" }),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK, "{body}");
-        }
+        assert_ne!(resolve_status, StatusCode::OK, "Paid cannot complete");
+        let (status, body) = resolve_call(
+            &app,
+            &seller.token,
+            &order_id,
+            Some(Uuid::new_v4()),
+            &json!({ "outcome": "paid" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["reason"], json!("refund_required"));
+        let (order_state, _) = order_row_state(&pool, &order_id).await;
+        assert_eq!(order_state, "cancelled");
         let resolutions: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM paykit_manual_resolutions WHERE order_id = $1",
         )
@@ -1548,13 +1510,7 @@ async fn resolution_racing_the_late_observer_is_consistent(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .expect("resolution count");
-        let outbox: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM paykit_resolve_outbox WHERE order_id = $1")
-                .bind(Uuid::parse_str(&order_id).unwrap())
-                .fetch_one(&pool)
-                .await
-                .expect("outbox count");
-        assert_eq!((resolutions, outbox), (1, 1), "exactly one of each");
+        assert_eq!(resolutions, 0);
     }
 }
 
@@ -1703,8 +1659,8 @@ async fn naive_resolution_write(
 // Drop and auction inventory cells
 // ---------------------------------------------------------------------------
 
-/// A drop-stamped order late-paid: reacquisition re-debits the drop only
-/// when units remain; an exhausted drop is the named `stock_unavailable`.
+/// A drop-stamped order late-paid: free remaining units complete via
+/// `late_completion`; an exhausted drop stamps `refund_required`.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
     let (app, _stripe, paykit, _ipn, _shippo, homeserver) = {
@@ -1835,7 +1791,7 @@ async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
         drain_outbox(&app.pool, client, app.clock.now(), 30)
             .await
             .expect("activation delivers");
-        let after_window = app.clock.now() + chrono::Duration::seconds(3700);
+        let after_window = app.clock.now() + chrono::Duration::seconds(7300);
         let expired = expire_due_payment_windows(&app.state, after_window)
             .await
             .expect("sweep runs");
@@ -1848,17 +1804,13 @@ async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
                 .expect("drop row");
         assert_eq!(remaining, 2, "the release credited the drop");
 
-        // Late settlement -> manual_review.
         let reference = order_reference(Uuid::parse_str(&order_id).unwrap());
-        paykit.set_status(&reference, status_confirmed("shared_manual", true));
-        let applied = poll_now(&app, after_window + chrono::Duration::seconds(60)).await;
-        assert_eq!(applied, 1);
-        let facts = payment_facts(&pool, &order_id).await;
-        assert_eq!(facts.state, "manual_review");
+        let mut late = status_confirmed("shared_manual", true);
+        late["late_settlement"] = json!(true);
 
         if exhaust_drop {
-            // Two other buyers claim and pay both remaining units: the drop
-            // ends sold out, so reacquisition must refuse.
+            // Two other buyers claim and pay both remaining units first so
+            // late money cannot reacquire.
             for _ in 0..2 {
                 let other = new_actor(&app).await;
                 let revision: i64 = sqlx::query_scalar(
@@ -1912,6 +1864,11 @@ async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
                     .expect("drop row");
             assert_eq!(remaining, 0, "the drop is exhausted");
 
+            paykit.set_status(&reference, late);
+            let applied = poll_now(&app, after_window + chrono::Duration::seconds(60)).await;
+            assert_eq!(applied, 1);
+            let facts = payment_facts(&pool, &order_id).await;
+            assert_eq!(facts.state, "manual_review");
             let (status, body) = resolve_call(
                 &app,
                 &seller.token,
@@ -1921,19 +1878,15 @@ async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
             )
             .await;
             assert_eq!(status, StatusCode::CONFLICT, "{body}");
-            assert_eq!(body["error"]["reason"], json!("stock_unavailable"));
+            assert_eq!(body["error"]["reason"], json!("refund_required"));
             let facts = payment_facts(&pool, &order_id).await;
             assert_eq!(facts.state, "manual_review", "nothing committed");
         } else {
-            let (status, body) = resolve_call(
-                &app,
-                &seller.token,
-                &order_id,
-                Some(Uuid::new_v4()),
-                &json!({ "outcome": "paid" }),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK, "{body}");
+            paykit.set_status(&reference, late);
+            let applied = poll_now(&app, after_window + chrono::Duration::seconds(60)).await;
+            assert_eq!(applied, 1);
+            let facts = payment_facts(&pool, &order_id).await;
+            assert_eq!(facts.state, "confirmed");
             let (order_state, _) = order_row_state(&pool, &order_id).await;
             assert_eq!(order_state, "paid");
             let (remaining, paid): (i64, i64) = sqlx::query_as(
@@ -1946,7 +1899,7 @@ async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
             assert_eq!(
                 (remaining, paid),
                 (1, 1),
-                "reacquired then paid exactly one unit"
+                "late_completion reacquired then paid exactly one unit"
             );
         }
     }

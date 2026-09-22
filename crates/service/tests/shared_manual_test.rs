@@ -531,7 +531,7 @@ async fn a_late_observation_goes_straight_to_manual_review(pool: PgPool) {
 
     // The hold window lapses with no payment: payment expired, order
     // cancelled, stock released — BEFORE any observation arrives.
-    let after_window = app.clock.now() + chrono::Duration::seconds(3700);
+    let after_window = app.clock.now() + chrono::Duration::seconds(7300);
     let expired = expire_due_payment_windows(&app.state, after_window)
         .await
         .expect("sweep runs");
@@ -554,20 +554,26 @@ async fn a_late_observation_goes_straight_to_manual_review(pool: PgPool) {
     paykit.set_status(&reference, status_confirmed("shared_manual", true, 2));
     let applied = poll_now(&app, after_window + chrono::Duration::seconds(120)).await;
     assert_eq!(applied, 1);
-    let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
-    assert_eq!(request_state, "confirmed");
-    assert_eq!(payment_state, "manual_review");
-    let entered_at: DateTime<Utc> =
-        sqlx::query_scalar("SELECT manual_review_entered_at FROM payments WHERE order_id = $1")
-            .bind(Uuid::parse_str(&order_id).unwrap())
-            .fetch_one(&pool)
-            .await
-            .expect("entry stamp");
-    assert_eq!(
-        entered_at,
-        after_window + chrono::Duration::seconds(120),
-        "the late entry stamps the same clock the reaper uses"
-    );
+    let (request_state, payment_state, stock_held, order_state) = {
+        let (request_state, payment_state, stock_held, order_state): (
+            Option<String>,
+            String,
+            bool,
+            String,
+        ) = sqlx::query_as(
+            "SELECT o.paykit_request_state, p.state, o.stock_held, o.state \
+             FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
+        )
+        .bind(Uuid::parse_str(&order_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .expect("late complete facts");
+        (request_state, payment_state, stock_held, order_state)
+    };
+    assert_eq!(order_state, "paid");
+    assert_eq!(payment_state, "confirmed");
+    assert!(!stock_held);
+    let _ = request_state;
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

@@ -46,6 +46,7 @@
           "fulfillment": "shipping",
           "guarantee_policy_version": 1,
           "hold_expires_at": null,
+          "hold_source": "bind",
           "id": "<uuid:1>",
           "lines": [
             {
@@ -400,6 +401,7 @@
           "fulfillment": "shipping",
           "guarantee_policy_version": 1,
           "hold_expires_at": null,
+          "hold_source": "bind",
           "id": "<uuid:4>",
           "lines": [
             {
@@ -482,6 +484,31 @@
       "status": 200
     }
   },
+  "refund_required": {
+    "request": {
+      "body": {
+        "outcome": "paid"
+      },
+      "headers_present": [
+        "authorization",
+        "content-type",
+        "idempotency-key"
+      ],
+      "method": "POST",
+      "path": "/v0/orders/<uuid:11>/bitcoin/resolve"
+    },
+    "response": {
+      "body": {
+        "error": {
+          "code": "INVALID_STATE",
+          "message": "This payment cannot complete the order. Return the funds, then record the refund.",
+          "reason": "refund_required"
+        },
+        "ok": false
+      },
+      "status": 409
+    }
+  },
   "refunded": {
     "request": {
       "body": {
@@ -494,7 +521,7 @@
         "idempotency-key"
       ],
       "method": "POST",
-      "path": "/v0/orders/<uuid:11>/bitcoin/resolve"
+      "path": "/v0/orders/<uuid:12>/bitcoin/resolve"
     },
     "response": {
       "body": {
@@ -533,7 +560,8 @@
           "fulfillment": "shipping",
           "guarantee_policy_version": 1,
           "hold_expires_at": null,
-          "id": "<uuid:11>",
+          "hold_source": "bind",
+          "id": "<uuid:12>",
           "lines": [
             {
               "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -575,7 +603,7 @@
           "paykit_seller_confirmation_deadline": null,
           "paykit_seller_confirmation_entered_at": null,
           "paykit_total_sats": 51637,
-          "payment_id": "<uuid:12>",
+          "payment_id": "<uuid:13>",
           "payment_method": "bitcoin",
           "payment_reported_at": null,
           "priced_from": "listing",
@@ -605,9 +633,9 @@
         },
         "resolution": {
           "basis": "seller_attestation",
-          "order_id": "<uuid:11>",
+          "order_id": "<uuid:12>",
           "outcome": "refunded",
-          "resolution_id": "<uuid:13>",
+          "resolution_id": "<uuid:14>",
           "resolved_at": "<timestamp:1>",
           "resolved_by_pubky": "<pubky:seller>"
         }
@@ -662,6 +690,7 @@
           "fulfillment": "shipping",
           "guarantee_policy_version": 1,
           "hold_expires_at": null,
+          "hold_source": "bind",
           "id": "<uuid:4>",
           "lines": [
             {
@@ -755,7 +784,7 @@
         "idempotency-key"
       ],
       "method": "POST",
-      "path": "/v0/orders/<uuid:14>/bitcoin/resolve"
+      "path": "/v0/orders/<uuid:15>/bitcoin/resolve"
     },
     "response": {
       "body": {
@@ -780,7 +809,7 @@
         "idempotency-key"
       ],
       "method": "POST",
-      "path": "/v0/orders/<uuid:15>/bitcoin/resolve"
+      "path": "/v0/orders/<uuid:16>/bitcoin/resolve"
     },
     "response": {
       "body": {

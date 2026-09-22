@@ -522,6 +522,9 @@ pub struct OrderRow {
     /// Server-time bound on the hold: elapsing while the order is still
     /// pending cancels the order, expires the payment, and restocks.
     pub hold_expires_at: Option<DateTime<Utc>>,
+    /// Which lock point armed the current hold (`checkout` | `locks` |
+    /// `bind` | `sandbox` | `drop_claim`).
+    pub hold_source: Option<String>,
     pub shipment: Option<Value>,
     /// TRUE only when the server-time `delivery_assume` transition marked
     /// the order delivered (DELIVERY_ASSUME_DAYS after shipment; there is
@@ -642,6 +645,7 @@ impl std::fmt::Debug for OrderRow {
             .field("cancellation_reason", &self.cancellation_reason)
             .field("stock_held", &self.stock_held)
             .field("hold_expires_at", &self.hold_expires_at)
+            .field("hold_source", &self.hold_source)
             .field("shipment", &self.shipment)
             .field("delivery_assumed", &self.delivery_assumed)
             .field("return_request", &self.return_request)
@@ -742,6 +746,7 @@ impl OrderRow {
             cancellation_reason: None,
             stock_held,
             hold_expires_at,
+            hold_source: None,
             shipment: None,
             delivery_assumed: false,
             return_request: None,
@@ -974,6 +979,7 @@ impl OrderRow {
             "cancellation_reason": self.cancellation_reason,
             "stock_held": self.stock_held,
             "hold_expires_at": self.hold_expires_at.map(format_timestamp),
+            "hold_source": self.hold_source,
             "shipment": self.shipment.clone().unwrap_or(Value::Null),
             "delivery_assumed": self.delivery_assumed,
             "next_actor": self.next_actor(),
@@ -1499,6 +1505,10 @@ pub struct PaymentRow {
     /// The validated external refund reference. Never serialized on the
     /// payment projection (the order's `external_refund` carries it).
     pub refund_reference: Option<String>,
+    /// Why a late or mismatched settlement sits in `manual_review`
+    /// (`late_settlement` | `refund_required` | `amount_mismatch` |
+    /// `unpinned_legacy`). Projected to both actors.
+    pub review_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1546,6 +1556,7 @@ impl PaymentRow {
             "resolution_outcome": self.resolution_outcome,
             "resolution_basis": self.resolution_basis,
             "resolved_at": self.resolved_at.map(format_timestamp),
+            "review_reason": self.review_reason,
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
         })

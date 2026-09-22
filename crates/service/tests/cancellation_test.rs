@@ -53,11 +53,9 @@ async fn notification_types(app: &TestApp, token: &str) -> Vec<String> {
         .collect()
 }
 
-// "Only a payment locks an item": an unpaid order with no payment activity
-// holds nothing, so cancelling it releases nothing — the CHECK-constrained
-// quantity ledger never moves and never goes negative.
+// Checkout parks the unit: cancelling the unpaid order releases it.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn cancelling_an_unheld_pending_order_releases_nothing(pool: PgPool) {
+async fn cancelling_a_checkout_hold_releases_the_unit(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -67,10 +65,9 @@ async fn cancelling_an_unheld_pending_order_releases_nothing(pool: PgPool) {
         .as_str()
         .expect("order id present")
         .to_string();
-    // Checkout moved nothing: the unit is still available to everyone.
     assert_eq!(
         listing_quantities(&app, &seller.pubky).await,
-        (1, 0, 0, "available".to_string())
+        (0, 1, 0, "reserved".to_string())
     );
 
     let cancel = order_command(
@@ -83,8 +80,6 @@ async fn cancelling_an_unheld_pending_order_releases_nothing(pool: PgPool) {
     let (status, cancelled) = execute(&app, &buyer.token, &cancel).await;
     assert_eq!(status, StatusCode::OK, "cancel failed: {cancelled}");
     assert_eq!(cancelled["result"]["order"]["state"], json!("cancelled"));
-    // Nothing was held, so nothing released: the ledger is untouched (the
-    // quantity CHECK constraints prove no negative movement happened).
     assert_eq!(
         listing_quantities(&app, &seller.pubky).await,
         (1, 0, 0, "available".to_string())

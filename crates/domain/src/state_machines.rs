@@ -349,12 +349,15 @@ pub fn order_machine() -> AggregateMachine {
                 vec![Command("refund.record_external")],
             ),
             // A late Paykit settlement whose hold already lapsed (order
-            // cancelled, stock released) can still be resolved `paid` by
-            // the listing seller: the Paykit resolution transaction
-            // reacquires the inventory and moves the order straight from
-            // `cancelled` to `paid` (design §B.9 r12). This is the ONLY
-            // writer of the edge — no command, no other server path.
-            t("cancelled", "paid", vec![Server("paykit_resolution")]),
+            // cancelled, stock released) can still complete via
+            // `late_completion` when the unit is free, or via seller
+            // `paykit_resolution` for a legacy `manual_review` row whose
+            // `review_reason` is not `refund_required`.
+            t(
+                "cancelled",
+                "paid",
+                vec![Server("paykit_resolution"), Server("late_completion")],
+            ),
         ],
         commands: vec![
             "checkout.create",
@@ -434,6 +437,7 @@ pub fn payment_machine() -> AggregateMachine {
                 vec![
                     Command("payment.sandbox_advance"),
                     Server("locks_verification"),
+                    Server("late_completion"),
                 ],
             ),
             t(
@@ -447,6 +451,7 @@ pub fn payment_machine() -> AggregateMachine {
                 vec![
                     Command("payment.sandbox_advance"),
                     Server("locks_verification"),
+                    Server("late_completion"),
                 ],
             ),
             t(
@@ -462,8 +467,9 @@ pub fn payment_machine() -> AggregateMachine {
             t(
                 "expired",
                 "manual_review",
-                vec![Server("locks_late_completion")],
+                vec![Server("locks_late_completion"), Server("late_completion")],
             ),
+            t("expired", "confirmed", vec![Server("late_completion")]),
             // The Paykit manual-review resolution (design §B.9 r12): the
             // listing seller (or the seven-day inactivity reaper, same
             // abandoned branch) resolves a `manual_review` payment exactly
@@ -689,11 +695,9 @@ mod tests {
         assert!(machine.commands.contains(&"fulfillment.confirm_pickup"));
     }
 
-    /// The W1.15 Paykit resolution edges (design §B.9 r12): a manual-review
-    /// payment exits exactly once to `confirmed` (paid/refunded) or
-    /// `expired` (abandoned), and a late-settled order can move
-    /// `cancelled -> paid` ONLY through the resolution server path — never
-    /// through a client command, and never the reverse (no un-pay edge).
+    /// `cancelled -> paid` through the resolution server path or an
+    /// automatic late_completion when stock is free — never a client
+    /// command, and never the reverse (no un-pay edge).
     #[test]
     fn paykit_resolution_edges_are_server_only_and_one_way() {
         let payments = payment_machine();
@@ -714,28 +718,30 @@ mod tests {
         ] {
             assert!(!can_transition(&payments, "confirmed", target));
         }
-        // A resolved payment cannot re-enter manual review from `expired`
-        // either: the only `expired -> manual_review` edge is the Locks
-        // late-completion entry, which a resolved payment never matches
-        // (its resolution fields are set and its correlation completed).
         assert!(!can_transition(
             &payments,
             "expired",
             "awaiting_entitlement"
         ));
+        let expired_confirmed = payments
+            .transitions
+            .iter()
+            .find(|t| t.from == "expired" && t.to == "confirmed")
+            .expect("expired -> confirmed exists");
+        assert_eq!(expired_confirmed.via, vec![Server("late_completion")]);
         let orders = order_machine();
         let transition = orders
             .transitions
             .iter()
             .find(|t| t.from == "cancelled" && t.to == "paid")
             .expect("cancelled -> paid exists");
-        assert_eq!(transition.via, vec![Server("paykit_resolution")]);
-        // The resolution edge is the only way OUT of cancelled besides the
-        // external-refund record; there is no un-pay edge anywhere.
+        assert_eq!(
+            transition.via,
+            vec![Server("paykit_resolution"), Server("late_completion")]
+        );
         assert!(!can_transition(&orders, "paid", "pending_payment"));
         assert!(!can_transition(&orders, "refunded_external", "paid"));
         assert!(!can_transition(&orders, "cancelled", "pending_payment"));
-        // `cancelled -> paid` carries no client command trigger.
         let command_triggered = transition.via.iter().any(|via| matches!(via, Command(_)));
         assert!(!command_triggered);
     }

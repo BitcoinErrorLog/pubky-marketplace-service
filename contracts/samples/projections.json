@@ -289,6 +289,7 @@
         "fulfillment": "shipping",
         "guarantee_policy_version": 1,
         "hold_expires_at": "<timestamp:3>",
+        "hold_source": "bind",
         "id": "<uuid:2>",
         "lines": [
           {
@@ -340,6 +341,7 @@
           "resolution_basis": null,
           "resolution_outcome": null,
           "resolved_at": null,
+          "review_reason": null,
           "revision": 2,
           "seller_pubky": "<pubky:seller>",
           "state": "awaiting_entitlement",
@@ -418,6 +420,7 @@
         "fulfillment": "shipping",
         "guarantee_policy_version": 1,
         "hold_expires_at": null,
+        "hold_source": "bind",
         "id": "<uuid:4>",
         "lines": [
           {
@@ -469,6 +472,7 @@
           "resolution_basis": null,
           "resolution_outcome": null,
           "resolved_at": null,
+          "review_reason": null,
           "revision": 3,
           "seller_pubky": "<pubky:seller>",
           "state": "manual_review",
@@ -547,6 +551,7 @@
         "fulfillment": "shipping",
         "guarantee_policy_version": 1,
         "hold_expires_at": null,
+        "hold_source": "bind",
         "id": "<uuid:6>",
         "lines": [
           {
@@ -598,6 +603,7 @@
           "resolution_basis": null,
           "resolution_outcome": null,
           "resolved_at": null,
+          "review_reason": "refund_required",
           "revision": 4,
           "seller_pubky": "<pubky:seller>",
           "state": "manual_review",
@@ -672,6 +678,7 @@
         "fulfillment": "shipping",
         "guarantee_policy_version": 1,
         "hold_expires_at": null,
+        "hold_source": "sandbox",
         "id": "<uuid:8>",
         "lines": [
           {
@@ -723,6 +730,7 @@
           "resolution_basis": null,
           "resolution_outcome": null,
           "resolved_at": null,
+          "review_reason": null,
           "revision": 2,
           "seller_pubky": "<pubky:seller>",
           "state": "confirmed",
@@ -801,6 +809,7 @@
         "fulfillment": "shipping",
         "guarantee_policy_version": 1,
         "hold_expires_at": "<timestamp:3>",
+        "hold_source": "bind",
         "id": "<uuid:2>",
         "lines": [
           {
@@ -864,6 +873,7 @@
           "resolution_basis": null,
           "resolution_outcome": null,
           "resolved_at": null,
+          "review_reason": null,
           "revision": 2,
           "seller_pubky": "<pubky:seller>",
           "state": "awaiting_entitlement",
@@ -940,6 +950,7 @@
             "fulfillment": "shipping",
             "guarantee_policy_version": 1,
             "hold_expires_at": null,
+            "hold_source": "sandbox",
             "id": "<uuid:8>",
             "lines": [
               {
@@ -996,6 +1007,7 @@
               "resolution_basis": null,
               "resolution_outcome": null,
               "resolved_at": null,
+              "review_reason": null,
               "revision": 2,
               "seller_pubky": "<pubky:seller>",
               "state": "confirmed",
@@ -1076,6 +1088,7 @@
         "fulfillment": "shipping",
         "guarantee_policy_version": 1,
         "hold_expires_at": null,
+        "hold_source": "bind",
         "id": "<uuid:4>",
         "lines": [
           {
@@ -1139,6 +1152,7 @@
           "resolution_basis": null,
           "resolution_outcome": null,
           "resolved_at": null,
+          "review_reason": null,
           "revision": 3,
           "seller_pubky": "<pubky:seller>",
           "state": "manual_review",
@@ -1217,6 +1231,7 @@
         "fulfillment": "shipping",
         "guarantee_policy_version": 1,
         "hold_expires_at": null,
+        "hold_source": "bind",
         "id": "<uuid:6>",
         "lines": [
           {
@@ -1280,6 +1295,7 @@
           "resolution_basis": null,
           "resolution_outcome": null,
           "resolved_at": null,
+          "review_reason": "refund_required",
           "revision": 4,
           "seller_pubky": "<pubky:seller>",
           "state": "manual_review",
@@ -1366,6 +1382,7 @@
         "fulfillment": "shipping",
         "guarantee_policy_version": 1,
         "hold_expires_at": null,
+        "hold_source": "sandbox",
         "id": "<uuid:8>",
         "lines": [
           {
@@ -1422,6 +1439,7 @@
           "resolution_basis": null,
           "resolution_outcome": null,
           "resolved_at": null,
+          "review_reason": null,
           "revision": 2,
           "seller_pubky": "<pubky:seller>",
           "state": "confirmed",

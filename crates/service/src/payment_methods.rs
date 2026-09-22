@@ -35,6 +35,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::auth::Actor;
+use crate::bitcoin_review::{apply_late_money, ResolutionFailure};
 use crate::clock::format_timestamp;
 use crate::executor::insert_event;
 use crate::handlers::{
@@ -712,14 +713,18 @@ pub async fn bind_payment_method(
         );
     }
 
-    // The bind lock point: choosing a real rail is the payment start, so it
-    // acquires the order's inventory hold and arms the fiat payment window
-    // (all three rails; the paykit worker and both fiat verification legs
-    // confirm against this hold).
+    // The bind lock point: choosing a real rail re-arms the checkout hold
+    // to the rail window. Live-test / rail-disabled checks ran above.
+    let bind_window = if method == "bitcoin" {
+        state.config.bitcoin_payment_window_seconds
+    } else {
+        state.config.fiat_payment_window_seconds
+    };
     let order = match crate::handlers::holds::acquire_payment_hold(
         &mut tx,
         order,
-        state.config.fiat_payment_window_seconds,
+        bind_window,
+        crate::handlers::holds::HOLD_SOURCE_BIND,
         now,
     )
     .await
@@ -1302,41 +1307,53 @@ async fn apply_fiat_paid(
             )
         })?;
     if payment.state == "expired" {
-        // The money is real but the payment window already elapsed: the
-        // sweep released the hold and cancelled the order, so the fact is
-        // retained under manual review — never silently dropped, never a
-        // confirmation of inventory the order no longer holds (exactly like
-        // a late Locks completion).
-        let updated: Option<(i64,)> = sqlx::query_as(
-            "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-             manual_review_entered_at = $2, updated_at = $2 \
-             WHERE id = $1 AND state = 'expired' RETURNING revision",
+        let command_id = Uuid::new_v4();
+        match apply_late_money(
+            &mut tx,
+            state.pickup.as_deref(),
+            &payment,
+            &order,
+            command_id,
+            actor,
+            now,
         )
-        .bind(payment.id)
-        .bind(now)
-        .fetch_optional(&mut *tx)
         .await
-        .map_err(|error| internal("manual review update", &error))?;
-        if let Some((revision,)) = updated {
-            insert_event(
-                &mut tx,
-                Uuid::new_v4(),
-                &ids::payment_aggregate_id(payment.id),
-                revision,
-                actor,
-                "payment.manual_review",
-                now,
-            )
-            .await
-            .map_err(|error| internal("manual review event", &error))?;
+        {
+            Ok(_outcome) => {
+                let Some(order) = fetch_order_for_update(&mut tx, order_id)
+                    .await
+                    .map_err(|error| internal("late fiat order re-read", &error))?
+                else {
+                    return Err(method_error(
+                        ErrorCode::NotFound,
+                        "order_not_found",
+                        "The order was not found.",
+                    ));
+                };
+                let response = order_response(&mut tx, &order, json!({ "verified": true }))
+                    .await
+                    .map_err(|error| internal("order projection", &error))?;
+                tx.commit()
+                    .await
+                    .map_err(|error| internal("late fiat commit", &error))?;
+                tracing::warn!(
+                    order_id = %order_id,
+                    "applied late-money fork for fiat settlement after expiry"
+                );
+                return Ok(response);
+            }
+            Err(ResolutionFailure::Internal(context, error)) => {
+                let _ = tx.rollback().await;
+                return Err(internal(&context, &error));
+            }
+            Err(other) => {
+                let _ = tx.rollback().await;
+                return Err(internal(
+                    "late fiat settlement",
+                    &format!("{:?}", std::mem::discriminant(&other)),
+                ));
+            }
         }
-        let response = order_response(&mut tx, &order, json!({ "verified": true }))
-            .await
-            .map_err(|error| internal("order projection", &error))?;
-        tx.commit()
-            .await
-            .map_err(|error| internal("manual review commit", &error))?;
-        return Ok(response);
     }
     if payment.state != "awaiting_entitlement" {
         // Already confirmed (or under review): a duplicate verification has

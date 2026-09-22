@@ -61,7 +61,8 @@
       "not_order_seller",
       "order_not_found",
       "resolution_not_applicable",
-      "stock_unavailable"
+      "stock_unavailable",
+      "refund_required"
     ],
     "request_schema": {
       "$schema": "http://json-schema.org/draft-07/schema#",

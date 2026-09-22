@@ -9,10 +9,16 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::executor::insert_event;
-use crate::handlers::{current_listing_revision, fetch_listing};
+use crate::handlers::holds::{self, HOLD_SOURCE_CHECKOUT, HOLD_SOURCE_DROP_CLAIM};
+use crate::handlers::{current_listing_revision, fetch_listing, fetch_listing_for_update};
 use crate::locks::LocksKeys;
 use crate::model::{money_json, ListingRow, OrderRow, PaymentRow, ProjectionContext};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
+
+pub struct CheckoutWindows {
+    pub drop_claim_seconds: i64,
+    pub checkout_hold_seconds: i64,
+}
 
 pub async fn handle(
     tx: &mut Transaction<'_, Postgres>,
@@ -20,9 +26,11 @@ pub async fn handle(
     command: &Command,
     payload: &CreateCheckoutPayload,
     locks_keys: Option<&LocksKeys>,
-    drop_claim_window_seconds: i64,
+    windows: CheckoutWindows,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
+    let drop_claim_window_seconds = windows.drop_claim_seconds;
+    let checkout_hold_window_seconds = windows.checkout_hold_seconds;
     if command.aggregate_id != ids::checkout_aggregate_id(command.command_id)
         || command.expected_revision != 0
     {
@@ -33,7 +41,9 @@ pub async fn handle(
         )));
     }
 
-    let mut resolved: Vec<(&CheckoutLine, ListingRow)> = Vec::with_capacity(payload.lines.len());
+    // Peek listings without FOR UPDATE so a bound drop can lock first
+    // (drop-then-listing, the order every gating and release path shares).
+    let mut peeked: Vec<(&CheckoutLine, ListingRow)> = Vec::with_capacity(payload.lines.len());
     for line in &payload.lines {
         let Some(listing) = fetch_listing(tx, &line.listing_aggregate_id).await? else {
             return Ok(Err(CommandFailure::refused(
@@ -42,9 +52,6 @@ pub async fn handle(
                 "A checkout listing is unavailable.",
             )));
         };
-        resolved.push((line, listing));
-    }
-    for (line, listing) in &resolved {
         if listing.seller_pubky == actor {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::Unauthorized,
@@ -59,6 +66,49 @@ pub async fn handle(
                 "Only fixed-price listings can enter checkout.",
             )));
         }
+        peeked.push((line, listing));
+    }
+
+    // Drop gating (ADR-0026). Bindings are looked up — and the bound drop
+    // row-locked — BEFORE any listing row lock or order insert. Cart shape:
+    // editions map one order to one unit, so a checkout containing a
+    // drop-bound line must be exactly that one line, holding one unit.
+    let mut bound_drop: Option<crate::model::DropRow> = None;
+    for (_, listing) in &peeked {
+        if let Some(drop) =
+            crate::handlers::drops::lock_bound_drop(tx, &listing.seller_pubky, &listing.listing_id)
+                .await?
+        {
+            bound_drop = Some(drop);
+            break;
+        }
+    }
+    let mut drop_aggregate_id: Option<String> = None;
+    if let Some(drop) = bound_drop {
+        if peeked.len() != 1 || peeked[0].0.quantity != 1 {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                crate::handlers::drops::DROP_SINGLE_LINE,
+            )));
+        }
+        match crate::handlers::drops::enforce_drop_gate(tx, drop, actor, 1, command.command_id, now)
+            .await?
+        {
+            Ok(drop) => drop_aggregate_id = Some(drop.aggregate_id),
+            Err(failure) => return Ok(Err(failure)),
+        }
+    }
+
+    let mut resolved: Vec<(&CheckoutLine, ListingRow)> = Vec::with_capacity(peeked.len());
+    for (line, _) in peeked {
+        let Some(listing) = fetch_listing_for_update(tx, &line.listing_aggregate_id).await? else {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::NotFound,
+                ErrorCode::NotFound,
+                "A checkout listing is unavailable.",
+            )));
+        };
         // State-specific refusals: a `reserved` listing is held by another
         // buyer's in-flight payment and may restock when its window lapses —
         // the buyer deserves that truth, not a generic unavailability.
@@ -91,9 +141,6 @@ pub async fn handle(
                 listing.server_revision,
             )));
         }
-        // Advisory pre-check only ("only a payment locks an item"): the
-        // checkout refuses when the stock is not available at this instant
-        // but moves nothing — the hold is acquired at a payment lock point.
         if line.quantity > listing.available_quantity {
             return Ok(Err(CommandFailure::refused_with_revision(
                 crate::refusal_audit::RefusalKind::InsufficientInventory,
@@ -102,6 +149,7 @@ pub async fn handle(
                 listing.server_revision,
             )));
         }
+        resolved.push((line, listing));
     }
     let first = &resolved[0].1;
     let same_asset = resolved.iter().all(|(_, listing)| {
@@ -117,38 +165,6 @@ pub async fn handle(
     }
     let currency = first.unit_price_currency.clone();
     let exponent = first.unit_price_exponent;
-
-    // Drop gating (ADR-0026). Bindings are looked up — and the bound drop
-    // row-locked — BEFORE any listing row lock or order insert, the lock
-    // order every gating and release path shares. Cart shape: editions map
-    // one order to one unit, so a checkout containing a drop-bound line
-    // must be exactly that one line, holding one unit.
-    let mut bound_drop: Option<crate::model::DropRow> = None;
-    for (_, listing) in &resolved {
-        if let Some(drop) =
-            crate::handlers::drops::lock_bound_drop(tx, &listing.seller_pubky, &listing.listing_id)
-                .await?
-        {
-            bound_drop = Some(drop);
-            break;
-        }
-    }
-    let mut drop_aggregate_id: Option<String> = None;
-    if let Some(drop) = bound_drop {
-        if resolved.len() != 1 || resolved[0].0.quantity != 1 {
-            return Ok(Err(CommandFailure::refused(
-                crate::refusal_audit::RefusalKind::InvalidCommand,
-                ErrorCode::InvalidCommand,
-                crate::handlers::drops::DROP_SINGLE_LINE,
-            )));
-        }
-        match crate::handlers::drops::enforce_drop_gate(tx, drop, actor, 1, command.command_id, now)
-            .await?
-        {
-            Ok(drop) => drop_aggregate_id = Some(drop.aggregate_id),
-            Err(failure) => return Ok(Err(failure)),
-        }
-    }
 
     // Group checkout lines by (seller, fulfillment), preserving line order
     // (§A2: one order per seller group per fulfillment choice; several
@@ -278,15 +294,14 @@ pub async fn handle(
         let payment_id = Uuid::new_v4();
         let seller_has_rail = crate::queries::seller_has_rail(tx, seller_pubky).await?;
 
-        // Ordinary orders start with NO hold; a drop-bound checkout keeps
-        // lock-at-claim (the gate above debited the drop; the listing moves
-        // below), so its claim window arms immediately.
+        // Drop-bound checkout keeps lock-at-claim. Ordinary checkout
+        // acquires the 900 s park after insert in this same transaction.
         let stock_held = drop_aggregate_id.is_some();
         let hold_expires_at = drop_aggregate_id
             .is_some()
             .then(|| now + chrono::Duration::seconds(drop_claim_window_seconds));
 
-        let order = OrderRow::new_for_insert(
+        let mut order = OrderRow::new_for_insert(
             order_id,
             None,
             drop_aggregate_id.clone(),
@@ -312,14 +327,17 @@ pub async fn handle(
             now,
             "listing".to_string(),
         );
+        if drop_aggregate_id.is_some() {
+            order.hold_source = Some(HOLD_SOURCE_DROP_CLAIM.to_string());
+        }
         sqlx::query(
             "INSERT INTO orders (id, checkout_command_id, drop_aggregate_id, buyer_pubky, \
              seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
              shipping_minor, total_minor, currency, exponent, \
-             guarantee_policy_version, payment_id, stock_held, hold_expires_at, fulfillment, \
-             created_at, updated_at) \
+             guarantee_policy_version, payment_id, stock_held, hold_expires_at, hold_source, \
+             fulfillment, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-             $18, $19, $20, $20)",
+             $18, $19, $20, $21, $21)",
         )
         .bind(order.id)
         .bind(command.command_id)
@@ -343,6 +361,7 @@ pub async fn handle(
         .bind(order.payment_id)
         .bind(order.stock_held)
         .bind(order.hold_expires_at)
+        .bind(&order.hold_source)
         .bind(&order.fulfillment)
         .bind(now)
         .execute(&mut **tx)
@@ -371,6 +390,7 @@ pub async fn handle(
             resolved_at: None,
             resolved_by_pubky: None,
             refund_reference: None,
+            review_reason: None,
             created_at: now,
             updated_at: now,
         };
@@ -448,6 +468,21 @@ pub async fn handle(
             }
         }
 
+        if drop_aggregate_id.is_none() {
+            order = match holds::acquire_payment_hold(
+                tx,
+                order,
+                checkout_hold_window_seconds,
+                HOLD_SOURCE_CHECKOUT,
+                now,
+            )
+            .await?
+            {
+                Ok(order) => order,
+                Err(failure) => return Ok(Err(failure)),
+            };
+        }
+
         let order_aggregate_id = ids::order_aggregate_id(order_id);
         let event_id = insert_event(
             tx,
@@ -487,9 +522,8 @@ pub async fn handle(
     // Drop-bound checkout keeps lock-at-claim (ADR-0026: the FCFS race IS
     // the product): the purchased unit moves to reserved with a
     // compare-and-swap on the validated line revision, in the same
-    // transaction as the drop debit above. Ordinary checkouts move NOTHING —
-    // the hold is acquired at a payment lock point
-    // (`handlers::holds::acquire_payment_hold`).
+    // transaction as the drop debit above. Ordinary checkouts already
+    // acquired their hold after insert.
     if drop_aggregate_id.is_some() {
         for (line, listing) in &resolved {
             let new_state = if listing.available_quantity == line.quantity {

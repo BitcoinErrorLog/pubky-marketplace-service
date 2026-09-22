@@ -877,7 +877,7 @@ async fn mixed_cart_splits_per_seller_fulfillment(pool: PgPool) {
         &app,
         &buyer.token,
         &checkout_lines(
-            vec![line(&seller_b.pubky, "boots_01", 1, "pickup")],
+            vec![line(&seller_b.pubky, "boots_01", 2, "pickup")],
             false,
             "00000000-0000-4000-9000-000000000155",
         ),
