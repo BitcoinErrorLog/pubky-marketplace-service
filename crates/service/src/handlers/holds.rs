@@ -14,10 +14,9 @@
 //! - `payment.sandbox_advance` leaving `awaiting_entitlement` — window
 //!   `SANDBOX_PAYMENT_WINDOW_SECONDS`.
 //!
-//! Live-test allow-list, `PAYMENT_RAILS_DISABLED`, and amount caps still run
-//! **before** the bind re-arm. Auction orders are excluded: their hold is
-//! the winning `reservations` row. Drop-bound checkout keeps lock-at-claim
-//! and arms `DROP_CLAIM_WINDOW_SECONDS` at checkout.
+//! Auction orders are excluded: their hold is the winning `reservations`
+//! row. Drop-bound checkout keeps lock-at-claim and arms
+//! `DROP_CLAIM_WINDOW_SECONDS` at checkout.
 //!
 //! The payment-window worker ([`crate::workers::expire_due_payment_windows`])
 //! releases a lapsed hold, expires the payment, and cancels the order.

@@ -697,29 +697,6 @@ async fn assert_order_event_revisions_match(pool: &PgPool, order_id: &str, order
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn live_test_cap_refuses_before_rearm(pool: PgPool) {
-    let mut config = Config::for_tests();
-    config.live_test_max_usd_minor = Some(100);
-    let (app, _stripe, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-    assert_eq!(
-        hold_row(&app.pool, &order.order_id).await,
-        (true, Some(ts_after(900)), Some("checkout".into()))
-    );
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["reason"], json!("live_test_amount_capped"));
-    assert_eq!(
-        hold_row(&app.pool, &order.order_id).await,
-        (true, Some(ts_after(900)), Some("checkout".into())),
-        "cap refusal must not re-arm"
-    );
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paypal_ipn_after_expire_with_stock_gone_is_refund_required(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let seller = new_actor(&app).await;

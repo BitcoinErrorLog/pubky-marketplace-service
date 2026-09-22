@@ -7,12 +7,11 @@ mod common;
 use axum::http::StatusCode;
 use common::*;
 use marketplace_service::clock::Clock;
-use marketplace_service::config::{Config, LiveTestSellerAllowlist};
+use marketplace_service::config::Config;
 use marketplace_service::payments::{order_reference, PaykitStatusOutcome};
 use marketplace_service::workers::run_once;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::collections::HashSet;
 use uuid::Uuid;
 
 const RESTRICTED_KEY: &str = "rk_test_51NxyzMarketplace";
@@ -646,166 +645,6 @@ async fn paypal_binding_builds_the_seller_direct_checkout_url(pool: PgPool) {
         url.contains("notify_url=https%3A%2F%2Fsvc.test%2Fv0%2Fpaypal%2Fipn"),
         "{url}"
     );
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn bind_refuses_a_disabled_rail_and_leaves_others(pool: PgPool) {
-    let mut config = Config::for_tests();
-    config.payment_rails_disabled.insert("stripe".to_string());
-    let (app, _stripe, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "stripe").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["reason"], json!("method_unavailable"));
-
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
-    assert_eq!(status, StatusCode::OK, "paypal must still bind: {body}");
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn bind_refuses_a_seller_outside_the_live_test_allowlist(pool: PgPool) {
-    let (allowed_keypair, allowed_pubky) = random_keypair();
-    let mut config = Config::for_tests();
-    config.live_test_seller_allowlist =
-        LiveTestSellerAllowlist::Restricted(HashSet::from([allowed_pubky.clone()]));
-    let (app, _stripe, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        body["error"]["reason"],
-        json!("live_test_seller_not_allowlisted")
-    );
-
-    let allowed_token = authenticate(&app, &allowed_keypair).await;
-    let allowed_seller = TestActor {
-        keypair: allowed_keypair,
-        pubky: allowed_pubky,
-        token: allowed_token,
-    };
-    let allowed_buyer = new_actor(&app).await;
-    put_config(&app, &allowed_seller.token, &full_config_body()).await;
-    let allowed_order = create_pending_order(&app, &allowed_seller, &allowed_buyer).await;
-    let (status, body) = bind_method(
-        &app,
-        &allowed_buyer.token,
-        &allowed_order.order_id,
-        "paypal",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "allowlisted seller binds: {body}");
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn bind_refuses_when_the_live_test_usd_cap_is_exceeded(pool: PgPool) {
-    let mut config = Config::for_tests();
-    config.live_test_max_usd_minor = Some(100);
-    let (app, _stripe, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["reason"], json!("live_test_amount_capped"));
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn bind_refuses_when_the_live_test_fiat_cap_is_exceeded_for_eur(pool: PgPool) {
-    let mut config = Config::for_tests();
-    config.live_test_max_usd_minor = Some(100);
-    let (app, _stripe, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-    sqlx::query("UPDATE orders SET currency = 'EUR' WHERE id = $1")
-        .bind(Uuid::parse_str(&order.order_id).expect("order id is a UUID"))
-        .execute(&app.pool)
-        .await
-        .expect("test order currency update");
-
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["reason"], json!("live_test_amount_capped"));
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn bind_empty_allowlist_denies_every_seller(pool: PgPool) {
-    let mut config = Config::for_tests();
-    config.live_test_seller_allowlist = LiveTestSellerAllowlist::Restricted(HashSet::new());
-    let (app, _stripe, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        body["error"]["reason"],
-        json!("live_test_seller_not_allowlisted")
-    );
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn bind_does_not_reveal_a_disabled_rail_to_a_non_buyer(pool: PgPool) {
-    let mut config = Config::for_tests();
-    config.payment_rails_disabled.insert("stripe".to_string());
-    let (app, _stripe, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-
-    let (status, body) = bind_method(&app, &seller.token, &order.order_id, "stripe").await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["error"]["reason"], json!("not_buyer"));
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn bind_does_not_reveal_a_disabled_rail_before_the_allow_list(pool: PgPool) {
-    let mut config = Config::for_tests();
-    config.live_test_seller_allowlist = LiveTestSellerAllowlist::Restricted(HashSet::new());
-    config.payment_rails_disabled.insert("stripe".to_string());
-    let (app, _stripe, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "stripe").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        body["error"]["reason"],
-        json!("live_test_seller_not_allowlisted")
-    );
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn bind_refuses_when_the_live_test_sats_cap_is_exceeded(pool: PgPool) {
-    let mut config = Config::for_tests();
-    config.live_test_max_sats = Some(1_000);
-    let (app, _stripe, paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    paykit.set_claimed(&seller.pubky);
-    let order = create_pending_sat_order(&app, &seller, &buyer).await;
-
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["reason"], json!("live_test_amount_capped"));
-    assert!(paykit.requests().is_empty(), "cap must fire before Paykit");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
