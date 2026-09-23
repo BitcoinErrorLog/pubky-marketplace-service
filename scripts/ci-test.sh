@@ -37,7 +37,7 @@ is_serial() {
 }
 
 echo "ci-test: lib and bins, ${THREADS} threads"
-cargo test --workspace --jobs 1 --lib --bins -- --test-threads="$THREADS" --no-fail-fast
+cargo test --workspace --jobs 1 --lib --bins --no-fail-fast -- --test-threads="$THREADS"
 
 parallel_args=()
 for file in crates/service/tests/*.rs; do
@@ -49,7 +49,7 @@ for file in crates/service/tests/*.rs; do
 done
 
 echo "ci-test: parallel integration tests (${#parallel_args[@]} binaries, ${THREADS} threads)"
-cargo test -p marketplace-service --jobs 1 "${parallel_args[@]}" -- --test-threads="$THREADS" --no-fail-fast
+cargo test -p marketplace-service --jobs 1 "${parallel_args[@]}" --no-fail-fast -- --test-threads="$THREADS"
 
 serial_args=()
 for name in "${SERIAL[@]}"; do
@@ -58,4 +58,4 @@ done
 
 echo "ci-test: serial role tests (${#SERIAL[@]} binaries, 1 thread)"
 echo "  ${SERIAL[*]}"
-cargo test -p marketplace-service --jobs 1 "${serial_args[@]}" -- --test-threads=1 --no-fail-fast
+cargo test -p marketplace-service --jobs 1 "${serial_args[@]}" --no-fail-fast -- --test-threads=1
