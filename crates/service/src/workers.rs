@@ -997,6 +997,11 @@ async fn track_invoice_live_after_void(
     invoice_id: Uuid,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
+    // Payment before order, the settlement paths' lock order.
+    sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
+        .bind(order_id)
+        .fetch_optional(&mut **tx)
+        .await?;
     let retracked = sqlx::query(
         "UPDATE orders SET paykit_activation_state = 'active', \
          paykit_request_state = 'pending', updated_at = $3 \

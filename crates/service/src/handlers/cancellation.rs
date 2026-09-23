@@ -52,6 +52,9 @@ pub async fn request(
     payload: &RequestCancellationPayload,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
+    // Payment before order: the settlement paths lock in that order, so a
+    // cancel racing a confirmation waits instead of deadlocking.
+    let payment = lock_payment(tx, payload.order_id).await?;
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::NotFound,
@@ -172,10 +175,11 @@ pub async fn request(
         }
     }
 
-    let paykit_void = if immediate {
-        end_paykit_request(tx, &order, actor, command.command_id, now).await?
-    } else {
-        None
+    let paykit_void = match (&payment, immediate) {
+        (Some(payment), true) => {
+            end_paykit_request(tx, &order, payment, actor, command.command_id, now).await?
+        }
+        _ => None,
     };
 
     let updated: OrderRow = sqlx::query_as(&format!(
@@ -221,6 +225,25 @@ fn paykit_money_observed(order: &OrderRow) -> bool {
     )
 }
 
+/// The order's payment row, locked: `(id, adapter, state)`.
+struct LockedPayment {
+    id: Uuid,
+    adapter: String,
+    state: String,
+}
+
+async fn lock_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+) -> Result<Option<LockedPayment>, sqlx::Error> {
+    let row: Option<(Uuid, String, String)> =
+        sqlx::query_as("SELECT id, adapter, state FROM payments WHERE order_id = $1 FOR UPDATE")
+            .bind(order_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(row.map(|(id, adapter, state)| LockedPayment { id, adapter, state }))
+}
+
 /// The persisted phase-1 pin a `paykit.void` row is dialed with.
 pub(crate) struct PaykitVoidPin {
     pub invoice_id: Uuid,
@@ -239,34 +262,27 @@ pub(crate) struct PaykitVoidPin {
 async fn end_paykit_request(
     tx: &mut Transaction<'_, Postgres>,
     order: &OrderRow,
+    payment: &LockedPayment,
     actor: &str,
     command_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<Option<PaykitVoidPin>, sqlx::Error> {
-    let payment: Option<(Uuid, String, String)> =
-        sqlx::query_as("SELECT id, adapter, state FROM payments WHERE order_id = $1 FOR UPDATE")
-            .bind(order.id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let Some((payment_id, adapter, payment_state)) = payment else {
-        return Ok(None);
-    };
-    if adapter != "paykit" {
+    if payment.adapter != "paykit" {
         return Ok(None);
     }
-    if payment_state == "awaiting_entitlement" {
+    if payment.state == "awaiting_entitlement" {
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'expired', revision = revision + 1, \
              updated_at = $2 WHERE id = $1 RETURNING revision",
         )
-        .bind(payment_id)
+        .bind(payment.id)
         .bind(now)
         .fetch_one(&mut **tx)
         .await?;
         insert_event(
             tx,
             command_id,
-            &ids::payment_aggregate_id(payment_id),
+            &ids::payment_aggregate_id(payment.id),
             revision,
             actor,
             "payment.expired",
