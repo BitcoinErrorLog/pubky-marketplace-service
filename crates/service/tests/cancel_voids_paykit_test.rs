@@ -637,3 +637,157 @@ async fn hold_expiry_void_locks_the_payment_before_the_order(pool: PgPool) {
         "void_cancelled"
     );
 }
+
+async fn payment_of(pool: &PgPool, order_id: &str) -> (Uuid, i64) {
+    sqlx::query_as("SELECT id, revision FROM payments WHERE order_id = $1")
+        .bind(order_uuid(order_id))
+        .fetch_one(pool)
+        .await
+        .expect("payment row")
+}
+
+/// Runs an expiry sweep while a separate transaction holds order `skipped`'s
+/// payment lock (as a cancel takes it first) and an uncommitted event on
+/// order `blocked`'s next payment revision, which parks the sweep's own
+/// transaction inside `blocked`'s expiry. Returns whether `skipped`'s order
+/// row was free (`FOR UPDATE NOWAIT`) while the sweep's transaction was open.
+async fn skipped_order_free_while_sweep_is_open(
+    app: &TestApp,
+    skipped: &str,
+    blocked: &str,
+) -> (bool, u64) {
+    let options = app.pool.connect_options().clone();
+    let mut holder = PgConnection::connect_with(&options)
+        .await
+        .expect("holder connection");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("holder transaction");
+    sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
+        .bind(order_uuid(skipped))
+        .execute(&mut holder)
+        .await
+        .expect("hold the skipped payment lock");
+    let (blocked_payment, revision) = payment_of(&app.pool, blocked).await;
+    sqlx::query(
+        "INSERT INTO events (id, command_id, aggregate_id, revision, actor_pubky, kind, occurred_at) \
+         VALUES ($1, $2, $3, $4, 'lock-order-test', 'test.hold', now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(format!("payment:{blocked_payment}"))
+    .bind(revision + 1)
+    .execute(&mut holder)
+    .await
+    .expect("park the sweep on the blocked payment's next event");
+    let (holder_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut holder)
+        .await
+        .expect("holder pid");
+
+    let state = app.state.clone();
+    let now = app.clock.now();
+    let sweep = tokio::spawn(async move { expire_due_payment_windows(&state, now).await });
+    let started = tokio::time::Instant::now();
+    loop {
+        let parked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> $1 \
+             AND wait_event_type = 'Lock' AND query ILIKE '%INSERT INTO events%')",
+        )
+        .bind(holder_pid)
+        .fetch_one(&app.pool)
+        .await
+        .expect("lock-wait probe");
+        if parked {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the sweep never reached the blocked order's expiry"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let order_free = sqlx::query("SELECT id FROM orders WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(order_uuid(skipped))
+        .execute(&mut holder)
+        .await
+        .is_ok();
+    let _ = sqlx::query("ROLLBACK").execute(&mut holder).await;
+    let expired = sweep.await.expect("sweep task joins").expect("sweep runs");
+    (order_free, expired)
+}
+
+// Lock order: the held-window sweep locks the payment before the order. An
+// order whose payment a cancel already holds is skipped without its order
+// row being locked.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn held_window_sweep_locks_the_payment_before_the_order(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let first_seller = new_actor(&app).await;
+    let second_seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (skipped, _) = preparing_order(&app, &paykit, &first_seller, &buyer).await;
+    let (blocked, _) = preparing_order(&app, &paykit, &second_seller, &buyer).await;
+    drain(&app).await;
+    assert_eq!(facts(&pool, &skipped).await.2.as_deref(), Some("active"));
+    assert_eq!(facts(&pool, &blocked).await.2.as_deref(), Some("active"));
+    app.clock.advance_seconds(7_201);
+
+    let (order_free, expired) =
+        skipped_order_free_while_sweep_is_open(&app, &skipped, &blocked).await;
+    assert!(
+        order_free,
+        "the sweep held a skipped order's row while its payment was locked"
+    );
+    assert_eq!(expired, 1, "only the order whose payment was free expired");
+    assert_eq!(facts(&pool, &blocked).await.0, "cancelled");
+    assert_eq!(facts(&pool, &skipped).await.0, "pending_payment");
+
+    // Next tick, with the payment free, the skipped order expires too.
+    let expired = expire_due_payment_windows(&app.state, app.clock.now())
+        .await
+        .expect("sweep runs");
+    assert_eq!(expired, 1);
+    assert_eq!(facts(&pool, &skipped).await.0, "cancelled");
+}
+
+// Lock order: the idle unbound-checkout sweep locks the payment before
+// the order, the same way.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn idle_checkout_sweep_locks_the_payment_before_the_order(pool: PgPool) {
+    let (app, _stripe, _paykit) = test_app_with_payments(pool.clone()).await;
+    let first_seller = new_actor(&app).await;
+    let second_seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    for seller in [&first_seller, &second_seller] {
+        let (status, body) =
+            execute(&app, &seller.token, &register_sat_command(&seller.pubky, 1)).await;
+        assert_eq!(status, StatusCode::OK, "register failed: {body}");
+    }
+    let skipped = checkout_one(&app, &first_seller, &buyer).await;
+    let blocked = checkout_one(&app, &second_seller, &buyer).await;
+    app.clock
+        .advance_seconds(app.state.config.checkout_hold_window_seconds + 1);
+
+    let (order_free, expired) =
+        skipped_order_free_while_sweep_is_open(&app, &skipped, &blocked).await;
+    assert!(
+        order_free,
+        "the sweep held a skipped order's row while its payment was locked"
+    );
+    assert_eq!(
+        expired, 1,
+        "only the checkout whose payment was free expired"
+    );
+    assert_eq!(facts(&pool, &blocked).await.0, "cancelled");
+    assert_eq!(facts(&pool, &skipped).await.0, "pending_payment");
+
+    let expired = expire_due_payment_windows(&app.state, app.clock.now())
+        .await
+        .expect("sweep runs");
+    assert_eq!(expired, 1);
+    assert_eq!(facts(&pool, &skipped).await.0, "cancelled");
+}
