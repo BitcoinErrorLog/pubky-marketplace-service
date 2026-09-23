@@ -32,7 +32,10 @@ if [ ! -t 0 ]; then
     else
       range="${remote_sha}..${local_sha}"
     fi
-    if git log --format=%s "$range" | grep -qv '\[skip ci\]'; then
+    # grep -q under pipefail exits 141 when git log is still writing,
+    # and the gate then skips every push. Read the subjects first.
+    subjects="$(git log --format=%s "$range" || true)"
+    if printf '%s\n' "$subjects" | grep -v '\[skip ci\]' >/dev/null; then
       skip=0
     fi
   done
