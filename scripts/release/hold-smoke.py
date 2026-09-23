@@ -5,9 +5,10 @@ Canonical copy: BitcoinErrorLog/pubky-marketplace-service
 `scripts/release/hold-smoke.py`. The release skill points here; do not keep
 a second live copy under .evidence/.
 
-Exercises checkout.create with the deployed Shop v0.6.19 wire shape
-(shop-v0.6.19 @ c4dfc495a4159f225c83be55739ecaf5ddc69af3). Keys match the
-v0.6.17 capture; hold semantics are Option B:
+Exercises checkout.create with the deployed Shop v0.6.22 wire shape
+(shop-v0.6.22 @ 55a084c804450ee3092bd519fac2306ce38d160e): the v0.6.17 keys
+plus the line's `variant_id`, which the Shop sends for every line whose
+listing variant it resolved. Hold semantics are Option B:
 
   (a) shipping listing + full delivery_address, region as free text
       ("California"), ISO suffix ("CA"), and empty for PT;
@@ -51,9 +52,9 @@ TTL_SLACK_SECONDS = 45.0
 TTL_OVER_SECONDS = 5.0
 FIAT_WINDOW_DEFAULT = 600
 
-SHOP_TAG = "shop-v0.6.19"
-SHOP_SHA = "c4dfc495a4159f225c83be55739ecaf5ddc69af3"
-FIXTURE_NAME = "shop-v0.6.19-checkout.create.json"
+SHOP_TAG = "shop-v0.6.22"
+SHOP_SHA = "55a084c804450ee3092bd519fac2306ce38d160e"
+FIXTURE_NAME = "shop-v0.6.22-checkout.create.json"
 
 STAGING_URL = "https://staging-api.pubky.app"
 STAGING_PROJECT = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed"
@@ -122,7 +123,11 @@ ENVELOPE_KEYS = {
 SHIPPING_PAYLOAD_KEYS = {"lines", "delivery_address", "guarantee_policy_version"}
 PICKUP_PAYLOAD_KEYS = {"lines", "guarantee_policy_version"}
 ADDRESS_KEYS = {"name", "line1", "line2", "city", "region", "postal_code", "country_code"}
-LINE_KEYS = {"listing_aggregate_id", "expected_revision", "quantity", "fulfillment"}
+LINE_KEYS = {"listing_aggregate_id", "expected_revision", "quantity", "variant_id", "fulfillment"}
+# The variant id production Shop sent for a single-variant listing (order
+# c7e700de, 2026-09-23). `variant_options` rides only a variant that has
+# options, which the smoke listings do not.
+SHOP_VARIANT_ID = "variant_1"
 
 
 def refuse_production(url: str, project: str) -> None:
@@ -157,11 +162,12 @@ def checkout_body(
     fulfillment: str,
     address: dict[str, str] | None,
 ) -> dict[str, Any]:
-    """Shop v0.6.17 checkout.create after toSnakeCaseWire."""
+    """Shop v0.6.22 checkout.create after toSnakeCaseWire."""
     line: dict[str, Any] = {
         "listing_aggregate_id": listing["aggregate_id"],
         "expected_revision": listing["server_revision"],
         "quantity": 1,
+        "variant_id": SHOP_VARIANT_ID,
         "fulfillment": fulfillment,
     }
     payload: dict[str, Any] = {
