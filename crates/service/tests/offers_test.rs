@@ -1143,11 +1143,43 @@ async fn award_expiry_worker_retries_when_it_is_the_deadlock_victim(pool: PgPool
         .execute(&mut reverse_holder)
         .await
         .expect("reverse-order transaction");
+    // Postgres checks for a deadlock once per lock wait, when that session's
+    // deadlock_timeout expires, and aborts the session that finds the cycle.
+    // The worker's timer starts when it begins waiting on the listing row,
+    // which is before this session closes the cycle. A longer timeout here
+    // means the worker's check is the one that observes the cycle, so the
+    // worker is the victim even when the machine is busy.
+    sqlx::query("SET deadlock_timeout = '180s'")
+        .execute(&mut reverse_holder)
+        .await
+        .expect("antagonist deadlock_timeout");
     sqlx::query("SELECT aggregate_id FROM listings WHERE aggregate_id = $1 FOR UPDATE")
         .bind(&listing_aggregate_id)
         .execute(&mut reverse_holder)
         .await
         .expect("hold listing lock");
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&app.pool)
+        .await
+        .expect("test database name");
+    let quoted_database = format!("\"{}\"", database_name.replace('"', "\"\""));
+    sqlx::query(&format!(
+        "ALTER DATABASE {quoted_database} SET deadlock_timeout = '30s'"
+    ))
+    .execute(&app.pool)
+    .await
+    .expect("worker database deadlock_timeout");
+    let live = app.pool.size();
+    let mut held = Vec::with_capacity(live);
+    for _ in 0..live {
+        let mut conn = app.pool.acquire().await.expect("pool connection");
+        sqlx::query("SET deadlock_timeout = '30s'")
+            .execute(&mut *conn)
+            .await
+            .expect("worker session deadlock_timeout");
+        held.push(conn);
+    }
+    drop(held);
 
     let worker = tokio::spawn({
         let pool = app.pool.clone();
@@ -1169,16 +1201,17 @@ async fn award_expiry_worker_retries_when_it_is_the_deadlock_victim(pool: PgPool
             break;
         }
         assert!(
-            wait_started.elapsed() < std::time::Duration::from_secs(10),
+            wait_started.elapsed() < std::time::Duration::from_secs(15),
             "award-expiry worker never reached the listing lock"
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
-    let _reverse_offer_lock = sqlx::query("SELECT id FROM offers WHERE id = $1 FOR UPDATE")
+    sqlx::query("SELECT id FROM offers WHERE id = $1 FOR UPDATE")
         .bind(offer_uuid)
         .execute(&mut reverse_holder)
-        .await;
+        .await
+        .expect("antagonist keeps its locks; the worker is the deadlock victim");
     let _ = sqlx::query("ROLLBACK").execute(&mut reverse_holder).await;
 
     let expired = worker
