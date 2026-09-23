@@ -1169,7 +1169,7 @@ async fn award_expiry_worker_retries_when_it_is_the_deadlock_victim(pool: PgPool
     .execute(&app.pool)
     .await
     .expect("worker database deadlock_timeout");
-    let live = app.pool.size();
+    let live = usize::try_from(app.pool.size()).expect("pool size");
     let mut held = Vec::with_capacity(live);
     for _ in 0..live {
         let mut conn = app.pool.acquire().await.expect("pool connection");
