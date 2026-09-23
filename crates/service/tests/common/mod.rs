@@ -1718,6 +1718,18 @@ pub enum FakePaykitReply {
     Hang,
 }
 
+/// A one-shot hold on the next `activate` for one invoice: the double
+/// signals `entered` when the call arrives and answers only after
+/// `release`. With `commit_first` the activation is applied before the
+/// wait (the response is what is delayed); otherwise it is applied after,
+/// against whatever state the invoice reached meanwhile.
+#[derive(Clone, Debug)]
+pub struct FakeActivateGate {
+    pub commit_first: bool,
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
+}
+
 /// One invoice the double prepared.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FakePaykitInvoice {
@@ -1757,6 +1769,7 @@ struct FakePaykitState {
     activate_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
     void_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
     resolve_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
+    activate_gates: HashMap<uuid::Uuid, FakeActivateGate>,
     /// Recorded resolutions: invoice -> (resolution, resolved_at), the
     /// idempotency anchor for `(invoice_id, resolution)` (§B.9).
     resolutions: HashMap<uuid::Uuid, (String, String)>,
@@ -1885,6 +1898,22 @@ impl FakePaykit {
             .expect("fake paykit lock")
             .activate_scripts
             .insert(invoice_id, replies.into());
+    }
+
+    /// Holds the next `activate` on one invoice until the returned gate's
+    /// `release` is notified (see [`FakeActivateGate`]).
+    pub fn gate_activate(&self, invoice_id: uuid::Uuid, commit_first: bool) -> FakeActivateGate {
+        let gate = FakeActivateGate {
+            commit_first,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .activate_gates
+            .insert(invoice_id, gate.clone());
+        gate
     }
 
     /// Queue scripted replies for `void` on one invoice.
@@ -2263,6 +2292,30 @@ async fn serve_paykit_command(
     };
     let path = format!("/v0/payment-requests/{invoice_id}/{command}");
     paykit_record_call(&state, "POST", &path, &host, &parsed);
+    let gate = if command == "activate" {
+        state
+            .lock()
+            .expect("fake paykit lock")
+            .activate_gates
+            .remove(&invoice_id)
+    } else {
+        None
+    };
+    if let Some(gate) = gate {
+        let committed = gate.commit_first.then(|| {
+            let mut guard = state.lock().expect("fake paykit lock");
+            paykit_command_contract(&mut guard, invoice_id, &parsed, command)
+        });
+        gate.entered.notify_one();
+        gate.release.notified().await;
+        return match committed {
+            Some(response) => response,
+            None => {
+                let mut guard = state.lock().expect("fake paykit lock");
+                paykit_command_contract(&mut guard, invoice_id, &parsed, command)
+            }
+        };
+    }
     let scripted = {
         let mut guard = state.lock().expect("fake paykit lock");
         if let Some((status, code)) = guard.command_failure.clone() {
@@ -2517,6 +2570,7 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         activate_scripts: HashMap::new(),
         void_scripts: HashMap::new(),
         resolve_scripts: HashMap::new(),
+        activate_gates: HashMap::new(),
         resolutions: HashMap::new(),
         status_bodies: HashMap::new(),
         calls: Vec::new(),
