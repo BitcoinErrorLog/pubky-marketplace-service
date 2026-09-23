@@ -33,19 +33,22 @@ pub static TEST_MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| {
          END $restore$;"
     );
     let release_sql = format!("SELECT pg_advisory_unlock({MIGRATION_LOCK_ID});");
+    // no_tx: the session advisory lock must outlive the statement. A
+    // transactional migration commits that statement on its own connection
+    // transaction, which is the wrong scope for a lock held across 0032.
     let prelude = Migration::new(
         0,
         Cow::Borrowed("restore_0032_retention_connlimit"),
         MigrationType::Simple,
         Cow::Owned(prelude_sql),
-        false,
+        true,
     );
     let release = Migration::new(
         9_000_000_001,
         Cow::Borrowed("release_test_migration_lock"),
         MigrationType::Simple,
         Cow::Owned(release_sql),
-        false,
+        true,
     );
     let mut migrations = Vec::with_capacity(all.migrations.len() + 2);
     migrations.push(prelude);
