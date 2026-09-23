@@ -13,9 +13,9 @@ use common::paykit_review::{enable_bitcoin, poll_now, status_confirmed, status_d
 use common::*;
 use marketplace_service::clock::Clock;
 use marketplace_service::payments::order_reference;
-use marketplace_service::workers::drain_outbox;
+use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
 fn order_uuid(order_id: &str) -> Uuid {
@@ -466,6 +466,172 @@ async fn activation_arm_refuses_an_order_that_left_pending_payment(pool: PgPool)
     let voids = calls_to(&paykit, "/void");
     assert_eq!(voids.len(), 1);
     assert_eq!(voids[0].body["reason"], json!("order_not_payable"));
+    assert_eq!(
+        paykit.invoice(invoice_id).expect("invoice").state,
+        "void_cancelled"
+    );
+}
+
+/// Holds the order's payment row lock the way a buyer cancel takes it
+/// first, runs `worker` until it blocks on that lock, and returns whether
+/// the order row was still free (`FOR UPDATE NOWAIT`) at that moment —
+/// i.e. whether the worker took the payment before the order.
+async fn order_free_while_worker_waits_on_payment<F, T>(
+    app: &TestApp,
+    order_id: &str,
+    worker: F,
+) -> (bool, T)
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let options = app.pool.connect_options().clone();
+    let mut holder = PgConnection::connect_with(&options)
+        .await
+        .expect("holder connection");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("holder transaction");
+    sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
+        .bind(order_uuid(order_id))
+        .execute(&mut holder)
+        .await
+        .expect("hold the payment lock");
+    let (holder_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut holder)
+        .await
+        .expect("holder pid");
+
+    let running = tokio::spawn(worker);
+    let started = tokio::time::Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> $1 \
+             AND wait_event_type = 'Lock' \
+             AND (query ILIKE '%FROM payments%' OR query ILIKE '%UPDATE payments%'))",
+        )
+        .bind(holder_pid)
+        .fetch_one(&app.pool)
+        .await
+        .expect("lock-wait probe");
+        if waiting {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the worker never waited on the payment lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let order_free = sqlx::query("SELECT id FROM orders WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(order_uuid(order_id))
+        .execute(&mut holder)
+        .await
+        .is_ok();
+    let _ = sqlx::query("ROLLBACK").execute(&mut holder).await;
+    let output = running.await.expect("worker task joins");
+    (order_free, output)
+}
+
+// Lock order: a terminal activation refusal voids the bind (payment and
+// order both written) taking the payment first, like cancel.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn terminal_activation_void_locks_the_payment_before_the_order(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
+    paykit.script_activate(
+        invoice_id,
+        vec![FakePaykitReply::Error(409, "prepare_expired".to_string())],
+    );
+
+    let state = app.state.clone();
+    let now = app.clock.now();
+    let (order_free, drained) =
+        order_free_while_worker_waits_on_payment(&app, &order_id, async move {
+            let paykit = state
+                .payments
+                .as_ref()
+                .and_then(|payments| payments.paykit.as_ref());
+            drain_outbox(&state.pool, paykit, now, 30).await
+        })
+        .await;
+    drained.expect("drain runs");
+    assert!(
+        order_free,
+        "the void held the order lock while waiting for the payment"
+    );
+    let (_, _, activation, request) = facts(&pool, &order_id).await;
+    assert_eq!(activation.as_deref(), Some("voided"));
+    assert_eq!(request, None);
+}
+
+// Lock order: the activation flip (and the re-track it can fall into)
+// takes the payment first.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn activation_flip_locks_the_payment_before_the_order(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
+
+    let state = app.state.clone();
+    let now = app.clock.now();
+    let (order_free, drained) =
+        order_free_while_worker_waits_on_payment(&app, &order_id, async move {
+            let paykit = state
+                .payments
+                .as_ref()
+                .and_then(|payments| payments.paykit.as_ref());
+            drain_outbox(&state.pool, paykit, now, 30).await
+        })
+        .await;
+    drained.expect("drain runs");
+    assert!(
+        order_free,
+        "the flip held the order lock while waiting for the payment"
+    );
+    let (state, _, activation, request) = facts(&pool, &order_id).await;
+    assert_eq!(state, "pending_payment");
+    assert_eq!(activation.as_deref(), Some("active"));
+    assert_eq!(request.as_deref(), Some("pending"));
+}
+
+// Lock order: the hold-expiry void of a `preparing` order expires the
+// payment and cancels the order taking the payment first.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn hold_expiry_void_locks_the_payment_before_the_order(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
+    app.clock.advance_seconds(7_201);
+
+    let state = app.state.clone();
+    let now = app.clock.now();
+    let (order_free, expired) =
+        order_free_while_worker_waits_on_payment(&app, &order_id, async move {
+            expire_due_payment_windows(&state, now).await
+        })
+        .await;
+    assert_eq!(expired.expect("expiry runs"), 1);
+    assert!(
+        order_free,
+        "the expiry held the order lock while waiting for the payment"
+    );
+    assert_eq!(
+        facts(&pool, &order_id).await,
+        (
+            "cancelled".to_string(),
+            "expired".to_string(),
+            Some("voided".to_string()),
+            None
+        )
+    );
     assert_eq!(
         paykit.invoice(invoice_id).expect("invoice").state,
         "void_cancelled"

@@ -670,6 +670,7 @@ async fn void_prepare_effects(
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
+    lock_order_payment(&mut tx, order_id).await?;
     let Some(order) = fetch_order_for_update(&mut tx, order_id).await? else {
         anyhow::bail!("paykit.activate row {row_id} references a missing order {order_id}");
     };
@@ -881,6 +882,7 @@ async fn deliver_paykit_activation(
                 return Ok(true);
             }
             let mut tx = pool.begin().await?;
+            lock_order_payment(&mut tx, payload.order_id).await?;
             // Conditional on `preparing` under the row lock: a redelivered
             // row cannot apply the flip twice.
             let flipped = sqlx::query(
@@ -984,6 +986,22 @@ async fn deliver_paykit_activation(
     }
 }
 
+/// Locks the order's payment row. Every transaction that writes both an
+/// order and its payment takes the payment first — cancel, settlement, and
+/// the Paykit activation and void arms — so two of them racing on one order
+/// wait on each other instead of deadlocking. Re-locking inside the same
+/// transaction is a no-op.
+async fn lock_order_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
+        .bind(order_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Paykit reports the invoice published after the marketplace voided the
 /// order's request (an activation that committed before the void landed).
 /// A voided order that already left `pending_payment` goes back to
@@ -997,11 +1015,7 @@ async fn track_invoice_live_after_void(
     invoice_id: Uuid,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    // Payment before order, the settlement paths' lock order.
-    sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
-        .bind(order_id)
-        .fetch_optional(&mut **tx)
-        .await?;
+    lock_order_payment(tx, order_id).await?;
     let retracked = sqlx::query(
         "UPDATE orders SET paykit_activation_state = 'active', \
          paykit_request_state = 'pending', updated_at = $3 \
@@ -2804,6 +2818,7 @@ async fn void_and_expire_preparing_order(
     enqueue_void_retry: bool,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
+    lock_order_payment(&mut tx, order_id).await?;
     let buyer_pubky: (String,) = sqlx::query_as("SELECT buyer_pubky FROM orders WHERE id = $1")
         .bind(order_id)
         .fetch_one(&mut *tx)
