@@ -14,7 +14,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-THREADS="${PREPUSH_TEST_THREADS:-8}"
+# Advisory locks are per-database, so the test migrator's lock does not
+# serialize CREATE/ALTER ROLE across sqlx::test databases. One thread keeps
+# those cluster-wide catalog updates from racing.
+THREADS="${PREPUSH_TEST_THREADS:-1}"
 
 # Integration-test binaries that mutate cluster-global roles.
 SERIAL=(

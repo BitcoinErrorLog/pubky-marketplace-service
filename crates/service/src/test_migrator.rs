@@ -3,11 +3,12 @@
 //! next `#[sqlx::test]` database replays 0032 against LIMIT 2 and aborts.
 //! Restore the 0032-era limit first; 0037 then raises it again.
 //!
-//! Roles are cluster-global, and sqlx's migrate advisory lock is per database
-//! name, so two `#[sqlx::test]` databases migrate in parallel and race that
-//! limit. The prelude takes one session lock (`pg_advisory_lock`) and the
-//! trailing migration releases it on the same connection. A failed migrate
-//! drops the connection, which releases the session lock.
+//! Roles are cluster-global. PostgreSQL advisory locks are per-database, so
+//! this lock does not serialize two `#[sqlx::test]` databases. The pre-push
+//! gate runs those tests on one thread. The prelude still restores the
+//! 0032-era limit on the same connection before 0032 runs, and the trailing
+//! migration releases the lock. A failed migrate drops the connection, which
+//! releases the session lock.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
