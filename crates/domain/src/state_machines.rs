@@ -440,10 +440,16 @@ pub fn payment_machine() -> AggregateMachine {
                     Server("late_completion"),
                 ],
             ),
+            // A buyer's cancel of an unpaid Paykit-rail order ends its
+            // payment, so money that still reaches the request is late.
             t(
                 "awaiting_entitlement",
                 "expired",
-                vec![Command("payment.sandbox_advance"), Server("payment_window")],
+                vec![
+                    Command("payment.sandbox_advance"),
+                    Command("order.cancel_request"),
+                    Server("payment_window"),
+                ],
             ),
             t(
                 "awaiting_entitlement",

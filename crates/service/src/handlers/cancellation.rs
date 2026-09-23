@@ -10,8 +10,8 @@
 //! the sold quantities to available under the listings quantity-balance
 //! constraint.
 //!
-//! Cancellation never touches the payment record: a confirmed payment stays
-//! confirmed with its receipt intact, and the only money path out of a
+//! Cancellation never touches a confirmed payment: it stays confirmed with
+//! its receipt intact, and the only money path out of a
 //! cancelled order is the externally evidenced `refund.record_external`
 //! (ADR-0019 §7 — the service never claims to move funds).
 //!
@@ -21,13 +21,24 @@
 //! drop row locked BEFORE any listing row (the shared lock order). The
 //! credit restocks a live drop; an ended drop keeps honest books but
 //! nothing reopens.
+//!
+//! Paykit-rail orders: the immediate cancel ends the unpaid payment
+//! (`awaiting_entitlement → expired`) so money that still reaches the
+//! request takes the late-money fork, and a `preparing` request is voided
+//! in the same transaction — activation state `voided`, the undelivered
+//! `paykit.activate` row stamped, one `paykit.void` row enqueued — so no
+//! activation can publish it afterwards. Once money is observed on the
+//! request (`detected`, `awaiting_seller_confirmation`, `confirmed`) the
+//! buyer can no longer cancel: the hold stays with the payment it backs.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{OrderActionPayload, RequestCancellationPayload};
 use marketplace_domain::state_machines::{can_transition, order_machine};
-use marketplace_domain::{Command, ErrorCode};
+use marketplace_domain::{ids, Command, ErrorCode};
 use sqlx::{Postgres, Transaction};
+use uuid::Uuid;
 
+use crate::executor::insert_event;
 use crate::handlers::holds::{release_lines, HeldQuantity};
 use crate::handlers::{fetch_order_for_update, finish_order_action, guard_order_action};
 use crate::model::OrderRow;
@@ -41,6 +52,9 @@ pub async fn request(
     payload: &RequestCancellationPayload,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
+    // Payment before order: the settlement paths lock in that order, so a
+    // cancel racing a confirmation waits instead of deadlocking.
+    let payment = lock_payment(tx, payload.order_id).await?;
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::NotFound,
@@ -62,6 +76,13 @@ pub async fn request(
         order.state.as_str(),
         "pending_payment" | "paid" | "processing" | "ready_for_pickup"
     ) {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "This order can no longer be cancelled.",
+        )));
+    }
+    if order.state == "pending_payment" && paykit_money_observed(&order) {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
@@ -154,6 +175,13 @@ pub async fn request(
         }
     }
 
+    let paykit_void = match (&payment, immediate) {
+        (Some(payment), true) => {
+            end_paykit_request(tx, &order, payment, actor, command.command_id, now).await?
+        }
+        _ => None,
+    };
+
     let updated: OrderRow = sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, state = $3, cancellation_reason = $4, \
          stock_held = false, hold_expires_at = NULL, \
@@ -168,7 +196,7 @@ pub async fn request(
     .await?;
 
     let recipient = updated.seller_pubky.clone();
-    finish_order_action(
+    let result = finish_order_action(
         tx,
         actor,
         command,
@@ -177,7 +205,167 @@ pub async fn request(
         ("order_cancelled", &recipient),
         now,
     )
-    .await
+    .await?;
+    if let (Some(pin), Ok(success)) = (&paykit_void, &result) {
+        let event_id = *success
+            .event_ids
+            .first()
+            .expect("an order action records its event");
+        enqueue_paykit_void(tx, event_id, order.id, pin, "order_cancelled", now).await?;
+    }
+    Ok(result)
+}
+
+/// Money was observed on the order's Paykit request: the payment it backs
+/// is confirming (or confirmed into review), so the hold must stay.
+fn paykit_money_observed(order: &OrderRow) -> bool {
+    matches!(
+        order.paykit_request_state.as_deref(),
+        Some("detected" | "awaiting_seller_confirmation" | "confirmed")
+    )
+}
+
+/// The order's payment row, locked: `(id, adapter, state)`.
+struct LockedPayment {
+    id: Uuid,
+    adapter: String,
+    state: String,
+}
+
+async fn lock_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+) -> Result<Option<LockedPayment>, sqlx::Error> {
+    let row: Option<(Uuid, String, String)> =
+        sqlx::query_as("SELECT id, adapter, state FROM payments WHERE order_id = $1 FOR UPDATE")
+            .bind(order_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(row.map(|(id, adapter, state)| LockedPayment { id, adapter, state }))
+}
+
+/// The persisted phase-1 pin a `paykit.void` row is dialed with.
+pub(crate) struct PaykitVoidPin {
+    pub invoice_id: Uuid,
+    pub stack_id: String,
+    pub stack_endpoint: String,
+}
+
+/// Ends the Paykit leg of an unpaid order that is leaving `pending_payment`
+/// by the buyer's hand, inside the cancel transaction and before the order
+/// row's revision bump. The `awaiting_entitlement` payment expires, so a
+/// settlement that still arrives is late money (`apply_late_money`), never
+/// an ordinary confirmation of a cancelled order. A `preparing` request is
+/// voided locally and its undelivered activate row stamped; the returned pin
+/// is the void the caller enqueues once the order event exists. An `active`
+/// request stays `pending` so the observation tail keeps polling it.
+async fn end_paykit_request(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &OrderRow,
+    payment: &LockedPayment,
+    actor: &str,
+    command_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<PaykitVoidPin>, sqlx::Error> {
+    if payment.adapter != "paykit" {
+        return Ok(None);
+    }
+    if payment.state == "awaiting_entitlement" {
+        let (revision,): (i64,) = sqlx::query_as(
+            "UPDATE payments SET state = 'expired', revision = revision + 1, \
+             updated_at = $2 WHERE id = $1 RETURNING revision",
+        )
+        .bind(payment.id)
+        .bind(now)
+        .fetch_one(&mut **tx)
+        .await?;
+        insert_event(
+            tx,
+            command_id,
+            &ids::payment_aggregate_id(payment.id),
+            revision,
+            actor,
+            "payment.expired",
+            now,
+        )
+        .await?;
+    }
+    if order.paykit_activation_state.as_deref() != Some("preparing") {
+        return Ok(None);
+    }
+    let (Some(invoice_id), Some(stack_id), Some(stack_endpoint)) = (
+        order.paykit_invoice_id,
+        order.paykit_stack_id.clone(),
+        order.paykit_stack_endpoint.clone(),
+    ) else {
+        tracing::error!(
+            order_id = %order.id,
+            "ALERT a preparing order is missing its persisted paykit pin at cancel"
+        );
+        return Ok(None);
+    };
+    void_preparing_request(tx, order.id, now).await?;
+    Ok(Some(PaykitVoidPin {
+        invoice_id,
+        stack_id,
+        stack_endpoint,
+    }))
+}
+
+/// `preparing → voided` for an order that is no longer payable: the request
+/// state clears and the undelivered `paykit.activate` row is stamped, so no
+/// outbox pass can publish the invoice. The remote void is the caller's
+/// `paykit.void` row.
+pub(crate) async fn void_preparing_request(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE orders SET paykit_activation_state = 'voided', paykit_request_state = NULL, \
+         updated_at = $2 WHERE id = $1 AND paykit_activation_state = 'preparing'",
+    )
+    .bind(order_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE outbox SET delivered_at = $2 WHERE kind = 'paykit.activate' \
+         AND payload->>'order_id' = $1 AND delivered_at IS NULL",
+    )
+    .bind(order_id.to_string())
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// One `paykit.void` row for the order's prepared invoice, retried by the
+/// outbox arm under its 24-hour bound.
+pub(crate) async fn enqueue_paykit_void(
+    tx: &mut Transaction<'_, Postgres>,
+    event_id: Uuid,
+    order_id: Uuid,
+    pin: &PaykitVoidPin,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO outbox (event_id, kind, payload, created_at) \
+         VALUES ($1, 'paykit.void', $2, $3)",
+    )
+    .bind(event_id)
+    .bind(serde_json::json!({
+        "invoice_id": pin.invoice_id,
+        "order_id": order_id,
+        "stack_id": pin.stack_id,
+        "stack_endpoint": pin.stack_endpoint,
+        "reason": reason,
+    }))
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 pub async fn approve(

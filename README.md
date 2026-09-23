@@ -196,6 +196,23 @@ immediately followed by a paykit outage can leave paykit `observing` an
 invoice for an order the marketplace voided — bounded because paykit's
 `expires_at` equals the hold deadline, so the invoice expires there too.
 
+**Buyer cancel of a Bitcoin order.** `order.cancel_request` on an unpaid
+Paykit-rail order expires its payment (`awaiting_entitlement → expired`)
+in the cancel transaction, so money that still reaches the request takes
+the late-money fork. A `preparing` request is voided in the same
+transaction: activation `voided`, the undelivered `paykit.activate` row
+stamped, and a `paykit.void` row (`reason=order_cancelled`) enqueued. The
+activation arm never activates an order that left `pending_payment`; it
+voids instead (`reason=order_not_payable`). An activate that committed at
+paykit before the void landed (activate `200 observing` after the local
+void, or void `409 invoice_finalized`) re-tracks the order as
+`active`/`pending` with alert `paykit_activated_after_cancel`, and the
+observation-tail poll keeps watching it. A request that was already
+published stays `pending` after the cancel for the same reason: paykit
+cannot retract a published request, and `resolve(abandoned)` would stop
+paykit observing it. Once money is observed (`detected`,
+`awaiting_seller_confirmation`, `confirmed`) the buyer's cancel is refused.
+
 ### `shared_manual` checkout and manual-review resolution (W1.15)
 
 A seller whose Paykit creator is `shared_manual` confirms Bitcoin payments
@@ -623,8 +640,9 @@ and refund branches):
   only, from `cancel_requested`) moves the order to `cancelled` and returns
   the sold quantities to available under the same quantity-balance
   constraint (see the divergence table for the resulting listing
-  `sold → available` transition). Cancellation never touches the payment
-  record: a confirmed payment stays confirmed with its receipt intact, and
+  `sold → available` transition). Cancellation never touches a confirmed
+  payment: it stays confirmed with its receipt intact (an unpaid Paykit
+  payment expires; see "Buyer cancel of a Bitcoin order"), and
   the only money path out of a cancelled order is the externally evidenced
   `refund.record_external` — the service never claims to move funds. An
   auction winner's cancel releases the winning hold through the reservation

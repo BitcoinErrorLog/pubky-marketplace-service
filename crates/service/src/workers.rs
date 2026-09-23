@@ -777,6 +777,49 @@ async fn deliver_paykit_activation(
             tx.commit().await?;
             return Ok(true);
         }
+        if order.state != "pending_payment" {
+            // An order that left `pending_payment` with its request still
+            // `preparing` (a cancel from before cancel voided the request):
+            // never publish it — void instead.
+            let pin = match (
+                order.paykit_invoice_id,
+                order.paykit_stack_id.clone(),
+                order.paykit_stack_endpoint.clone(),
+            ) {
+                (Some(invoice_id), Some(stack_id), Some(stack_endpoint)) => {
+                    Some(crate::handlers::cancellation::PaykitVoidPin {
+                        invoice_id,
+                        stack_id,
+                        stack_endpoint,
+                    })
+                }
+                _ => None,
+            };
+            crate::handlers::cancellation::void_preparing_request(&mut tx, order.id, now).await?;
+            if let Some(pin) = &pin {
+                crate::handlers::cancellation::enqueue_paykit_void(
+                    &mut tx,
+                    row.event_id,
+                    order.id,
+                    pin,
+                    "order_not_payable",
+                    now,
+                )
+                .await?;
+            }
+            sqlx::query("UPDATE outbox SET delivered_at = $2 WHERE id = $1")
+                .bind(row.id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            tracing::warn!(
+                order_id = %order.id,
+                order_state = %order.state,
+                "refused to activate a paykit request for an order that is no longer payable"
+            );
+            return Ok(true);
+        }
         let attempt = payload.activation_attempt + 1;
         sqlx::query(
             "UPDATE outbox SET payload = jsonb_set(payload, '{activation_attempt}', $2) \
@@ -849,6 +892,14 @@ async fn deliver_paykit_activation(
             .bind(now)
             .execute(&mut *tx)
             .await?;
+            let retracked = flipped.rows_affected() == 0
+                && track_invoice_live_after_void(
+                    &mut tx,
+                    payload.order_id,
+                    payload.invoice_id,
+                    now,
+                )
+                .await?;
             sqlx::query("UPDATE outbox SET delivered_at = $2 WHERE id = $1")
                 .bind(row.id)
                 .bind(now)
@@ -860,6 +911,14 @@ async fn deliver_paykit_activation(
                     order_id = %payload.order_id,
                     invoice_id = %payload.invoice_id,
                     "activated a prepared bitcoin payment request"
+                );
+            }
+            if retracked {
+                tracing::error!(
+                    order_id = %payload.order_id,
+                    invoice_id = %payload.invoice_id,
+                    "ALERT paykit_activated_after_cancel: the activation committed at paykit \
+                     before the void; the cancelled order's request is tracked as pending"
                 );
             }
             Ok(true)
@@ -925,9 +984,68 @@ async fn deliver_paykit_activation(
     }
 }
 
-/// Delivers one `paykit.void` row (inserted only by the preparing-order
-/// hold-expiry hard bound): an idempotent void retried under the ordinary
-/// lease until delivered or 24 h old, then stamped with a `gave_up` log.
+/// Paykit reports the invoice published after the marketplace voided the
+/// order's request (an activation that committed before the void landed).
+/// A voided order that already left `pending_payment` goes back to
+/// tracking that same invoice as `active` / `pending`, and an unpaid Paykit
+/// payment on it expires, so the status poll's observation tail keeps
+/// watching and any settlement is late money. Returns whether the order
+/// was re-tracked.
+async fn track_invoice_live_after_void(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+    invoice_id: Uuid,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    // Payment before order, the settlement paths' lock order.
+    sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
+        .bind(order_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let retracked = sqlx::query(
+        "UPDATE orders SET paykit_activation_state = 'active', \
+         paykit_request_state = 'pending', updated_at = $3 \
+         WHERE id = $1 AND paykit_invoice_id = $2 \
+         AND paykit_activation_state = 'voided' AND state <> 'pending_payment'",
+    )
+    .bind(order_id)
+    .bind(invoice_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    if retracked.rows_affected() == 0 {
+        return Ok(false);
+    }
+    let unpaid: Option<(Uuid, i64, String)> = sqlx::query_as(
+        "UPDATE payments p SET state = 'expired', revision = p.revision + 1, updated_at = $2 \
+         FROM orders o WHERE o.id = $1 AND p.order_id = o.id \
+         AND p.adapter = 'paykit' AND p.state = 'awaiting_entitlement' \
+         RETURNING p.id, p.revision, o.buyer_pubky",
+    )
+    .bind(order_id)
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((payment_id, revision, buyer_pubky)) = unpaid {
+        crate::executor::insert_event(
+            tx,
+            Uuid::new_v4(),
+            &ids::payment_aggregate_id(payment_id),
+            revision,
+            &buyer_pubky,
+            "payment.expired",
+            now,
+        )
+        .await?;
+    }
+    Ok(true)
+}
+
+/// Delivers one `paykit.void` row (the preparing-order hold-expiry hard
+/// bound, a buyer cancel of a `preparing` request, or an activation refused
+/// for an order that is no longer payable): an idempotent void retried
+/// under the ordinary lease until delivered or 24 h old, then stamped with
+/// a `gave_up` log.
 async fn deliver_paykit_void(
     pool: &PgPool,
     paykit: &PaykitClient,
@@ -963,10 +1081,39 @@ async fn deliver_paykit_void(
         }
         // Idempotent by contract (§B.11.6): the invoice is already in a
         // final state, so the caller's intent is satisfied.
-        Err(PaykitCommandError::PrepareExpired)
-        | Err(PaykitCommandError::InvoiceFinalized)
-        | Err(PaykitCommandError::UnknownInvoice) => {
+        Err(PaykitCommandError::PrepareExpired) | Err(PaykitCommandError::UnknownInvoice) => {
             stamp_delivered_only(pool, row.id, now).await?;
+            Ok(true)
+        }
+        // Paykit refuses to void a published invoice: the activation won
+        // the race. The order must keep watching it so any money reaching
+        // it takes the late-money fork.
+        Err(PaykitCommandError::InvoiceFinalized) => {
+            let order_id: Option<Uuid> = row.payload["order_id"]
+                .as_str()
+                .and_then(|value| value.parse().ok());
+            let mut tx = pool.begin().await?;
+            let retracked = match order_id {
+                Some(order_id) => {
+                    track_invoice_live_after_void(&mut tx, order_id, invoice_id, now).await?
+                }
+                None => false,
+            };
+            sqlx::query("UPDATE outbox SET delivered_at = $2 WHERE id = $1")
+                .bind(row.id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            if retracked {
+                tracing::error!(
+                    row_id = row.id,
+                    invoice_id = %invoice_id,
+                    reason = %reason,
+                    "ALERT paykit_activated_after_cancel: paykit refused the void of a published \
+                     invoice; the order's request is tracked as pending"
+                );
+            }
             Ok(true)
         }
         Err(PaykitCommandError::StackIdentityMismatch) => {
