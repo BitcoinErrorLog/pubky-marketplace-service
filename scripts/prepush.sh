@@ -42,6 +42,9 @@ if [ ! -t 0 ]; then
   fi
 fi
 
+echo "prepush: cargo fmt"
+cargo fmt --check
+
 port="${PREPUSH_PG_PORT:-55433}"
 name="${PREPUSH_PG_CONTAINER:-prepush-ms-pg}"
 export DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@127.0.0.1:${port}/postgres}"
@@ -75,15 +78,13 @@ if [ "$ready" != 1 ]; then
   exit 1
 fi
 
-encryption="$(docker exec "$name" psql -U postgres -d postgres -tAc 'SHOW password_encryption' | tr -d '[:space:]')"
-trust_hosts="$(docker exec "$name" psql -U postgres -d postgres -tAc "SELECT count(*) FROM pg_hba_file_rules WHERE type = 'host' AND auth_method = 'trust'")"
-if [ "$encryption" != "scram-sha-256" ] || [ "${trust_hosts:-1}" != "0" ]; then
-  echo "prepush: Postgres is not scram-sha-256 like CI (encryption=${encryption} trust_host_rules=${trust_hosts})" >&2
+encryption="$(docker exec "$name" psql -h 127.0.0.1 -U postgres -d postgres -tAc 'SHOW password_encryption' | tr -d '[:space:]')"
+host_all="$(docker exec "$name" psql -h 127.0.0.1 -U postgres -d postgres -tAc "SELECT auth_method FROM pg_hba_file_rules WHERE type = 'host' AND address = 'all'" | tr -d '[:space:]')"
+# The official image keeps trust on 127.0.0.1/::1. Published-port clients match address "all".
+if [ "$encryption" != "scram-sha-256" ] || [ "$host_all" != "scram-sha-256" ]; then
+  echo "prepush: Postgres is not scram-sha-256 like CI (encryption=${encryption} host_all=${host_all})" >&2
   exit 1
 fi
-
-echo "prepush: cargo fmt"
-cargo fmt --check
 
 echo "prepush: cargo clippy"
 run_heavy cargo clippy --workspace --all-targets -- -D warnings
