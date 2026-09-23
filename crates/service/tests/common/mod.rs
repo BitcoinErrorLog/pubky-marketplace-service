@@ -123,6 +123,22 @@ pub struct RefusalAuditRetentionLogin {
     _guard: AsyncMutexGuard<'static, ()>,
 }
 
+/// Host and port from `DATABASE_URL`. Named logins must use the same server
+/// as `#[sqlx::test]`. CI publishes Postgres on localhost:5432; a local gate
+/// may publish it on another port when 5432 is already taken.
+pub fn test_pg_authority() -> String {
+    let url = std::env::var("DATABASE_URL").unwrap_or_default();
+    let after_at = url.rsplit_once('@').map(|(_, rest)| rest).unwrap_or("");
+    let authority = after_at.split(['/', '?']).next().unwrap_or("");
+    if authority.contains(':') {
+        authority.to_string()
+    } else if !authority.is_empty() {
+        format!("{authority}:5432")
+    } else {
+        "localhost:5432".to_string()
+    }
+}
+
 async fn claim_named_login(
     pool: &PgPool,
     role: &str,
@@ -148,7 +164,10 @@ async fn claim_named_login(
     .await
     .expect("grant test database connect");
     (
-        format!("postgres://{role}:{password}@localhost:5432/{database}"),
+        format!(
+            "postgres://{role}:{password}@{}/{database}",
+            test_pg_authority()
+        ),
         guard,
     )
 }

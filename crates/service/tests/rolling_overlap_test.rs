@@ -86,14 +86,17 @@ async fn spawn_replica(
 }
 
 async fn forget_test_only_restore_migration(pool: &PgPool) {
-    let deleted = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 0")
+    // TEST_MIGRATOR wraps production migrations with version 0 (restore the
+    // 0032-era connection limit) and 9000000001 (release the session lock).
+    // The production migrator does not know those versions.
+    let deleted = sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (0, 9000000001)")
         .execute(pool)
         .await
-        .expect("drop test-only restore_0032_retention_connlimit")
+        .expect("drop test-only migration rows")
         .rows_affected();
     assert_eq!(
-        deleted, 1,
-        "TEST_MIGRATOR records version 0 before production 0001"
+        deleted, 2,
+        "TEST_MIGRATOR records version 0 and 9000000001 around the production catalog"
     );
 }
 

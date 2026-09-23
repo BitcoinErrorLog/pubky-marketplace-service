@@ -836,7 +836,8 @@ async fn refusal_audit_operator_roles_enforce_aggregate_and_raw_capabilities(poo
     let operator_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&format!(
-            "postgres://{login}:{password}@localhost:5432/{database}"
+            "postgres://{login}:{password}@{}/{database}",
+            common::test_pg_authority()
         ))
         .await
         .expect("operator login");
@@ -1154,8 +1155,10 @@ async fn refusal_audit_retention_actual_login_is_probed_before_purge(pool: PgPoo
     .await
     .expect("retention connect");
     let url = format!(
-        "postgres://marketplace_refusal_audit_retention:{}@localhost:5432/{}",
-        password, database
+        "postgres://marketplace_refusal_audit_retention:{}@{}/{}",
+        password,
+        common::test_pg_authority(),
+        database
     );
     let retention_pool = PgPoolOptions::new()
         .max_connections(1)
@@ -1285,7 +1288,8 @@ async fn refusal_audit_admin_path_erases_actor_and_gates_key_destruction(pool: P
     .await
     .expect("grant admin database connect");
     let url = format!(
-        "postgres://marketplace_refusal_audit_admin_login:{password}@localhost:5432/{database}"
+        "postgres://marketplace_refusal_audit_admin_login:{password}@{}/{database}",
+        common::test_pg_authority()
     );
     let previous_root =
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
