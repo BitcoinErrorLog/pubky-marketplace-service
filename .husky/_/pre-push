@@ -1,0 +1,4 @@
+#!/bin/sh
+# The global pre-push hook delegates to this path.
+hook="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)/pre-push"
+exec sh "$hook" "$@"

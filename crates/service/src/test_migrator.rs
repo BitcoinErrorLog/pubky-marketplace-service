@@ -2,35 +2,55 @@
 //! `CONNECTION LIMIT 1`. 0037 raises that cluster-global limit to 2, so the
 //! next `#[sqlx::test]` database replays 0032 against LIMIT 2 and aborts.
 //! Restore the 0032-era limit first; 0037 then raises it again.
+//!
+//! Roles are cluster-global, and sqlx's migrate advisory lock is per database
+//! name, so two `#[sqlx::test]` databases migrate in parallel and race that
+//! limit. The prelude takes one session lock (`pg_advisory_lock`) and the
+//! trailing migration releases it on the same connection. A failed migrate
+//! drops the connection, which releases the session lock.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 
-const RESTORE_0032_RETENTION_LIMIT: &str = "\
-DO $restore$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM pg_catalog.pg_roles
-    WHERE rolname = 'marketplace_refusal_audit_retention'
-  ) THEN
-    ALTER ROLE marketplace_refusal_audit_retention CONNECTION LIMIT 1;
-  END IF;
-END $restore$;";
+/// Session advisory lock held for the whole test migration. Not a
+/// `hashtextextended` seed (those are 32, 42, 6341, 6342, 6353–6355).
+const MIGRATION_LOCK_ID: i64 = 8_719_463_540_01;
 
 pub static TEST_MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| {
     let all = sqlx::migrate!("./migrations");
+    let prelude_sql = format!(
+        "DO $restore$\n\
+         BEGIN\n\
+           PERFORM pg_advisory_lock({MIGRATION_LOCK_ID});\n\
+           IF EXISTS (\n\
+             SELECT 1 FROM pg_catalog.pg_roles\n\
+             WHERE rolname = 'marketplace_refusal_audit_retention'\n\
+           ) THEN\n\
+             ALTER ROLE marketplace_refusal_audit_retention CONNECTION LIMIT 1;\n\
+           END IF;\n\
+         END $restore$;"
+    );
+    let release_sql = format!("SELECT pg_advisory_unlock({MIGRATION_LOCK_ID});");
     let prelude = Migration::new(
         0,
         Cow::Borrowed("restore_0032_retention_connlimit"),
         MigrationType::Simple,
-        Cow::Borrowed(RESTORE_0032_RETENTION_LIMIT),
+        Cow::Owned(prelude_sql),
         false,
     );
-    let mut migrations = Vec::with_capacity(all.migrations.len() + 1);
+    let release = Migration::new(
+        9_000_000_001,
+        Cow::Borrowed("release_test_migration_lock"),
+        MigrationType::Simple,
+        Cow::Owned(release_sql),
+        false,
+    );
+    let mut migrations = Vec::with_capacity(all.migrations.len() + 2);
     migrations.push(prelude);
     migrations.extend(all.migrations.iter().cloned());
+    migrations.push(release);
     Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: all.ignore_missing,

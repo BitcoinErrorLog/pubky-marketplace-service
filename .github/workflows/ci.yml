@@ -82,14 +82,15 @@ jobs:
       - name: Install native build deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
       - uses: Swatinem/rust-cache@v2
-      # One thread and one cargo job: migrations CREATE ROLE names and
-      # ALTER ROLE connection limits that are cluster-global, and
-      # pg_advisory_xact_lock keys are instance-wide, so two #[sqlx::test]
-      # databases on one Postgres cannot run in parallel. `--test-threads=1`
-      # serializes tests inside a binary; `--jobs 1` serializes the lib and
-      # integration binaries. shm-size is set on the service; GHA cannot
+      # #[sqlx::test] isolates databases. TEST_MIGRATOR holds a cluster-wide
+      # session lock across each database's migrations so 0032's CONNECTION
+      # LIMIT check cannot race. scripts/ci-test.sh then runs those tests in
+      # parallel and, afterwards, the binaries that mutate cluster-global
+      # roles (fixed CREATE/ALTER ROLE and shared login passwords) with
+      # --test-threads=1. --jobs 1 stays: one binary's pools at a time, under
+      # Postgres max_connections. shm-size is set on the service; GHA cannot
       # pass `postgres -c max_connections=`.
-      - run: cargo test --workspace --jobs 1 -- --test-threads=1
+      - run: bash scripts/ci-test.sh
 
   migrations:
     name: migrations
