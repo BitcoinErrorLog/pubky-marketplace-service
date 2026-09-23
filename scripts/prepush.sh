@@ -45,6 +45,24 @@ if [ ! -t 0 ]; then
   fi
 fi
 
+# Sibling worktrees share one Cargo target unless this gate overrides it.
+# A shared target can run another tree's test binary. This checkout gets its own.
+shared_target="${CARGO_TARGET_DIR:-}"
+private_target="/Volumes/t7/vibes-dev/.cargo-target/marketplace-service/$(basename "$ROOT")"
+if [ ! -d "$private_target" ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
+  seed="${private_target}.partial"
+  rm -rf "$seed"
+  mkdir -p "$(dirname "$private_target")"
+  if cp -cR "$shared_target" "$seed" 2>/dev/null || cp -R "$shared_target" "$seed"; then
+    mv "$seed" "$private_target"
+  else
+    rm -rf "$seed"
+    mkdir -p "$private_target"
+  fi
+fi
+mkdir -p "$private_target"
+export CARGO_TARGET_DIR="$private_target"
+
 echo "prepush: cargo fmt"
 cargo fmt --check
 
