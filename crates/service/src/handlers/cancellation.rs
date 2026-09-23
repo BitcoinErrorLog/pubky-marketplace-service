@@ -10,8 +10,8 @@
 //! the sold quantities to available under the listings quantity-balance
 //! constraint.
 //!
-//! Cancellation never touches the payment record: a confirmed payment stays
-//! confirmed with its receipt intact, and the only money path out of a
+//! Cancellation never touches a confirmed payment: it stays confirmed with
+//! its receipt intact, and the only money path out of a
 //! cancelled order is the externally evidenced `refund.record_external`
 //! (ADR-0019 §7 — the service never claims to move funds).
 //!
