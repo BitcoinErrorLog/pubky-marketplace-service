@@ -336,25 +336,31 @@ pub struct ProbeScan {
     pub straggler_class: bool,
 }
 
+/// Every row the probe pages is authenticated, not only one per key class:
+/// a row that opens under neither key fails the boot even when a valid
+/// previous-key row was found first.
 async fn probe_family(
     pool: &PgPool,
     keys: &DigitalKeys,
     family: SealedFamily,
 ) -> anyhow::Result<ProbeScan> {
     let mut scan = ProbeScan::default();
-    let mut samples: Vec<SealedRow> = Vec::new();
     let mut after = 0i64;
     let mut batches = 0u32;
     let mut stopped_early = false;
-    let classify = |row: SealedRow, scan: &mut ProbeScan, samples: &mut Vec<SealedRow>| {
-        let current = keys.opens_under_current(&row.aad, &row.ciphertext);
-        if current && !scan.current_class {
+    let classify = |row: &SealedRow, scan: &mut ProbeScan| -> anyhow::Result<()> {
+        if keys.opens_under_current(&row.aad, &row.ciphertext) {
             scan.current_class = true;
-            samples.push(row);
-        } else if !current && !scan.straggler_class {
+        } else if keys.open_under_previous(&row.aad, &row.ciphertext).is_ok() {
             scan.straggler_class = true;
-            samples.push(row);
+        } else {
+            anyhow::bail!(
+                "sealed digital delivery {} rows do not open under the configured \
+                 {ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY} (current or previous)",
+                family.name()
+            );
         }
+        Ok(())
     };
     loop {
         let rows = family_rows(
@@ -369,9 +375,9 @@ async fn probe_family(
         }
         batches += 1;
         after = rows.last().map(|row| row.id).unwrap_or(after);
-        for row in rows {
+        for row in &rows {
             scan.scanned += 1;
-            classify(row, &mut scan, &mut samples);
+            classify(row, &mut scan)?;
         }
         // Without a previous key there is no legitimate straggler class to
         // hunt for once a current-key row is confirmed.
@@ -388,20 +394,11 @@ async fn probe_family(
             continue;
         }
         scan.probed += 1;
-        classify(row, &mut scan, &mut samples);
+        classify(&row, &mut scan)?;
     }
     if stopped_early {
         let total = family_count(pool, family).await? as u64;
         scan.family_total = (total > scan.probed).then_some(total);
-    }
-    for row in samples {
-        keys.open(&row.aad, &row.ciphertext).map_err(|_| {
-            anyhow::anyhow!(
-                "sealed digital delivery {} rows do not open under the configured \
-                 {ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY} (current or previous)",
-                family.name()
-            )
-        })?;
     }
     Ok(scan)
 }
@@ -457,33 +454,69 @@ pub struct ResealProgress {
     pub versions_resealed: u64,
     pub pins_resealed: u64,
     pub emails_resealed: u64,
+    /// Rows a concurrent writer replaced between the read and the write.
+    pub skipped_changed: u64,
     pub remaining_under_previous: u64,
 }
 
 const RESEAL_BATCH_SIZE: i64 = 100;
 
+/// Writes a re-sealed row only if it still holds the ciphertext the pass
+/// read: a row a writer replaced meanwhile (a buyer changing their delivery
+/// email) is already sealed under the current key and must not be
+/// overwritten with the old plaintext. Returns whether the row was written.
 async fn write_resealed(
     pool: &PgPool,
     family: SealedFamily,
     id: i64,
-    ciphertext: &[u8],
-) -> Result<(), sqlx::Error> {
+    read: &[u8],
+    resealed: &[u8],
+) -> Result<bool, sqlx::Error> {
     let sql = match family {
         SealedFamily::Version => {
-            "UPDATE listing_digital_versions SET payload_ciphertext = $2 WHERE id = $1"
+            "UPDATE listing_digital_versions SET payload_ciphertext = $3 \
+             WHERE id = $1 AND payload_ciphertext = $2"
         }
-        SealedFamily::Pin => "UPDATE order_digital_pins SET payload_ciphertext = $2 WHERE id = $1",
+        SealedFamily::Pin => {
+            "UPDATE order_digital_pins SET payload_ciphertext = $3 \
+             WHERE id = $1 AND payload_ciphertext = $2"
+        }
         SealedFamily::Email => {
-            "UPDATE order_delivery_emails SET email_ciphertext = $2 \
-             WHERE id = $1 AND email_ciphertext IS NOT NULL"
+            "UPDATE order_delivery_emails SET email_ciphertext = $3 \
+             WHERE id = $1 AND email_ciphertext = $2"
         }
     };
-    sqlx::query(sql)
+    let written = sqlx::query(sql)
         .bind(id)
-        .bind(ciphertext)
+        .bind(read)
+        .bind(resealed)
         .execute(pool)
-        .await?;
-    Ok(())
+        .await?
+        .rows_affected();
+    Ok(written == 1)
+}
+
+/// Runs between a re-seal pass reading a row and writing it back. The pass
+/// takes no row lock, so tests use this seam to commit a concurrent write
+/// at exactly that point.
+pub trait ResealHook: Send + Sync {
+    fn before_write<'a>(
+        &'a self,
+        family: SealedFamily,
+        row_id: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
+struct NoResealHook;
+
+impl ResealHook for NoResealHook {
+    fn before_write<'a>(
+        &'a self,
+        _family: SealedFamily,
+        _row_id: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
 }
 
 /// One re-seal pass: pages every row of each family by id, re-seals rows
@@ -494,6 +527,16 @@ async fn write_resealed(
 pub async fn reseal_previous_key_batch(
     pool: &PgPool,
     keys: &DigitalKeys,
+) -> anyhow::Result<ResealProgress> {
+    reseal_previous_key_batch_with_hook(pool, keys, &NoResealHook).await
+}
+
+/// [`reseal_previous_key_batch`] with a [`ResealHook`] between each read and
+/// its write.
+pub async fn reseal_previous_key_batch_with_hook(
+    pool: &PgPool,
+    keys: &DigitalKeys,
+    hook: &dyn ResealHook,
 ) -> anyhow::Result<ResealProgress> {
     if !keys.has_previous() {
         return Ok(ResealProgress::default());
@@ -527,7 +570,12 @@ pub async fn reseal_previous_key_batch(
                     );
                     continue;
                 };
-                write_resealed(pool, family, row.id, &keys.seal(&row.aad, &plaintext)).await?;
+                hook.before_write(family, row.id).await;
+                let resealed = keys.seal(&row.aad, &plaintext);
+                if !write_resealed(pool, family, row.id, &row.ciphertext, &resealed).await? {
+                    progress.skipped_changed += 1;
+                    continue;
+                }
                 match family {
                     SealedFamily::Version => progress.versions_resealed += 1,
                     SealedFamily::Pin => progress.pins_resealed += 1,

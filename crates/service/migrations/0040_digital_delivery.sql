@@ -107,9 +107,32 @@ CREATE TABLE IF NOT EXISTS order_digital_pins (
 CREATE INDEX IF NOT EXISTS order_digital_pins_listing_version
     ON order_digital_pins (listing_aggregate_id, version);
 
+-- A pin is what the buyer paid for and the entitlement evidence: it is
+-- never deleted, and only its ciphertext may change (the key-rotation
+-- re-seal writes the same payload under the current key).
+CREATE OR REPLACE FUNCTION public.forbid_digital_pin_mutation() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'order_digital_pins is append-only';
+  END IF;
+  IF (NEW.id, NEW.order_id, NEW.line_index, NEW.listing_aggregate_id, NEW.deliverable_id,
+      NEW.version, NEW.kind, NEW.confirming_adapter, NEW.created_at)
+     IS DISTINCT FROM
+     (OLD.id, OLD.order_id, OLD.line_index, OLD.listing_aggregate_id, OLD.deliverable_id,
+      OLD.version, OLD.kind, OLD.confirming_adapter, OLD.created_at) THEN
+    RAISE EXCEPTION 'order_digital_pins rows change only by re-seal';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS order_digital_pins_append_only ON order_digital_pins;
+CREATE TRIGGER order_digital_pins_append_only BEFORE UPDATE OR DELETE ON order_digital_pins
+    FOR EACH ROW EXECUTE FUNCTION public.forbid_digital_pin_mutation();
+
 -- === Buyer access log =====================================================
--- One row per successful buyer read of a pinned line: the delivery evidence
--- ("first opened 14:02 · opened 3 times"). No IP address or client detail.
+-- Successful buyer reads of a pinned line: the delivery evidence ("first
+-- opened 14:02"). Append-only; the read coalesces repeat opens so a looping
+-- client cannot grow it without bound. No IP address or client detail.
 
 CREATE TABLE IF NOT EXISTS order_digital_access (
     id BIGSERIAL PRIMARY KEY,
@@ -118,7 +141,10 @@ CREATE TABLE IF NOT EXISTS order_digital_access (
     accessed_at TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS order_digital_access_order_line
-    ON order_digital_access (order_id, line_index);
+    ON order_digital_access (order_id, line_index, accessed_at);
+DROP TRIGGER IF EXISTS order_digital_access_append_only ON order_digital_access;
+CREATE TRIGGER order_digital_access_append_only BEFORE UPDATE OR DELETE ON order_digital_access
+    FOR EACH ROW EXECUTE FUNCTION forbid_event_mutation();
 
 -- === Sealed family 3: buyer delivery emails ===============================
 -- AAD: buyer-email/v1|{order_id}|{buyer_pubky}. One row per order with an

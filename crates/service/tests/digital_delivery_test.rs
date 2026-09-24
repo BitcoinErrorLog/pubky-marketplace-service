@@ -1104,3 +1104,201 @@ async fn boot_probe_and_rotation_cover_all_three_families(pool: PgPool) {
         .await
         .expect_err("an unopenable row fails the pass");
 }
+
+async fn seed_version(pool: &PgPool, listing: &str, keys: &DigitalKeys) {
+    sqlx::query(
+        "INSERT INTO listing_digital_versions (listing_aggregate_id, seller_pubky, deliverable_id, \
+         version, kind, payload_ciphertext, created_at) VALUES ($1, 's', $2, 1, 'text', $3, now())",
+    )
+    .bind(listing)
+    .bind(DELIVERABLE_ID)
+    .bind(keys.seal(
+        &version_aad(listing, DELIVERABLE_ID, 1, DigitalDeliveryKind::Text),
+        br#"{"text":"t"}"#,
+    ))
+    .execute(pool)
+    .await
+    .expect("seed version");
+}
+
+// Review P1 (slice 1): during a rotation, a row sealed under neither key
+// that sits after a valid previous-key row in the sampled range must still
+// fail the boot.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn boot_probe_authenticates_every_sampled_row(pool: PgPool) {
+    let current = DigitalKeys::from_hex(TEST_DIGITAL_ENCRYPTION_KEY, None).expect("current");
+    let previous =
+        DigitalKeys::from_hex(TEST_DIGITAL_PREVIOUS_ENCRYPTION_KEY, None).expect("previous");
+    let unrelated = DigitalKeys::from_hex(&"a".repeat(64), None).expect("unrelated");
+    let rotated = DigitalKeys::from_hex(
+        TEST_DIGITAL_ENCRYPTION_KEY,
+        Some(TEST_DIGITAL_PREVIOUS_ENCRYPTION_KEY),
+    )
+    .expect("rotated");
+    seed_version(&pool, "listing:probe_1", &current).await;
+    seed_version(&pool, "listing:probe_2", &previous).await;
+    assert_digital_sealing_coherent(&pool, Some(&rotated))
+        .await
+        .expect("current and previous rows boot under the rotation window");
+    seed_version(&pool, "listing:probe_3", &unrelated).await;
+    assert_digital_sealing_coherent(&pool, Some(&rotated))
+        .await
+        .expect_err("a row under neither key fails the boot");
+}
+
+struct ChangeEmailBeforeWrite {
+    pool: PgPool,
+    order_id: Uuid,
+    buyer: String,
+}
+
+impl digital::ResealHook for ChangeEmailBeforeWrite {
+    fn before_write<'a>(
+        &'a self,
+        family: digital::SealedFamily,
+        _row_id: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if family != digital::SealedFamily::Email {
+                return;
+            }
+            let current =
+                DigitalKeys::from_hex(TEST_DIGITAL_ENCRYPTION_KEY, None).expect("current");
+            sqlx::query(
+                "UPDATE order_delivery_emails SET email_ciphertext = $2 WHERE order_id = $1",
+            )
+            .bind(self.order_id)
+            .bind(current.seal(&email_aad(self.order_id, &self.buyer), b"new@example.com"))
+            .execute(&self.pool)
+            .await
+            .expect("concurrent email change");
+        })
+    }
+}
+
+// Review P2 (slice 1): a buyer's address change that commits while the
+// re-seal pass holds the old ciphertext is not overwritten.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn reseal_does_not_overwrite_a_concurrent_email_change(pool: PgPool) {
+    let (app, _server) = digital_app(pool.clone()).await;
+    let shipper = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &shipper.token, &register_command(&shipper.pubky, 2)).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_command(vec![checkout_line(&shipper.pubky, None)], true, 70),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (order_id,): (Uuid,) = sqlx::query_as("SELECT id FROM orders")
+        .fetch_one(&pool)
+        .await
+        .expect("order id");
+    let previous =
+        DigitalKeys::from_hex(TEST_DIGITAL_PREVIOUS_ENCRYPTION_KEY, None).expect("previous");
+    sqlx::query(
+        "INSERT INTO order_delivery_emails (order_id, buyer_pubky, email_ciphertext, created_at, \
+         updated_at) VALUES ($1, $2, $3, now(), now())",
+    )
+    .bind(order_id)
+    .bind(&buyer.pubky)
+    .bind(previous.seal(&email_aad(order_id, &buyer.pubky), b"old@example.com"))
+    .execute(&pool)
+    .await
+    .expect("seed email");
+    let rotated = DigitalKeys::from_hex(
+        TEST_DIGITAL_ENCRYPTION_KEY,
+        Some(TEST_DIGITAL_PREVIOUS_ENCRYPTION_KEY),
+    )
+    .expect("rotated");
+    let hook = ChangeEmailBeforeWrite {
+        pool: pool.clone(),
+        order_id,
+        buyer: buyer.pubky.clone(),
+    };
+    let progress = digital::reseal_previous_key_batch_with_hook(&pool, &rotated, &hook)
+        .await
+        .expect("re-seal pass");
+    assert_eq!((progress.emails_resealed, progress.skipped_changed), (0, 1));
+    assert_eq!(progress.remaining_under_previous, 0);
+    let (sealed,): (Vec<u8>,) =
+        sqlx::query_as("SELECT email_ciphertext FROM order_delivery_emails WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .expect("email row");
+    let current = DigitalKeys::from_hex(TEST_DIGITAL_ENCRYPTION_KEY, None).expect("current");
+    assert_eq!(
+        current
+            .open(&email_aad(order_id, &buyer.pubky), &sealed)
+            .expect("opens under current"),
+        b"new@example.com",
+        "the buyer's newer address survives the rotation"
+    );
+}
+
+// Kimi P1: the pins and the access log are the entitlement and delivery
+// evidence. Neither can be deleted; access rows never change; a pin changes
+// only its ciphertext (the key-rotation re-seal).
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn digital_evidence_is_append_only(pool: PgPool) {
+    let (app, _server) = digital_app(pool.clone()).await;
+    let shipper = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &shipper.token, &register_command(&shipper.pubky, 2)).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout_command(vec![checkout_line(&shipper.pubky, None)], true, 80),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (order_id,): (Uuid,) = sqlx::query_as("SELECT id FROM orders")
+        .fetch_one(&pool)
+        .await
+        .expect("order id");
+    sqlx::query(
+        "INSERT INTO order_digital_pins (order_id, line_index, listing_aggregate_id, \
+         deliverable_id, version, kind, payload_ciphertext, confirming_adapter, created_at) \
+         VALUES ($1, 0, 'listing:x', $2, 1, 'text', '\\x01'::bytea, 'paykit', now())",
+    )
+    .bind(order_id)
+    .bind(DELIVERABLE_ID)
+    .execute(&pool)
+    .await
+    .expect("pin insert");
+    sqlx::query(
+        "INSERT INTO order_digital_access (order_id, line_index, accessed_at) VALUES ($1, 0, now())",
+    )
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("access insert");
+    for (statement, what) in [
+        (
+            "UPDATE order_digital_access SET accessed_at = now() - interval '1 day'",
+            "access update",
+        ),
+        ("DELETE FROM order_digital_access", "access delete"),
+        ("DELETE FROM order_digital_pins", "pin delete"),
+        (
+            "UPDATE order_digital_pins SET version = 2",
+            "pin version change",
+        ),
+        (
+            "UPDATE order_digital_pins SET confirming_adapter = 'sandbox'",
+            "pin adapter change",
+        ),
+        (
+            "UPDATE order_digital_pins SET listing_aggregate_id = 'listing:y'",
+            "pin transplant",
+        ),
+    ] {
+        sqlx::query(statement).execute(&pool).await.expect_err(what);
+    }
+    sqlx::query("UPDATE order_digital_pins SET payload_ciphertext = '\\x02'::bytea")
+        .execute(&pool)
+        .await
+        .expect("the re-seal may rewrite the ciphertext");
+}
