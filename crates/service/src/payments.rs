@@ -884,6 +884,13 @@ pub fn attempt_reference(order_id: uuid::Uuid, attempt: i32) -> String {
     crockford_bundle_id(&bytes)
 }
 
+/// The single per-order reference every bind used before per-attempt
+/// references: Crockford base32 of the order UUID. Attempts released
+/// under it are polled by it.
+pub fn legacy_order_reference(order_id: uuid::Uuid) -> String {
+    crockford_bundle_id(order_id.as_bytes())
+}
+
 /// Crockford base32 (uppercase, no padding) of 16 bytes: the encoding
 /// `locks-core` bundle identifiers use, so the value is accepted verbatim
 /// as a `bundle_id` by paykit-server.

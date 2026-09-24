@@ -796,6 +796,16 @@ pub async fn bind_payment_method(
             _ => unreachable!("method validated above"),
         };
 
+    // Pins still on an unbound order belong to a released attempt; they are
+    // recorded (idempotently) before this bind overwrites them, so that
+    // attempt stays polled.
+    if order.paykit_invoice_id.is_some() {
+        if let Err(error) =
+            crate::paykit_attempts::record_released_attempt(&mut tx, order.id, now).await
+        {
+            return internal("released paykit attempt record", &error);
+        }
+    }
     let updated_order: OrderRow = match sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, payment_method = $2, \
          fiat_checkout_url = $3, paykit_request_reference = $4, \

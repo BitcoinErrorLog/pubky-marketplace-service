@@ -684,6 +684,7 @@ async fn void_prepare_effects(
         tx.commit().await?;
         return Ok(());
     }
+    crate::paykit_attempts::record_released_attempt(&mut tx, order_id, now).await?;
     if order.stock_held {
         if let Err(failure) = crate::handlers::holds::release_lines(
             &mut tx,
@@ -2304,6 +2305,13 @@ pub async fn verify_due_paykit_payments(
                 );
             }
         }
+    }
+    match crate::paykit_attempts::verify_due_released_attempts(state, source, now).await {
+        Ok(routed) => applied += routed,
+        Err(error) => tracing::error!(
+            error = %error,
+            "released paykit attempt verification pass failed"
+        ),
     }
     Ok(applied)
 }
