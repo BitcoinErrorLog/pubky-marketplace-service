@@ -548,6 +548,10 @@ pub struct OrderRow {
     /// (Stripe key lookup), `gateway` (verified PayPal IPN), or `seller`
     /// (manual confirm-received). NULL until verified.
     pub fiat_verified_by: Option<String>,
+    /// First verified PayPal `Reversed` IPN recorded on the order (a buyer
+    /// chargeback or dispute). Never cleared: `Canceled_Reversal` does not
+    /// undo a recorded refund.
+    pub payment_reversed_at: Option<DateTime<Utc>>,
     /// A purchased Shippo label: SELLER-ONLY (the PDF embeds the buyer's
     /// address), deliberately absent from [`Self::view`] and served
     /// exclusively through the seller-scoped label endpoints.
@@ -655,6 +659,7 @@ impl std::fmt::Debug for OrderRow {
             .field("payment_reported_at", &self.payment_reported_at)
             .field("fiat_transaction_ref", &self.fiat_transaction_ref)
             .field("fiat_verified_by", &self.fiat_verified_by)
+            .field("payment_reversed_at", &self.payment_reversed_at)
             .field("paykit_request_reference", &self.paykit_request_reference)
             .field("paykit_request_state", &self.paykit_request_state)
             .field("paykit_last_checked_at", &self.paykit_last_checked_at)
@@ -756,6 +761,7 @@ impl OrderRow {
             payment_reported_at: None,
             fiat_transaction_ref: None,
             fiat_verified_by: None,
+            payment_reversed_at: None,
             shipping_label: None,
             paykit_request_reference: None,
             paykit_request_state: None,
@@ -1010,6 +1016,7 @@ impl OrderRow {
             "updated_at": format_timestamp(self.updated_at),
         });
         view["priced_from"] = json!(self.priced_from);
+        view["payment_reversed_at"] = self.payment_reversed_at.map(format_timestamp).into();
         view["merchandise_total"] = money_json(self.total_minor, &self.currency, self.exponent);
         view["bitcoin_payable"] = self
             .paykit_total_sats

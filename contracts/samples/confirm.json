@@ -259,6 +259,7 @@
           "payment_id": "<uuid:4>",
           "payment_method": "bitcoin",
           "payment_reported_at": null,
+          "payment_reversed_at": null,
           "priced_from": "listing",
           "receipt_id": "<uuid:5>",
           "return_request": null,

@@ -16,6 +16,9 @@
 //!   buyer-reports/seller-confirms pair remains as the fallback when no IPN
 //!   arrives. The projection exposes the provenance as `fiat_verification:
 //!   'processor' | 'gateway-notified' | 'seller-attested'`.
+//! - PayPal `Refunded`/`Reversed` IPNs are recorded on the order whose
+//!   gateway-verified payment id is their `parent_txn_id`
+//!   (`paypal_refund`, docs/paypal-refund-ipn.md).
 //! - Payment confirmation reuses the sandbox/Locks confirmation path
 //!   (`confirm_order`): receipt exactly once, inventory reserved → sold,
 //!   payment CAS `awaiting_entitlement → confirmed`. A confirmation the
@@ -49,6 +52,8 @@ use crate::payments::{
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
+
+mod paypal_refund;
 
 const CONFIG_COLUMNS: &str = "seller_pubky, bitcoin_enabled, stripe_payment_link, \
      stripe_restricted_key_ciphertext, paypal_merchant_email, created_at, updated_at";
@@ -1819,7 +1824,9 @@ fn parse_gateway_amount_minor(value: &str, exponent: i32) -> Option<i64> {
 /// be the seller's configured PayPal email and the amount and currency must
 /// equal the order total exactly. Anything that doesn't match is dropped
 /// with a 200 (PayPal retries non-2xx; a mismatch will never become valid).
-/// Transient failures answer 5xx so PayPal retries.
+/// Transient failures answer 5xx so PayPal retries. `Refunded` and
+/// `Reversed` notifications are recorded on the refunded order
+/// (`paypal_refund`, docs/paypal-refund-ipn.md).
 pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response {
     let Ok(payments) = payments_runtime(&state) else {
         tracing::warn!("paypal ipn received while payment methods are disabled");
@@ -1842,15 +1849,18 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
     let field = |name: &str| fields.get(name).map(String::as_str).unwrap_or_default();
 
     let payment_status = field("payment_status");
-    if payment_status != "Completed" {
-        // Pending/Refunded/Reversed etc.: retained in the logs, never a
-        // confirmation. Refunds stay on the peer-to-peer return/refund
-        // surface (`refund.record_external`).
-        tracing::info!(
-            payment_status,
-            "paypal ipn ignored: not a completed payment"
-        );
-        return StatusCode::OK.into_response();
+    match payment_status {
+        "Completed" => {}
+        "Refunded" | "Reversed" => return paypal_refund::apply_refund_ipn(&state, &fields).await,
+        _ => {
+            // Pending, Canceled_Reversal, Denied etc.: retained in the logs,
+            // never a confirmation or a refund.
+            tracing::info!(
+                payment_status,
+                "paypal ipn ignored: not a completed payment or a refund"
+            );
+            return StatusCode::OK.into_response();
+        }
     }
     let Ok(order_id) = field("custom").parse::<Uuid>() else {
         tracing::warn!("paypal ipn dropped: custom field is not an order id");
@@ -1875,10 +1885,7 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
         tracing::warn!(%order_id, "paypal ipn dropped: seller has no paypal email configured");
         return StatusCode::OK.into_response();
     };
-    let receiver = field("receiver_email");
-    let business = field("business");
-    let merchant = merchant_email.to_ascii_lowercase();
-    if receiver.to_ascii_lowercase() != merchant && business.to_ascii_lowercase() != merchant {
+    if !paypal_refund::paid_to_merchant(&fields, &merchant_email) {
         tracing::warn!(%order_id, "paypal ipn dropped: receiver is not the configured seller");
         return StatusCode::OK.into_response();
     }
@@ -1892,6 +1899,21 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
     }
     let txn_id = field("txn_id");
     let transaction_ref = (!txn_id.is_empty() && txn_id.len() <= 64).then_some(txn_id);
+    if let Some(gateway_txn_id) = paypal_refund::paypal_transaction_id(txn_id) {
+        // Written in every payment state, before the confirmation, so a
+        // payment the seller already confirmed by hand still matches its
+        // later refund. The first verified payment id is kept.
+        if let Err(error) = sqlx::query(
+            "UPDATE orders SET paypal_txn_id = COALESCE(paypal_txn_id, $2) WHERE id = $1",
+        )
+        .bind(order_id)
+        .bind(gateway_txn_id)
+        .execute(&state.pool)
+        .await
+        {
+            return internal("ipn gateway transaction id", &error);
+        }
+    }
     match apply_fiat_paid(
         &state,
         PAYPAL_GATEWAY_ACTOR,
