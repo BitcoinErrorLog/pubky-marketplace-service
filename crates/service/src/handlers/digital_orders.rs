@@ -220,19 +220,32 @@ pub const ACCESS_COALESCE_SECONDS: i64 = 3_600;
 
 /// A token bucket in `digital_read_rate_limits`, consumed in the caller's
 /// transaction. Returns the seconds to wait when the bucket is empty.
+///
+/// The bucket row is seeded full with `ON CONFLICT DO NOTHING` and then
+/// locked before any arithmetic, so concurrent first reads (for example one
+/// buyer opening several orders at once) all consume from the same row
+/// rather than each computing from an absent one.
 async fn consume_read_token(
     tx: &mut Transaction<'_, Postgres>,
     bucket: &str,
     per_minute: f64,
     now: DateTime<Utc>,
 ) -> Result<Option<i64>, sqlx::Error> {
-    let row: Option<(f64, DateTime<Utc>)> = sqlx::query_as(
+    sqlx::query(
+        "INSERT INTO digital_read_rate_limits (bucket, tokens, updated_at) VALUES ($1, $2, $3) \
+         ON CONFLICT (bucket) DO NOTHING",
+    )
+    .bind(bucket)
+    .bind(per_minute)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    let (stored, updated_at): (f64, DateTime<Utc>) = sqlx::query_as(
         "SELECT tokens, updated_at FROM digital_read_rate_limits WHERE bucket = $1 FOR UPDATE",
     )
     .bind(bucket)
-    .fetch_optional(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
-    let (stored, updated_at) = row.unwrap_or((per_minute, now));
     let elapsed = (now - updated_at).num_milliseconds().max(0) as f64 / 1_000.0;
     let available = (stored + elapsed * per_minute / 60.0).min(per_minute);
     let (tokens, retry_after) = if available >= 1.0 {
@@ -242,9 +255,8 @@ async fn consume_read_token(
         (available, Some(seconds))
     };
     sqlx::query(
-        "INSERT INTO digital_read_rate_limits (bucket, tokens, updated_at) VALUES ($1, $2, $3) \
-         ON CONFLICT (bucket) DO UPDATE SET tokens = EXCLUDED.tokens, \
-         updated_at = EXCLUDED.updated_at",
+        "UPDATE digital_read_rate_limits SET tokens = $2, updated_at = GREATEST(updated_at, $3) \
+         WHERE bucket = $1",
     )
     .bind(bucket)
     .bind(tokens)

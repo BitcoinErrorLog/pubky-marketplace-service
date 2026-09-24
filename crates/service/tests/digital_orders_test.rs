@@ -1592,3 +1592,65 @@ async fn still_held_late_money_with_nothing_to_pin_refund_required(pool: PgPool)
         "hold released"
     );
 }
+
+// Sol delta P2: concurrent first reads across several orders of one buyer
+// all consume from the one buyer bucket; exactly the per-buyer allowance
+// succeeds.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_first_reads_share_the_buyer_bucket(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool).await;
+    let buyer = new_actor(&app).await;
+    let mut orders = Vec::new();
+    for _ in 0..4 {
+        let seller = new_actor(&app).await;
+        let (order_id, _) = bitcoin_digital_order(&app, &paykit, &seller, &buyer).await;
+        paykit_confirm(&app, &paykit, &order_id).await;
+        orders.push(order_id);
+    }
+    // Ten reads per order: inside every per-order allowance (10), forty in
+    // all against a per-buyer allowance of thirty, none of them preceded by
+    // an existing bucket row.
+    let mut reads = Vec::new();
+    for order_id in &orders {
+        for _ in 0..10 {
+            let router = app.router.clone();
+            let token = buyer.token.clone();
+            let order_id = order_id.clone();
+            reads.push(tokio::spawn(async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(format!("/v1/orders/{order_id}/digital-delivery"))
+                            .header("authorization", format!("Bearer {token}"))
+                            .body(Body::empty())
+                            .expect("request builds"),
+                    )
+                    .await
+                    .expect("request executes")
+                    .status()
+            }));
+        }
+    }
+    let mut ok = 0;
+    let mut limited = 0;
+    for read in reads {
+        match read.await.expect("read task") {
+            StatusCode::OK => ok += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(
+        (ok, limited),
+        (30, 10),
+        "the buyer bucket admits exactly its allowance"
+    );
+    let (tokens,): (f64,) =
+        sqlx::query_as("SELECT tokens FROM digital_read_rate_limits WHERE bucket = $1")
+            .bind(format!("buyer:{}", buyer.pubky))
+            .fetch_one(&app.pool)
+            .await
+            .expect("buyer bucket");
+    assert!(tokens < 1.0, "the buyer bucket is spent: {tokens}");
+}
