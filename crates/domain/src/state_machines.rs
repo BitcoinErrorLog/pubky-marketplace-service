@@ -261,6 +261,7 @@ pub fn order_machine() -> AggregateMachine {
                 "delivered",
                 vec![
                     Command("fulfillment.confirm_pickup"),
+                    Command("fulfillment.deliver_digital"),
                     Server("digital_delivery"),
                 ],
             ),
@@ -1039,6 +1040,9 @@ mod tests {
             .find(|t| t.from == "paid" && t.to == "delivered")
             .expect("paid -> delivered");
         assert!(delivered.via.contains(&Server("digital_delivery")));
+        assert!(delivered
+            .via
+            .contains(&Command("fulfillment.deliver_digital")));
         assert!(delivered
             .via
             .contains(&Command("fulfillment.confirm_pickup")));

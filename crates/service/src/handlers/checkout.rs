@@ -15,10 +15,11 @@ use crate::locks::LocksKeys;
 use crate::model::{money_json, ListingRow, OrderRow, PaymentRow, ProjectionContext};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
-pub struct CheckoutContext {
+pub struct CheckoutContext<'a> {
     pub drop_claim_seconds: i64,
-    /// `DIGITAL_DELIVERY_ENCRYPTION_KEY` is configured.
-    pub digital_available: bool,
+    /// The digital delivery sealing keys; `None` when digital delivery is
+    /// off on this deployment.
+    pub digital: Option<&'a crate::digital::DigitalKeys>,
 }
 
 pub async fn handle(
@@ -27,7 +28,7 @@ pub async fn handle(
     command: &Command,
     payload: &CreateCheckoutPayload,
     locks_keys: Option<&LocksKeys>,
-    context: CheckoutContext,
+    context: CheckoutContext<'_>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let drop_claim_window_seconds = context.drop_claim_seconds;
@@ -189,34 +190,22 @@ pub async fn handle(
             )));
         }
         if method == FulfillmentMethod::Digital {
-            if !context.digital_available {
+            if context.digital.is_none() {
                 return Ok(Err(crate::handlers::digital::unavailable()));
             }
             // The seller must have a current deliverable (§6 B4).
-            match listing
+            if listing
                 .digital_delivery_kind
                 .as_deref()
                 .and_then(DigitalDeliveryKind::parse)
+                .is_none()
             {
-                None => {
-                    return Ok(Err(CommandFailure::refused_with_reason(
-                        crate::refusal_audit::RefusalKind::InvalidState,
-                        ErrorCode::InvalidState,
-                        "The seller has not finished setting up delivery for this item.",
-                        crate::handlers::digital::REASON_NOT_READY,
-                    )))
-                }
-                // The email and message kinds need the buyer-email and
-                // mark-delivered paths before they can be sold.
-                Some(kind) if !kind.is_instant() => {
-                    return Ok(Err(CommandFailure::refused_with_reason(
-                        crate::refusal_audit::RefusalKind::InvalidState,
-                        ErrorCode::InvalidState,
-                        "This item's delivery method cannot be bought yet.",
-                        crate::handlers::digital::REASON_NOT_READY,
-                    )));
-                }
-                Some(_) => {}
+                return Ok(Err(CommandFailure::refused_with_reason(
+                    crate::refusal_audit::RefusalKind::InvalidState,
+                    ErrorCode::InvalidState,
+                    "The seller has not finished setting up delivery for this item.",
+                    crate::handlers::digital::REASON_NOT_READY,
+                )));
             }
         }
         match groups.iter_mut().find(|(seller, group_method, _)| {
@@ -246,6 +235,39 @@ pub async fn handle(
                 ErrorCode::InvalidCommand,
                 "A delivery address is required when any checkout group ships.",
             )));
+        }
+        _ => {}
+    }
+
+    // The delivery email is required exactly when a line is email-kind, and
+    // refused otherwise, so no client can store an address the order does
+    // not need (§4.3, §6 F1–F3). Issues and messages never echo it.
+    let is_email_line = |index: &usize| {
+        let (_, listing) = &resolved[*index];
+        listing.digital_delivery_kind.as_deref() == Some("email")
+    };
+    let any_email_line = groups.iter().any(|(_, method, indices)| {
+        *method == FulfillmentMethod::Digital && indices.iter().any(is_email_line)
+    });
+    match (&payload.delivery_email, any_email_line) {
+        (None, true) => {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                "An email for delivery is required for this checkout.",
+                crate::handlers::digital_manual::REASON_EMAIL_REQUIRED,
+            )));
+        }
+        (Some(_), false) => {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                "No item in this checkout is delivered by email.",
+                crate::handlers::digital_manual::REASON_EMAIL_NOT_NEEDED,
+            )));
+        }
+        (Some(email), true) if !email.is_well_formed() => {
+            return Ok(Err(crate::handlers::digital_manual::invalid_email()));
         }
         _ => {}
     }
@@ -404,6 +426,21 @@ pub async fn handle(
         .bind(now)
         .execute(&mut **tx)
         .await?;
+        // One sealed address per email-kind order, in the order-create
+        // transaction; two email-kind sellers each get their own row.
+        if *group_method == FulfillmentMethod::Digital && indices.iter().any(is_email_line) {
+            let (Some(email), Some(keys)) = (&payload.delivery_email, context.digital) else {
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvariantViolation,
+                    ErrorCode::InvariantViolation,
+                    "An email-kind order reached storage without its address or key.",
+                )));
+            };
+            crate::handlers::digital_manual::store_delivery_email(
+                tx, keys, order.id, actor, email, now,
+            )
+            .await?;
+        }
 
         let payment = PaymentRow {
             id: payment_id,

@@ -424,6 +424,10 @@
               "name": "fulfillment.confirm_pickup"
             },
             {
+              "trigger": "command",
+              "name": "fulfillment.deliver_digital"
+            },
+            {
               "trigger": "server",
               "name": "digital_delivery"
             }
