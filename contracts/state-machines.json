@@ -594,6 +594,10 @@
             {
               "trigger": "command",
               "name": "refund.record_external"
+            },
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
             }
           ]
         },
@@ -644,6 +648,136 @@
             {
               "trigger": "server",
               "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "cancel_requested",
+          "to": "refunded_external",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "return_requested",
+          "to": "refunded_external",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "return_approved",
+          "to": "refunded_external",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "refunded_external",
+          "to": "paid",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded_external",
+          "to": "ready_for_pickup",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded_external",
+          "to": "shipped",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded_external",
+          "to": "delivered",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded_external",
+          "to": "completed",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded_external",
+          "to": "cancel_requested",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded_external",
+          "to": "cancelled",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded_external",
+          "to": "return_requested",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded_external",
+          "to": "return_approved",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded_external",
+          "to": "return_received",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
             }
           ]
         },
@@ -871,6 +1005,56 @@
             {
               "trigger": "server",
               "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "requested",
+          "to": "refunded",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "approved",
+          "to": "refunded",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "refunded",
+          "to": "requested",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded",
+          "to": "approved",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
+            }
+          ]
+        },
+        {
+          "from": "refunded",
+          "to": "received",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_reversal_cancelled"
             }
           ]
         }
