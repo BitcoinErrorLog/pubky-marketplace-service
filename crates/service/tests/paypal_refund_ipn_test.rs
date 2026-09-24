@@ -1944,12 +1944,20 @@ async fn a_held_refund_is_re_evaluated_when_its_payment_lands(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let order = pending_paypal_order(&app).await;
 
-    let wrong_currency = with(
-        refund("refund-full.ipn", &order.id, PAYMENT_TXN),
-        "mc_currency",
-        "EUR",
+    let other_receiver = with(
+        with(
+            with(
+                refund("refund-full.ipn", &order.id, PAYMENT_TXN),
+                "receiver_email",
+                "other@example.com",
+            ),
+            "business",
+            "other@example.com",
+        ),
+        "receiver_id",
+        "OTHERACCOUNT1",
     );
-    assert_eq!(post_ipn(&app, &wrong_currency).await, StatusCode::OK);
+    assert_eq!(post_ipn(&app, &other_receiver).await, StatusCode::OK);
     assert_eq!(
         inbox_rows(&pool).await,
         vec![(
@@ -1960,14 +1968,15 @@ async fn a_held_refund_is_re_evaluated_when_its_payment_lands(pool: PgPool) {
         )]
     );
 
-    // Once the payment is settled, the held refund's real problem shows.
+    // Once the payment is settled, the held refund's real problem replaces
+    // the stale reason.
     let status = post_ipn(&app, &fixture("completed.ipn", &order.id)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         inbox_rows(&pool).await,
         vec![(
             FULL_REFUND_TXN.to_string(),
-            "currency_mismatch".to_string(),
+            "receiver_mismatch".to_string(),
             Some(order.id.clone()),
             false
         )]
@@ -1975,9 +1984,42 @@ async fn a_held_refund_is_re_evaluated_when_its_payment_lands(pool: PgPool) {
     let view = read_order(&app, &order.seller.token, &order.id).await;
     assert_eq!(view["state"], json!("paid"));
     assert_eq!(view["gateway_refund_unmatched"], json!(true));
-    // A payment retry re-evaluates the same row; nothing multiplies.
+
+    // The row is now terminal: a payment retry does not replay it, even
+    // though a replay against this snapshot would apply it.
+    sqlx::query(
+        "UPDATE orders SET paypal_receiver_email = 'other@example.com', \
+         paypal_receiver_id = NULL WHERE id = $1::uuid",
+    )
+    .bind(&order.id)
+    .execute(&pool)
+    .await
+    .unwrap();
     let status = post_ipn(&app, &fixture("completed.ipn", &order.id)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(inbox_rows(&pool).await.len(), 1);
     assert!(ledger_rows(&pool, &order.id).await.is_empty());
+    assert_eq!(
+        read_order(&app, &order.seller.token, &order.id).await["state"],
+        json!("paid")
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_canceled_reversal_before_its_reversal_leaves_nothing_outstanding(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let order = paid_paypal_order(&app, PAYMENT_TXN).await;
+
+    // PayPal delivers the cancellation first, then the reversal it cancels.
+    let status = post_ipn(&app, &fixture("canceled-reversal.ipn", &order.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    let status = post_ipn(&app, &refund("reversal-full.ipn", &order.id, PAYMENT_TXN)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let view = read_order(&app, &order.seller.token, &order.id).await;
+    assert_eq!(view["payment_reversed_at"], Value::Null, "{view}");
+    assert_eq!(view["state"], json!("paid"));
+    assert_eq!(view["external_refund"], Value::Null);
+    assert!(view["gateway_refund_review_at"].is_string());
+    assert_eq!(ledger_rows(&pool, &order.id).await.len(), 2);
 }

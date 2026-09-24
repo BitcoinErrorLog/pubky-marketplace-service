@@ -435,8 +435,8 @@ struct InboxEntry<'a> {
 
 impl InboxEntry<'_> {
     /// Holds the notification, or moves an unresolved held row to this
-    /// evaluation's reason and order, so a re-evaluation never leaves a stale
-    /// reason behind.
+    /// evaluation's reason (and order, when this evaluation names one), so a
+    /// re-evaluation never leaves a stale reason behind.
     async fn store(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -457,10 +457,11 @@ impl InboxEntry<'_> {
              (txn_id, parent_txn_id, payment_status, reason, order_id, fields, received_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (txn_id) DO UPDATE SET reason = EXCLUDED.reason, \
-                 order_id = EXCLUDED.order_id \
+                 order_id = COALESCE(EXCLUDED.order_id, gateway_refund_inbox.order_id) \
              WHERE gateway_refund_inbox.resolved_at IS NULL \
                AND (gateway_refund_inbox.reason, gateway_refund_inbox.order_id) \
-                   IS DISTINCT FROM (EXCLUDED.reason, EXCLUDED.order_id)",
+                   IS DISTINCT FROM (EXCLUDED.reason, \
+                       COALESCE(EXCLUDED.order_id, gateway_refund_inbox.order_id))",
         )
         .bind(self.txn_id)
         .bind(self.parent_txn_id)
