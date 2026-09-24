@@ -45,21 +45,62 @@ if [ ! -t 0 ]; then
   fi
 fi
 
+# Sibling worktrees share one Cargo target unless this gate overrides it.
+# A shared target can run another tree's test binary. This checkout gets its own.
+shared_target="${CARGO_TARGET_DIR:-}"
+private_target="/Volumes/t7/vibes-dev/.cargo-target/marketplace-service/$(basename "$ROOT")"
+if [ ! -d "$private_target" ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
+  seed="${private_target}.partial"
+  rm -rf "$seed"
+  mkdir -p "$(dirname "$private_target")"
+  if cp -cR "$shared_target" "$seed" 2>/dev/null || cp -R "$shared_target" "$seed"; then
+    mv "$seed" "$private_target"
+  else
+    rm -rf "$seed"
+    mkdir -p "$private_target"
+  fi
+fi
+mkdir -p "$private_target"
+export CARGO_TARGET_DIR="$private_target"
+
 echo "prepush: cargo fmt"
 cargo fmt --check
 
-port="${PREPUSH_PG_PORT:-55433}"
-name="${PREPUSH_PG_CONTAINER:-prepush-ms-pg}"
-export DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@127.0.0.1:${port}/postgres}"
+# One container per worktree. A shared name let this gate remove a Postgres
+# container another lane's tests were using, because the name check raced
+# the start. This gate does not remove containers.
+worktree_slug="$(printf '%s' "$(basename "$ROOT")" | tr -c 'A-Za-z0-9_.-' '-')"
+name="${PREPUSH_PG_CONTAINER:-prepush-ms-pg-${worktree_slug}}"
+owner_label="pubky.prepush.worktree"
+if [ -n "${PREPUSH_PG_PORT:-}" ]; then
+  port="$PREPUSH_PG_PORT"
+else
+  sum="$(printf '%s' "$ROOT" | cksum | awk '{print $1}')"
+  port="$((56000 + sum % 1000))"
+fi
 
 if ! docker info >/dev/null 2>&1; then
   echo "prepush: docker is required for the scram-sha-256 Postgres" >&2
   exit 1
 fi
 
-if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
-  docker rm -f "$name" >/dev/null 2>&1 || true
+container_names() {
+  docker ps -a --format '{{.Names}}'
+}
+
+if container_names | grep -qx "$name"; then
+  owner="$(docker inspect -f "{{index .Config.Labels \"${owner_label}\"}}" "$name")"
+  if [ "$owner" != "$ROOT" ]; then
+    echo "prepush: container ${name} exists and this gate did not create it" >&2
+    exit 1
+  fi
+  if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
+    docker start "$name" >/dev/null
+  fi
+  port="$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "$name")"
+else
   docker run -d --name "$name" \
+    --label "${owner_label}=${ROOT}" \
     -e POSTGRES_USER=postgres \
     -e POSTGRES_PASSWORD=postgres \
     -e POSTGRES_DB=postgres \
@@ -67,6 +108,8 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
     -p "127.0.0.1:${port}:5432" \
     postgres:16 >/dev/null
 fi
+
+export DATABASE_URL="postgres://postgres:postgres@127.0.0.1:${port}/postgres"
 
 ready=0
 for _ in $(seq 1 60); do
