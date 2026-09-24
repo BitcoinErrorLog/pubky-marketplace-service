@@ -341,12 +341,36 @@ pub fn order_machine() -> AggregateMachine {
             t(
                 "return_received",
                 "refunded_external",
-                vec![Command("refund.record_external")],
+                vec![Command("refund.record_external"), Server("paypal_refund")],
             ),
             t(
                 "cancelled",
                 "refunded_external",
                 vec![Command("refund.record_external")],
+            ),
+            // `paypal_refund` is a postback-verified PayPal refund or
+            // reversal IPN whose recorded refunds reach the order total
+            // (docs/paypal-refund-ipn.md). A partial refund keeps the state.
+            t("paid", "refunded_external", vec![Server("paypal_refund")]),
+            t(
+                "ready_for_pickup",
+                "refunded_external",
+                vec![Server("paypal_refund")],
+            ),
+            t(
+                "shipped",
+                "refunded_external",
+                vec![Server("paypal_refund")],
+            ),
+            t(
+                "delivered",
+                "refunded_external",
+                vec![Server("paypal_refund")],
+            ),
+            t(
+                "completed",
+                "refunded_external",
+                vec![Server("paypal_refund")],
             ),
             // A late Paykit settlement whose hold already lapsed (order
             // cancelled, stock released) can still complete via
@@ -394,7 +418,7 @@ pub fn return_machine() -> AggregateMachine {
             t(
                 "received",
                 "refunded",
-                vec![Command("refund.record_external")],
+                vec![Command("refund.record_external"), Server("paypal_refund")],
             ),
         ],
         commands: vec![
@@ -750,6 +774,60 @@ mod tests {
         assert!(!can_transition(&orders, "cancelled", "pending_payment"));
         let command_triggered = transition.via.iter().any(|via| matches!(via, Command(_)));
         assert!(!command_triggered);
+    }
+
+    /// A verified PayPal refund reaches `refunded_external` from every paid,
+    /// not-yet-terminal state it may arrive in, and from nowhere else; no
+    /// client command gains an edge, and no state is added.
+    #[test]
+    fn paypal_refund_edges_are_server_only_and_end_at_refunded_external() {
+        let orders = order_machine();
+        let mut sources: Vec<&str> = orders
+            .transitions
+            .iter()
+            .filter(|t| t.via.contains(&Server("paypal_refund")))
+            .map(|t| {
+                assert_eq!(t.to, "refunded_external");
+                t.from
+            })
+            .collect();
+        sources.sort_unstable();
+        assert_eq!(
+            sources,
+            vec![
+                "completed",
+                "delivered",
+                "paid",
+                "ready_for_pickup",
+                "return_received",
+                "shipped"
+            ]
+        );
+        for from in [
+            "paid",
+            "ready_for_pickup",
+            "shipped",
+            "delivered",
+            "completed",
+        ] {
+            let transition = orders
+                .transitions
+                .iter()
+                .find(|t| t.from == from && t.to == "refunded_external")
+                .expect("refund edge exists");
+            assert_eq!(transition.via, vec![Server("paypal_refund")]);
+        }
+        assert!(!orders.states.contains(&"refunded_partial"));
+        let returns = return_machine();
+        let refunded = returns
+            .transitions
+            .iter()
+            .find(|t| t.from == "received" && t.to == "refunded")
+            .expect("received -> refunded exists");
+        assert_eq!(
+            refunded.via,
+            vec![Command("refund.record_external"), Server("paypal_refund")]
+        );
     }
 
     #[test]

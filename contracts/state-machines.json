@@ -580,6 +580,10 @@
             {
               "trigger": "command",
               "name": "refund.record_external"
+            },
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
             }
           ]
         },
@@ -590,6 +594,56 @@
             {
               "trigger": "command",
               "name": "refund.record_external"
+            }
+          ]
+        },
+        {
+          "from": "paid",
+          "to": "refunded_external",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "ready_for_pickup",
+          "to": "refunded_external",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "shipped",
+          "to": "refunded_external",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "delivered",
+          "to": "refunded_external",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
+            }
+          ]
+        },
+        {
+          "from": "completed",
+          "to": "refunded_external",
+          "via": [
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
             }
           ]
         },
@@ -813,6 +867,10 @@
             {
               "trigger": "command",
               "name": "refund.record_external"
+            },
+            {
+              "trigger": "server",
+              "name": "paypal_refund"
             }
           ]
         }
