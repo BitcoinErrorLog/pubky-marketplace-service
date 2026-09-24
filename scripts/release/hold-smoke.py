@@ -5,8 +5,8 @@ Canonical copy: BitcoinErrorLog/pubky-marketplace-service
 `scripts/release/hold-smoke.py`. The release skill points here; do not keep
 a second live copy under .evidence/.
 
-Exercises checkout.create with the deployed Shop v0.6.23 wire shape
-(shop-v0.6.23 @ 5f9f20ff7cb3caa06174c4a308a7abc79d60ddd2, checkout wire
+Exercises checkout.create with the deployed Shop v0.6.25 wire shape
+(shop-v0.6.25 @ 5e7fc0e6433e8535ca0444607e7864d79ff4f73c, checkout wire
 unchanged since v0.6.22): the v0.6.17 keys
 plus the line's `variant_id`, which the Shop sends for every line whose
 listing variant it resolved. Hold semantics are Option B:
@@ -53,9 +53,9 @@ TTL_SLACK_SECONDS = 45.0
 TTL_OVER_SECONDS = 5.0
 FIAT_WINDOW_DEFAULT = 600
 
-SHOP_TAG = "shop-v0.6.23"
-SHOP_SHA = "5f9f20ff7cb3caa06174c4a308a7abc79d60ddd2"
-FIXTURE_NAME = "shop-v0.6.23-checkout.create.json"
+SHOP_TAG = "shop-v0.6.25"
+SHOP_SHA = "5e7fc0e6433e8535ca0444607e7864d79ff4f73c"
+FIXTURE_NAME = "shop-v0.6.25-checkout.create.json"
 
 STAGING_URL = "https://staging-api.pubky.app"
 STAGING_PROJECT = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed"
@@ -163,7 +163,7 @@ def checkout_body(
     fulfillment: str,
     address: dict[str, str] | None,
 ) -> dict[str, Any]:
-    """Shop v0.6.23 checkout.create after toSnakeCaseWire."""
+    """Shop v0.6.25 checkout.create after toSnakeCaseWire."""
     line: dict[str, Any] = {
         "listing_aggregate_id": listing["aggregate_id"],
         "expected_revision": listing["server_revision"],
