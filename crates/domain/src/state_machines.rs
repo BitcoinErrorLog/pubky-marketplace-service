@@ -341,12 +341,106 @@ pub fn order_machine() -> AggregateMachine {
             t(
                 "return_received",
                 "refunded_external",
-                vec![Command("refund.record_external")],
+                vec![Command("refund.record_external"), Server("paypal_refund")],
             ),
             t(
                 "cancelled",
                 "refunded_external",
-                vec![Command("refund.record_external")],
+                vec![Command("refund.record_external"), Server("paypal_refund")],
+            ),
+            // `paypal_refund` is a postback-verified PayPal refund or
+            // reversal IPN whose recorded refunds reach the order total
+            // (docs/paypal-refund-ipn.md). A partial refund keeps the state;
+            // an open cancel or return request is resolved by the refund.
+            t("paid", "refunded_external", vec![Server("paypal_refund")]),
+            t(
+                "ready_for_pickup",
+                "refunded_external",
+                vec![Server("paypal_refund")],
+            ),
+            t(
+                "shipped",
+                "refunded_external",
+                vec![Server("paypal_refund")],
+            ),
+            t(
+                "delivered",
+                "refunded_external",
+                vec![Server("paypal_refund")],
+            ),
+            t(
+                "completed",
+                "refunded_external",
+                vec![Server("paypal_refund")],
+            ),
+            t(
+                "cancel_requested",
+                "refunded_external",
+                vec![Server("paypal_refund")],
+            ),
+            t(
+                "return_requested",
+                "refunded_external",
+                vec![Server("paypal_refund")],
+            ),
+            t(
+                "return_approved",
+                "refunded_external",
+                vec![Server("paypal_refund")],
+            ),
+            // `paypal_reversal_cancelled`: PayPal cancelled the reversal that
+            // brought the order to `refunded_external`, and the funds went
+            // back to the seller. The order returns to the state that
+            // reversal replaced.
+            t(
+                "refunded_external",
+                "paid",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded_external",
+                "ready_for_pickup",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded_external",
+                "shipped",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded_external",
+                "delivered",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded_external",
+                "completed",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded_external",
+                "cancel_requested",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded_external",
+                "cancelled",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded_external",
+                "return_requested",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded_external",
+                "return_approved",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded_external",
+                "return_received",
+                vec![Server("paypal_reversal_cancelled")],
             ),
             // A late Paykit settlement whose hold already lapsed (order
             // cancelled, stock released) can still complete via
@@ -394,7 +488,24 @@ pub fn return_machine() -> AggregateMachine {
             t(
                 "received",
                 "refunded",
-                vec![Command("refund.record_external")],
+                vec![Command("refund.record_external"), Server("paypal_refund")],
+            ),
+            t("requested", "refunded", vec![Server("paypal_refund")]),
+            t("approved", "refunded", vec![Server("paypal_refund")]),
+            t(
+                "refunded",
+                "requested",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded",
+                "approved",
+                vec![Server("paypal_reversal_cancelled")],
+            ),
+            t(
+                "refunded",
+                "received",
+                vec![Server("paypal_reversal_cancelled")],
             ),
         ],
         commands: vec![
@@ -746,10 +857,81 @@ mod tests {
             vec![Server("paykit_resolution"), Server("late_completion")]
         );
         assert!(!can_transition(&orders, "paid", "pending_payment"));
-        assert!(!can_transition(&orders, "refunded_external", "paid"));
+        // Only a canceled PayPal reversal leaves `refunded_external`.
+        let unrefund = orders
+            .transitions
+            .iter()
+            .find(|t| t.from == "refunded_external" && t.to == "paid")
+            .expect("refunded_external -> paid exists");
+        assert_eq!(unrefund.via, vec![Server("paypal_reversal_cancelled")]);
         assert!(!can_transition(&orders, "cancelled", "pending_payment"));
         let command_triggered = transition.via.iter().any(|via| matches!(via, Command(_)));
         assert!(!command_triggered);
+    }
+
+    /// A verified PayPal refund reaches `refunded_external` from every state
+    /// that holds a confirmed payment, and a canceled reversal leads back to
+    /// exactly those states; no client command gains an edge, and no state
+    /// is added.
+    #[test]
+    fn paypal_refund_edges_are_server_only_and_reversible() {
+        let refundable = [
+            "cancel_requested",
+            "cancelled",
+            "completed",
+            "delivered",
+            "paid",
+            "ready_for_pickup",
+            "return_approved",
+            "return_received",
+            "return_requested",
+            "shipped",
+        ];
+        let orders = order_machine();
+        let mut sources: Vec<&str> = orders
+            .transitions
+            .iter()
+            .filter(|t| t.via.contains(&Server("paypal_refund")))
+            .map(|t| {
+                assert_eq!(t.to, "refunded_external");
+                t.from
+            })
+            .collect();
+        sources.sort_unstable();
+        assert_eq!(sources, refundable);
+        let mut restores: Vec<&str> = orders
+            .transitions
+            .iter()
+            .filter(|t| t.via.contains(&Server("paypal_reversal_cancelled")))
+            .map(|t| {
+                assert_eq!(t.from, "refunded_external");
+                assert_eq!(t.via, vec![Server("paypal_reversal_cancelled")]);
+                t.to
+            })
+            .collect();
+        restores.sort_unstable();
+        assert_eq!(restores, refundable);
+        for transition in orders.transitions.iter().filter(|t| {
+            t.to == "refunded_external" && !matches!(t.from, "cancelled" | "return_received")
+        }) {
+            assert_eq!(transition.via, vec![Server("paypal_refund")]);
+        }
+        assert!(!orders.states.contains(&"refunded_partial"));
+        assert!(!can_transition(
+            &orders,
+            "pending_payment",
+            "refunded_external"
+        ));
+        let returns = return_machine();
+        for from in ["requested", "approved", "received"] {
+            assert!(can_transition(&returns, from, "refunded"));
+            let back = returns
+                .transitions
+                .iter()
+                .find(|t| t.from == "refunded" && t.to == from)
+                .expect("restore edge exists");
+            assert_eq!(back.via, vec![Server("paypal_reversal_cancelled")]);
+        }
     }
 
     #[test]

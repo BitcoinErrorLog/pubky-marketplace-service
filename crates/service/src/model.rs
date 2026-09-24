@@ -548,6 +548,19 @@ pub struct OrderRow {
     /// (Stripe key lookup), `gateway` (verified PayPal IPN), or `seller`
     /// (manual confirm-received). NULL until verified.
     pub fiat_verified_by: Option<String>,
+    /// Set while a verified PayPal reversal (a buyer chargeback or dispute)
+    /// is outstanding on the order; cleared when `Canceled_Reversal`
+    /// notifications restore every reversed amount.
+    pub payment_reversed_at: Option<DateTime<Utc>>,
+    /// Latest verified PayPal `Canceled_Reversal` that restored reversed
+    /// funds to the seller.
+    pub payment_reversal_cancelled_at: Option<DateTime<Utc>>,
+    /// First PayPal refund notification recorded for this order that could
+    /// not be reflected on it automatically; the seller reviews it.
+    pub gateway_refund_review_at: Option<DateTime<Utc>>,
+    /// A verified PayPal refund notification naming this order is held in
+    /// `gateway_refund_inbox` unapplied (derived, not stored).
+    pub gateway_refund_unmatched: bool,
     /// A purchased Shippo label: SELLER-ONLY (the PDF embeds the buyer's
     /// address), deliberately absent from [`Self::view`] and served
     /// exclusively through the seller-scoped label endpoints.
@@ -655,6 +668,13 @@ impl std::fmt::Debug for OrderRow {
             .field("payment_reported_at", &self.payment_reported_at)
             .field("fiat_transaction_ref", &self.fiat_transaction_ref)
             .field("fiat_verified_by", &self.fiat_verified_by)
+            .field("payment_reversed_at", &self.payment_reversed_at)
+            .field(
+                "payment_reversal_cancelled_at",
+                &self.payment_reversal_cancelled_at,
+            )
+            .field("gateway_refund_review_at", &self.gateway_refund_review_at)
+            .field("gateway_refund_unmatched", &self.gateway_refund_unmatched)
             .field("paykit_request_reference", &self.paykit_request_reference)
             .field("paykit_request_state", &self.paykit_request_state)
             .field("paykit_last_checked_at", &self.paykit_last_checked_at)
@@ -756,6 +776,10 @@ impl OrderRow {
             payment_reported_at: None,
             fiat_transaction_ref: None,
             fiat_verified_by: None,
+            payment_reversed_at: None,
+            payment_reversal_cancelled_at: None,
+            gateway_refund_review_at: None,
+            gateway_refund_unmatched: false,
             shipping_label: None,
             paykit_request_reference: None,
             paykit_request_state: None,
@@ -1010,6 +1034,14 @@ impl OrderRow {
             "updated_at": format_timestamp(self.updated_at),
         });
         view["priced_from"] = json!(self.priced_from);
+        view["payment_reversed_at"] = self.payment_reversed_at.map(format_timestamp).into();
+        view["payment_reversal_cancelled_at"] = self
+            .payment_reversal_cancelled_at
+            .map(format_timestamp)
+            .into();
+        view["gateway_refund_review_at"] =
+            self.gateway_refund_review_at.map(format_timestamp).into();
+        view["gateway_refund_unmatched"] = json!(self.gateway_refund_unmatched);
         view["merchandise_total"] = money_json(self.total_minor, &self.currency, self.exponent);
         view["bitcoin_payable"] = self
             .paykit_total_sats

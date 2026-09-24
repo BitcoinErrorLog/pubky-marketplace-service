@@ -1130,6 +1130,13 @@ async fn a_verified_completed_ipn_pays_the_order_without_any_participant(pool: P
     );
     assert!(order_view["receipt_id"].is_string());
     assert_eq!(order_view["payment"]["state"], json!("confirmed"));
+    let gateway_txn: Option<String> =
+        sqlx::query_scalar("SELECT paypal_txn_id FROM orders WHERE id = $1::uuid")
+            .bind(&order.order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(gateway_txn.as_deref(), Some("7XP31449AB123456C"));
 
     // The gateway actor notifies BOTH participants.
     assert_eq!(
@@ -1162,7 +1169,7 @@ async fn an_ipn_that_fails_postback_validation_is_dropped(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_ipn_that_does_not_match_server_held_facts_is_dropped(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool).await;
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -1180,6 +1187,8 @@ async fn an_ipn_that_does_not_match_server_held_facts_is_dropped(pool: PgPool) {
         ]
         .as_slice(),
         [("payment_status", "Pending")].as_slice(),
+        [("payment_status", "Canceled_Reversal")].as_slice(),
+        [("payment_status", "Denied")].as_slice(),
     ] {
         let status = post_ipn(&app, ipn_body(&order.order_id, overrides)).await;
         assert_eq!(status, StatusCode::OK);
@@ -1191,6 +1200,15 @@ async fn an_ipn_that_does_not_match_server_held_facts_is_dropped(pool: PgPool) {
         order_view["payment"]["state"],
         json!("awaiting_entitlement")
     );
+    // A notification that failed the payment checks never arms refund
+    // matching.
+    let gateway_txn: Option<String> =
+        sqlx::query_scalar("SELECT paypal_txn_id FROM orders WHERE id = $1::uuid")
+            .bind(&order.order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(gateway_txn, None);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

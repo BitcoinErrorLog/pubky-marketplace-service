@@ -729,7 +729,9 @@ async fn count_rows_under_previous(pool: &PgPool, keys: &PickupKeys) -> anyhow::
 /// evidence is recorded (`refund.record_external` sets
 /// `orders.external_refund`), after which it purges with the rest; when no
 /// evidence ever lands, the ordinary terminal-order purge takes it once
-/// `dispute_retention_days` have elapsed since the order closed. The
+/// `dispute_retention_days` have elapsed since the order closed. While a
+/// PayPal reversal is outstanding (`payment_reversed_at`) nothing purges:
+/// a canceled reversal reopens the order. The
 /// current (latest) details version of each listing is never purged here —
 //  only `pickup_details.clear` removes live details.
 pub async fn purge_terminal_pickup_retention(
@@ -742,6 +744,7 @@ pub async fn purge_terminal_pickup_retention(
         "DELETE FROM pickup_line_snapshots s USING orders o \
          WHERE o.id = s.order_id \
            AND o.state IN ('completed', 'cancelled', 'refunded_external', 'closed') \
+           AND o.payment_reversed_at IS NULL \
            AND (o.state <> 'cancelled' \
                 OR o.external_refund IS NOT NULL \
                 OR o.updated_at <= $1)",

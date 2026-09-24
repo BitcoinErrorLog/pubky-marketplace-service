@@ -258,9 +258,27 @@ pub async fn record_external_refund(
             "Only the seller may record a refund.",
         )));
     }
+    // An `external_refund` recorded from PayPal refund notifications is a
+    // running partial sum: the seller may close the order with a record
+    // that covers at least what PayPal already returned. Any other existing
+    // record refuses a second one.
+    let recorded_minor = match order.external_refund.as_ref() {
+        None => Some(0),
+        Some(existing) => {
+            let gateway: Option<(String,)> = sqlx::query_as(
+                "SELECT refund_txn_id FROM order_gateway_refunds \
+                 WHERE order_id = $1 AND refund_txn_id = $2",
+            )
+            .bind(order.id)
+            .bind(existing["transaction_id"].as_str().unwrap_or_default())
+            .fetch_optional(&mut **tx)
+            .await?;
+            gateway.and(existing["amount_minor"].as_i64())
+        }
+    };
     if !matches!(order.state.as_str(), "return_received" | "cancelled")
         || payload.amount_minor > order.total_minor
-        || order.external_refund.is_some()
+        || recorded_minor.is_none_or(|recorded| payload.amount_minor < recorded)
     {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,

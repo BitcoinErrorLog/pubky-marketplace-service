@@ -3684,6 +3684,8 @@ struct SellerOrderStats {
     shipped_at: Option<DateTime<Utc>>,
     delivered_at: Option<DateTime<Utc>>,
     cancelled: Option<bool>,
+    /// A refund was recorded and the order is still `refunded_external`: a
+    /// canceled PayPal reversal that reopened the order is not a refund.
     refunded: Option<bool>,
     /// The order's terminal cancel was a buyer-protection exit (§A3):
     /// `order.cancelled_terms_change` excludes the WHOLE order from
@@ -3740,7 +3742,8 @@ pub async fn generate_due_stat_attestations(
                MIN(CASE WHEN e.kind = 'fulfillment.shipped' THEN e.occurred_at END) AS shipped_at, \
                MIN(CASE WHEN e.kind = 'fulfillment.delivered' THEN e.occurred_at END) AS delivered_at, \
                BOOL_OR(e.kind = 'order.cancelled') AS cancelled, \
-               BOOL_OR(e.kind = 'refund.recorded_external') AS refunded, \
+               (BOOL_OR(e.kind = 'refund.recorded_external') \
+                AND o.state = 'refunded_external') AS refunded, \
                BOOL_OR(e.kind = 'order.cancelled_terms_change') AS terms_change_cancelled, \
                BOOL_OR(e.kind = 'order.completed') AS auto_completed, \
                BOOL_OR(e.kind IN ('order.cancel_requested', 'order.cancelled', \

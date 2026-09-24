@@ -3005,6 +3005,8 @@ pub async fn spawn_fake_shippo() -> FakeShippo {
 struct FakePaypalIpnState {
     /// Answer `INVALID` instead of `VERIFIED`.
     reject: bool,
+    /// Answer HTTP 503, as an unreachable PayPal validation endpoint does.
+    unavailable: bool,
     /// Raw postback bodies received (each must carry `cmd=_notify-validate`).
     postbacks: Vec<String>,
 }
@@ -3022,6 +3024,10 @@ impl FakePaypalIpn {
         self.state.lock().expect("fake ipn lock").reject = true;
     }
 
+    pub fn set_unavailable(&self, unavailable: bool) {
+        self.state.lock().expect("fake ipn lock").unavailable = unavailable;
+    }
+
     pub fn postbacks(&self) -> Vec<String> {
         self.state.lock().expect("fake ipn lock").postbacks.clone()
     }
@@ -3034,6 +3040,9 @@ async fn serve_paypal_ipn_validation(
     use axum::response::IntoResponse;
     let mut guard = state.lock().expect("fake ipn lock");
     guard.postbacks.push(body);
+    if guard.unavailable {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let answer = if guard.reject { "INVALID" } else { "VERIFIED" };
     (StatusCode::OK, answer.to_string()).into_response()
 }

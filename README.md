@@ -104,7 +104,7 @@ Railway IaC `preserve()`):
 | `AUTO_COMPLETE_DAYS` | `14` | days after delivery when the worker completes a `delivered` order on server time, unless a return/cancel request is open (≥ 1) |
 | `DELIVERY_SWEEP_BATCH_SIZE` | `100` | rows claimed per inner delivery/auto-complete sweep pass (≥ 1); the worker loops until a short batch or the per-lease cap |
 | `PUBLIC_APP_ORIGIN` | unset | the web app's public origin (e.g. `https://shop.pubky.app`); when set, hosted checkouts that support a return destination (PayPal `_xclick`) send the buyer back to `{origin}/marketplace/orders` after commit/cancel |
-| `PUBLIC_SERVICE_ORIGIN` | unset | this service's own public origin; when set, PayPal checkout links carry `notify_url={origin}/v0/paypal/ipn` so PayPal's IPN pays the order automatically (postback-verified, matched against seller email + exact order total). Unset, PayPal stays participant-attested |
+| `PUBLIC_SERVICE_ORIGIN` | unset | this service's own public origin; when set, PayPal checkout links carry `notify_url={origin}/v0/paypal/ipn` so PayPal's IPN pays the order automatically (postback-verified, matched against seller email + exact order total) and records the seller's PayPal refunds and the buyer's reversals on it. Unset, PayPal stays participant-attested |
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |
 | `PAYPAL_CHECKOUT_URL` | `https://www.paypal.com/cgi-bin/webscr` | PayPal `_xclick` checkout base. HTTPS only; host must be `www.paypal.com` (live) or `www.sandbox.paypal.com`. Default stays live. |
 | `SHIPPO_API_BASE` | `https://api.goshippo.com` | Shippo API base for the seller-token label integration (`/v0/sellers/me/shipping-config`, `/v0/orders/{id}/shipping/*`); tests point it at a local double |
@@ -669,6 +669,20 @@ and refund branches):
   and advances the order to `refunded_external`. The service never claims
   to have moved funds (ADR-0019 §7); a CHECK constraint keeps the recorded
   amount within the order total.
+- **PayPal refunds and reversals.** A postback-verified `Refunded`,
+  `Reversed`, or `Canceled_Reversal` IPN is never dropped: it is recorded
+  once per PayPal `txn_id` on the order whose gateway-verified payment is its
+  `parent_txn_id`, in every order state, after checking the receiver against
+  the snapshot taken when that payment was verified; otherwise it is held in
+  `gateway_refund_inbox` (applied later when the parent payment is recorded).
+  `external_refund.amount_minor` is the running refund. A partial refund
+  keeps the order's state; the refund that reaches the total moves the order
+  to `refunded_external` (server trigger `paypal_refund`), resolving an open
+  cancel or return request. A reversal sets `payment_reversed_at`; a canceled
+  reversal clears it and returns the order to the state the reversal replaced
+  (`paypal_reversal_cancelled`), and the reputation worker stops counting it.
+  A refund never restocks. Contract table:
+  [`docs/paypal-refund-ipn.md`](docs/paypal-refund-ipn.md).
 - **Reviews.** `review.create` (participants, from
   `delivered`/`completed`/`closed`): one review per participant per order
   per role, enforced by the `reviews_one_per_order_role` database

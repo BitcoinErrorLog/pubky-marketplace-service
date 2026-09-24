@@ -16,6 +16,10 @@
 //!   buyer-reports/seller-confirms pair remains as the fallback when no IPN
 //!   arrives. The projection exposes the provenance as `fiat_verification:
 //!   'processor' | 'gateway-notified' | 'seller-attested'`.
+//! - PayPal `Refunded`/`Reversed`/`Canceled_Reversal` IPNs are recorded on
+//!   the order whose gateway-verified payment id is their `parent_txn_id`,
+//!   or held in `gateway_refund_inbox` (`paypal_refund`,
+//!   docs/paypal-refund-ipn.md).
 //! - Payment confirmation reuses the sandbox/Locks confirmation path
 //!   (`confirm_order`): receipt exactly once, inventory reserved → sold,
 //!   payment CAS `awaiting_entitlement → confirmed`. A confirmation the
@@ -49,6 +53,8 @@ use crate::payments::{
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
+
+mod paypal_refund;
 
 const CONFIG_COLUMNS: &str = "seller_pubky, bitcoin_enabled, stripe_payment_link, \
      stripe_restricted_key_ciphertext, paypal_merchant_email, created_at, updated_at";
@@ -1227,13 +1233,17 @@ fn spawn_courtesy_void(
 /// Applies a verified/attested fiat payment: payment CAS
 /// `awaiting_entitlement → confirmed` with the shared confirmation effects,
 /// or `manual_review` when the order can no longer confirm. Idempotent for
-/// already-advanced payments.
+/// already-advanced payments. A verified PayPal payment (`gateway`) is
+/// settled in the same transaction under its payment lock: the payment id,
+/// the receiver snapshot, and every held refund naming it
+/// ([`paypal_refund::settle_verified_payment`]).
 async fn apply_fiat_paid(
     state: &AppState,
     actor: &str,
     order_id: Uuid,
     transaction_ref: Option<&str>,
     verified_by: &str,
+    gateway: Option<&paypal_refund::GatewayPayment<'_>>,
     now: DateTime<Utc>,
 ) -> Result<Response, Response> {
     let mut tx = state
@@ -1241,6 +1251,11 @@ async fn apply_fiat_paid(
         .begin()
         .await
         .map_err(|error| internal("fiat confirmation transaction", &error))?;
+    if let Some(gateway) = gateway {
+        paypal_refund::lock_paypal_payment(&mut tx, gateway.txn_id)
+            .await
+            .map_err(|error| internal("paypal payment lock", &error))?;
+    }
     let payment = fetch_payment_for_order_update(&mut tx, order_id)
         .await
         .map_err(|error| internal("payment lookup", &error))?
@@ -1285,6 +1300,7 @@ async fn apply_fiat_paid(
                         "The order was not found.",
                     ));
                 };
+                settle_gateway(&mut tx, state, order_id, gateway, now).await?;
                 let response = order_response(&mut tx, &order, json!({ "verified": true }))
                     .await
                     .map_err(|error| internal("order projection", &error))?;
@@ -1312,7 +1328,8 @@ async fn apply_fiat_paid(
     }
     if payment.state != "awaiting_entitlement" {
         // Already confirmed (or under review): a duplicate verification has
-        // no further effect.
+        // no further effect beyond settling the gateway payment id.
+        settle_gateway(&mut tx, state, order_id, gateway, now).await?;
         let response = order_response(&mut tx, &order, json!({ "verified": true }))
             .await
             .map_err(|error| internal("order projection", &error))?;
@@ -1393,6 +1410,7 @@ async fn apply_fiat_paid(
                 .await
                 .map_err(|error| internal("payment confirmation notification", &error))?;
             }
+            settle_gateway(&mut tx, state, order_id, gateway, now).await?;
             let response = order_response(&mut tx, &confirmed_order, json!({ "verified": true }))
                 .await
                 .map_err(|error| internal("order projection", &error))?;
@@ -1418,6 +1436,14 @@ async fn apply_fiat_paid(
                 .begin()
                 .await
                 .map_err(|error| internal("manual review transaction", &error))?;
+            if let Some(gateway) = gateway {
+                paypal_refund::lock_paypal_payment(&mut tx, gateway.txn_id)
+                    .await
+                    .map_err(|error| internal("paypal payment lock", &error))?;
+            }
+            fetch_payment_for_order_update(&mut tx, order_id)
+                .await
+                .map_err(|error| internal("payment lookup", &error))?;
             let updated: Option<(i64,)> = sqlx::query_as(
                 "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
                  manual_review_entered_at = $3, updated_at = $3 \
@@ -1452,6 +1478,7 @@ async fn apply_fiat_paid(
                         "The order was not found.",
                     )
                 })?;
+            settle_gateway(&mut tx, state, order_id, gateway, now).await?;
             let response = order_response(&mut tx, &order, json!({ "verified": true }))
                 .await
                 .map_err(|error| internal("order projection", &error))?;
@@ -1461,6 +1488,21 @@ async fn apply_fiat_paid(
             Ok(response)
         }
     }
+}
+
+async fn settle_gateway(
+    tx: &mut Transaction<'_, Postgres>,
+    state: &AppState,
+    order_id: Uuid,
+    gateway: Option<&paypal_refund::GatewayPayment<'_>>,
+    now: DateTime<Utc>,
+) -> Result<(), Response> {
+    let Some(gateway) = gateway else {
+        return Ok(());
+    };
+    paypal_refund::settle_verified_payment(tx, state, order_id, gateway, now)
+        .await
+        .map_err(|error| internal("paypal payment settlement", &error))
 }
 
 /// Reads the order and payment without locks for the verification preamble.
@@ -1533,6 +1575,7 @@ pub async fn verify_fiat_payment(
             order_id,
             None,
             "processor",
+            None,
             state.clock.now(),
         )
         .await
@@ -1575,6 +1618,7 @@ pub async fn verify_fiat_payment(
                 order_id,
                 Some(&matched.session_id),
                 "processor",
+                None,
                 state.clock.now(),
             )
             .await
@@ -1773,6 +1817,7 @@ pub async fn confirm_fiat_received(
         order_id,
         None,
         "seller",
+        None,
         state.clock.now(),
     )
     .await
@@ -1819,7 +1864,9 @@ fn parse_gateway_amount_minor(value: &str, exponent: i32) -> Option<i64> {
 /// be the seller's configured PayPal email and the amount and currency must
 /// equal the order total exactly. Anything that doesn't match is dropped
 /// with a 200 (PayPal retries non-2xx; a mismatch will never become valid).
-/// Transient failures answer 5xx so PayPal retries.
+/// Transient failures answer 5xx so PayPal retries. `Refunded`,
+/// `Reversed`, and `Canceled_Reversal` notifications are never dropped
+/// (`paypal_refund`, docs/paypal-refund-ipn.md).
 pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response {
     let Ok(payments) = payments_runtime(&state) else {
         tracing::warn!("paypal ipn received while payment methods are disabled");
@@ -1842,15 +1889,20 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
     let field = |name: &str| fields.get(name).map(String::as_str).unwrap_or_default();
 
     let payment_status = field("payment_status");
-    if payment_status != "Completed" {
-        // Pending/Refunded/Reversed etc.: retained in the logs, never a
-        // confirmation. Refunds stay on the peer-to-peer return/refund
-        // surface (`refund.record_external`).
-        tracing::info!(
-            payment_status,
-            "paypal ipn ignored: not a completed payment"
-        );
-        return StatusCode::OK.into_response();
+    match payment_status {
+        "Completed" => {}
+        "Refunded" | "Reversed" | "Canceled_Reversal" => {
+            return paypal_refund::apply_refund_ipn(&state, &fields).await
+        }
+        _ => {
+            // Pending, Denied, Voided etc.: retained in the logs, never a
+            // confirmation or a refund.
+            tracing::info!(
+                payment_status,
+                "paypal ipn ignored: not a completed payment or a refund"
+            );
+            return StatusCode::OK.into_response();
+        }
     }
     let Ok(order_id) = field("custom").parse::<Uuid>() else {
         tracing::warn!("paypal ipn dropped: custom field is not an order id");
@@ -1875,10 +1927,7 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
         tracing::warn!(%order_id, "paypal ipn dropped: seller has no paypal email configured");
         return StatusCode::OK.into_response();
     };
-    let receiver = field("receiver_email");
-    let business = field("business");
-    let merchant = merchant_email.to_ascii_lowercase();
-    if receiver.to_ascii_lowercase() != merchant && business.to_ascii_lowercase() != merchant {
+    if !paypal_refund::paid_to_merchant(&fields, &merchant_email) {
         tracing::warn!(%order_id, "paypal ipn dropped: receiver is not the configured seller");
         return StatusCode::OK.into_response();
     }
@@ -1892,23 +1941,26 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
     }
     let txn_id = field("txn_id");
     let transaction_ref = (!txn_id.is_empty() && txn_id.len() <= 64).then_some(txn_id);
-    match apply_fiat_paid(
+    // Payment id, receiver snapshot, confirmation, and any held refunds
+    // naming this payment settle in one transaction under the payment lock.
+    let gateway = paypal_refund::paypal_transaction_id(txn_id)
+        .map(|txn_id| paypal_refund::GatewayPayment::from_fields(txn_id, &merchant_email, &fields));
+    let confirmed = match apply_fiat_paid(
         &state,
         PAYPAL_GATEWAY_ACTOR,
         order_id,
         transaction_ref,
         "gateway",
+        gateway.as_ref(),
         state.clock.now(),
     )
     .await
     {
-        Ok(response) | Err(response) => {
-            // PayPal only needs the status: 2xx acknowledges, 5xx retries.
-            if response.status().is_server_error() {
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            } else {
-                StatusCode::OK.into_response()
-            }
-        }
+        Ok(response) | Err(response) => response,
+    };
+    // PayPal only needs the status: 2xx acknowledges, 5xx retries.
+    if confirmed.status().is_server_error() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    StatusCode::OK.into_response()
 }
