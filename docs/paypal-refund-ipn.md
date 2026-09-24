@@ -171,6 +171,7 @@ transaction id.
 | `custom` absent, `parent_txn_id` matches no order | 200, dropped | Drop ("unknown parent") | unchanged | `refund_ipn_with_unknown_parent_is_dropped` |
 | `custom` absent, `parent_txn_id` matches one order | 200, dropped | Resolve to that order, then as the state rows | as the state rows | `refund_ipn_without_custom_resolves_by_parent` |
 | `parent_txn_id` equals a buyer-reported `fiat_transaction_ref` on a seller-attested order (no gateway id) | 200, dropped | Drop ("unknown parent") | unchanged | `a_buyer_reported_reference_never_matches_a_refund` |
+| Refund IPN arrives before the order's `Completed` IPN is recorded (the payment IPN still in PayPal's retry queue) | 200, dropped | Drop (the order has no gateway id yet). Not retried with a 5xx: PayPal can disable IPN for an account whose endpoint keeps failing, and a seller-attested order never gains a gateway id | unchanged | `a_buyer_reported_reference_never_matches_a_refund` (same resolution: `custom` order without a gateway id) |
 | Order not PayPal-bound | 200, dropped | Drop. Unreachable through resolution: only a PayPal-bound order's `Completed` IPN writes `paypal_txn_id` | unchanged | `refund_ipn_with_unknown_parent_is_dropped` (resolution) |
 | `receiver_email` and `business` both differ from the seller's configured PayPal email | 200, dropped | Drop | unchanged | `refund_ipn_to_another_receiver_is_dropped` |
 | `mc_currency` differs from the order currency | 200, dropped | Drop | unchanged | `refund_ipn_with_currency_mismatch_is_dropped` |
