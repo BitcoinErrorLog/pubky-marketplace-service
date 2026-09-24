@@ -19,7 +19,7 @@ use marketplace_service::bitcoin_review::{
     watch_manual_reviews, SELLER_CONFIRMATION_WINDOW_SECONDS,
 };
 use marketplace_service::clock::Clock;
-use marketplace_service::payments::order_reference;
+use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
 use sqlx::{Acquire, PgPool};
@@ -73,7 +73,7 @@ async fn bound_exclusive_order(
         .await
         .expect("activation delivers");
     assert!(delivered >= 1, "the activate row delivers");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     (order.order_id, order.payment_id, reference)
 }
 
@@ -1536,7 +1536,7 @@ async fn the_status_contract_fails_closed(pool: PgPool) {
             .await
             .expect("persisted mode");
     assert_eq!(persisted, "exclusive");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     paykit.set_status(&reference, status_confirmed("shared_manual", true, 2));
     let applied = poll_now(&app, app.clock.now()).await;
     assert_eq!(applied, 1);

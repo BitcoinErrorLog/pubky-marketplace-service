@@ -21,7 +21,7 @@ use marketplace_service::bitcoin_review::{
     MANUAL_REVIEW_INACTIVITY_DAYS, SELLER_CONFIRMATION_WINDOW_SECONDS,
 };
 use marketplace_service::clock::Clock;
-use marketplace_service::payments::order_reference;
+use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{
     close_due_auctions, drain_outbox, expire_due_payment_windows, verify_due_locks_lifecycles,
     verify_due_paykit_payments,
@@ -1804,7 +1804,7 @@ async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
                 .expect("drop row");
         assert_eq!(remaining, 2, "the release credited the drop");
 
-        let reference = order_reference(Uuid::parse_str(&order_id).unwrap());
+        let reference = attempt_reference(Uuid::parse_str(&order_id).unwrap(), 1);
         let mut late = status_confirmed("shared_manual", true);
         late["late_settlement"] = json!(true);
 
@@ -2019,7 +2019,7 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
     drain_outbox(&app.pool, client, app.clock.now(), 30)
         .await
         .expect("activation delivers");
-    let reference = order_reference(Uuid::parse_str(&order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order_id).unwrap(), 1);
     paykit.set_status(&reference, status_confirmed("shared_manual", true));
     let entered_at = app.clock.now();
     poll_now(&app, entered_at).await;
@@ -2108,7 +2108,7 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
     drain_outbox(&app.pool, client, app.clock.now(), 30)
         .await
         .expect("activation delivers");
-    let reference = order_reference(Uuid::parse_str(&order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order_id).unwrap(), 1);
     paykit.set_status(&reference, status_confirmed("shared_manual", true));
     let entered_at = app.clock.now();
     poll_now(&app, entered_at).await;
@@ -2176,7 +2176,7 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
         .await
         .expect("reservation sweep runs");
     assert_eq!(expired, 1, "the winning reservation lapsed");
-    let reference = order_reference(Uuid::parse_str(&order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order_id).unwrap(), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true));
     let applied = poll_now(&app, app.clock.now()).await;
     assert_eq!(applied, 1, "the confirm failure routes to manual_review");

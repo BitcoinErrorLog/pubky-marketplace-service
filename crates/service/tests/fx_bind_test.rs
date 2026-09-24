@@ -19,7 +19,7 @@ use marketplace_service::bitcoin_review::{
     route_due_seller_confirmation_windows, SELLER_CONFIRMATION_WINDOW_SECONDS,
 };
 use marketplace_service::clock::Clock;
-use marketplace_service::payments::order_reference;
+use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows, sample_fx_rate};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -572,7 +572,7 @@ async fn shared_manual_extension_and_late_settlement_retain_the_quote(pool: PgPo
         .await
         .paykit_total_sats
         .expect("invoice total");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     fixture.paykit.set_status(
         &reference,
         bitcoin_status_v2(
@@ -624,7 +624,7 @@ async fn shared_manual_extension_and_late_settlement_retain_the_quote(pool: PgPo
             .expect("window sweep runs")
             >= 1
     );
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     let mut late = bitcoin_status_v2(
         "confirmed",
         true,
@@ -669,7 +669,7 @@ async fn quote_divergent_observation_clears_an_active_seller_window(pool: PgPool
         .await
         .paykit_total_sats
         .expect("invoice total");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     fixture.paykit.set_status(
         &reference,
         bitcoin_status_v2(
@@ -731,7 +731,7 @@ async fn settlement_only_exact_non_late_exclusive_auto_pays(pool: PgPool) {
                 .paykit_total_sats
                 .expect("invoice total");
             let observed = total_sats + observed_delta;
-            let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+            let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
             fixture.paykit.set_status(
                 &reference,
                 bitcoin_status_v2(
@@ -817,7 +817,7 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
             .expect("window sweep runs")
             >= 1
     );
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     let mut late = bitcoin_status_v2(
         "confirmed",
         true,
@@ -883,7 +883,7 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
             .expect("window sweep runs")
             >= 1
     );
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     let mut late = bitcoin_status_v2("confirmed", true, "exclusive", None, None, None);
     late["late_settlement"] = json!(true);
     sqlx::query(
@@ -935,7 +935,7 @@ async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
         .await
         .paykit_total_sats
         .expect("invoice total");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     fixture.paykit.set_status(
         &reference,
         bitcoin_status_v2(
@@ -1023,7 +1023,7 @@ async fn shared_manual_freeze_pins_the_first_observation_for_refunds(pool: PgPoo
         .await
         .paykit_total_sats
         .expect("invoice total");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     fixture.paykit.set_status(
         &reference,
         bitcoin_status_v2(

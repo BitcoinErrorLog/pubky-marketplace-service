@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use common::*;
 use marketplace_service::clock::Clock;
-use marketplace_service::payments::{order_reference, PaykitClient, PaykitStatusOutcome};
+use marketplace_service::payments::{attempt_reference, PaykitClient, PaykitStatusOutcome};
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -1065,9 +1065,10 @@ async fn activation_terminal_errors_void_the_bind(pool: PgPool) {
 }
 
 // A voided bind is released: the buyer binds again, and the retry is a
-// fresh phase 1 with a fresh idempotency key.
+// fresh phase 1 under a new reference and idempotency key (paykit refuses
+// a second binding against the voided attempt's reference).
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_voided_bind_retries_with_a_fresh_idempotency_key(pool: PgPool) {
+async fn a_voided_bind_retries_with_a_fresh_reference(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -1102,9 +1103,13 @@ async fn a_voided_bind_retries_with_a_fresh_idempotency_key(pool: PgPool) {
     assert_eq!(attempt, 2, "the retry incremented the counter");
     let requests = paykit.requests();
     assert_eq!(requests.len(), 2, "two phase-1 calls");
-    let reference = order_reference(order_uuid(&order_id));
-    assert_eq!(requests[0].idempotency_key, format!("{reference}:1"));
-    assert_eq!(requests[1].idempotency_key, format!("{reference}:2"));
+    let first = attempt_reference(order_uuid(&order_id), 1);
+    let second = attempt_reference(order_uuid(&order_id), 2);
+    assert_ne!(first, second);
+    assert_eq!(requests[0].reference, first);
+    assert_eq!(requests[0].idempotency_key, format!("{first}:1"));
+    assert_eq!(requests[1].reference, second);
+    assert_eq!(requests[1].idempotency_key, format!("{second}:2"));
     let (_request_state, activation_state, ..) = order_paykit_row(&pool, &order_id).await;
     assert_eq!(activation_state.as_deref(), Some("preparing"));
 }
@@ -1208,7 +1213,7 @@ async fn a_preparing_order_is_not_polled(pool: PgPool) {
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, _invoice_id) =
         bound_preparing_order(&app, &paykit, &seller, &buyer).await;
-    let reference = order_reference(order_uuid(&order_id));
+    let reference = attempt_reference(order_uuid(&order_id), 1);
 
     let source = FakePaykitStatus::default();
     source.set_outcome(
@@ -1260,7 +1265,7 @@ async fn the_buyer_total_is_the_paykit_total(pool: PgPool) {
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, _invoice_id) =
         bound_preparing_order(&app, &paykit, &seller, &buyer).await;
-    let reference = order_reference(order_uuid(&order_id));
+    let reference = attempt_reference(order_uuid(&order_id), 1);
 
     let (status, body) = send(
         app.router.clone(),

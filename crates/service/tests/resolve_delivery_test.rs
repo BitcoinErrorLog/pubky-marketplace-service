@@ -17,7 +17,7 @@ use marketplace_service::bitcoin_review::{
     SELLER_CONFIRMATION_WINDOW_SECONDS,
 };
 use marketplace_service::clock::Clock;
-use marketplace_service::payments::{order_reference, PaykitClient};
+use marketplace_service::payments::{attempt_reference, PaykitClient};
 use marketplace_service::resolve_delivery::{
     acknowledge_resolve_row, deliver_due_resolve_rows, terminate_resolve_delivery,
 };
@@ -120,7 +120,7 @@ async fn confirmed_order_with_resolve_row(
     drain_outbox(&app.pool, client, app.clock.now(), 30)
         .await
         .expect("activation delivers");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     paykit.set_status(&reference, status_confirmed());
     poll_now(app, app.clock.now()).await;
     let (status, body) = send(
@@ -884,7 +884,7 @@ async fn drain_gate_7_6_7_interleavings(pool: PgPool) {
     drain_outbox(&app.pool, paykit_client_ref, app.clock.now(), 30)
         .await
         .expect("activation delivers");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     paykit.set_status(&reference, status_confirmed());
     poll_now(&app, app.clock.now()).await;
 
@@ -966,7 +966,7 @@ async fn drain_gate_7_6_7_interleavings(pool: PgPool) {
     drain_outbox(&app.pool, paykit_client_ref, app.clock.now(), 30)
         .await
         .expect("activation delivers");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     paykit.set_status(&reference, status_confirmed());
     poll_now(&app, app.clock.now()).await;
     assert!(

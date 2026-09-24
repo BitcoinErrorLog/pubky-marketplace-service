@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use common::*;
 use marketplace_service::clock::Clock;
 use marketplace_service::config::Config;
-use marketplace_service::payments::{order_reference, PaykitStatusOutcome};
+use marketplace_service::payments::{attempt_reference, PaykitStatusOutcome};
 use marketplace_service::workers::run_once;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -681,7 +681,7 @@ async fn bitcoin_binding_creates_the_signed_paykit_request(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "bitcoin bind failed: {body}");
     let bound = &body["order"];
     let order_uuid = Uuid::parse_str(&order.order_id).expect("order id is a uuid");
-    let reference = order_reference(order_uuid);
+    let reference = attempt_reference(order_uuid, 1);
     assert_eq!(bound["payment_method"], json!("bitcoin"));
     assert_eq!(bound["fiat_verification"], Value::Null);
     assert_eq!(bound["fiat_checkout_url"], Value::Null);
@@ -1243,7 +1243,7 @@ async fn the_paykit_worker_confirms_a_settled_bitcoin_order(pool: PgPool) {
     let order = create_pending_sat_order(&app, &seller, &buyer).await;
     let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
 
     // A bound order is `preparing` until the activation outbox row
     // delivers; only then does the poll claim it.
@@ -1337,7 +1337,7 @@ async fn a_confirmed_but_mismatched_amount_routes_to_manual_review(pool: PgPool)
     paykit.set_claimed(&seller.pubky);
     let order = create_pending_sat_order(&app, &seller, &buyer).await;
     bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
-    let reference = order_reference(Uuid::parse_str(&order.order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
     // Activate the prepared invoice so the order becomes pollable.
     let paykit_client = app
         .state
