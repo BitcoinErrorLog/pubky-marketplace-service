@@ -20,6 +20,14 @@ async fn migration_0041_adds_digital_delivered_at_and_is_rerunnable(pool: PgPool
         .await
         .expect("0041 must be directly rerunnable");
     assert!(column().await);
+    let buckets: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_tables \
+         WHERE schemaname = 'public' AND tablename = 'digital_read_rate_limits')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("table existence");
+    assert!(buckets);
 }
 
 #[test]

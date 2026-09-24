@@ -3408,3 +3408,32 @@ pub async fn test_app_with_digital(
         server,
     )
 }
+
+/// [`test_app_with_payments_and_ipn`] with digital delivery keyed and a
+/// deliverable server behind the real homeserver client, so digital orders
+/// can be confirmed through the real Paykit and PayPal rails.
+pub async fn test_app_with_payments_and_digital(
+    pool: PgPool,
+) -> (TestApp, FakePaykit, FakePaypalIpn, DeliverableServer) {
+    let (app, _stripe, paykit, ipn) = test_app_with_payments_and_ipn(pool).await;
+    let server = spawn_deliverable_server().await;
+    let homeserver = DigitalTestHomeserver {
+        http: HttpHomeserverClient::new(&server.base_url).expect("deliverable client builds"),
+    };
+    let state = app
+        .state
+        .clone()
+        .with_homeserver(Some(Arc::new(homeserver)))
+        .with_digital(Some(test_digital_keys()));
+    (
+        TestApp {
+            router: build_router(state.clone()),
+            pool: app.pool,
+            clock: app.clock,
+            state,
+        },
+        paykit,
+        ipn,
+        server,
+    )
+}

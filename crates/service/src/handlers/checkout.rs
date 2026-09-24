@@ -192,9 +192,7 @@ pub async fn handle(
             if !context.digital_available {
                 return Ok(Err(crate::handlers::digital::unavailable()));
             }
-            // The seller must have a current deliverable (§6 B4). The manual
-            // kinds (email, message) need the buyer-email and mark-delivered
-            // paths before they can be sold.
+            // The seller must have a current deliverable (§6 B4).
             match listing
                 .digital_delivery_kind
                 .as_deref()
@@ -208,8 +206,15 @@ pub async fn handle(
                         crate::handlers::digital::REASON_NOT_READY,
                     )))
                 }
+                // The email and message kinds need the buyer-email and
+                // mark-delivered paths before they can be sold.
                 Some(kind) if !kind.is_instant() => {
-                    return Ok(Err(crate::handlers::digital::unavailable()));
+                    return Ok(Err(CommandFailure::refused_with_reason(
+                        crate::refusal_audit::RefusalKind::InvalidState,
+                        ErrorCode::InvalidState,
+                        "This item's delivery method cannot be bought yet.",
+                        crate::handlers::digital::REASON_NOT_READY,
+                    )));
                 }
                 Some(_) => {}
             }

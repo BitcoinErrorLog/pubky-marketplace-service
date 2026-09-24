@@ -132,6 +132,50 @@ pub async fn advance(
         order
     };
 
+    // A digital order whose deliverable is gone takes the refund-required
+    // shape on the sandbox exactly as on the money rails (§6 D3): no
+    // receipt, the hold released, the payment in review.
+    if payload.target == SandboxPaymentTarget::Confirmed
+        && crate::handlers::digital_orders::unpinnable(tx, &order).await?
+    {
+        let event_id = crate::bitcoin_review::refund_required(
+            tx,
+            &payment,
+            &order,
+            "digital delivery unavailable at payment",
+            command.command_id,
+            actor,
+            now,
+        )
+        .await
+        .map_err(|failure| {
+            sqlx::Error::Protocol(format!(
+                "sandbox refund route failed: {:?}",
+                std::mem::discriminant(&failure)
+            ))
+        })?;
+        let payment: PaymentRow = sqlx::query_as(&format!(
+            "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1"
+        ))
+        .bind(payment.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let order = fetch_order_for_update(tx, payment.order_id)
+            .await?
+            .expect("order locked above");
+        let reviews = fetch_order_reviews(tx, order.id).await?;
+        return Ok(Ok(HandlerSuccess {
+            revision: payment.revision,
+            event_ids: vec![event_id],
+            result: json!({
+                "kind": "payment",
+                "payment": payment.projection(),
+                "order": order_json_with_reviews(&order, &reviews),
+                "receipt": Value::Null,
+            }),
+        }));
+    }
+
     let updated_payment: PaymentRow = sqlx::query_as(&format!(
         "UPDATE payments SET revision = revision + 1, state = $2, confirmations = $3, \
          manual_review_entered_at = CASE WHEN $2 = 'manual_review' THEN $4 ELSE NULL END, \

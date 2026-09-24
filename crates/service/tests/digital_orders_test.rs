@@ -393,16 +393,13 @@ async fn checkout_refused_when_deliverable_missing(pool: PgPool) {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["reason"], json!("digital_delivery_not_ready"));
     // Manual kinds are not sold until the email and mark-delivered paths
-    // exist.
+    // exist; the reason names the item, not the deployment (Kimi P4-1).
     let (status, body) =
         set_delivery(&app, &seller, "guide_01", 0, json!({ "kind": "email" })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = checkout(&app, &buyer, lines.clone(), false).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        body["error"]["reason"],
-        json!("digital_delivery_unavailable")
-    );
+    assert_eq!(body["error"]["reason"], json!("digital_delivery_not_ready"));
     set_text(&app, &seller, "guide_01", 1, TEXT_V1).await;
     let (status, body) = checkout(&app, &buyer, lines, false).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -603,10 +600,29 @@ async fn bitcoin_digital_order(
     seller: &TestActor,
     buyer: &TestActor,
 ) -> (String, String) {
+    bitcoin_order_with(
+        app,
+        paykit,
+        seller,
+        buyer,
+        json!({ "kind": "text", "text": TEXT_V1 }),
+    )
+    .await
+}
+
+/// A SAT digital listing with `delivery`, checked out and bound to Bitcoin.
+async fn bitcoin_order_with(
+    app: &TestApp,
+    paykit: &FakePaykit,
+    seller: &TestActor,
+    buyer: &TestActor,
+    delivery: Value,
+) -> (String, String) {
     paykit.set_allocation_mode("exclusive");
     common::paykit_review::enable_bitcoin(app, paykit, seller).await;
     register(app, seller, "guide_01", json!(["digital"]), sat(50_000), 5).await;
-    set_text(app, seller, "guide_01", 0, TEXT_V1).await;
+    let (status, body) = set_delivery(app, seller, "guide_01", 0, delivery).await;
+    assert_eq!(status, StatusCode::OK, "set failed: {body}");
     let order = digital_checkout(app, seller, buyer, "guide_01").await;
     let (status, body) = send(
         app.router.clone(),
@@ -866,7 +882,7 @@ async fn confirm_with_nothing_to_pin_refund_required(pool: PgPool) {
         ("manual_review", Some("refund_required"))
     );
 
-    // Sandbox has no money to route: the confirm is refused before any write.
+    // Sandbox: the same refund-required shape (Sol P1).
     let sb_seller = new_actor(&app).await;
     let sb_buyer = new_actor(&app).await;
     register(
@@ -887,9 +903,31 @@ async fn confirm_with_nothing_to_pin_refund_required(pool: PgPool) {
         &payment_command(&sb_order.payment_id, 1, "confirmed", 1, next()),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["reason"], json!("digital_delivery_not_ready"));
-    assert!(!order_facts(&app, &sb_order.order_id).await.1, "no receipt");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["receipt"], Value::Null);
+    let (state, receipt, payment, reason) = order_facts(&app, &sb_order.order_id).await;
+    assert_eq!((state.as_str(), receipt), ("cancelled", false));
+    assert_eq!(
+        (payment.as_str(), reason.as_deref()),
+        ("manual_review", Some("refund_required"))
+    );
+    assert_eq!(
+        stock(&app, &sb_seller.pubky, "guide_01").await,
+        (5, 0, 0),
+        "hold released"
+    );
+    for recipient in [&sb_buyer.pubky, &sb_seller.pubky] {
+        let notified: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.payment_refund_required' \
+             AND payload->>'aggregate_id' = 'order:' || $1 AND payload->>'recipient_pubky' = $2",
+        )
+        .bind(&sb_order.order_id)
+        .bind(recipient)
+        .fetch_one(&app.pool)
+        .await
+        .expect("notification");
+        assert_eq!(notified, 1, "{recipient} notified");
+    }
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -993,17 +1031,16 @@ fn ciphertext(plaintext_len: usize) -> Vec<u8> {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn buyer_reads_pinned_deliverable_after_receipt(pool: PgPool) {
-    let (app, server) = keyed_app(pool).await;
+    let (app, paykit, _ipn, server) = test_app_with_payments_and_digital(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    register(&app, &seller, "guide_01", json!(["digital"]), usd(900), 5).await;
     let bytes = ciphertext(4_096);
     server.put(&seller.pubky, DELIVERABLE_ID, 1, bytes.clone());
-    let (status, body) = set_delivery(
+    let (order_id, _) = bitcoin_order_with(
         &app,
+        &paykit,
         &seller,
-        "guide_01",
-        0,
+        &buyer,
         json!({
             "kind": "file",
             "deliverable_id": DELIVERABLE_ID,
@@ -1018,26 +1055,15 @@ async fn buyer_reads_pinned_deliverable_after_receipt(pool: PgPool) {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let order = digital_checkout(&app, &seller, &buyer, "guide_01").await;
-    sandbox_confirm(&app, &buyer, &order).await;
-    // Pins record the confirming adapter; this read is the real-rail shape,
-    // so mark the pin as a Paykit confirmation (the sandbox refusal is D11).
-    sqlx::query(
-        "UPDATE order_digital_pins SET confirming_adapter = 'paykit' WHERE order_id = $1::uuid",
-    )
-    .bind(&order.order_id)
-    .execute(&app.pool)
-    .await
-    .expect("adapter");
+    paykit_confirm(&app, &paykit, &order_id).await;
 
-    let (status, cache, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    let (status, cache, body) = read_delivery(&app, &buyer.token, &order_id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(cache, "no-store");
     assert_eq!(
         body,
         json!({
-            "order_id": order.order_id,
+            "order_id": order_id,
             "lines": [{
                 "line_index": 0,
                 "listing_aggregate_id": aggregate(&seller.pubky, "guide_01"),
@@ -1055,49 +1081,52 @@ async fn buyer_reads_pinned_deliverable_after_receipt(pool: PgPool) {
             }],
         })
     );
-    assert_eq!(access_rows(&app, &order.order_id).await, 1);
-    read_delivery(&app, &buyer.token, &order.order_id).await;
-    assert_eq!(
-        access_rows(&app, &order.order_id).await,
-        2,
-        "every open is logged"
-    );
+    assert_eq!(access_rows(&app, &order_id).await, 1);
 
     // Link and text lines return just their payload.
-    let text_seller = new_actor(&app).await;
-    let text_buyer = new_actor(&app).await;
-    let text_order = delivered_text_order(&app, &text_seller, &text_buyer).await;
-    sqlx::query(
-        "UPDATE order_digital_pins SET confirming_adapter = 'paykit' WHERE order_id = $1::uuid",
-    )
-    .bind(&text_order.order_id)
-    .execute(&app.pool)
-    .await
-    .expect("adapter");
+    let (_text_seller, text_buyer, text_order) = paykit_delivered_order(&app, &paykit).await;
     let (status, _, body) = read_delivery(&app, &text_buyer.token, &text_order.order_id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["lines"][0]["text"], json!(TEXT_V1));
     assert!(body["lines"][0].get("key").is_none());
 }
 
-async fn paykit_delivered_order(app: &TestApp) -> (TestActor, TestActor, DigitalOrder) {
+/// Confirms a bound Bitcoin order through the Paykit worker poll.
+async fn paykit_confirm(app: &TestApp, paykit: &FakePaykit, order_id: &str) {
+    let reference = order_reference(Uuid::parse_str(order_id).expect("order uuid"));
+    paykit.set_status(&reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(app, app.clock.now()).await >= 1);
+}
+
+/// A text order delivered by a real Paykit confirmation.
+async fn paykit_delivered_order(
+    app: &TestApp,
+    paykit: &FakePaykit,
+) -> (TestActor, TestActor, DigitalOrder) {
     let seller = new_actor(app).await;
     let buyer = new_actor(app).await;
-    let order = delivered_text_order(app, &seller, &buyer).await;
-    sqlx::query(
-        "UPDATE order_digital_pins SET confirming_adapter = 'paykit' WHERE order_id = $1::uuid",
+    let (order_id, payment_id) = bitcoin_digital_order(app, paykit, &seller, &buyer).await;
+    paykit_confirm(app, paykit, &order_id).await;
+    assert_eq!(order_facts(app, &order_id).await.0, "delivered");
+    (
+        seller,
+        buyer,
+        DigitalOrder {
+            order_id,
+            payment_id,
+        },
     )
-    .bind(&order.order_id)
-    .execute(&app.pool)
-    .await
-    .expect("adapter");
-    (seller, buyer, order)
+}
+
+async fn paykit_app(pool: PgPool) -> (TestApp, FakePaykit) {
+    let (app, paykit, _ipn, _server) = test_app_with_payments_and_digital(pool).await;
+    (app, paykit)
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn seller_cannot_read_buyer_delivery(pool: PgPool) {
-    let (app, _server) = keyed_app(pool).await;
-    let (seller, _buyer, order) = paykit_delivered_order(&app).await;
+    let (app, paykit) = paykit_app(pool).await;
+    let (seller, _buyer, order) = paykit_delivered_order(&app, &paykit).await;
     let (status, _, body) = read_delivery(&app, &seller.token, &order.order_id).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(access_rows(&app, &order.order_id).await, 0);
@@ -1105,8 +1134,8 @@ async fn seller_cannot_read_buyer_delivery(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn outsider_cannot_read_digital_delivery(pool: PgPool) {
-    let (app, _server) = keyed_app(pool).await;
-    let (_seller, _buyer, order) = paykit_delivered_order(&app).await;
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, _buyer, order) = paykit_delivered_order(&app, &paykit).await;
     let outsider = new_actor(&app).await;
     let (status, _, body) = read_delivery(&app, &outsider.token, &order.order_id).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
@@ -1129,8 +1158,8 @@ async fn unpaid_order_has_no_delivery(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn ended_order_delivery_refused(pool: PgPool) {
-    let (app, _server) = keyed_app(pool).await;
-    let (seller, buyer, order) = paykit_delivered_order(&app).await;
+    let (app, paykit) = paykit_app(pool).await;
+    let (seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
     let (status, body) = order_action(
         &app,
         &seller.token,
@@ -1158,8 +1187,8 @@ async fn ended_order_delivery_refused(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn completed_digital_order_still_downloads(pool: PgPool) {
-    let (app, _server) = keyed_app(pool).await;
-    let (_seller, buyer, order) = paykit_delivered_order(&app).await;
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
     let later = app.clock.now() + chrono::Duration::days(app.state.config.auto_complete_days + 1);
     let completed = complete_due_delivered_orders(
         &app.pool,
@@ -1224,8 +1253,8 @@ async fn ship_refused_for_digital(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn confirm_delivery_refused_for_digital(pool: PgPool) {
-    let (app, _server) = keyed_app(pool).await;
-    let (_seller, buyer, order) = paykit_delivered_order(&app).await;
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
     sqlx::query("UPDATE orders SET state = 'shipped' WHERE id = $1::uuid")
         .bind(&order.order_id)
         .execute(&app.pool)
@@ -1248,8 +1277,8 @@ async fn confirm_delivery_refused_for_digital(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn delivery_assume_skips_digital(pool: PgPool) {
-    let (app, _server) = keyed_app(pool).await;
-    let (_seller, _buyer, order) = paykit_delivered_order(&app).await;
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, _buyer, order) = paykit_delivered_order(&app, &paykit).await;
     sqlx::query(
         "UPDATE orders SET state = 'shipped', \
          shipment = jsonb_build_object('state', 'shipped', 'shipped_at', '2026-01-01T00:00:00.000Z') \
@@ -1269,8 +1298,8 @@ async fn delivery_assume_skips_digital(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn return_request_refused_for_digital(pool: PgPool) {
-    let (app, _server) = keyed_app(pool).await;
-    let (_seller, buyer, order) = paykit_delivered_order(&app).await;
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
     for state in ["delivered", "completed"] {
         sqlx::query("UPDATE orders SET state = $2 WHERE id = $1::uuid")
             .bind(&order.order_id)
@@ -1296,8 +1325,8 @@ async fn return_request_refused_for_digital(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn delivered_digital_cancel_refused(pool: PgPool) {
-    let (app, _server) = keyed_app(pool).await;
-    let (_seller, buyer, order) = paykit_delivered_order(&app).await;
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
     let (status, body) = order_action(
         &app,
         &buyer.token,
@@ -1313,9 +1342,9 @@ async fn delivered_digital_cancel_refused(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn digital_refund_from_delivered_or_completed(pool: PgPool) {
-    let (app, _server) = keyed_app(pool).await;
+    let (app, paykit) = paykit_app(pool).await;
     for state in ["delivered", "completed"] {
-        let (seller, buyer, order) = paykit_delivered_order(&app).await;
+        let (seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
         sqlx::query("UPDATE orders SET state = $2 WHERE id = $1::uuid")
             .bind(&order.order_id)
             .bind(state)
@@ -1389,4 +1418,177 @@ async fn digital_refund_from_delivered_or_completed(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
+}
+
+// Sol P1 / Kimi P2-1: a refund that is committing while the buyer's read is
+// in flight is seen by the read, which then releases nothing.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn refund_racing_download_never_releases_key(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool.clone()).await;
+    let (_seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
+    let mut refund = pool.begin().await.expect("refund transaction");
+    sqlx::query("SELECT id FROM orders WHERE id = $1::uuid FOR UPDATE")
+        .bind(&order.order_id)
+        .execute(&mut *refund)
+        .await
+        .expect("lock order");
+    sqlx::query("UPDATE orders SET state = 'refunded_external' WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&mut *refund)
+        .await
+        .expect("refund");
+    let read = {
+        let app_router = app.router.clone();
+        let token = buyer.token.clone();
+        let order_id = order.order_id.clone();
+        tokio::spawn(async move {
+            let response = app_router
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/v1/orders/{order_id}/digital-delivery"))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("request executes");
+            let status = response.status();
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("body")
+                .to_bytes();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    refund.commit().await.expect("refund commits");
+    let (status, body) = read.await.expect("read task");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("delivery_ended"), "{body}");
+    assert!(!body.contains(TEXT_V1), "the text was released: {body}");
+    assert_eq!(access_rows(&app, &order.order_id).await, 0);
+}
+
+// Kimi P2-2: reads are rate limited per order and per buyer.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn download_rate_limited_per_order_and_buyer(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
+    for read in 0..10 {
+        let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+        assert_eq!(status, StatusCode::OK, "read {read}: {body}");
+    }
+    let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["reason"], json!("rate_limited"));
+    assert!(!body.to_string().contains(TEXT_V1));
+    // The bucket refills over time.
+    app.clock
+        .set(app.clock.now() + chrono::Duration::seconds(60));
+    let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Per buyer: three more orders drain the buyer bucket across orders.
+    let mut orders = Vec::new();
+    for _ in 0..3 {
+        let seller = new_actor(&app).await;
+        let (order_id, _) = bitcoin_digital_order(&app, &paykit, &seller, &buyer).await;
+        paykit_confirm(&app, &paykit, &order_id).await;
+        orders.push(order_id);
+    }
+    app.clock
+        .set(app.clock.now() + chrono::Duration::seconds(120));
+    // 30 reads per minute per buyer: ten on each of three orders (inside
+    // each order's own limit) drain the buyer bucket.
+    for order_id in &orders {
+        for _ in 0..10 {
+            let (status, _, body) = read_delivery(&app, &buyer.token, order_id).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    }
+    let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the buyer bucket is empty: {body}"
+    );
+}
+
+// Kimi P2-2: repeat opens coalesce into at most one access row per line per
+// hour, so the append-only log cannot be grown without bound.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn repeat_opens_coalesce_into_one_access_row_per_hour(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
+    for _ in 0..5 {
+        let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(
+        access_rows(&app, &order.order_id).await,
+        1,
+        "the first open is recorded once"
+    );
+    app.clock
+        .set(app.clock.now() + chrono::Duration::seconds(3_601));
+    let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(access_rows(&app, &order.order_id).await, 2);
+}
+
+// Kimi P3-1, decided fail closed: the access row is the delivery evidence
+// (§4.2, E8), so a read whose access row cannot be written releases nothing.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn access_log_failure_fails_closed(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool.clone()).await;
+    let (_seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
+    sqlx::raw_sql(
+        "CREATE FUNCTION test_refuse_access() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'access log unavailable'; END $$; \
+         CREATE TRIGGER test_refuse_access BEFORE INSERT ON order_digital_access \
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_access();",
+    )
+    .execute(&pool)
+    .await
+    .expect("install failing trigger");
+    let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        !body.to_string().contains(TEXT_V1),
+        "released without evidence: {body}"
+    );
+}
+
+// Sol P1: late money that arrives while the hold is still held (window
+// elapsed, expiry sweep not yet run) for a digital order with nothing to
+// pin takes the refund-required shape, not generic late-settlement review.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn still_held_late_money_with_nothing_to_pin_refund_required(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _) = bitcoin_digital_order(&app, &paykit, &seller, &buyer).await;
+    assert_eq!(
+        stock(&app, &seller.pubky, "guide_01").await,
+        (4, 1, 0),
+        "held at bind"
+    );
+    drop_current_version(&app, &seller.pubky).await;
+    let reference = order_reference(Uuid::parse_str(&order_id).expect("uuid"));
+    let mut late = status_confirmed("exclusive", true, 2);
+    late["late_settlement"] = json!(true);
+    paykit.set_status(&reference, late);
+    assert!(poll_now(&app, app.clock.now() + chrono::Duration::seconds(7_300)).await >= 1);
+    let (state, receipt, payment, reason) = order_facts(&app, &order_id).await;
+    assert_eq!((state.as_str(), receipt), ("cancelled", false));
+    assert_eq!(
+        (payment.as_str(), reason.as_deref()),
+        ("manual_review", Some("refund_required"))
+    );
+    assert_eq!(
+        stock(&app, &seller.pubky, "guide_01").await,
+        (5, 0, 0),
+        "hold released"
+    );
 }

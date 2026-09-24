@@ -1376,23 +1376,10 @@ pub(crate) async fn apply_late_money(
     event_actor: &str,
     now: DateTime<Utc>,
 ) -> Result<LateMoneyOutcome, ResolutionFailure> {
-    let still_held = order.state == "pending_payment" && order.stock_held;
-    if still_held {
-        stamp_review_reason(
-            tx,
-            payment,
-            "late_settlement",
-            "manual_review",
-            command_id,
-            event_actor,
-            now,
-        )
-        .await?;
-        return Ok(LateMoneyOutcome::HeldLateSettlement);
-    }
-
     // A digital order the seller can no longer deliver takes the stock-gone
-    // shape before any stock is reacquired (digital delivery design §6 D3).
+    // shape (digital delivery design §6 D3) before any other late-money
+    // branch: a still-held order releases its hold, a lapsed one never
+    // reacquires stock.
     let undeliverable = crate::handlers::digital_orders::unpinnable(tx, order)
         .await
         .map_err(|e| ResolutionFailure::Internal("digital pin check".into(), e.to_string()))?;
@@ -1409,6 +1396,21 @@ pub(crate) async fn apply_late_money(
         .await?;
         return Ok(LateMoneyOutcome::RefundRequired);
     }
+    let still_held = order.state == "pending_payment" && order.stock_held;
+    if still_held {
+        stamp_review_reason(
+            tx,
+            payment,
+            "late_settlement",
+            "manual_review",
+            command_id,
+            event_actor,
+            now,
+        )
+        .await?;
+        return Ok(LateMoneyOutcome::HeldLateSettlement);
+    }
+
     match reacquire_hold(tx, order, now).await {
         Ok(()) => complete_late_order(tx, keys, payment, order, command_id, event_actor, now)
             .await
@@ -1443,7 +1445,7 @@ pub(crate) async fn refund_required(
     command_id: Uuid,
     event_actor: &str,
     now: DateTime<Utc>,
-) -> Result<(), ResolutionFailure> {
+) -> Result<Uuid, ResolutionFailure> {
     let event_id = stamp_review_reason(
         tx,
         payment,
@@ -1515,7 +1517,7 @@ pub(crate) async fn refund_required(
         .await
         .map_err(|e| ResolutionFailure::Internal("refund notification".into(), e.to_string()))?;
     }
-    Ok(())
+    Ok(event_id)
 }
 
 async fn complete_late_order(

@@ -209,20 +209,95 @@ struct PinRow {
     confirming_adapter: String,
 }
 
+/// Download reads a buyer may make per minute across all their orders, and
+/// per order. Re-downloads are unlimited over time; a looping client is
+/// refused with `429` and `Retry-After`.
+pub const BUYER_READS_PER_MINUTE: f64 = 30.0;
+pub const ORDER_READS_PER_MINUTE: f64 = 10.0;
+/// Repeat opens of one line within this window add no access row: the log
+/// records the first open and at most one open per line per hour.
+pub const ACCESS_COALESCE_SECONDS: i64 = 3_600;
+
+/// A token bucket in `digital_read_rate_limits`, consumed in the caller's
+/// transaction. Returns the seconds to wait when the bucket is empty.
+async fn consume_read_token(
+    tx: &mut Transaction<'_, Postgres>,
+    bucket: &str,
+    per_minute: f64,
+    now: DateTime<Utc>,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row: Option<(f64, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT tokens, updated_at FROM digital_read_rate_limits WHERE bucket = $1 FOR UPDATE",
+    )
+    .bind(bucket)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (stored, updated_at) = row.unwrap_or((per_minute, now));
+    let elapsed = (now - updated_at).num_milliseconds().max(0) as f64 / 1_000.0;
+    let available = (stored + elapsed * per_minute / 60.0).min(per_minute);
+    let (tokens, retry_after) = if available >= 1.0 {
+        (available - 1.0, None)
+    } else {
+        let seconds = ((1.0 - available) * 60.0 / per_minute).ceil().max(1.0) as i64;
+        (available, Some(seconds))
+    };
+    sqlx::query(
+        "INSERT INTO digital_read_rate_limits (bucket, tokens, updated_at) VALUES ($1, $2, $3) \
+         ON CONFLICT (bucket) DO UPDATE SET tokens = EXCLUDED.tokens, \
+         updated_at = EXCLUDED.updated_at",
+    )
+    .bind(bucket)
+    .bind(tokens)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(retry_after)
+}
+
+fn rate_limited(retry_after: i64) -> Response {
+    let mut response = read_error(
+        ErrorCode::InvalidState,
+        "Too many downloads; try again shortly.",
+        Some("rate_limited"),
+    );
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_str(&retry_after.to_string())
+            .expect("retry-after is a safe integer"),
+    );
+    response
+}
+
 /// `GET /v1/orders/{id}/digital-delivery`: the paying buyer's download
-/// (§4.2). Each successful read appends one access row per line served.
+/// (§4.2).
+///
+/// The entitlement is checked and the payload released in ONE transaction
+/// that holds the order row `FOR SHARE`: a refund or cancel that commits
+/// first is seen here, and one that arrives later waits for this read to
+/// commit, so a key is never released for an ended order.
+///
+/// The access row is written in that same transaction before the payload is
+/// returned, and a failed write fails the read (fail closed). The access
+/// log is the delivery evidence the design calls for (§4.2, §3.6 E8: an
+/// opened instant line stays sold on cancel), so no key leaves without it.
 pub async fn get_order_digital_delivery(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return internal_error("digital delivery read"),
+    };
     let order: Result<Option<OrderRow>, sqlx::Error> = sqlx::query_as(&format!(
-        "SELECT {} FROM orders WHERE id = $1 AND (buyer_pubky = $2 OR seller_pubky = $2)",
+        "SELECT {} FROM orders WHERE id = $1 AND (buyer_pubky = $2 OR seller_pubky = $2) \
+         FOR SHARE",
         crate::queries::ORDER_COLUMNS
     ))
     .bind(id)
     .bind(&actor.0)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await;
     let order = match order {
         Ok(Some(order)) if order.fulfillment == "digital" => order,
@@ -250,10 +325,6 @@ pub async fn get_order_digital_delivery(
             Some("delivery_ended"),
         );
     }
-    let mut tx = match state.pool.begin().await {
-        Ok(tx) => tx,
-        Err(_) => return internal_error("digital delivery read"),
-    };
     let pins: Vec<PinRow> = match sqlx::query_as(
         "SELECT line_index, listing_aggregate_id, deliverable_id, version, kind, \
          payload_ciphertext, confirming_adapter FROM order_digital_pins \
@@ -281,6 +352,25 @@ pub async fn get_order_digital_delivery(
         );
     };
     let now = state.clock.now();
+    for (bucket, per_minute) in [
+        (
+            format!("buyer:{}", order.buyer_pubky),
+            BUYER_READS_PER_MINUTE,
+        ),
+        (format!("order:{}", order.id), ORDER_READS_PER_MINUTE),
+    ] {
+        match consume_read_token(&mut tx, &bucket, per_minute, now).await {
+            Ok(None) => {}
+            Ok(Some(retry_after)) => {
+                // The spent tokens persist; the refusal itself releases nothing.
+                if tx.commit().await.is_err() {
+                    return internal_error("digital delivery rate limit commit");
+                }
+                return rate_limited(retry_after);
+            }
+            Err(_) => return internal_error("digital delivery rate limit"),
+        }
+    }
     let mut lines = Vec::with_capacity(pins.len());
     for pin in pins {
         let aad = pin_aad(
@@ -324,11 +414,14 @@ pub async fn get_order_digital_delivery(
         lines.push(line);
         if sqlx::query(
             "INSERT INTO order_digital_access (order_id, line_index, accessed_at) \
-             VALUES ($1, $2, $3)",
+             SELECT $1, $2, $3 WHERE NOT EXISTS ( \
+                 SELECT 1 FROM order_digital_access \
+                 WHERE order_id = $1 AND line_index = $2 AND accessed_at > $4)",
         )
         .bind(order.id)
         .bind(pin.line_index)
         .bind(now)
+        .bind(now - chrono::Duration::seconds(ACCESS_COALESCE_SECONDS))
         .execute(&mut *tx)
         .await
         .is_err()
