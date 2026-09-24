@@ -670,6 +670,7 @@ async fn void_prepare_effects(
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
+    lock_order_payment(&mut tx, order_id).await?;
     let Some(order) = fetch_order_for_update(&mut tx, order_id).await? else {
         anyhow::bail!("paykit.activate row {row_id} references a missing order {order_id}");
     };
@@ -881,6 +882,7 @@ async fn deliver_paykit_activation(
                 return Ok(true);
             }
             let mut tx = pool.begin().await?;
+            lock_order_payment(&mut tx, payload.order_id).await?;
             // Conditional on `preparing` under the row lock: a redelivered
             // row cannot apply the flip twice.
             let flipped = sqlx::query(
@@ -984,6 +986,22 @@ async fn deliver_paykit_activation(
     }
 }
 
+/// Locks the order's payment row. Every transaction that writes both an
+/// order and its payment takes the payment first — cancel, settlement, and
+/// the Paykit activation and void arms — so two of them racing on one order
+/// wait on each other instead of deadlocking. Re-locking inside the same
+/// transaction is a no-op.
+async fn lock_order_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
+        .bind(order_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Paykit reports the invoice published after the marketplace voided the
 /// order's request (an activation that committed before the void landed).
 /// A voided order that already left `pending_payment` goes back to
@@ -997,11 +1015,7 @@ async fn track_invoice_live_after_void(
     invoice_id: Uuid,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    // Payment before order, the settlement paths' lock order.
-    sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
-        .bind(order_id)
-        .fetch_optional(&mut **tx)
-        .await?;
+    lock_order_payment(tx, order_id).await?;
     let retracked = sqlx::query(
         "UPDATE orders SET paykit_activation_state = 'active', \
          paykit_request_state = 'pending', updated_at = $3 \
@@ -2327,22 +2341,24 @@ pub async fn expire_due_payment_windows(
     // seller-window reaper (which routes the payment to `manual_review`
     // with the hold PRESERVED) owns it — the buyer demonstrably paid on
     // chain, so the ordinary sweep must never release that stock.
-    let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+    // Discovery locks only the payment rows; each order is locked after
+    // its payment (see `lock_sweep_order`).
+    let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(&format!(
         "SELECT o.id, p.id, p.state, o.buyer_pubky \
          FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE o.state = 'pending_payment' AND o.stock_held \
-         AND (o.hold_expires_at IS NULL OR o.hold_expires_at <= $1) \
+         WHERE {HELD_DUE_ORDER} \
          AND p.state IN ('awaiting_entitlement', 'detected', 'expired') \
-         AND o.paykit_activation_state IS DISTINCT FROM 'preparing' \
-         AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation' \
-         ORDER BY o.hold_expires_at NULLS FIRST FOR UPDATE OF o, p SKIP LOCKED",
-    )
+         ORDER BY o.hold_expires_at NULLS FIRST FOR UPDATE OF p SKIP LOCKED"
+    ))
     .bind(now)
     .fetch_all(&mut *tx)
     .await?;
 
     let mut expired = 0u64;
     for (order_id, payment_id, payment_state, buyer_pubky) in due {
+        if !lock_sweep_order(&mut tx, HELD_DUE_ORDER, order_id, now).await? {
+            continue;
+        }
         expire_held_order(
             &mut tx,
             order_id,
@@ -2529,6 +2545,41 @@ async fn expire_held_order(
     Ok(())
 }
 
+/// The order half of the held-window expiry predicate; `$1` is `now`.
+const HELD_DUE_ORDER: &str = "o.state = 'pending_payment' AND o.stock_held \
+     AND (o.hold_expires_at IS NULL OR o.hold_expires_at <= $1) \
+     AND o.paykit_activation_state IS DISTINCT FROM 'preparing' \
+     AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation'";
+
+/// The order half of the idle unbound-checkout predicate; `$1` is the
+/// creation cutoff.
+const IDLE_UNBOUND_ORDER: &str = "o.state = 'pending_payment' AND NOT o.stock_held \
+     AND o.payment_method IS NULL AND o.auction_aggregate_id IS NULL \
+     AND o.drop_aggregate_id IS NULL AND o.created_at <= $1";
+
+/// Locks one sweep candidate's order after the discovery statement locked
+/// its payment, re-checking the order half of the predicate that statement
+/// read without locking the order. `false` skips the candidate this tick:
+/// the order no longer matches, or another transaction holds it. A joined
+/// `FOR UPDATE OF o, p` would lock the order row first and keep it even
+/// when the payment is skipped, inverting the payment-then-order order.
+async fn lock_sweep_order(
+    tx: &mut Transaction<'_, Postgres>,
+    predicate: &str,
+    order_id: Uuid,
+    bound: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let locked: Option<(Uuid,)> = sqlx::query_as(&format!(
+        "SELECT o.id FROM orders o WHERE {predicate} AND o.id = $2 \
+         FOR UPDATE OF o SKIP LOCKED"
+    ))
+    .bind(bound)
+    .bind(order_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(locked.is_some())
+}
+
 /// Cancels leftover unbound checkouts (`pending_payment`, no hold, no
 /// payment method, not auction/drop) after `CHECKOUT_HOLD_WINDOW_SECONDS`.
 /// No inventory moves: ordinary create never reserved a unit. Bound
@@ -2539,23 +2590,23 @@ async fn expire_idle_unbound_checkouts(
 ) -> anyhow::Result<u64> {
     let cutoff = now - chrono::Duration::seconds(state.config.checkout_hold_window_seconds);
     let mut tx = state.pool.begin().await?;
-    let due: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+    // Payment first, then each order (see `lock_sweep_order`).
+    let due: Vec<(Uuid, Uuid, String)> = sqlx::query_as(&format!(
         "SELECT o.id, p.id, o.buyer_pubky \
          FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE o.state = 'pending_payment' AND NOT o.stock_held \
-         AND o.payment_method IS NULL \
-         AND o.auction_aggregate_id IS NULL \
-         AND o.drop_aggregate_id IS NULL \
-         AND o.created_at <= $1 \
+         WHERE {IDLE_UNBOUND_ORDER} \
          AND p.state = 'awaiting_entitlement' \
-         ORDER BY o.created_at FOR UPDATE OF o, p SKIP LOCKED",
-    )
+         ORDER BY o.created_at FOR UPDATE OF p SKIP LOCKED"
+    ))
     .bind(cutoff)
     .fetch_all(&mut *tx)
     .await?;
 
     let mut cancelled = 0u64;
     for (order_id, payment_id, buyer_pubky) in due {
+        if !lock_sweep_order(&mut tx, IDLE_UNBOUND_ORDER, order_id, cutoff).await? {
+            continue;
+        }
         let command_id = Uuid::new_v4();
         let (payment_revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'expired', revision = revision + 1, \
@@ -2804,6 +2855,7 @@ async fn void_and_expire_preparing_order(
     enqueue_void_retry: bool,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
+    lock_order_payment(&mut tx, order_id).await?;
     let buyer_pubky: (String,) = sqlx::query_as("SELECT buyer_pubky FROM orders WHERE id = $1")
         .bind(order_id)
         .fetch_one(&mut *tx)

@@ -1,22 +1,24 @@
 {
   "captured_from": {
-    "shop_tag": "shop-v0.6.19",
-    "shop_sha": "c4dfc495a4159f225c83be55739ecaf5ddc69af3",
-    "captured_on": "2026-09-22",
+    "shop_tag": "shop-v0.6.22",
+    "shop_sha": "55a084c804450ee3092bd519fac2306ce38d160e",
+    "captured_on": "2026-09-23",
     "files": [
-      "src/core/application/commerce/commerce.ts (commitCreateMarketplaceCheckout)",
-      "src/hooks/useMarketplaceCheckout/useMarketplaceCheckout.ts",
+      "src/core/application/commerce/commerce.ts (commitCreateMarketplaceCheckout, lines 732-733)",
+      "src/hooks/useMarketplaceCheckout/useMarketplaceCheckout.ts (lines 355-365)",
       "src/core/services/marketplace/marketplace-transaction.ts (JSON.stringify(toSnakeCaseWire(command)))",
       "src/libs/commerce/wire-casing.ts (camelToSnakeKey)",
-      "src/libs/commerce/transaction-commands.ts (createMarketplaceCheckoutCommandSchema)",
+      "src/libs/commerce/transaction-commands.ts (checkoutLineSchema, createMarketplaceCheckoutCommandSchema)",
       "src/libs/commerce/postal-address.ts (commerceDeliveryAddressValueSchema)"
     ],
+    "live_capture": "shop.pubky.app POST /v1/commands checkout.create for order c7e700de on 2026-09-23 (Shop v0.6.21, same line builder): line keys expected_revision, fulfillment, listing_aggregate_id, quantity, variant_id=variant_1",
     "notes": [
-      "Deployed Shop v0.6.19 checkout.create wire. Keys are unchanged from the v0.6.17 capture.",
+      "Deployed Shop v0.6.22 checkout.create wire (Vercel dpl_2dPZFvkr5GRnKrtQfZCzdEfoT7k7).",
       "Wire keys are snake_case. Shop builds camelCase then toSnakeCaseWire at POST /v1/commands.",
-      "Shipping line always includes fulfillment=shipping and a delivery_address object with name, line1, line2, city, region, postal_code, country_code.",
+      "Every line whose cart item resolves a listing variant carries variant_id; variant_options is added only when that variant has options.",
+      "Shipping line includes fulfillment=shipping and a delivery_address object with name, line1, line2, city, region, postal_code, country_code.",
       "Pickup-only checkout omits delivery_address entirely and sets fulfillment=pickup. Presenting an address on pickup is rejected.",
-      "This smoke still posts free-text California because that is the class Shop v0.6.16 sent and that PR #23 422'd. Region values cover free text, ISO suffix, and PT empty.",
+      "Region values cover free text, ISO suffix, and PT empty.",
       "Option B: checkout.create does not hold; POST /v0/orders/{id}/payment-method acquires hold_source=bind."
     ]
   },
@@ -35,6 +37,7 @@
       "listing_aggregate_id",
       "expected_revision",
       "quantity",
+      "variant_id",
       "fulfillment"
     ],
     "delivery_address": [
