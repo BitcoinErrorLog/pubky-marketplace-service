@@ -321,7 +321,7 @@ pub(crate) async fn void_preparing_request(
     order_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let voided = sqlx::query(
         "UPDATE orders SET paykit_activation_state = 'voided', paykit_request_state = NULL, \
          updated_at = $2 WHERE id = $1 AND paykit_activation_state = 'preparing'",
     )
@@ -329,6 +329,9 @@ pub(crate) async fn void_preparing_request(
     .bind(now)
     .execute(&mut **tx)
     .await?;
+    if voided.rows_affected() == 1 {
+        crate::paykit_attempts::record_released_attempt(tx, order_id, now).await?;
+    }
     sqlx::query(
         "UPDATE outbox SET delivered_at = $2 WHERE kind = 'paykit.activate' \
          AND payload->>'order_id' = $1 AND delivered_at IS NULL",

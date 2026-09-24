@@ -2886,6 +2886,7 @@ async fn void_and_expire_preparing_order(
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;
+    crate::paykit_attempts::record_released_attempt(&mut tx, order_id, now).await?;
     let event_id = crate::executor::insert_event(
         &mut tx,
         Uuid::new_v4(),

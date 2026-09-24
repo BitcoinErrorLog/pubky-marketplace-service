@@ -1,26 +1,35 @@
 //! Released Paykit attempts (migration 0042).
 //!
-//! An order carries one set of Paykit pins: the attempt it is bound to. When
-//! `void_prepare_effects` releases that attempt the order becomes unbound,
-//! and a re-bind (or a fiat bind) overwrites the pins. paykit-server keeps
-//! answering status for the released invoice by `(creator, reference)`, and
-//! the invoice can still be payable — an activation that committed at
-//! paykit but whose response was lost. Every released attempt is therefore
-//! recorded in `paykit_superseded_attempts` and polled through its
-//! observation tail:
+//! An order carries one set of Paykit pins: the attempt it is bound to. An
+//! attempt is released when the activation worker voids the bind, a buyer
+//! cancels a preparing request, or a preparing order's hold expires; the
+//! order stops polling it, and a re-bind (or a fiat bind) later overwrites
+//! the pins. paykit-server keeps answering status for the released invoice
+//! by `(creator, reference)`, and the invoice can still be payable — an
+//! activation that committed at paykit but whose response was lost. Every
+//! released attempt is therefore recorded in `paykit_superseded_attempts`,
+//! with its pins and its bind-time quote, and polled with backoff:
 //!
 //! - confirmed money routes to the late-money path, with the paid attempt
-//!   restored as the order's attempt of record (so a later resolution names
-//!   the invoice that was paid) and the order's other attempt released in
-//!   its place, still watched;
-//! - money the order can no longer take (its payment already settled or
-//!   under review, or the order now bound to a fiat method) is held as
-//!   `needs_review` and alerted;
-//! - a detection is recorded and keeps the attempt watched past its tail;
+//!   (pins and quote) restored as the order's attempt of record, so a later
+//!   resolution names the invoice that was paid, and the order's other
+//!   attempt released in its place, still watched;
+//! - money the order can no longer take (its payment settled or under
+//!   review, or the order on another rail: a fiat method, or a payment
+//!   managed by Locks or any adapter but paykit or sandbox) goes to
+//!   `needs_review`, alerted, with the order and payment untouched;
+//! - a detection keeps the attempt watched past its tail, up to
+//!   [`DETECTION_WINDOW_DAYS`], after which it goes to `needs_review`;
 //! - no money by the end of the tail closes the attempt `closed_unpaid`.
+//!
+//! Checks start at the paykit poll interval and double per check up to
+//! [`MAX_CHECK_INTERVAL_SECONDS`]. An operator records the outcome of a
+//! `needs_review` attempt with [`resolve_needs_review`] (the
+//! `paykit-attempts-admin` binary; runbook: `docs/paykit-released-attempts.md`).
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::ids;
+use serde::Serialize;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -33,15 +42,20 @@ use crate::payments::{
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
 
-/// How long after its expiry a released attempt stays watched with no
-/// detection: the same observation tail the order poller keeps for an
-/// expired pending request.
+/// How long after its expiry a released attempt with no detection stays
+/// watched: the observation tail the order poller keeps for an expired
+/// pending request.
 const OBSERVATION_TAIL_HOURS: i64 = 24;
+/// How long a detection that never confirms stays watched before it goes to
+/// an operator.
+pub const DETECTION_WINDOW_DAYS: i64 = 7;
+/// The longest gap between two checks of one released attempt.
+pub const MAX_CHECK_INTERVAL_SECONDS: i64 = 3600;
 const BATCH_SIZE: i64 = 50;
 
-/// Records the order's current Paykit attempt as released, from the pins on
-/// the order row. Idempotent per `(order, invoice)`. A row without complete
-/// pins (no prepared invoice) records nothing.
+/// Records the order's current Paykit attempt as released, from the pins
+/// and quote on the order row. Idempotent per `(order, invoice)`. A row
+/// without complete pins (no prepared invoice) records nothing.
 pub(crate) async fn record_released_attempt(
     tx: &mut Transaction<'_, Postgres>,
     order_id: Uuid,
@@ -49,11 +63,17 @@ pub(crate) async fn record_released_attempt(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO paykit_superseded_attempts (order_id, invoice_id, reference, stack_id, \
-         stack_endpoint, total_sats, expires_at, allocation_mode, address_fingerprint, \
+         stack_endpoint, total_sats, expires_at, prepare_expires_at, allocation_mode, \
+         address_fingerprint, bitcoin_quote_rate, bitcoin_quote_source, \
+         bitcoin_quote_fetched_at, bitcoin_quoted_sats, bitcoin_quote_expires_at, \
+         bitcoin_quote_currency, bitcoin_quote_exponent, bitcoin_quote_spread_bps, \
          released_at) \
          SELECT id, paykit_invoice_id, paykit_request_reference, paykit_stack_id, \
-         paykit_stack_endpoint, paykit_total_sats, paykit_expires_at, paykit_allocation_mode, \
-         paykit_address_fingerprint, $2 FROM orders \
+         paykit_stack_endpoint, paykit_total_sats, paykit_expires_at, \
+         paykit_prepare_expires_at, paykit_allocation_mode, paykit_address_fingerprint, \
+         bitcoin_quote_rate, bitcoin_quote_source, bitcoin_quote_fetched_at, \
+         bitcoin_quoted_sats, bitcoin_quote_expires_at, bitcoin_quote_currency, \
+         bitcoin_quote_exponent, bitcoin_quote_spread_bps, $2 FROM orders \
          WHERE id = $1 AND paykit_invoice_id IS NOT NULL AND paykit_stack_id IS NOT NULL \
          AND paykit_stack_endpoint IS NOT NULL AND paykit_total_sats > 0 \
          ON CONFLICT (order_id, invoice_id) DO NOTHING",
@@ -70,12 +90,7 @@ struct WatchedAttempt {
     order_id: Uuid,
     invoice_id: Uuid,
     reference: Option<String>,
-    stack_id: String,
-    stack_endpoint: String,
-    total_sats: i64,
     expires_at: Option<DateTime<Utc>>,
-    allocation_mode: Option<String>,
-    address_fingerprint: Option<String>,
     released_at: DateTime<Utc>,
     detected_at: Option<DateTime<Utc>>,
     seller_pubky: String,
@@ -89,8 +104,10 @@ impl WatchedAttempt {
     }
 }
 
-/// Claims watched attempts due for a status poll by stamping
-/// `last_checked_at`, the only pre-effect write. An attempt the order row
+/// Claims watched attempts due for a status poll. The claim is the only
+/// pre-effect write: it stamps `last_checked_at`, counts the check, and
+/// schedules the next one at the poll interval doubled per earlier check,
+/// capped at [`MAX_CHECK_INTERVAL_SECONDS`]. An attempt the order row
 /// itself tracks again (its invoice is the order's current one with a live
 /// request state) belongs to the order poller and is skipped.
 async fn claim_due_attempts(
@@ -103,23 +120,30 @@ async fn claim_due_attempts(
              SELECT h.order_id, h.invoice_id FROM paykit_superseded_attempts h \
              JOIN orders o ON o.id = h.order_id \
              WHERE h.state = 'watching' \
-             AND (h.last_checked_at IS NULL OR h.last_checked_at <= $2) \
+             AND (h.next_check_at IS NULL OR h.next_check_at <= $1) \
              AND NOT (o.paykit_invoice_id IS NOT DISTINCT FROM h.invoice_id \
                       AND o.paykit_request_state IS NOT NULL) \
-             ORDER BY h.last_checked_at ASC NULLS FIRST LIMIT $3 \
+             ORDER BY h.next_check_at ASC NULLS FIRST LIMIT $2 \
              FOR UPDATE OF h SKIP LOCKED\
          ), claimed AS (\
-             UPDATE paykit_superseded_attempts h SET last_checked_at = $1 FROM due \
+             UPDATE paykit_superseded_attempts h SET last_checked_at = $1, \
+             check_count = h.check_count + 1, \
+             next_check_at = $1 + LEAST(\
+                 make_interval(secs => $3::double precision \
+                     * power(2, LEAST(h.check_count, 20))), \
+                 make_interval(secs => $4::double precision)) \
+             FROM due \
              WHERE h.order_id = due.order_id AND h.invoice_id = due.invoice_id \
-             RETURNING h.*\
-         ) SELECT c.order_id, c.invoice_id, c.reference, c.stack_id, c.stack_endpoint, \
-           c.total_sats, c.expires_at, c.allocation_mode, c.address_fingerprint, \
-           c.released_at, c.detected_at, o.seller_pubky \
+             RETURNING h.order_id, h.invoice_id, h.reference, h.expires_at, h.released_at, \
+             h.detected_at\
+         ) SELECT c.order_id, c.invoice_id, c.reference, c.expires_at, c.released_at, \
+           c.detected_at, o.seller_pubky \
            FROM claimed c JOIN orders o ON o.id = c.order_id",
     )
     .bind(now)
-    .bind(now - chrono::Duration::seconds(poll_seconds))
     .bind(BATCH_SIZE)
+    .bind(poll_seconds.max(1) as f64)
+    .bind(MAX_CHECK_INTERVAL_SECONDS as f64)
     .fetch_all(pool)
     .await
 }
@@ -155,6 +179,9 @@ async fn apply_attempt_status(
     attempt: &WatchedAttempt,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
+    let detection_expired = attempt
+        .detected_at
+        .is_some_and(|detected| now >= detected + chrono::Duration::days(DETECTION_WINDOW_DAYS));
     match source
         .status(&attempt.seller_pubky, &attempt.reference())
         .await
@@ -166,31 +193,44 @@ async fn apply_attempt_status(
             route_released_settlement(state, attempt, amount_matched, &facts.observation, now).await
         }
         PaykitStatusOutcome::Detected { facts } => {
-            sqlx::query(
-                "UPDATE paykit_superseded_attempts SET detected_at = COALESCE(detected_at, $3), \
-                 observation = $4 \
-                 WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching'",
+            let observation = observation_json("detected", true, &facts.observation, now, false);
+            if detection_expired {
+                return escalate_unconfirmed(&state.pool, attempt, Some(&observation), now).await;
+            }
+            let first = sqlx::query(
+                "UPDATE paykit_superseded_attempts SET detected_at = $3, observation = $4 \
+                 WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching' \
+                 AND detected_at IS NULL",
             )
             .bind(attempt.order_id)
             .bind(attempt.invoice_id)
             .bind(now)
-            .bind(observation_json(
-                "detected",
-                true,
-                &facts.observation,
-                now,
-                false,
-            ))
+            .bind(&observation)
             .execute(&state.pool)
             .await?;
-            tracing::warn!(
-                order_id = %attempt.order_id,
-                invoice_id = %attempt.invoice_id,
-                "ALERT money detected on a released paykit attempt; watching for confirmation"
-            );
+            if first.rows_affected() == 1 {
+                tracing::warn!(
+                    order_id = %attempt.order_id,
+                    invoice_id = %attempt.invoice_id,
+                    "ALERT money detected on a released paykit attempt; watching for confirmation"
+                );
+            } else {
+                sqlx::query(
+                    "UPDATE paykit_superseded_attempts SET observation = $3 \
+                     WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching'",
+                )
+                .bind(attempt.order_id)
+                .bind(attempt.invoice_id)
+                .bind(&observation)
+                .execute(&state.pool)
+                .await?;
+            }
             Ok(false)
         }
         PaykitStatusOutcome::Undetected | PaykitStatusOutcome::NotFound => {
+            if detection_expired {
+                return escalate_unconfirmed(&state.pool, attempt, None, now).await;
+            }
             let tail_ends = attempt.expires_at.unwrap_or(attempt.released_at)
                 + chrono::Duration::hours(OBSERVATION_TAIL_HOURS);
             if attempt.detected_at.is_none() && now >= tail_ends {
@@ -210,6 +250,59 @@ async fn apply_attempt_status(
         }
         PaykitStatusOutcome::Unavailable => Ok(false),
     }
+}
+
+/// A detection that never confirmed within [`DETECTION_WINDOW_DAYS`]: the
+/// attempt stops polling and goes to an operator.
+async fn escalate_unconfirmed(
+    pool: &PgPool,
+    attempt: &WatchedAttempt,
+    observation: Option<&serde_json::Value>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let escalated = sqlx::query(
+        "UPDATE paykit_superseded_attempts SET state = 'needs_review', \
+         review_reason = 'detected_unconfirmed', closed_at = $3, \
+         observation = COALESCE($4, observation) \
+         WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching'",
+    )
+    .bind(attempt.order_id)
+    .bind(attempt.invoice_id)
+    .bind(now)
+    .bind(observation)
+    .execute(pool)
+    .await?;
+    if escalated.rows_affected() == 1 {
+        tracing::error!(
+            order_id = %attempt.order_id,
+            invoice_id = %attempt.invoice_id,
+            code = "paykit_released_attempt_detected_unconfirmed",
+            "ALERT money detected on a released paykit attempt never confirmed; held for review"
+        );
+    }
+    Ok(false)
+}
+
+/// The released attempt's pins and bind-time quote, read under the row lock.
+#[derive(Debug, sqlx::FromRow)]
+struct ReleasedPins {
+    state: String,
+    reference: Option<String>,
+    stack_id: String,
+    stack_endpoint: String,
+    total_sats: i64,
+    expires_at: Option<DateTime<Utc>>,
+    prepare_expires_at: Option<DateTime<Utc>>,
+    allocation_mode: Option<String>,
+    address_fingerprint: Option<String>,
+    bitcoin_quote_rate: Option<sqlx::types::BigDecimal>,
+    bitcoin_quote_source: Option<String>,
+    bitcoin_quote_fetched_at: Option<DateTime<Utc>>,
+    bitcoin_quoted_sats: Option<i64>,
+    bitcoin_quote_expires_at: Option<DateTime<Utc>>,
+    bitcoin_quote_currency: Option<String>,
+    bitcoin_quote_exponent: Option<i16>,
+    bitcoin_quote_spread_bps: Option<i32>,
 }
 
 /// Confirmed money on a released attempt, in one transaction under the
@@ -240,18 +333,22 @@ async fn route_released_settlement(
     let Some(order) = fetch_order_for_update(&mut tx, attempt.order_id).await? else {
         anyhow::bail!("released paykit attempt names a missing order");
     };
-    let still_watching: Option<(String,)> = sqlx::query_as(
-        "SELECT state FROM paykit_superseded_attempts \
+    let pins: Option<ReleasedPins> = sqlx::query_as(
+        "SELECT state, reference, stack_id, stack_endpoint, total_sats, expires_at, \
+         prepare_expires_at, allocation_mode, address_fingerprint, bitcoin_quote_rate, \
+         bitcoin_quote_source, bitcoin_quote_fetched_at, bitcoin_quoted_sats, \
+         bitcoin_quote_expires_at, bitcoin_quote_currency, bitcoin_quote_exponent, \
+         bitcoin_quote_spread_bps FROM paykit_superseded_attempts \
          WHERE order_id = $1 AND invoice_id = $2 FOR UPDATE",
     )
     .bind(attempt.order_id)
     .bind(attempt.invoice_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if still_watching.as_ref().map(|(state,)| state.as_str()) != Some("watching") {
+    let Some(pins) = pins.filter(|pins| pins.state == "watching") else {
         tx.rollback().await?;
         return Ok(false);
-    }
+    };
     let current_invoice = order.paykit_invoice_id;
     if current_invoice == Some(attempt.invoice_id) && order.paykit_request_state.is_some() {
         // The order poller tracks this invoice again.
@@ -260,21 +357,33 @@ async fn route_released_settlement(
     }
     let frozen = observation_json("confirmed", amount_matched, observation, now, false);
 
-    let fiat_bound = order
+    // Another rail owns the payment: a fiat method, or an adapter other
+    // than paykit (bitcoin) or sandbox (unbound). Locks pins `adapter`
+    // without a `payment_method`.
+    let other_rail = order
         .payment_method
         .as_deref()
-        .is_some_and(|method| method != "bitcoin");
-    if fiat_bound || !matches!(payment.state.as_str(), "awaiting_entitlement" | "expired") {
-        close_attempt(&mut tx, attempt, "needs_review", &frozen, now).await?;
+        .is_some_and(|method| method != "bitcoin")
+        || !matches!(payment.adapter.as_str(), "paykit" | "sandbox");
+    let settled = !matches!(payment.state.as_str(), "awaiting_entitlement" | "expired");
+    if other_rail || settled {
+        let reason = if settled {
+            "payment_settled"
+        } else {
+            "other_rail"
+        };
+        close_attempt(&mut tx, attempt, "needs_review", Some(reason), &frozen, now).await?;
         tx.commit().await?;
         tracing::error!(
             order_id = %attempt.order_id,
             invoice_id = %attempt.invoice_id,
             payment_state = %payment.state,
             payment_method = ?order.payment_method,
+            payment_adapter = %payment.adapter,
+            review_reason = reason,
             code = "paykit_released_attempt_paid_after_settlement",
             "ALERT money confirmed on a released paykit attempt of an order that is settled, \
-             under review, or bound to another method; held for review"
+             under review, or on another payment rail; held for review"
         );
         return Ok(true);
     }
@@ -292,21 +401,34 @@ async fn route_released_settlement(
     sqlx::query(
         "UPDATE orders SET payment_method = 'bitcoin', paykit_invoice_id = $2, \
          paykit_request_reference = $3, paykit_stack_id = $4, paykit_stack_endpoint = $5, \
-         paykit_total_sats = $6, paykit_expires_at = $7, paykit_allocation_mode = $8, \
-         paykit_address_fingerprint = $9, paykit_activation_state = 'active', \
-         paykit_request_state = 'confirmed', paykit_observation = $10, \
-         paykit_observed_sats = $11, paykit_seller_confirmation_entered_at = NULL, \
-         paykit_seller_confirmation_deadline = NULL, updated_at = $12 WHERE id = $1",
+         paykit_total_sats = $6, paykit_expires_at = $7, paykit_prepare_expires_at = $8, \
+         paykit_allocation_mode = $9, paykit_address_fingerprint = $10, \
+         bitcoin_quote_rate = $11, bitcoin_quote_source = $12, bitcoin_quote_fetched_at = $13, \
+         bitcoin_quoted_sats = $14, bitcoin_quote_expires_at = $15, \
+         bitcoin_quote_currency = $16, bitcoin_quote_exponent = $17, \
+         bitcoin_quote_spread_bps = $18, paykit_activation_state = 'active', \
+         paykit_request_state = 'confirmed', paykit_observation = $19, \
+         paykit_observed_sats = $20, paykit_seller_confirmation_entered_at = NULL, \
+         paykit_seller_confirmation_deadline = NULL, updated_at = $21 WHERE id = $1",
     )
     .bind(order.id)
     .bind(attempt.invoice_id)
-    .bind(attempt.reference())
-    .bind(&attempt.stack_id)
-    .bind(&attempt.stack_endpoint)
-    .bind(attempt.total_sats)
-    .bind(attempt.expires_at)
-    .bind(&attempt.allocation_mode)
-    .bind(&attempt.address_fingerprint)
+    .bind(pins.reference.unwrap_or_else(|| attempt.reference()))
+    .bind(&pins.stack_id)
+    .bind(&pins.stack_endpoint)
+    .bind(pins.total_sats)
+    .bind(pins.expires_at)
+    .bind(pins.prepare_expires_at)
+    .bind(&pins.allocation_mode)
+    .bind(&pins.address_fingerprint)
+    .bind(&pins.bitcoin_quote_rate)
+    .bind(&pins.bitcoin_quote_source)
+    .bind(pins.bitcoin_quote_fetched_at)
+    .bind(pins.bitcoin_quoted_sats)
+    .bind(pins.bitcoin_quote_expires_at)
+    .bind(&pins.bitcoin_quote_currency)
+    .bind(pins.bitcoin_quote_exponent)
+    .bind(pins.bitcoin_quote_spread_bps)
     .bind(&frozen)
     .bind(observation.observed_sats.map(i64::try_from).transpose()?)
     .bind(now)
@@ -317,7 +439,7 @@ async fn route_released_settlement(
          currency = 'SAT', exponent = 0, updated_at = $3 WHERE id = $1",
     )
     .bind(payment.id)
-    .bind(attempt.total_sats)
+    .bind(pins.total_sats)
     .bind(now)
     .execute(&mut *tx)
     .await?;
@@ -352,7 +474,7 @@ async fn route_released_settlement(
             now,
         )
         .await?;
-        close_attempt(&mut tx, attempt, "late_money", &frozen, now).await?;
+        close_attempt(&mut tx, attempt, "late_money", None, &frozen, now).await?;
         tx.commit().await?;
         tracing::warn!(
             order_id = %attempt.order_id,
@@ -374,7 +496,7 @@ async fn route_released_settlement(
     .await
     {
         Ok(outcome) => {
-            close_attempt(&mut tx, attempt, "late_money", &frozen, now).await?;
+            close_attempt(&mut tx, attempt, "late_money", None, &frozen, now).await?;
             tx.commit().await?;
             tracing::warn!(
                 order_id = %attempt.order_id,
@@ -399,19 +521,119 @@ async fn close_attempt(
     tx: &mut Transaction<'_, Postgres>,
     attempt: &WatchedAttempt,
     state: &str,
+    review_reason: Option<&str>,
     observation: &serde_json::Value,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE paykit_superseded_attempts SET state = $3, observation = $4, closed_at = $5 \
-         WHERE order_id = $1 AND invoice_id = $2",
+        "UPDATE paykit_superseded_attempts SET state = $3, review_reason = $4, \
+         observation = $5, closed_at = $6 WHERE order_id = $1 AND invoice_id = $2",
     )
     .bind(attempt.order_id)
     .bind(attempt.invoice_id)
     .bind(state)
+    .bind(review_reason)
     .bind(observation)
     .bind(now)
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// One released attempt waiting for an operator.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct NeedsReview {
+    pub order_id: Uuid,
+    pub invoice_id: Uuid,
+    pub seller_pubky: String,
+    pub buyer_pubky: String,
+    pub review_reason: String,
+    pub total_sats: i64,
+    pub observation: Option<serde_json::Value>,
+    pub closed_at: DateTime<Utc>,
+}
+
+/// Every released attempt waiting for an operator, oldest first.
+pub async fn list_needs_review(pool: &PgPool) -> Result<Vec<NeedsReview>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT h.order_id, h.invoice_id, o.seller_pubky, o.buyer_pubky, h.review_reason, \
+         h.total_sats, h.observation, h.closed_at \
+         FROM paykit_superseded_attempts h JOIN orders o ON o.id = h.order_id \
+         WHERE h.state = 'needs_review' ORDER BY h.closed_at, h.order_id, h.invoice_id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// How an operator closed a `needs_review` attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewOutcome {
+    /// The buyer's money was returned; the note is the external refund
+    /// reference.
+    Refunded,
+    /// No refund is due (for example a detection that never settled); the
+    /// note is the reason.
+    Dismissed,
+}
+
+impl ReviewOutcome {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "refunded" => Ok(Self::Refunded),
+            "dismissed" => Ok(Self::Dismissed),
+            other => anyhow::bail!("the outcome must be refunded or dismissed, not {other:?}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Refunded => "refunded",
+            Self::Dismissed => "dismissed",
+        }
+    }
+}
+
+/// Records an operator's outcome for one `needs_review` attempt. Returns
+/// false when the attempt is not waiting for review (unknown, or already
+/// resolved). The note (refund reference or reason) and the operator are
+/// required.
+pub async fn resolve_needs_review(
+    pool: &PgPool,
+    order_id: Uuid,
+    invoice_id: Uuid,
+    outcome: ReviewOutcome,
+    note: &str,
+    operator: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let note = note.trim();
+    let operator = operator.trim();
+    if note.is_empty() || note.chars().count() > 500 {
+        anyhow::bail!("the note must be 1 to 500 characters");
+    }
+    if operator.is_empty() || operator.chars().count() > 128 {
+        anyhow::bail!("the operator must be 1 to 128 characters");
+    }
+    let resolved = sqlx::query(
+        "UPDATE paykit_superseded_attempts SET state = 'resolved', resolution_outcome = $3, \
+         resolution_note = $4, resolved_by = $5, resolved_at = $6 \
+         WHERE order_id = $1 AND invoice_id = $2 AND state = 'needs_review'",
+    )
+    .bind(order_id)
+    .bind(invoice_id)
+    .bind(outcome.as_str())
+    .bind(note)
+    .bind(operator)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    if resolved.rows_affected() == 1 {
+        tracing::info!(
+            order_id = %order_id,
+            invoice_id = %invoice_id,
+            outcome = outcome.as_str(),
+            "released paykit attempt review resolved"
+        );
+    }
+    Ok(resolved.rows_affected() == 1)
 }
