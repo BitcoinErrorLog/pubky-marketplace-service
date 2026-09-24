@@ -1109,6 +1109,43 @@ async fn a_voided_bind_retries_with_a_fresh_idempotency_key(pool: PgPool) {
     assert_eq!(activation_state.as_deref(), Some("preparing"));
 }
 
+// A bind that rolls back after phase 1 leaves a voided invoice at paykit
+// (the courtesy void). The retry is a new attempt with its own reference,
+// never a replay of the voided attempt's identity.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_retry_after_a_rolled_back_bind_prepares_a_new_attempt(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+
+    fail_activation_intent_inserts(&pool).await;
+    let (status, body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    restore_activation_intent_inserts(&pool).await;
+    let voids = await_voids(&paykit, 1).await;
+    assert_eq!(voids.len(), 1, "the rolled-back bind's courtesy void");
+
+    let (status, body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "the retry binds: {body}");
+    let requests = paykit.requests();
+    assert_eq!(requests.len(), 2, "two phase-1 calls");
+    assert_ne!(requests[0].reference, requests[1].reference);
+    assert_ne!(requests[0].idempotency_key, requests[1].idempotency_key);
+    let (reference, attempt): (Option<String>, i32) = sqlx::query_as(
+        "SELECT paykit_request_reference, paykit_bind_attempt FROM orders WHERE id = $1",
+    )
+    .bind(order_uuid(&order.order_id))
+    .fetch_one(&pool)
+    .await
+    .expect("order row exists");
+    assert_eq!(reference.as_deref(), Some(requests[1].reference.as_str()));
+    assert_eq!(attempt, 2, "the rolled-back attempt stays spent");
+    let (_request_state, activation_state, ..) = order_paykit_row(&pool, &order.order_id).await;
+    assert_eq!(activation_state.as_deref(), Some("preparing"));
+}
+
 // 9. A 5xx leaves the row undelivered and re-leased; a later 200 completes
 //    it.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
