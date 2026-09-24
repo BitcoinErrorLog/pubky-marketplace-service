@@ -76,6 +76,16 @@ async fn main() -> anyhow::Result<()> {
         },
         "pickup details sealing mode resolved"
     );
+    let digital =
+        marketplace_service::digital::digital_keys_from_env(locks.as_deref(), pickup.as_deref())?;
+    tracing::info!(
+        digital_delivery = if digital.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        "digital delivery sealing mode resolved"
+    );
     // HOMESERVER_URL is required: `listing.sync` fetches canonical
     // seller-signed records from it, and running without the sync path would
     // silently re-open the unregistered-listing dead-end it exists to fix.
@@ -122,6 +132,9 @@ async fn main() -> anyhow::Result<()> {
     // boot rather than the first buyer's reveal (§A8).
     marketplace_service::pickup::assert_pickup_sealing_coherent(&pool, pickup.as_deref()).await?;
     tracing::info!("pickup sealing coherence probe passed");
+    marketplace_service::digital::assert_digital_sealing_coherent(&pool, digital.as_deref())
+        .await?;
+    tracing::info!("digital delivery sealing coherence probe passed");
 
     let bind_addr = config.bind_addr;
     let state = AppState::new(pool, Arc::new(SystemClock), config)
@@ -130,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         .with_homeserver(Some(homeserver))
         .with_payments(payments)
         .with_pickup(pickup)
+        .with_digital(digital)
         .with_refusal_audit(refusal_audit)
         .with_refusal_audit_retention_pool(audit_retention_pool)
         .with_grant(grant);

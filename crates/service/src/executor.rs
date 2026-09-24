@@ -359,6 +359,8 @@ fn command_kind(payload: &CommandPayload) -> CommandKind {
         CommandPayload::ConfirmDelivery(_) => CommandKind::ConfirmDelivery,
         CommandPayload::SetPickupDetails(_) => CommandKind::SetPickupDetails,
         CommandPayload::ClearPickupDetails(_) => CommandKind::ClearPickupDetails,
+        CommandPayload::SetDigitalDelivery(_) => CommandKind::SetDigitalDelivery,
+        CommandPayload::ClearDigitalDelivery(_) => CommandKind::ClearDigitalDelivery,
         CommandPayload::MarkReadyForPickup(_) => CommandKind::MarkReadyForPickup,
         CommandPayload::ConfirmPickup(_) => CommandKind::ConfirmPickup,
         CommandPayload::RequestReturn(_) => CommandKind::RequestReturn,
@@ -574,6 +576,30 @@ async fn dispatch(
                 payload,
                 state.pickup.as_deref(),
                 state.config.sandbox_payments_enabled,
+                now,
+            )
+            .await
+        }
+        CommandPayload::SetDigitalDelivery(payload) => {
+            crate::handlers::digital::set(
+                tx,
+                actor,
+                command,
+                payload,
+                state.digital.as_deref(),
+                state.homeserver.as_deref(),
+                state.config.digital_delivery_max_bytes,
+                now,
+            )
+            .await
+        }
+        CommandPayload::ClearDigitalDelivery(payload) => {
+            crate::handlers::digital::clear(
+                tx,
+                actor,
+                command,
+                payload,
+                state.digital.as_deref(),
                 now,
             )
             .await

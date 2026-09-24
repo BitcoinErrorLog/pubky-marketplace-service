@@ -70,6 +70,12 @@ impl PickupKeys {
         self.previous.is_some()
     }
 
+    /// Both configured keys, for distinctness checks against other sealing
+    /// keys. Never logged or serialized.
+    pub(crate) fn key_material(&self) -> impl Iterator<Item = &[u8; KEY_LEN]> {
+        std::iter::once(&self.current).chain(self.previous.iter())
+    }
+
     /// Seals under the CURRENT key. Only ever called with fresh plaintext;
     /// re-sealing during rotation opens first and seals again under current.
     pub fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {

@@ -157,6 +157,10 @@ pub struct Config {
     /// before the ordinary terminal-order purge takes it
     /// (`PICKUP_DISPUTE_RETENTION_DAYS`, default 30, minimum 1; §A3).
     pub pickup_dispute_retention_days: i64,
+    /// Largest digital deliverable file, in plaintext bytes
+    /// (`DIGITAL_DELIVERY_MAX_BYTES`, default 52,428,800). Exposed as
+    /// `/health.digital_delivery_max_bytes`.
+    pub digital_delivery_max_bytes: i64,
     /// Days a Locks checkout snapshot is retained after its payment went
     /// terminal before the worker's locks pass hard-deletes it
     /// (`LOCKS_SNAPSHOT_RETENTION_DAYS`, default 90, minimum 1). The purge
@@ -299,6 +303,11 @@ impl Config {
         )?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         let pickup_dispute_retention_days = env_days("PICKUP_DISPUTE_RETENTION_DAYS", 30)?;
+        let digital_delivery_max_bytes = parse_positive(
+            "DIGITAL_DELIVERY_MAX_BYTES",
+            std::env::var("DIGITAL_DELIVERY_MAX_BYTES").ok().as_deref(),
+            DEFAULT_DIGITAL_DELIVERY_MAX_BYTES,
+        )?;
         let locks_snapshot_retention_days = env_days("LOCKS_SNAPSHOT_RETENTION_DAYS", 90)?;
         // The FX feed is the pinned Blocktank endpoint, always: the source
         // is a permanent bounded single source, so no environment variable
@@ -350,6 +359,7 @@ impl Config {
             public_service_origin,
             sandbox_payments_enabled,
             pickup_dispute_retention_days,
+            digital_delivery_max_bytes,
             locks_snapshot_retention_days,
             fx_feed_url,
             paypal_checkout_url,
@@ -407,6 +417,7 @@ impl Config {
             public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
             pickup_dispute_retention_days: 30,
+            digital_delivery_max_bytes: DEFAULT_DIGITAL_DELIVERY_MAX_BYTES,
             locks_snapshot_retention_days: 90,
             fx_feed_url: crate::fx::FX_URL.to_string(),
             paypal_checkout_url: DEFAULT_PAYPAL_CHECKOUT_URL.to_string(),
@@ -522,6 +533,24 @@ fn automation_rate_capacity(rate: i64, burst: i64) -> anyhow::Result<i64> {
 /// A positive whole-day count from the environment (minimum 1, so a
 /// deployment cannot disable or zero out a server-time post-purchase
 /// transition).
+pub const DEFAULT_DIGITAL_DELIVERY_MAX_BYTES: i64 = 52_428_800;
+
+fn parse_positive(name: &str, raw: Option<&str>, default: i64) -> anyhow::Result<i64> {
+    match raw {
+        None => Ok(default),
+        Some(value) => {
+            let parsed: i64 = value
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{name} must be an integer"))?;
+            if parsed < 1 {
+                anyhow::bail!("{name} must be at least 1");
+            }
+            Ok(parsed)
+        }
+    }
+}
+
 fn env_days(name: &str, default: i64) -> anyhow::Result<i64> {
     parse_days(name, std::env::var(name).ok().as_deref(), default)
 }

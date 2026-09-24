@@ -17,6 +17,7 @@ pub mod clock;
 pub mod config;
 pub mod content_lock;
 pub mod contracts;
+pub mod digital;
 pub mod executor;
 pub mod expiry;
 pub mod fx;
@@ -50,6 +51,7 @@ use sqlx::PgPool;
 use crate::attestor::Attestor;
 use crate::clock::Clock;
 use crate::config::Config;
+use crate::digital::DigitalKeys;
 use crate::homeserver::HomeserverListingClient;
 use crate::locks::LocksRuntime;
 use crate::payment_availability::PaymentAvailabilityCache;
@@ -89,6 +91,11 @@ pub struct AppState {
     /// plaintext, and `pickup_available` reports false (all-or-none gating;
     /// see [`pickup::pickup_keys_from_env`]).
     pub pickup: Option<Arc<PickupKeys>>,
+    /// The digital delivery sealing keys (digital delivery design §4.1).
+    /// `None` when `DIGITAL_DELIVERY_ENCRYPTION_KEY` is unset: digital
+    /// delivery is off, `digital_delivery.set` and digital checkout lines
+    /// are refused, and `digital_delivery_available` reports false.
+    pub digital: Option<Arc<DigitalKeys>>,
     /// Per-endpoint cache of pinned-stack readiness identities for the
     /// resolve delivery arm (§B.8.8: 15 s TTL, per endpoint).
     pub resolve_pin_cache: resolve_delivery::ResolvePinCache,
@@ -110,6 +117,14 @@ impl AppState {
     pub fn pickup_available(&self) -> bool {
         self.pickup.is_some() && !self.config.sandbox_payments_enabled
     }
+
+    /// Digital delivery is available whenever its key is configured.
+    /// Sandbox confirmations never release a deliverable (the pin records
+    /// the confirming adapter and the buyer read refuses it), so the flag
+    /// does not depend on the sandbox setting.
+    pub fn digital_delivery_available(&self) -> bool {
+        self.digital.is_some()
+    }
 }
 
 impl AppState {
@@ -124,6 +139,7 @@ impl AppState {
             payments: None,
             payment_availability: PaymentAvailabilityCache::default(),
             pickup: None,
+            digital: None,
             resolve_pin_cache: resolve_delivery::ResolvePinCache::default(),
             refusal_audit: None,
             refusal_audit_retention_pool: None,
@@ -153,6 +169,11 @@ impl AppState {
 
     pub fn with_pickup(mut self, pickup: Option<Arc<PickupKeys>>) -> Self {
         self.pickup = pickup;
+        self
+    }
+
+    pub fn with_digital(mut self, digital: Option<Arc<DigitalKeys>>) -> Self {
+        self.digital = digital;
         self
     }
 

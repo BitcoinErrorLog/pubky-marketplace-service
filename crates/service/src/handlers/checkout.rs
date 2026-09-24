@@ -179,11 +179,17 @@ pub async fn handle(
             .iter()
             .any(|published| published == method.as_str());
         if !published {
-            return Ok(Err(CommandFailure::refused(
+            return Ok(Err(CommandFailure::refused_with_reason(
                 crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "A checkout line's listing does not publish the chosen fulfillment method.",
+                "fulfillment_not_published",
             )));
+        }
+        // Digital orders need the confirm-time pin and the buyer read before
+        // they can be sold; until then a digital line is refused.
+        if method == FulfillmentMethod::Digital {
+            return Ok(Err(crate::handlers::digital::unavailable()));
         }
         match groups.iter_mut().find(|(seller, group_method, _)| {
             *seller == listing.seller_pubky && *group_method == method
@@ -203,7 +209,7 @@ pub async fn handle(
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
-                "A pickup-only checkout must not carry a delivery address.",
+                "A checkout with no shipped group must not carry a delivery address.",
             )));
         }
         (None, true) => {

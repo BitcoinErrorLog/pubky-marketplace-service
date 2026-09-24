@@ -78,6 +78,8 @@ pub enum CommandPayload {
     ConfirmDelivery(OrderActionPayload),
     SetPickupDetails(SetPickupDetailsPayload),
     ClearPickupDetails(ClearPickupDetailsPayload),
+    SetDigitalDelivery(SetDigitalDeliveryPayload),
+    ClearDigitalDelivery(ClearDigitalDeliveryPayload),
     MarkReadyForPickup(OrderActionPayload),
     ConfirmPickup(OrderActionPayload),
     RequestReturn(RequestReturnPayload),
@@ -116,6 +118,8 @@ impl Command {
             CommandPayload::ConfirmDelivery(_) => "fulfillment.confirm_delivery",
             CommandPayload::SetPickupDetails(_) => "pickup_details.set",
             CommandPayload::ClearPickupDetails(_) => "pickup_details.clear",
+            CommandPayload::SetDigitalDelivery(_) => "digital_delivery.set",
+            CommandPayload::ClearDigitalDelivery(_) => "digital_delivery.clear",
             CommandPayload::MarkReadyForPickup(_) => "fulfillment.mark_ready",
             CommandPayload::ConfirmPickup(_) => "fulfillment.confirm_pickup",
             CommandPayload::RequestReturn(_) => "return.request",
@@ -155,6 +159,8 @@ impl Command {
             CommandPayload::ShipOrder(p) => serde_json::to_value(p),
             CommandPayload::SetPickupDetails(p) => serde_json::to_value(p),
             CommandPayload::ClearPickupDetails(p) => serde_json::to_value(p),
+            CommandPayload::SetDigitalDelivery(p) => serde_json::to_value(p),
+            CommandPayload::ClearDigitalDelivery(p) => serde_json::to_value(p),
             CommandPayload::ConfirmDelivery(p)
             | CommandPayload::ApproveCancellation(p)
             | CommandPayload::ApproveReturn(p)
@@ -197,15 +203,18 @@ pub enum SaleFormat {
     Auction,
 }
 
-/// How a physical order reaches the buyer (local pickup design §A2): the
-/// seller-signed flat-rate shipping path, or an in-person handover at the
-/// seller's published meeting point. Distinct from the listing's item type —
-/// fulfillment is meaningful only for physical items.
+/// How an order reaches the buyer: the seller-signed flat-rate shipping
+/// path, an in-person handover at the seller's published meeting point
+/// (local pickup design §A2), or digital delivery (digital delivery design
+/// §2). Distinct from the listing record's item type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FulfillmentMethod {
     Shipping,
     Pickup,
+    /// Delivered by the service or the seller without shipping (digital
+    /// delivery design §2). Never shipped and never returned.
+    Digital,
 }
 
 impl FulfillmentMethod {
@@ -213,6 +222,7 @@ impl FulfillmentMethod {
         match self {
             FulfillmentMethod::Shipping => "shipping",
             FulfillmentMethod::Pickup => "pickup",
+            FulfillmentMethod::Digital => "digital",
         }
     }
 }
@@ -727,6 +737,148 @@ pub struct ClearPickupDetailsPayload {
     pub expected_version: i64,
 }
 
+/// Largest text a seller may hand every buyer (a code, a password,
+/// instructions), in Unicode scalar values.
+pub const DIGITAL_TEXT_MAX_CHARS: usize = 4_000;
+/// Longest accepted link.
+pub const DIGITAL_LINK_MAX_CHARS: usize = 2_048;
+/// Longest accepted file name.
+pub const DIGITAL_FILE_NAME_MAX_CHARS: usize = 255;
+/// Longest accepted MIME type.
+pub const DIGITAL_CONTENT_TYPE_MAX_CHARS: usize = 127;
+/// AES-256-GCM authentication tag length: the homeserver ciphertext is the
+/// plaintext length plus this.
+pub const AES_GCM_TAG_BYTES: i64 = 16;
+
+/// How the buyer of a digital listing receives it (digital delivery design
+/// §2). File, link and text are released on the order page once payment is
+/// confirmed; email and message are delivered by the seller by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigitalDeliveryKind {
+    File,
+    Link,
+    Text,
+    Email,
+    Message,
+}
+
+impl DigitalDeliveryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DigitalDeliveryKind::File => "file",
+            DigitalDeliveryKind::Link => "link",
+            DigitalDeliveryKind::Text => "text",
+            DigitalDeliveryKind::Email => "email",
+            DigitalDeliveryKind::Message => "message",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "file" => Some(DigitalDeliveryKind::File),
+            "link" => Some(DigitalDeliveryKind::Link),
+            "text" => Some(DigitalDeliveryKind::Text),
+            "email" => Some(DigitalDeliveryKind::Email),
+            "message" => Some(DigitalDeliveryKind::Message),
+            _ => None,
+        }
+    }
+
+    /// File, link and text are released automatically at confirmation.
+    pub fn is_instant(self) -> bool {
+        matches!(
+            self,
+            DigitalDeliveryKind::File | DigitalDeliveryKind::Link | DigitalDeliveryKind::Text
+        )
+    }
+}
+
+/// The encrypted file a seller uploaded to their homeserver at
+/// `/pub/pubky.app/marketplace/v1/deliverables/{deliverable_id}/{version}`.
+/// `key` and `iv` are the browser's AES-256-GCM parameters; the service
+/// seals them and never applies them to the file.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DigitalFile {
+    pub deliverable_id: String,
+    pub version: i64,
+    pub key: String,
+    pub iv: String,
+    pub ciphertext_blake3: String,
+    pub plaintext_blake3: String,
+    pub size_bytes: i64,
+    pub content_type: String,
+    pub file_name: String,
+}
+
+impl std::fmt::Debug for DigitalFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DigitalFile")
+            .field("deliverable_id", &self.deliverable_id)
+            .field("version", &self.version)
+            .field("key", &"<redacted>")
+            .field("iv", &"<redacted>")
+            .field("size_bytes", &self.size_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the seller hands every buyer, by kind.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DigitalDelivery {
+    File(DigitalFile),
+    Link { url: String },
+    Text { text: String },
+    Email {},
+    Message {},
+}
+
+impl DigitalDelivery {
+    pub fn kind(&self) -> DigitalDeliveryKind {
+        match self {
+            DigitalDelivery::File(_) => DigitalDeliveryKind::File,
+            DigitalDelivery::Link { .. } => DigitalDeliveryKind::Link,
+            DigitalDelivery::Text { .. } => DigitalDeliveryKind::Text,
+            DigitalDelivery::Email {} => DigitalDeliveryKind::Email,
+            DigitalDelivery::Message {} => DigitalDeliveryKind::Message,
+        }
+    }
+}
+
+impl std::fmt::Debug for DigitalDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DigitalDelivery({}, <redacted>)", self.kind().as_str())
+    }
+}
+
+/// `digital_delivery.set` (seller, own listing only). Each set issues the
+/// next version of the listing's deliverable; `expected_version` is the
+/// compare-and-swap, 0 before the first set.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetDigitalDeliveryPayload {
+    pub expected_version: i64,
+    pub delivery: DigitalDelivery,
+}
+
+impl std::fmt::Debug for SetDigitalDeliveryPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetDigitalDeliveryPayload")
+            .field("expected_version", &self.expected_version)
+            .field("delivery", &self.delivery)
+            .finish()
+    }
+}
+
+/// `digital_delivery.clear` (seller, own listing only).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClearDigitalDeliveryPayload {
+    pub expected_version: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestReturnPayload {
@@ -901,6 +1053,12 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         }
         "pickup_details.clear" => {
             parse_payload(&envelope.payload).and_then(validate_clear_pickup_details)?
+        }
+        "digital_delivery.set" => {
+            parse_payload(&envelope.payload).and_then(validate_set_digital_delivery)?
+        }
+        "digital_delivery.clear" => {
+            parse_payload(&envelope.payload).and_then(validate_clear_digital_delivery)?
         }
         "fulfillment.mark_ready" => {
             parse_payload(&envelope.payload).map(CommandPayload::MarkReadyForPickup)?
@@ -1682,6 +1840,168 @@ fn validate_set_pickup_details(
     }
 }
 
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A random 128-bit id in lowercase hex: it names the homeserver path and
+/// appears in no public record.
+pub fn is_valid_deliverable_id(value: &str) -> bool {
+    is_lower_hex(value, 32)
+}
+
+fn is_valid_content_type(value: &str) -> bool {
+    let Some((kind, subtype)) = value.split_once('/') else {
+        return false;
+    };
+    let token = |part: &str| {
+        !part.is_empty()
+            && part.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#' | b'$' | b'&' | b'-' | b'^' | b'_' | b'.' | b'+'
+                    )
+            })
+    };
+    value.len() <= DIGITAL_CONTENT_TYPE_MAX_CHARS && token(kind) && token(subtype)
+}
+
+fn is_valid_file_name(value: &str) -> bool {
+    let chars = value.chars().count();
+    (1..=DIGITAL_FILE_NAME_MAX_CHARS).contains(&chars)
+        && value.trim() == value
+        && value != "."
+        && value != ".."
+        && !value
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
+}
+
+fn is_valid_digital_link(value: &str) -> bool {
+    if value.chars().count() > DIGITAL_LINK_MAX_CHARS
+        || value.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return false;
+    }
+    match url::Url::parse(value) {
+        Ok(url) => url.scheme() == "https" && url.host_str().is_some_and(|host| !host.is_empty()),
+        Err(_) => false,
+    }
+}
+
+/// Shape checks for `digital_delivery.set`. Issues describe the expected
+/// shape only: the key, link and text are secrets until payment. File size
+/// against the deployment cap is the handler's check (the cap is
+/// configuration, `DIGITAL_DELIVERY_MAX_BYTES`).
+fn validate_set_digital_delivery(
+    payload: SetDigitalDeliveryPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    if !(0..MAX_SAFE_INTEGER).contains(&payload.expected_version) {
+        issues.push(issue(
+            "payload.expected_version",
+            "Expected a non-negative delivery version",
+        ));
+    }
+    match &payload.delivery {
+        DigitalDelivery::File(file) => {
+            if !is_valid_deliverable_id(&file.deliverable_id) {
+                issues.push(issue(
+                    "payload.delivery.deliverable_id",
+                    "Expected 32 lowercase hexadecimal characters",
+                ));
+            }
+            if file.version != payload.expected_version + 1 {
+                issues.push(issue(
+                    "payload.delivery.version",
+                    "Expected the next delivery version",
+                ));
+            }
+            if !is_lower_hex(&file.key, 64) {
+                issues.push(issue(
+                    "payload.delivery.key",
+                    "Expected 64 lowercase hexadecimal characters",
+                ));
+            }
+            if !is_lower_hex(&file.iv, 24) {
+                issues.push(issue(
+                    "payload.delivery.iv",
+                    "Expected 24 lowercase hexadecimal characters",
+                ));
+            }
+            for (path, value) in [
+                (
+                    "payload.delivery.ciphertext_blake3",
+                    &file.ciphertext_blake3,
+                ),
+                ("payload.delivery.plaintext_blake3", &file.plaintext_blake3),
+            ] {
+                if !is_lower_hex(value, 64) {
+                    issues.push(issue(path, "Expected 64 lowercase hexadecimal characters"));
+                }
+            }
+            if file.size_bytes < 1 {
+                issues.push(issue(
+                    "payload.delivery.size_bytes",
+                    "Expected a positive file size",
+                ));
+            }
+            if !is_valid_content_type(&file.content_type) {
+                issues.push(issue(
+                    "payload.delivery.content_type",
+                    "Expected a MIME type such as application/pdf",
+                ));
+            }
+            if !is_valid_file_name(&file.file_name) {
+                issues.push(issue(
+                    "payload.delivery.file_name",
+                    "Expected a file name of 1-255 characters without slashes or control characters",
+                ));
+            }
+        }
+        DigitalDelivery::Link { url } => {
+            if !is_valid_digital_link(url) {
+                issues.push(issue(
+                    "payload.delivery.url",
+                    "Expected an https:// link of at most 2048 characters",
+                ));
+            }
+        }
+        DigitalDelivery::Text { text } => {
+            let chars = text.chars().count();
+            if text.trim().is_empty() || chars > DIGITAL_TEXT_MAX_CHARS || text.contains('\0') {
+                issues.push(issue(
+                    "payload.delivery.text",
+                    "Expected 1-4000 characters of text",
+                ));
+            }
+        }
+        DigitalDelivery::Email {} | DigitalDelivery::Message {} => {}
+    }
+    if issues.is_empty() {
+        Ok(CommandPayload::SetDigitalDelivery(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_clear_digital_delivery(
+    payload: ClearDigitalDeliveryPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    if (0..=MAX_SAFE_INTEGER).contains(&payload.expected_version) {
+        Ok(CommandPayload::ClearDigitalDelivery(payload))
+    } else {
+        Err(vec![issue(
+            "payload.expected_version",
+            "Expected a non-negative delivery version",
+        )])
+    }
+}
+
 fn validate_clear_pickup_details(
     payload: ClearPickupDetailsPayload,
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
@@ -1788,7 +2108,11 @@ fn validate_create_checkout(
     let any_shipping = payload
         .lines
         .iter()
-        .any(|line| line.fulfillment != Some(FulfillmentMethod::Pickup));
+        .any(|line| matches!(line.fulfillment, None | Some(FulfillmentMethod::Shipping)));
+    let all_pickup = payload
+        .lines
+        .iter()
+        .all(|line| line.fulfillment == Some(FulfillmentMethod::Pickup));
     match (&mut payload.delivery_address, any_shipping) {
         (Some(address), true) => {
             validate_delivery_address("payload.delivery_address", address, &mut issues)
@@ -1796,7 +2120,11 @@ fn validate_create_checkout(
         (Some(_), false) => {
             issues.push(issue(
                 "payload.delivery_address",
-                "A pickup-only checkout must not carry a delivery address",
+                if all_pickup {
+                    "A pickup-only checkout must not carry a delivery address"
+                } else {
+                    "A checkout with no shipped line must not carry a delivery address"
+                },
             ));
         }
         (None, true) => {
@@ -2423,6 +2751,165 @@ mod tests {
             let command = order_command_json(kind, json!({ "order_id": order_id }));
             assert_eq!(parse_command(&command).expect("valid").kind(), kind);
         }
+    }
+
+    fn digital_set_command_json(delivery: Value) -> Value {
+        json!({
+            "version": 1,
+            "command_id": "00000000-0000-4000-9000-000000000d01",
+            "aggregate_id": format!("listing:{}_guide_01", "y".repeat(52)),
+            "expected_revision": 0,
+            "issued_at": "2026-08-19T22:00:00.000Z",
+            "kind": "digital_delivery.set",
+            "payload": { "expected_version": 0, "delivery": delivery },
+        })
+    }
+
+    fn digital_file_json() -> Value {
+        json!({
+            "kind": "file",
+            "deliverable_id": "4f1c0e7a2b6d4c85a9e3f1027b5d6c38",
+            "version": 1,
+            "key": "b".repeat(64),
+            "iv": "c".repeat(24),
+            "ciphertext_blake3": "d".repeat(64),
+            "plaintext_blake3": "e".repeat(64),
+            "size_bytes": 1024,
+            "content_type": "application/pdf",
+            "file_name": "guide.pdf",
+        })
+    }
+
+    #[test]
+    fn parses_digital_delivery_commands_and_redacts_secrets() {
+        for delivery in [
+            digital_file_json(),
+            json!({ "kind": "link", "url": "https://drive.example.com/SECRET-LINK" }),
+            json!({ "kind": "text", "text": "SECRET-TEXT" }),
+            json!({ "kind": "email" }),
+            json!({ "kind": "message" }),
+        ] {
+            let command = parse_command(&digital_set_command_json(delivery.clone()))
+                .unwrap_or_else(|issues| panic!("{delivery}: {issues:?}"));
+            assert_eq!(command.kind(), "digital_delivery.set");
+            let debug = format!("{:?}", command.payload);
+            for secret in ["bbbbbbbb", "cccccccc", "SECRET-LINK", "SECRET-TEXT"] {
+                assert!(!debug.contains(secret), "{secret} in {debug}");
+            }
+            // Canonical JSON round-trips the kind tag, so replays hash equal.
+            let canonical = command.canonical_json();
+            assert_eq!(canonical["payload"]["delivery"]["kind"], delivery["kind"]);
+        }
+        let mut clear = digital_set_command_json(json!({}));
+        clear["kind"] = json!("digital_delivery.clear");
+        clear["payload"] = json!({ "expected_version": 2 });
+        assert_eq!(
+            parse_command(&clear).expect("valid clear").kind(),
+            "digital_delivery.clear"
+        );
+    }
+
+    #[test]
+    fn validates_digital_delivery_shapes() {
+        let path_rejected = |delivery: Value, path: &str| {
+            let issues = parse_command(&digital_set_command_json(delivery.clone()))
+                .expect_err("invalid delivery");
+            assert!(
+                issues.iter().any(|issue| issue.path == path),
+                "{delivery}: {issues:?}"
+            );
+            let serialized = serde_json::to_string(&issues).expect("issues serialize");
+            assert!(!serialized.contains("SECRET"), "{serialized}");
+        };
+        for (field, value, path) in [
+            (
+                "deliverable_id",
+                json!("NOT-HEX"),
+                "payload.delivery.deliverable_id",
+            ),
+            ("version", json!(2), "payload.delivery.version"),
+            ("key", json!("SECRET".repeat(10)), "payload.delivery.key"),
+            ("iv", json!("abc"), "payload.delivery.iv"),
+            (
+                "ciphertext_blake3",
+                json!("f".repeat(63)),
+                "payload.delivery.ciphertext_blake3",
+            ),
+            ("size_bytes", json!(0), "payload.delivery.size_bytes"),
+            (
+                "content_type",
+                json!("pdf"),
+                "payload.delivery.content_type",
+            ),
+            (
+                "file_name",
+                json!("../SECRET.pdf"),
+                "payload.delivery.file_name",
+            ),
+            ("file_name", json!(""), "payload.delivery.file_name"),
+        ] {
+            let mut file = digital_file_json();
+            file[field] = value;
+            path_rejected(file, path);
+        }
+        for url in [
+            "http://example.com/SECRET",
+            "https://",
+            "https://example.com/SECRET path",
+            "javascript:SECRET",
+        ] {
+            path_rejected(
+                json!({ "kind": "link", "url": url }),
+                "payload.delivery.url",
+            );
+        }
+        path_rejected(
+            json!({ "kind": "link", "url": format!("https://example.com/{}", "a".repeat(2_048)) }),
+            "payload.delivery.url",
+        );
+        for text in [
+            "   ".to_string(),
+            "S".repeat(DIGITAL_TEXT_MAX_CHARS + 1),
+            "SECRET\0".to_string(),
+        ] {
+            path_rejected(
+                json!({ "kind": "text", "text": text }),
+                "payload.delivery.text",
+            );
+        }
+        parse_command(&digital_set_command_json(
+            json!({ "kind": "text", "text": "é".repeat(DIGITAL_TEXT_MAX_CHARS) }),
+        ))
+        .expect("the limit counts characters, not bytes");
+        // Unknown fields and kinds are refused.
+        let mut extra = digital_file_json();
+        extra["public_url"] = json!("https://example.com");
+        parse_command(&digital_set_command_json(extra)).expect_err("unknown file field");
+        parse_command(&digital_set_command_json(
+            json!({ "kind": "email", "address": "x" }),
+        ))
+        .expect_err("email kind carries nothing up front");
+        parse_command(&digital_set_command_json(
+            json!({ "kind": "key_list", "keys": [] }),
+        ))
+        .expect_err("key lists are not a first-release kind");
+    }
+
+    #[test]
+    fn digital_checkout_lines_carry_no_address() {
+        let mut command = checkout_command_json();
+        command["payload"]["lines"][0]["fulfillment"] = json!("digital");
+        let issues =
+            parse_command(&command).expect_err("an all-digital checkout refuses an address");
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == "payload.delivery_address"
+                && issue.message.contains("no shipped line")));
+        command["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("delivery_address");
+        parse_command(&command).expect("an all-digital checkout needs no address");
     }
 
     #[test]

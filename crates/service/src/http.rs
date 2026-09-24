@@ -111,6 +111,10 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::handlers::pickup::get_listing_pickup_details),
         )
         .route(
+            "/v1/listings/{aggregate_id}/digital-delivery",
+            get(crate::handlers::digital::get_listing_digital_delivery),
+        )
+        .route(
             "/v1/orders/{id}/review-attestation",
             get(queries::get_review_attestation),
         )
@@ -249,6 +253,8 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "status": "ok",
         "offer_checkout": true,
         "pickup_available": state.pickup_available(),
+        "digital_delivery_available": state.digital_delivery_available(),
+        "digital_delivery_max_bytes": state.config.digital_delivery_max_bytes,
         "paykit_rail": {
             "bitcoin_offer_available": bitcoin_offer_available,
             "age_seconds": age_seconds,

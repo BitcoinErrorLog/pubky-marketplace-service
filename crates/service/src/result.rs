@@ -13,6 +13,7 @@ pub struct CommandFailure {
     message: String,
     current_revision: Option<i64>,
     issues: Option<Vec<ValidationIssue>>,
+    reason: Option<&'static str>,
 }
 
 impl CommandFailure {
@@ -25,6 +26,21 @@ impl CommandFailure {
             message: message.to_string(),
             current_revision: None,
             issues: None,
+            reason: None,
+        }
+    }
+
+    /// A refusal the client distinguishes by `error.reason`, a stable
+    /// snake_case token (digital delivery design §6).
+    pub(crate) fn refused_with_reason(
+        kind: RefusalKind,
+        code: ErrorCode,
+        message: &str,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            reason: Some(reason),
+            ..Self::refused(kind, code, message)
         }
     }
 
@@ -87,6 +103,9 @@ impl CommandFailure {
         }
         if let Some(issues) = &self.issues {
             error["issues"] = json!(issues);
+        }
+        if let Some(reason) = self.reason {
+            error["reason"] = json!(reason);
         }
         json!({ "ok": false, "error": error })
     }

@@ -3214,3 +3214,197 @@ pub fn register_sat_command(seller_pubky: &str, quantity: i64) -> Value {
         json!({ "amount_minor": 50_000, "currency": "SAT", "exponent": 0 });
     command
 }
+
+/// Deterministic digital delivery sealing key, distinct from every other
+/// test key.
+pub const TEST_DIGITAL_ENCRYPTION_KEY: &str =
+    "8888888888888888888888888888888888888888888888888888888888888888";
+pub const TEST_DIGITAL_PREVIOUS_ENCRYPTION_KEY: &str =
+    "9999999999999999999999999999999999999999999999999999999999999999";
+
+pub fn test_digital_keys() -> Arc<marketplace_service::digital::DigitalKeys> {
+    Arc::new(
+        marketplace_service::digital::DigitalKeys::from_hex(TEST_DIGITAL_ENCRYPTION_KEY, None)
+            .expect("test digital keys"),
+    )
+}
+
+type DeliverableMap = Arc<Mutex<HashMap<(String, String, String), Vec<u8>>>>;
+
+/// Serves seller deliverables at the production path over real HTTP, keyed
+/// by `pubky-host`, and counts every request it answers.
+pub struct DeliverableServer {
+    blobs: DeliverableMap,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+    pub base_url: String,
+}
+
+impl DeliverableServer {
+    pub fn put(&self, seller_pubky: &str, deliverable_id: &str, version: i64, bytes: Vec<u8>) {
+        self.blobs.lock().expect("deliverables lock").insert(
+            (
+                seller_pubky.to_string(),
+                deliverable_id.to_string(),
+                version.to_string(),
+            ),
+            bytes,
+        );
+    }
+
+    pub fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+struct DeliverableServerState {
+    blobs: DeliverableMap,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn serve_deliverable(
+    axum::extract::State(state): axum::extract::State<DeliverableServerState>,
+    axum::extract::Path((deliverable_id, version)): axum::extract::Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    state
+        .requests
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let seller = headers
+        .get("pubky-host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let stored = state
+        .blobs
+        .lock()
+        .expect("deliverables lock")
+        .get(&(seller, deliverable_id, version))
+        .cloned();
+    match stored {
+        Some(bytes) => (StatusCode::OK, bytes).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+pub async fn spawn_deliverable_server() -> DeliverableServer {
+    let state = DeliverableServerState {
+        blobs: Arc::default(),
+        requests: Arc::default(),
+    };
+    let router = Router::new()
+        .route(
+            "/pub/pubky.app/marketplace/v1/deliverables/{deliverable_id}/{version}",
+            axum::routing::get(serve_deliverable),
+        )
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("deliverable server binds");
+    let addr = listener.local_addr().expect("deliverable server address");
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("deliverable server serves");
+    });
+    DeliverableServer {
+        blobs: state.blobs,
+        requests: state.requests,
+        base_url: format!("http://{addr}"),
+    }
+}
+
+/// Listing records from the command mirror; deliverables through the real
+/// [`HttpHomeserverClient`] against a [`DeliverableServer`].
+struct DigitalTestHomeserver {
+    http: HttpHomeserverClient,
+}
+
+impl HomeserverListingClient for DigitalTestHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        CommandMirrorHomeserver.fetch_listing(seller_pubky, listing_id)
+    }
+
+    fn fetch_listing_raw<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverRawFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        CommandMirrorHomeserver.fetch_listing_raw(seller_pubky, listing_id)
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        drop_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        CommandMirrorHomeserver.fetch_drop(seller_pubky, drop_id)
+    }
+
+    fn fetch_deliverable_digest<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        deliverable_id: &'a str,
+        version: i64,
+        max_len: u64,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::DeliverableFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.http
+            .fetch_deliverable_digest(seller_pubky, deliverable_id, version, max_len)
+    }
+}
+
+/// A test app with digital delivery keyed (or not) and a deliverable
+/// server behind the real homeserver client.
+pub async fn test_app_with_digital(
+    pool: PgPool,
+    keys: Option<Arc<marketplace_service::digital::DigitalKeys>>,
+    config: Config,
+) -> (TestApp, DeliverableServer) {
+    let server = spawn_deliverable_server().await;
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let homeserver = DigitalTestHomeserver {
+        http: HttpHomeserverClient::new(&server.base_url).expect("deliverable client builds"),
+    };
+    let state = AppState::new(pool.clone(), clock.clone(), config)
+        .with_homeserver(Some(Arc::new(homeserver)))
+        .with_digital(keys);
+    (
+        TestApp {
+            router: build_router(state.clone()),
+            pool,
+            clock,
+            state,
+        },
+        server,
+    )
+}

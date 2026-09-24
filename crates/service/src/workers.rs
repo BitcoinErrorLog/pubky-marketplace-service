@@ -73,6 +73,7 @@ pub const TASK_PAYMENT_WINDOW: &str = "payment_window";
 pub const TASK_STAT_ATTESTATIONS: &str = "stat_attestations";
 pub const TASK_DELIVERY_AUTOCOMPLETE: &str = "delivery_autocomplete";
 pub const TASK_PICKUP_RESEAL: &str = "pickup_reseal";
+pub const TASK_DIGITAL_RESEAL: &str = "digital_reseal";
 pub const TASK_PICKUP_RETENTION: &str = "pickup_retention";
 pub const TASK_SELLER_CONFIRMATION_WINDOW: &str = "seller_confirmation_window";
 pub const TASK_MANUAL_REVIEW_WATCH: &str = "manual_review_watch";
@@ -3273,6 +3274,7 @@ pub struct WorkerSummary {
     pub pickup_rows_resealed: u64,
     pub pickup_snapshots_purged: u64,
     pub pickup_versions_purged: u64,
+    pub digital_rows_resealed: u64,
     pub seller_windows_routed: u64,
     pub manual_review_sla_alerts: u64,
     pub manual_reviews_abandoned: u64,
@@ -3661,6 +3663,39 @@ pub async fn run_once(
                     tracing::error!(
                         error = %error,
                         "pickup re-seal pass failed; continuing with the remaining worker tasks"
+                    );
+                }
+            }
+        }
+    }
+    // While a previous digital delivery key is configured, one re-seal pass
+    // per tick across all three sealed families (digital delivery design
+    // §7). A failed pass is logged and retried next tick, as pickup's is.
+    if let Some(digital) = &state.digital {
+        if digital.has_previous()
+            && try_acquire_lease(&state.pool, TASK_DIGITAL_RESEAL, holder, now, lease_seconds)
+                .await?
+        {
+            let result = crate::digital::reseal_previous_key_batch(&state.pool, digital).await;
+            release_lease(&state.pool, TASK_DIGITAL_RESEAL, holder, now).await?;
+            match result {
+                Ok(progress) => {
+                    summary.digital_rows_resealed = progress.versions_resealed
+                        + progress.pins_resealed
+                        + progress.emails_resealed;
+                    if progress.remaining_under_previous == 0 && summary.digital_rows_resealed > 0 {
+                        tracing::info!(
+                            resealed = summary.digital_rows_resealed,
+                            "digital delivery key rotation complete: zero rows remain under the \
+                             previous key across all three sealed families"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "digital delivery re-seal pass failed; continuing with the remaining \
+                         worker tasks"
                     );
                 }
             }
