@@ -538,14 +538,16 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 /// The migration catalog is strictly increasing, unique per number, and
 /// contains refusal-audit 0032, reserve-secrecy 0033, inventory 0034,
 /// automation API 0035, grant-flow 0036, overlap-limits 0037,
-/// checkout-hold 0038, and PayPal gateway refunds 0039.
+/// checkout-hold 0038, PayPal gateway refunds 0039, and released Paykit
+/// attempts 0042. 0040 and 0041 belong to digital delivery; once they land
+/// the catalog is gapless through 0042.
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0039() {
+fn migration_catalog_is_gapless_through_0039_then_0042() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -555,11 +557,11 @@ fn migration_catalog_is_gapless_through_0039() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    let expected = (1..=39).collect::<Vec<_>>();
+    let expected = (1..=39).chain([42]).collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
         expected,
-        "the raw catalog is 0001..=0039, gapless"
+        "the raw catalog is 0001..=0039, gapless, then 0042"
     );
 }
 
@@ -629,7 +631,8 @@ fn every_manual_review_writer_stamps_the_entry_time() {
     // (4: amount mismatch, observed-amount-vs-quote mismatch, confirm-failure,
     // seller-window reaper — late settlement now goes through apply_late_money),
     // the fiat apply_fiat_paid confirm-failure (1; expired uses apply_late_money),
-    // and the sandbox transition (1). Any NEW writer fails here until it is
+    // the sandbox transition (1), and a released Paykit attempt settling with a
+    // different amount (1 in paykit_attempts). Any NEW writer fails here until it is
     // reviewed, stamped, and enumerated.
     let mut per_file: std::collections::BTreeMap<String, usize> = Default::default();
     for (file, _) in &writers {
@@ -640,6 +643,7 @@ fn every_manual_review_writer_stamps_the_entry_time() {
         std::collections::BTreeMap::from([
             ("bitcoin_review.rs".to_string(), 2),
             ("payment.rs".to_string(), 1),
+            ("paykit_attempts.rs".to_string(), 1),
             ("payment_methods.rs".to_string(), 1),
             ("workers.rs".to_string(), 4),
         ]),
