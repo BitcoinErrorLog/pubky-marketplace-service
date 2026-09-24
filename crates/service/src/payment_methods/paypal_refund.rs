@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use marketplace_domain::ids;
 use marketplace_domain::state_machines::{can_transition, order_machine};
 use serde_json::{json, Value};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{parse_gateway_amount_minor, PAYPAL_GATEWAY_ACTOR};
@@ -94,7 +94,7 @@ pub(super) fn paid_to_merchant(fields: &HashMap<String, String>, merchant_email:
 /// against: the same PayPal account id, or the same email.
 fn paid_to_snapshot(
     fields: &HashMap<String, String>,
-    receiver_email: &str,
+    receiver_email: Option<&str>,
     receiver_id: Option<&str>,
 ) -> bool {
     let same_account = receiver_id.is_some_and(|stored| {
@@ -102,21 +102,61 @@ fn paid_to_snapshot(
             .get("receiver_id")
             .is_some_and(|value| !value.is_empty() && value == stored)
     });
-    same_account || paid_to_merchant(fields, receiver_email)
+    same_account || receiver_email.is_some_and(|email| paid_to_merchant(fields, email))
 }
 
-/// Stores the verified payment's `txn_id` and receiver snapshot on the
-/// order, once. A payment id already owned by another order is not reused.
-pub(super) async fn record_verified_payment(
-    pool: &PgPool,
-    order_id: Uuid,
-    txn_id: &str,
-    merchant_email: &str,
-    fields: &HashMap<String, String>,
+/// The verified PayPal payment behind a `Completed` IPN.
+pub(super) struct GatewayPayment<'a> {
+    pub(super) txn_id: &'a str,
+    pub(super) merchant_email: &'a str,
+    pub(super) receiver_id: Option<&'a str>,
+}
+
+impl<'a> GatewayPayment<'a> {
+    pub(super) fn from_fields(
+        txn_id: &'a str,
+        merchant_email: &'a str,
+        fields: &'a HashMap<String, String>,
+    ) -> Self {
+        Self {
+            txn_id,
+            merchant_email,
+            receiver_id: fields
+                .get("receiver_id")
+                .and_then(|value| paypal_transaction_id(value)),
+        }
+    }
+}
+
+/// Serializes everything keyed by one PayPal payment: its `Completed`
+/// settlement and every refund-class notification naming it as parent.
+/// Taken first, before the payment row and then the order row, on both
+/// paths, so the lock order is advisory, payment, order.
+pub(super) async fn lock_paypal_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    payment_txn_id: &str,
 ) -> Result<(), sqlx::Error> {
-    let receiver_id = fields
-        .get("receiver_id")
-        .and_then(|value| paypal_transaction_id(value));
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6361))")
+        .bind(payment_txn_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Inside the payment's settlement transaction (after
+/// [`lock_paypal_payment`] and the payment and order row locks): stores the
+/// verified payment id and receiver snapshot on the order, once, then
+/// re-evaluates every held `unknown_parent` row naming that payment. A
+/// refund therefore never sees the payment id before the payment is
+/// settled, and a settlement never leaves a held refund behind. A row that
+/// now fails a later check takes that reason and is not replayed again.
+pub(super) async fn settle_verified_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    state: &AppState,
+    order_id: Uuid,
+    payment: &GatewayPayment<'_>,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE orders SET paypal_txn_id = $2, paypal_receiver_email = $3, \
          paypal_receiver_id = $4 \
@@ -124,28 +164,20 @@ pub(super) async fn record_verified_payment(
            AND NOT EXISTS (SELECT 1 FROM orders d WHERE d.paypal_txn_id = $2)",
     )
     .bind(order_id)
-    .bind(txn_id)
-    .bind(merchant_email.to_ascii_lowercase())
-    .bind(receiver_id)
-    .execute(pool)
+    .bind(payment.txn_id)
+    .bind(payment.merchant_email.to_ascii_lowercase())
+    .bind(payment.receiver_id)
+    .execute(&mut **tx)
     .await?;
-    Ok(())
-}
-
-/// Applies inbox rows that were waiting for this payment's `Completed` IPN.
-pub(super) async fn apply_waiting_refunds(
-    state: &AppState,
-    parent_txn_id: &str,
-) -> Result<(), sqlx::Error> {
-    let waiting: Vec<(Value,)> = sqlx::query_as(
+    let held: Vec<(Value,)> = sqlx::query_as(
         "SELECT fields FROM gateway_refund_inbox \
          WHERE parent_txn_id = $1 AND reason = 'unknown_parent' AND resolved_at IS NULL \
          ORDER BY received_at, txn_id",
     )
-    .bind(parent_txn_id)
-    .fetch_all(&state.pool)
+    .bind(payment.txn_id)
+    .fetch_all(&mut **tx)
     .await?;
-    for (stored,) in waiting {
+    for (stored,) in held {
         let fields: HashMap<String, String> = stored
             .as_object()
             .map(|object| {
@@ -155,10 +187,10 @@ pub(super) async fn apply_waiting_refunds(
                     .collect()
             })
             .unwrap_or_default();
-        let disposition = process(state, &fields, state.clock.now()).await?;
+        let disposition = evaluate(tx, state, &fields, now).await?;
         tracing::info!(
             outcome = disposition.outcome(),
-            "waiting paypal refund notification replayed"
+            "held paypal refund notification re-evaluated"
         );
     }
     Ok(())
@@ -256,6 +288,30 @@ async fn process(
     now: DateTime<Utc>,
 ) -> Result<Disposition, sqlx::Error> {
     let field = |name: &str| fields.get(name).map(String::as_str).unwrap_or_default();
+    if GatewayStatus::parse(field("payment_status")).is_none()
+        || paypal_transaction_id(field("txn_id")).is_none()
+    {
+        return Ok(Disposition::Malformed);
+    }
+    let mut tx = state.pool.begin().await?;
+    if let Some(parent_txn_id) = paypal_transaction_id(field("parent_txn_id")) {
+        lock_paypal_payment(&mut tx, parent_txn_id).await?;
+    }
+    let disposition = evaluate(&mut tx, state, fields, now).await?;
+    tx.commit().await?;
+    Ok(disposition)
+}
+
+/// Resolves, validates, and records one refund-class notification inside
+/// the caller's transaction, which already holds [`lock_paypal_payment`] for
+/// its parent. Used by the IPN handler and by a payment's settlement.
+async fn evaluate(
+    tx: &mut Transaction<'_, Postgres>,
+    state: &AppState,
+    fields: &HashMap<String, String>,
+    now: DateTime<Utc>,
+) -> Result<Disposition, sqlx::Error> {
+    let field = |name: &str| fields.get(name).map(String::as_str).unwrap_or_default();
     let (Some(status), Some(txn_id)) = (
         GatewayStatus::parse(field("payment_status")),
         paypal_transaction_id(field("txn_id")),
@@ -265,7 +321,7 @@ async fn process(
     let recorded: Option<(Uuid,)> =
         sqlx::query_as("SELECT order_id FROM order_gateway_refunds WHERE refund_txn_id = $1")
             .bind(txn_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut **tx)
             .await?;
     if recorded.is_some() {
         return Ok(Disposition::Duplicate);
@@ -274,7 +330,7 @@ async fn process(
         Ok(order_id) => {
             let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM orders WHERE id = $1")
                 .bind(order_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&mut **tx)
                 .await?;
             exists.map(|(id,)| id)
         }
@@ -287,39 +343,48 @@ async fn process(
         fields,
     };
     let Some(parent_txn_id) = paypal_transaction_id(field("parent_txn_id")) else {
-        return inbox
-            .store(&state.pool, "missing_parent", custom_order, now)
-            .await;
+        return inbox.store(tx, "missing_parent", custom_order, now).await;
     };
     let inbox = InboxEntry {
         parent_txn_id: Some(parent_txn_id),
         ..inbox
     };
-    let owner: Option<(Uuid, String, Option<String>, String, i32)> = sqlx::query_as(
+    let owner: Option<PaymentOwner> = sqlx::query_as(
         "SELECT id, paypal_receiver_email, paypal_receiver_id, currency, exponent \
          FROM orders WHERE paypal_txn_id = $1",
     )
     .bind(parent_txn_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **tx)
     .await?;
-    let Some((order_id, receiver_email, receiver_id, currency, exponent)) = owner else {
-        return inbox
-            .store(&state.pool, "unknown_parent", custom_order, now)
-            .await;
+    let Some(PaymentOwner {
+        id: order_id,
+        paypal_receiver_email: receiver_email,
+        paypal_receiver_id: receiver_id,
+        currency,
+        exponent,
+    }) = owner
+    else {
+        return inbox.store(tx, "unknown_parent", custom_order, now).await;
     };
     if custom_order.is_some_and(|custom| custom != order_id) {
         return inbox
-            .store(&state.pool, "custom_mismatch", Some(order_id), now)
+            .store(tx, "custom_mismatch", Some(order_id), now)
             .await;
     }
-    if !paid_to_snapshot(fields, &receiver_email, receiver_id.as_deref()) {
+    if receiver_email.is_none() && receiver_id.is_none() {
+        // A payment id backfilled by migration 0039 has no observed receiver.
         return inbox
-            .store(&state.pool, "receiver_mismatch", Some(order_id), now)
+            .store(tx, "receiver_unverified", Some(order_id), now)
+            .await;
+    }
+    if !paid_to_snapshot(fields, receiver_email.as_deref(), receiver_id.as_deref()) {
+        return inbox
+            .store(tx, "receiver_mismatch", Some(order_id), now)
             .await;
     }
     if field("mc_currency") != currency {
         return inbox
-            .store(&state.pool, "currency_mismatch", Some(order_id), now)
+            .store(tx, "currency_mismatch", Some(order_id), now)
             .await;
     }
     let amount = match status {
@@ -329,11 +394,15 @@ async fn process(
         }
     };
     let Some(amount_minor) = amount else {
-        return inbox
-            .store(&state.pool, "amount_invalid", Some(order_id), now)
-            .await;
+        return inbox.store(tx, "amount_invalid", Some(order_id), now).await;
     };
+    // Payment row, then order row (inside `record_on_order`).
+    sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
+        .bind(order_id)
+        .execute(&mut **tx)
+        .await?;
     record_on_order(
+        tx,
         state,
         &GatewayRecord {
             order_id,
@@ -347,6 +416,16 @@ async fn process(
     .await
 }
 
+/// The order owning a verified PayPal payment, with its receiver snapshot.
+#[derive(sqlx::FromRow)]
+struct PaymentOwner {
+    id: Uuid,
+    paypal_receiver_email: Option<String>,
+    paypal_receiver_id: Option<String>,
+    currency: String,
+    exponent: i32,
+}
+
 struct InboxEntry<'a> {
     txn_id: &'a str,
     parent_txn_id: Option<&'a str>,
@@ -355,9 +434,12 @@ struct InboxEntry<'a> {
 }
 
 impl InboxEntry<'_> {
+    /// Holds the notification, or moves an unresolved held row to this
+    /// evaluation's reason and order, so a re-evaluation never leaves a stale
+    /// reason behind.
     async fn store(
         &self,
-        pool: &PgPool,
+        tx: &mut Transaction<'_, Postgres>,
         reason: &'static str,
         order_id: Option<Uuid>,
         now: DateTime<Utc>,
@@ -370,10 +452,15 @@ impl InboxEntry<'_> {
                     .map(|value| (name.to_string(), json!(value)))
             })
             .collect();
-        let inserted = sqlx::query(
+        let written = sqlx::query(
             "INSERT INTO gateway_refund_inbox \
              (txn_id, parent_txn_id, payment_status, reason, order_id, fields, received_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (txn_id) DO NOTHING",
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (txn_id) DO UPDATE SET reason = EXCLUDED.reason, \
+                 order_id = EXCLUDED.order_id \
+             WHERE gateway_refund_inbox.resolved_at IS NULL \
+               AND (gateway_refund_inbox.reason, gateway_refund_inbox.order_id) \
+                   IS DISTINCT FROM (EXCLUDED.reason, EXCLUDED.order_id)",
         )
         .bind(self.txn_id)
         .bind(self.parent_txn_id)
@@ -382,9 +469,9 @@ impl InboxEntry<'_> {
         .bind(order_id)
         .bind(Value::Object(kept))
         .bind(now)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
-        if inserted.rows_affected() == 0 {
+        if written.rows_affected() == 0 {
             return Ok(Disposition::Duplicate);
         }
         tracing::warn!(
@@ -443,12 +530,12 @@ impl Totals {
 /// order state: ledger row, running amount, reversal fields, state move or
 /// review flag, event, and notifications.
 async fn record_on_order(
+    tx: &mut Transaction<'_, Postgres>,
     state: &AppState,
     record: &GatewayRecord<'_>,
     now: DateTime<Utc>,
 ) -> Result<Disposition, sqlx::Error> {
-    let mut tx = state.pool.begin().await?;
-    let Some(order) = fetch_order_for_update(&mut tx, record.order_id).await? else {
+    let Some(order) = fetch_order_for_update(tx, record.order_id).await? else {
         return Ok(Disposition::Inbox("unknown_parent"));
     };
     let ledger: Vec<LedgerRow> = sqlx::query_as(
@@ -456,7 +543,7 @@ async fn record_on_order(
          FROM order_gateway_refunds WHERE order_id = $1 ORDER BY recorded_at, refund_txn_id",
     )
     .bind(order.id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
     if ledger.iter().any(|row| row.refund_txn_id == record.txn_id) {
         return Ok(Disposition::Duplicate);
@@ -490,7 +577,7 @@ async fn record_on_order(
     .bind(record.status.as_str())
     .bind(record.amount_minor)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() == 0 {
         return Ok(Disposition::Duplicate);
@@ -501,7 +588,7 @@ async fn record_on_order(
     )
     .bind(record.txn_id)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     let effective = after.effective();
@@ -531,7 +618,10 @@ async fn record_on_order(
                 next.external_refund = running_refund(record.txn_id);
             }
             if record.status == GatewayStatus::Reversed {
-                next.reversed_at = Some(order.payment_reversed_at.unwrap_or(now));
+                // A `Canceled_Reversal` delivered before its `Reversed` nets
+                // the reversal to zero: nothing is outstanding.
+                next.reversed_at = (after.outstanding_reversal() > 0)
+                    .then(|| order.payment_reversed_at.unwrap_or(now));
             }
             next.review = manual_external || effective > order.total_minor || (full && !transition);
             if transition {
@@ -552,7 +642,7 @@ async fn record_on_order(
                 .bind(record.txn_id)
                 .bind(&order.state)
                 .bind(&from_return_state)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
                 next.state = "refunded_external".to_string();
                 next.return_request = set_return_state(&order.return_request, "refunded", now);
@@ -632,7 +722,7 @@ async fn record_on_order(
     .bind(next.reversal_cancelled_at)
     .bind(next.review)
     .bind(now)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
 
     let (event_kind, notification) = match (record.status, effect) {
@@ -642,17 +732,7 @@ async fn record_on_order(
         (_, Effect::Full) => ("refund.recorded_external", "refund_recorded"),
         _ => ("refund.recorded_partial", "refund_recorded"),
     };
-    finish(
-        &mut tx,
-        state,
-        &updated,
-        event_kind,
-        notification,
-        effect,
-        now,
-    )
-    .await?;
-    tx.commit().await?;
+    finish(tx, state, &updated, event_kind, notification, effect, now).await?;
     Ok(Disposition::Applied(effect))
 }
 
@@ -832,27 +912,15 @@ mod tests {
             ("receiver_email", "new@example.com"),
             ("receiver_id", "S8XGHLYDW9T3S"),
         ]);
-        assert!(paid_to_snapshot(
-            &renamed,
-            "merchant@example.com",
-            Some("S8XGHLYDW9T3S")
-        ));
-        assert!(!paid_to_snapshot(&renamed, "merchant@example.com", None));
-        assert!(!paid_to_snapshot(
-            &renamed,
-            "merchant@example.com",
-            Some("OTHERACCOUNT1")
-        ));
+        let snapshot = Some("merchant@example.com");
+        assert!(paid_to_snapshot(&renamed, snapshot, Some("S8XGHLYDW9T3S")));
+        assert!(!paid_to_snapshot(&renamed, snapshot, None));
+        assert!(!paid_to_snapshot(&renamed, snapshot, Some("OTHERACCOUNT1")));
         let empty_id = fields(&[("receiver_email", "new@example.com"), ("receiver_id", "")]);
-        assert!(!paid_to_snapshot(
-            &empty_id,
-            "merchant@example.com",
-            Some("")
-        ));
-        assert!(paid_to_snapshot(
-            &fields(&[("business", "MERCHANT@example.com")]),
-            "merchant@example.com",
-            None
-        ));
+        assert!(!paid_to_snapshot(&empty_id, snapshot, Some("")));
+        let business = fields(&[("business", "MERCHANT@example.com")]);
+        assert!(paid_to_snapshot(&business, snapshot, None));
+        // No observed receiver never matches.
+        assert!(!paid_to_snapshot(&business, None, None));
     }
 }

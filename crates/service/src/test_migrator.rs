@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 
 /// Session advisory lock held for the whole test migration. Not a
-/// `hashtextextended` seed (those are 32, 42, 6341, 6342, 6353–6355).
+/// `hashtextextended` seed (those are 32, 42, 6341, 6342, 6353–6355, 6361).
 const MIGRATION_LOCK_ID: i64 = 871_946_354_001;
 
 pub static TEST_MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| {

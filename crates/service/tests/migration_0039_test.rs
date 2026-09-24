@@ -162,12 +162,11 @@ async fn migration_0039_backfills_only_gateway_verified_payment_ids(pool: PgPool
 
     rerun(&pool).await;
 
+    // The payment id is backfilled; the receiver it matched was never
+    // stored, so it stays unresolved rather than copied from configuration.
     assert_eq!(
         stored(&pool, &plain.order_id).await,
-        (
-            Some("1HH00000HH0000001".to_string()),
-            Some("merchant@example.com".to_string())
-        )
+        (Some("1HH00000HH0000001".to_string()), None)
     );
     assert_eq!(
         stored(&pool, &reported_before.order_id).await.0.as_deref(),
@@ -232,7 +231,7 @@ async fn migration_0039_constraints_hold(pool: PgPool) {
     assert!(insert("R4", "Reversed", 0).await.is_err());
     assert!(insert("", "Reversed", 1).await.is_err());
 
-    // One verified payment id per order, and never without its receiver.
+    // One verified payment id per order.
     assert!(sqlx::query(
         "UPDATE orders SET paypal_txn_id = '1HH00000HH0000007', \
          paypal_receiver_email = 'merchant@example.com' WHERE id = $1::uuid"
@@ -241,13 +240,16 @@ async fn migration_0039_constraints_hold(pool: PgPool) {
     .execute(&pool)
     .await
     .is_err());
-    assert!(
-        sqlx::query("UPDATE orders SET paypal_receiver_email = NULL WHERE id = $1::uuid")
-            .bind(&paid.order_id)
-            .execute(&pool)
-            .await
-            .is_err()
-    );
+    // A backfilled payment id has no receiver; an account id is never stored
+    // without the email it came with.
+    assert_eq!(stored(&pool, &paid.order_id).await.1, None);
+    assert!(sqlx::query(
+        "UPDATE orders SET paypal_receiver_id = 'S8XGHLYDW9T3S' WHERE id = $1::uuid"
+    )
+    .bind(&paid.order_id)
+    .execute(&pool)
+    .await
+    .is_err());
 
     let inbox = |reason: &'static str| {
         let pool = pool.clone();
@@ -264,4 +266,53 @@ async fn migration_0039_constraints_hold(pool: PgPool) {
     };
     inbox("unknown_parent").await.expect("valid reason");
     assert!(inbox("anything_else").await.is_err());
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_on_a_backfilled_payment_is_held_as_receiver_unverified(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let paid = gateway_paid_order(&app, None, "1HH00000HH0000009").await;
+    rerun(&pool).await;
+    assert_eq!(
+        stored(&pool, &paid.order_id).await,
+        (Some("1HH00000HH0000009".to_string()), None)
+    );
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in [
+        ("payment_status", "Refunded"),
+        ("receiver_email", "merchant@example.com"),
+        ("mc_gross", "-137.00"),
+        ("mc_currency", "USD"),
+        ("custom", paid.order_id.as_str()),
+        ("txn_id", "2HH00000HH0000009"),
+        ("parent_txn_id", "1HH00000HH0000009"),
+    ] {
+        serializer.append_pair(name, value);
+    }
+    let (status, _) = send_bytes(
+        app.router.clone(),
+        "POST",
+        "/v0/paypal/ipn",
+        serializer.finish().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let held: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT reason, order_id::text FROM gateway_refund_inbox")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        held,
+        vec![(
+            "receiver_unverified".to_string(),
+            Some(paid.order_id.clone())
+        )]
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM orders WHERE id = $1::uuid")
+        .bind(&paid.order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "paid");
 }

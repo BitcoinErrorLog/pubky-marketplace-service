@@ -9,7 +9,9 @@
 -- receiver that payment was verified against. Refund IPNs match their
 -- `parent_txn_id` against it, never against the buyer-writable
 -- `fiat_transaction_ref`, and their receiver against the snapshot, never
--- against the seller's current configuration.
+-- against the seller's current configuration. A backfilled payment id has
+-- no observed receiver (both snapshot columns NULL); its refunds are held
+-- for review as `receiver_unverified`.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_txn_id TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_receiver_email TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_receiver_id TEXT;
@@ -23,10 +25,11 @@ ALTER TABLE orders ADD CONSTRAINT orders_paypal_txn_id_check
         (paypal_txn_id IS NULL AND paypal_receiver_email IS NULL AND paypal_receiver_id IS NULL)
         OR (
             paypal_txn_id IS NOT NULL
-            AND paypal_receiver_email IS NOT NULL
             AND char_length(paypal_txn_id) BETWEEN 1 AND 64
-            AND char_length(paypal_receiver_email) BETWEEN 1 AND 254
+            AND (paypal_receiver_email IS NULL
+                 OR char_length(paypal_receiver_email) BETWEEN 1 AND 254)
             AND (paypal_receiver_id IS NULL OR char_length(paypal_receiver_id) BETWEEN 1 AND 64)
+            AND (paypal_receiver_id IS NULL OR paypal_receiver_email IS NOT NULL)
         )
     );
 
@@ -37,17 +40,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS orders_paypal_txn_id_key
 -- Gateway-verified payments already carry the IPN `txn_id` in
 -- `fiat_transaction_ref`, unless a buyer report was appended to the order's
 -- event log after the receipt (a report overwrites the stored value). The
--- event sequence decides, not timestamps. The receiver snapshot is the
--- seller's configured PayPal email at migration time, which the verified
--- payment matched unless the seller changed it since.
+-- event sequence decides, not timestamps. The receiver that payment matched
+-- was never stored, and the seller's current configuration is not evidence
+-- of it, so the receiver stays unresolved.
 -- A reference shared by two gateway-verified orders is not backfilled.
 UPDATE orders o
-   SET paypal_txn_id = o.fiat_transaction_ref,
-       paypal_receiver_email = lower(c.paypal_merchant_email)
-  FROM seller_payment_configs c
- WHERE c.seller_pubky = o.seller_pubky
-   AND c.paypal_merchant_email IS NOT NULL
-   AND o.paypal_txn_id IS NULL
+   SET paypal_txn_id = o.fiat_transaction_ref
+ WHERE o.paypal_txn_id IS NULL
    AND o.payment_method = 'paypal'
    AND o.fiat_verified_by = 'gateway'
    AND o.fiat_transaction_ref IS NOT NULL
@@ -106,7 +105,8 @@ CREATE TABLE IF NOT EXISTS gateway_refund_inbox (
         CHECK (payment_status IN ('Refunded', 'Reversed', 'Canceled_Reversal')),
     reason TEXT NOT NULL CHECK (reason IN (
         'missing_parent', 'unknown_parent', 'custom_mismatch',
-        'receiver_mismatch', 'currency_mismatch', 'amount_invalid')),
+        'receiver_mismatch', 'receiver_unverified', 'currency_mismatch',
+        'amount_invalid')),
     order_id UUID REFERENCES orders (id),
     fields JSONB NOT NULL,
     received_at TIMESTAMPTZ NOT NULL,

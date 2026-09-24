@@ -1842,3 +1842,142 @@ async fn a_refund_racing_each_return_step_is_recorded(pool: PgPool) {
         );
     }
 }
+
+/// Waits until at least `waiting` sessions block on a lock, up to five
+/// seconds, and returns how many did.
+async fn lock_waiters(pool: &PgPool, waiting: i64) -> i64 {
+    let mut blocked = 0;
+    for _ in 0..250 {
+        blocked = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("lock waiters");
+        if blocked >= waiting {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    blocked
+}
+
+/// Review schedule 1: the refund finds no payment yet and is about to hold
+/// itself when the payment settles. The payment's settlement must see the
+/// held refund, or the refund must see the payment.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_racing_its_payment_settlement_is_never_stranded(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let order = pending_paypal_order(&app).await;
+
+    // An uncommitted row with the refund's key parks the refund at its inbox
+    // write, after it found no owner for the payment.
+    let mut locker = pool.begin().await.expect("lock transaction");
+    sqlx::query(
+        "INSERT INTO gateway_refund_inbox \
+         (txn_id, payment_status, reason, fields, received_at) \
+         VALUES ($1, 'Refunded', 'unknown_parent', '{}'::jsonb, now())",
+    )
+    .bind(FULL_REFUND_TXN)
+    .execute(&mut *locker)
+    .await
+    .expect("parking row");
+    let refund_ipn = spawn_ipn(&app, refund("refund-full.ipn", &order.id, PAYMENT_TXN));
+    let parked = lock_waiters(&pool, 1).await;
+    let payment_ipn = spawn_ipn(&app, fixture("completed.ipn", &order.id));
+    let both = lock_waiters(&pool, 2).await;
+    locker.rollback().await.expect("release");
+    assert_eq!(refund_ipn.await.expect("refund joins"), StatusCode::OK);
+    assert_eq!(payment_ipn.await.expect("payment joins"), StatusCode::OK);
+
+    let view = read_order(&app, &order.buyer.token, &order.id).await;
+    assert_eq!(view["state"], json!("refunded_external"), "{view}");
+    assert_eq!(view["gateway_refund_unmatched"], json!(false));
+    assert_eq!(
+        ledger_rows(&pool, &order.id).await,
+        vec![(
+            FULL_REFUND_TXN.to_string(),
+            "Refunded".to_string(),
+            TOTAL_MINOR
+        )]
+    );
+    assert!(inbox_rows(&pool).await.iter().all(|row| row.3));
+    // The payment waited on the refund's payment lock.
+    assert_eq!((parked, both), (1, 2));
+}
+
+/// Review schedule 2: a full refund arrives while the payment is settling.
+/// It must not see the payment before the order is paid, so it moves the
+/// paid order to `refunded_external` instead of flagging a pending one.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_full_refund_racing_payment_confirmation_moves_the_paid_order(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let order = pending_paypal_order(&app).await;
+
+    // Hold the payment row: the payment IPN parks at its payment lock.
+    let mut locker = pool.begin().await.expect("lock transaction");
+    sqlx::query("SELECT id FROM payments WHERE order_id = $1::uuid FOR UPDATE")
+        .bind(&order.id)
+        .execute(&mut *locker)
+        .await
+        .expect("payment lock");
+    let payment_ipn = spawn_ipn(&app, fixture("completed.ipn", &order.id));
+    let parked = lock_waiters(&pool, 1).await;
+    let refund_ipn = spawn_ipn(&app, refund("refund-full.ipn", &order.id, PAYMENT_TXN));
+    let both = lock_waiters(&pool, 2).await;
+    locker.rollback().await.expect("release");
+    assert_eq!(payment_ipn.await.expect("payment joins"), StatusCode::OK);
+    assert_eq!(refund_ipn.await.expect("refund joins"), StatusCode::OK);
+
+    let view = read_order(&app, &order.seller.token, &order.id).await;
+    assert_eq!(view["state"], json!("refunded_external"), "{view}");
+    assert!(view["receipt_id"].is_string());
+    assert_eq!(view["gateway_refund_review_at"], Value::Null);
+    assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_MINOR));
+    // The refund waited on the payment's lock.
+    assert_eq!((parked, both), (1, 2));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_held_refund_is_re_evaluated_when_its_payment_lands(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let order = pending_paypal_order(&app).await;
+
+    let wrong_currency = with(
+        refund("refund-full.ipn", &order.id, PAYMENT_TXN),
+        "mc_currency",
+        "EUR",
+    );
+    assert_eq!(post_ipn(&app, &wrong_currency).await, StatusCode::OK);
+    assert_eq!(
+        inbox_rows(&pool).await,
+        vec![(
+            FULL_REFUND_TXN.to_string(),
+            "unknown_parent".to_string(),
+            Some(order.id.clone()),
+            false
+        )]
+    );
+
+    // Once the payment is settled, the held refund's real problem shows.
+    let status = post_ipn(&app, &fixture("completed.ipn", &order.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        inbox_rows(&pool).await,
+        vec![(
+            FULL_REFUND_TXN.to_string(),
+            "currency_mismatch".to_string(),
+            Some(order.id.clone()),
+            false
+        )]
+    );
+    let view = read_order(&app, &order.seller.token, &order.id).await;
+    assert_eq!(view["state"], json!("paid"));
+    assert_eq!(view["gateway_refund_unmatched"], json!(true));
+    // A payment retry re-evaluates the same row; nothing multiplies.
+    let status = post_ipn(&app, &fixture("completed.ipn", &order.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inbox_rows(&pool).await.len(), 1);
+    assert!(ledger_rows(&pool, &order.id).await.is_empty());
+}
