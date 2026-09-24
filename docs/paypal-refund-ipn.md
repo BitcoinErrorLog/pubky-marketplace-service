@@ -46,8 +46,10 @@ clearing the PayPal email after the sale does not strand later refunds.
 keeps its meaning and projection.
 
 Migration `0039` backfills `paypal_txn_id` from `fiat_transaction_ref` for
-gateway-verified payments, with the seller's configured email at migration
-time as the snapshot (no `receiver_id`), only when:
+gateway-verified payments. The receiver that payment matched was never
+stored, and the seller's current configuration is not evidence of it, so a
+backfilled payment has no receiver snapshot and its refund-class
+notifications are held as `receiver_unverified`. It backfills only when:
 
 - the order's event log has no `order.fiat_payment_reported` after its
   `receipt.issued` (the event sequence decides, not timestamps);
@@ -60,6 +62,26 @@ Production preflight (2026-09-24, read-only): 69 order rows (256 kB), one
 backfill candidate, no buyer report on it, and a configured email. The index
 builds hold their lock for milliseconds.
 
+## Serialization
+
+Everything keyed by one PayPal payment runs under one transaction-scoped
+advisory lock on that payment's `txn_id`
+(`pg_advisory_xact_lock(hashtextextended(txn_id, 6361))`), taken before the
+payment row and then the order row, so the lock order on both paths is
+advisory, payment, order:
+
+- A verified `Completed` IPN settles in one transaction: the payment lock,
+  the payment and order rows, confirmation (or late-money or manual-review
+  handling), the payment id and receiver snapshot, and re-evaluation of every
+  held `unknown_parent` row naming the payment.
+- A refund-class IPN takes the lock for its `parent_txn_id`, then resolves,
+  validates, and records or holds itself in one transaction, locking the
+  payment row before the order row.
+
+A refund therefore never sees a payment id before that payment is settled,
+and a refund held while the payment settles is either seen by the settlement
+or sees the settled payment.
+
 ## Resolution and the inbox
 
 1. `payment_status` is not one of the three, or `txn_id` is missing or not
@@ -67,18 +89,23 @@ builds hold their lock for milliseconds.
    sends a `txn_id`; the notification is logged and acknowledged.
 2. `txn_id` already recorded on an order or held in the inbox: no-op.
 3. `parent_txn_id` missing or malformed: inbox, `missing_parent`.
-4. No order owns `parent_txn_id` yet: inbox, `unknown_parent`. When the
-   parent payment's `Completed` IPN is later recorded (PayPal delivers out of
-   order, or retries the payment notification), the held row is applied to
-   the order and marked resolved.
+4. No order owns `parent_txn_id` yet: inbox, `unknown_parent`. The parent
+   payment's settlement re-evaluates the row in its own transaction: it is
+   applied and marked resolved, or it takes the reason a later check now
+   gives. A row with any reason other than `unknown_parent` is terminal and
+   is not replayed; it waits for the seller's review.
 5. `custom` names an order other than the owner: inbox, `custom_mismatch`.
-6. Receiver does not match the snapshot: inbox, `receiver_mismatch`.
+6. The payment has no receiver snapshot (backfilled): inbox,
+   `receiver_unverified`. Otherwise, a receiver that does not match the
+   snapshot: inbox, `receiver_mismatch`.
 7. `mc_currency` differs from the order currency: inbox, `currency_mismatch`.
 8. `mc_gross` has the wrong sign, is zero, or lacks exactly the currency's
    fraction digits: inbox, `amount_invalid`.
 9. Otherwise: recorded on the order.
 
-An inbox row keeps the fields needed to apply it (`payment_status`, ids,
+Re-evaluating or re-delivering a held notification moves the unresolved row
+to the new reason, keeping the known order when the new evaluation names
+none. An inbox row keeps the fields needed to apply it (`payment_status`, ids,
 `custom`, `mc_gross`, `mc_currency`, `receiver_email`, `business`,
 `receiver_id`, `reason_code`) and nothing about the payer. An unresolved row
 naming an order projects `gateway_refund_unmatched: true` on that order.
@@ -114,7 +141,9 @@ flagged for review instead.
 - Effective refund reaching the total from `pending_payment`, `processing`,
   `closed`, or an already manual `refunded_external`; or exceeding the total:
   recorded, state unchanged, `gateway_refund_review_at` set.
-- `Reversed` also sets `payment_reversed_at` (first outstanding reversal).
+- `Reversed` also sets `payment_reversed_at` (first outstanding reversal),
+  but only while a reversal is outstanding: a `Canceled_Reversal` delivered
+  before its `Reversed` nets it to zero, and the flag stays clear.
 
 An open cancel or return request is resolved by the refund that reaches the
 total: the seller refunded the buyer, which is what either request asks for.
@@ -228,6 +257,8 @@ email, amount, or transaction id.
 | Refund races a cancel approval on the order lock | n/a | Recorded whichever commits first; approval may lose with 409 | As the state rows | `a_refund_racing_a_cancel_approval_is_recorded` |
 | Refund races `return.approve` or `return.receive` | n/a | Recorded whichever commits first; a full refund resolves the return | return "refunded" | `a_refund_racing_each_return_step_is_recorded` |
 | Two refunds arrive together | n/a | Both recorded under the lock; the second completes the refund | "Refund recorded from external evidence: {txn}" | `two_simultaneous_partial_refunds_both_record` |
+| Refund finds no payment and is being held while the payment settles | stranded as `unknown_parent` (round 2) | The payment lock serializes them; the settlement applies the held refund | refunded once paid | `a_refund_racing_its_payment_settlement_is_never_stranded` |
+| Full refund arrives while the payment is confirming | recorded for review on a `pending_payment` order, then left `paid` (round 2) | The refund waits for the settlement and moves the paid order to `refunded_external` | "Refund recorded from external evidence: {txn}" | `a_full_refund_racing_payment_confirmation_moves_the_paid_order` |
 | `Reversed`, any state | 200, dropped | As `Refunded` in that state, plus `payment_reversed_at` | `payment_reversed_at` on the order | `reversed_ipn_records_the_refund_and_flags_the_order` |
 
 ### Canceled_Reversal
@@ -237,6 +268,7 @@ email, amount, or transaction id.
 | After a full reversal moved the order to `refunded_external` | 200, dropped (previous revision: penalty and flag kept) | Order back to the replaced state; `payment_reversed_at` null; `payment_reversal_cancelled_at` set; `external_refund` null; attestor `refund_reversal_cancelled`; `refund.reversal_cancelled`; `payment_reversal_cancelled` to both | prior state restored | `canceled_reversal_restores_the_order_and_clears_the_flag` |
 | After a partial refund plus a reversal reached the total from `return_received` | 200, dropped | Order back to `return_received`, return back to `received`; `external_refund` = the refund only | "Refunded $X of $Y" | `canceled_reversal_restores_the_order_and_clears_the_flag` |
 | Nothing reversed on the order | 200, dropped | Recorded; state and `external_refund` unchanged; `gateway_refund_review_at` set | review flag | `canceled_reversal_restores_the_order_and_clears_the_flag` |
+| `Canceled_Reversal` delivered before its `Reversed` | `payment_reversed_at` stuck set, blocking the pickup purge (round 2) | Both recorded; the reversal nets to zero; `payment_reversed_at` stays null; review flag from the early cancellation | review flag | `a_canceled_reversal_before_its_reversal_leaves_nothing_outstanding` |
 | Reputation after a canceled reversal | full reversal counted in `terminated_badly` | Not counted; a standing reversal still is | completion rate | `a_canceled_reversal_removes_the_reputation_penalty` |
 
 ### Other payment statuses
@@ -259,7 +291,8 @@ email, amount, or transaction id.
 | `txn_id` missing, empty, over 64 characters, or not printable ASCII | 200, dropped | Logged and acknowledged; no key to record under | unchanged | `refund_ipn_transaction_ids` |
 | `parent_txn_id` missing or malformed | 200, dropped | Inbox `missing_parent` | `gateway_refund_unmatched` when `custom` names the order | `refund_ipn_transaction_ids` |
 | No order owns `parent_txn_id` | 200, dropped | Inbox `unknown_parent` | `gateway_refund_unmatched` when `custom` names the order | `refund_ipn_with_unknown_parent_is_held_in_the_inbox` |
-| Refund before its payment's `Completed` IPN | 200, dropped | Inbox `unknown_parent`, applied when the payment is recorded | refunded once paid | `a_refund_that_arrives_before_its_payment_is_applied_when_the_payment_lands` |
+| Refund before its payment's `Completed` IPN | 200, dropped | Inbox `unknown_parent`, applied in the payment's settlement transaction | refunded once paid | `a_refund_that_arrives_before_its_payment_is_applied_when_the_payment_lands` |
+| Held refund fails a later check once its payment settles | reason stayed `unknown_parent`, replayed on every payment retry (round 2) | Row moves to the real reason (for example `receiver_mismatch`) and is terminal: not replayed | `gateway_refund_unmatched` | `a_held_refund_is_re_evaluated_when_its_payment_lands` |
 | `parent_txn_id` equals a buyer-reported `fiat_transaction_ref` (no gateway payment) | 200, dropped | Inbox `unknown_parent`; order untouched | `gateway_refund_unmatched` | `a_buyer_reported_reference_never_matches_a_refund` |
 | `custom` names an order other than the parent's owner | 200, dropped | Inbox `custom_mismatch`; both orders untouched | `gateway_refund_unmatched` on the owner | `refund_ipn_whose_custom_order_does_not_own_the_parent_is_held` |
 | `custom` absent, parent owned | 200, dropped | Recorded on the owner | as the state rows | `refund_ipn_without_custom_resolves_by_parent` |
@@ -284,4 +317,5 @@ email, amount, or transaction id.
 | Backfill, buyer report after the receipt at the same instant | n/a | Not backfilled (event sequence) | n/a | `migration_0039_backfills_only_gateway_verified_payment_ids` |
 | Backfill, buyer report before a payment IPN without `txn_id` (buyer value survives) | n/a | Not backfilled (not PayPal-shaped) | n/a | `migration_0039_backfills_only_gateway_verified_payment_ids` |
 | Backfill, a reference on two gateway orders | n/a | Neither backfilled | n/a | `migration_0039_skips_a_reference_shared_by_two_orders` |
-| `paypal_txn_id` on two orders, or without its receiver | n/a | Refused by the unique index and CHECK | n/a | `migration_0039_constraints_hold` |
+| `paypal_txn_id` on two orders, or an account id without its email | n/a | Refused by the unique index and CHECK | n/a | `migration_0039_constraints_hold` |
+| Backfilled payment id (no receiver snapshot) | receiver copied from current configuration (round 2) | Receiver unresolved; its refunds held as `receiver_unverified` | `gateway_refund_unmatched` | `a_refund_on_a_backfilled_payment_is_held_as_receiver_unverified` |
