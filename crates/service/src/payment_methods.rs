@@ -16,9 +16,10 @@
 //!   buyer-reports/seller-confirms pair remains as the fallback when no IPN
 //!   arrives. The projection exposes the provenance as `fiat_verification:
 //!   'processor' | 'gateway-notified' | 'seller-attested'`.
-//! - PayPal `Refunded`/`Reversed` IPNs are recorded on the order whose
-//!   gateway-verified payment id is their `parent_txn_id`
-//!   (`paypal_refund`, docs/paypal-refund-ipn.md).
+//! - PayPal `Refunded`/`Reversed`/`Canceled_Reversal` IPNs are recorded on
+//!   the order whose gateway-verified payment id is their `parent_txn_id`,
+//!   or held in `gateway_refund_inbox` (`paypal_refund`,
+//!   docs/paypal-refund-ipn.md).
 //! - Payment confirmation reuses the sandbox/Locks confirmation path
 //!   (`confirm_order`): receipt exactly once, inventory reserved → sold,
 //!   payment CAS `awaiting_entitlement → confirmed`. A confirmation the
@@ -1824,8 +1825,8 @@ fn parse_gateway_amount_minor(value: &str, exponent: i32) -> Option<i64> {
 /// be the seller's configured PayPal email and the amount and currency must
 /// equal the order total exactly. Anything that doesn't match is dropped
 /// with a 200 (PayPal retries non-2xx; a mismatch will never become valid).
-/// Transient failures answer 5xx so PayPal retries. `Refunded` and
-/// `Reversed` notifications are recorded on the refunded order
+/// Transient failures answer 5xx so PayPal retries. `Refunded`,
+/// `Reversed`, and `Canceled_Reversal` notifications are never dropped
 /// (`paypal_refund`, docs/paypal-refund-ipn.md).
 pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response {
     let Ok(payments) = payments_runtime(&state) else {
@@ -1851,10 +1852,12 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
     let payment_status = field("payment_status");
     match payment_status {
         "Completed" => {}
-        "Refunded" | "Reversed" => return paypal_refund::apply_refund_ipn(&state, &fields).await,
+        "Refunded" | "Reversed" | "Canceled_Reversal" => {
+            return paypal_refund::apply_refund_ipn(&state, &fields).await
+        }
         _ => {
-            // Pending, Canceled_Reversal, Denied etc.: retained in the logs,
-            // never a confirmation or a refund.
+            // Pending, Denied, Voided etc.: retained in the logs, never a
+            // confirmation or a refund.
             tracing::info!(
                 payment_status,
                 "paypal ipn ignored: not a completed payment or a refund"
@@ -1899,22 +1902,25 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
     }
     let txn_id = field("txn_id");
     let transaction_ref = (!txn_id.is_empty() && txn_id.len() <= 64).then_some(txn_id);
-    if let Some(gateway_txn_id) = paypal_refund::paypal_transaction_id(txn_id) {
+    let gateway_txn_id = paypal_refund::paypal_transaction_id(txn_id);
+    if let Some(gateway_txn_id) = gateway_txn_id {
         // Written in every payment state, before the confirmation, so a
         // payment the seller already confirmed by hand still matches its
-        // later refund. The first verified payment id is kept.
-        if let Err(error) = sqlx::query(
-            "UPDATE orders SET paypal_txn_id = COALESCE(paypal_txn_id, $2) WHERE id = $1",
+        // later refund. The first verified payment id and its receiver
+        // snapshot are kept.
+        if let Err(error) = paypal_refund::record_verified_payment(
+            &state.pool,
+            order_id,
+            gateway_txn_id,
+            &merchant_email,
+            &fields,
         )
-        .bind(order_id)
-        .bind(gateway_txn_id)
-        .execute(&state.pool)
         .await
         {
             return internal("ipn gateway transaction id", &error);
         }
     }
-    match apply_fiat_paid(
+    let confirmed = match apply_fiat_paid(
         &state,
         PAYPAL_GATEWAY_ACTOR,
         order_id,
@@ -1924,13 +1930,18 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
     )
     .await
     {
-        Ok(response) | Err(response) => {
-            // PayPal only needs the status: 2xx acknowledges, 5xx retries.
-            if response.status().is_server_error() {
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            } else {
-                StatusCode::OK.into_response()
-            }
+        Ok(response) | Err(response) => response,
+    };
+    // PayPal only needs the status: 2xx acknowledges, 5xx retries.
+    if confirmed.status().is_server_error() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    // Refund notifications that arrived before this payment's are applied
+    // now that the order owns the payment id.
+    if let Some(gateway_txn_id) = gateway_txn_id {
+        if let Err(error) = paypal_refund::apply_waiting_refunds(&state, gateway_txn_id).await {
+            return internal("waiting paypal refund replay", &error);
         }
     }
+    StatusCode::OK.into_response()
 }

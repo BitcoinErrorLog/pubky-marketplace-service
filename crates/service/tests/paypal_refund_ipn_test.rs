@@ -308,6 +308,122 @@ fn with_attestor(app: TestApp) -> TestApp {
     }
 }
 
+async fn notification_recipients(pool: &PgPool, order_id: &str, kind: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT payload->>'recipient_pubky' FROM outbox \
+         WHERE kind = 'notification.' || $2 AND payload->>'aggregate_id' = 'order:' || $1 \
+         ORDER BY id",
+    )
+    .bind(order_id)
+    .bind(kind)
+    .fetch_all(pool)
+    .await
+    .expect("outbox read")
+}
+
+/// `(txn_id, reason, order_id, resolved)` for every inbox row.
+async fn inbox_rows(pool: &PgPool) -> Vec<(String, String, Option<String>, bool)> {
+    sqlx::query_as(
+        "SELECT txn_id, reason, order_id::text, resolved_at IS NOT NULL \
+         FROM gateway_refund_inbox ORDER BY received_at, txn_id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("inbox read")
+}
+
+async fn put_paypal_email(app: &TestApp, seller: &TestActor, email: Option<&str>) {
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({ "bitcoin_enabled": email.is_none(), "paypal_merchant_email": email }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "config put failed: {body}");
+}
+
+/// Holds the order row lock while `contenders` start, waits until `waiting`
+/// sessions block on it, then releases it so they run against each other.
+async fn race_on_order_lock(
+    pool: &PgPool,
+    order_id: &str,
+    waiting: i64,
+    contenders: Vec<tokio::task::JoinHandle<StatusCode>>,
+) -> Vec<StatusCode> {
+    let mut locker = pool.begin().await.expect("lock transaction");
+    sqlx::query("SELECT id FROM orders WHERE id = $1::uuid FOR UPDATE")
+        .bind(order_id)
+        .execute(&mut *locker)
+        .await
+        .expect("order lock");
+    let mut blocked = 0;
+    for _ in 0..500 {
+        blocked = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("lock waiters");
+        if blocked >= waiting {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        blocked, waiting,
+        "contenders did not block on the order lock"
+    );
+    locker.rollback().await.expect("lock released");
+    let mut statuses = Vec::new();
+    for contender in contenders {
+        statuses.push(contender.await.expect("contender joins"));
+    }
+    statuses
+}
+
+fn spawn_ipn(app: &TestApp, fields: Fields) -> tokio::task::JoinHandle<StatusCode> {
+    let router = app.router.clone();
+    tokio::spawn(async move {
+        send_bytes(
+            router,
+            "POST",
+            "/v0/paypal/ipn",
+            encode(&fields).into_bytes(),
+        )
+        .await
+        .0
+    })
+}
+
+async fn spawn_command(
+    app: &TestApp,
+    token: &str,
+    kind: &str,
+    order_id: &str,
+    payload: Value,
+) -> tokio::task::JoinHandle<StatusCode> {
+    let revision = read_order(app, token, order_id).await["revision"]
+        .as_i64()
+        .expect("revision");
+    let command = order_command(
+        kind,
+        order_id,
+        revision,
+        payload,
+        COMMAND_NUMBER.fetch_add(1, Ordering::Relaxed),
+    );
+    let router = app.router.clone();
+    let token = token.to_string();
+    tokio::spawn(async move {
+        send(router, "POST", "/v1/commands", Some(&token), &command)
+            .await
+            .0
+    })
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn full_refund_ipn_moves_a_paid_order_to_refunded_external(pool: PgPool) {
     let (app, _stripe, _paykit, ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
@@ -341,6 +457,8 @@ async fn full_refund_ipn_moves_a_paid_order_to_refunded_external(pool: PgPool) {
         json!(format_timestamp(app.clock.now()))
     );
     assert_eq!(view["payment_reversed_at"], Value::Null);
+    assert_eq!(view["gateway_refund_review_at"], Value::Null);
+    assert_eq!(view["gateway_refund_unmatched"], json!(false));
     assert_eq!(view["next_actor"], Value::Null);
     assert_eq!(view["fiat_transaction_ref"], json!(PAYMENT_TXN));
 
@@ -399,6 +517,7 @@ async fn partial_refund_ipn_keeps_the_state_and_records_the_amount(pool: PgPool)
         view["external_refund"]["transaction_id"],
         json!(PARTIAL_1_TXN)
     );
+    assert_eq!(view["gateway_refund_review_at"], Value::Null);
     assert_eq!(view["next_actor"], before["next_actor"]);
     assert_eq!(
         order_events(&pool, &order.id, "refund.recorded_partial").await,
@@ -519,37 +638,136 @@ async fn duplicate_refund_ipn_is_a_no_op(pool: PgPool) {
         refund_notification_recipients(&pool, &order.id).await.len(),
         4
     );
+
+    // And for a held notification.
+    let stray = without(
+        refund("refund-full.ipn", &order.id, "9ZZ99999ZZ9999999"),
+        "custom",
+    );
+    for _ in 0..2 {
+        assert_eq!(post_ipn(&app, &stray).await, StatusCode::OK);
+    }
+    assert_eq!(inbox_rows(&pool).await.len(), 1);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn refund_ipn_with_unknown_parent_is_dropped(pool: PgPool) {
+async fn refund_ipn_with_unknown_parent_is_held_in_the_inbox(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let order = paid_paypal_order(&app, PAYMENT_TXN).await;
     let before = snapshot(&app, &order).await;
 
     let unknown = "9ZZ99999ZZ9999999";
-    for body in [
+    let missing_order = uuid::Uuid::new_v4().to_string();
+    for (txn, body) in [
         // No custom: resolved by parent, which matches no order.
-        without(refund("refund-full.ipn", &order.id, unknown), "custom"),
+        (
+            "1II00000II0000001",
+            without(refund("refund-full.ipn", &order.id, unknown), "custom"),
+        ),
         // The right order, but a parent it never received.
-        refund("refund-full.ipn", &order.id, unknown),
+        (
+            "1II00000II0000002",
+            refund("refund-full.ipn", &order.id, unknown),
+        ),
         // A custom order id that does not exist.
-        refund(
-            "refund-full.ipn",
-            &uuid::Uuid::new_v4().to_string(),
-            PAYMENT_TXN,
+        (
+            "1II00000II0000003",
+            refund("refund-full.ipn", &missing_order, unknown),
         ),
     ] {
-        assert_eq!(post_ipn(&app, &body).await, StatusCode::OK);
+        assert_eq!(
+            post_ipn(&app, &with(body, "txn_id", txn)).await,
+            StatusCode::OK
+        );
     }
     assert_untouched(&app, &order, &before).await;
     assert!(refund_notification_recipients(&pool, &order.id)
         .await
         .is_empty());
+    assert_eq!(
+        inbox_rows(&pool).await,
+        vec![
+            (
+                "1II00000II0000001".to_string(),
+                "unknown_parent".to_string(),
+                None,
+                false
+            ),
+            (
+                "1II00000II0000002".to_string(),
+                "unknown_parent".to_string(),
+                Some(order.id.clone()),
+                false
+            ),
+            (
+                "1II00000II0000003".to_string(),
+                "unknown_parent".to_string(),
+                None,
+                false
+            ),
+        ]
+    );
+    let view = read_order(&app, &order.seller.token, &order.id).await;
+    assert_eq!(view["gateway_refund_unmatched"], json!(true));
+    // The inbox keeps what applying the notification needs, not the payer.
+    let stored: Value =
+        sqlx::query_scalar("SELECT fields FROM gateway_refund_inbox WHERE txn_id = $1")
+            .bind("1II00000II0000002")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored["mc_gross"], json!("-137.00"));
+    assert!(stored.get("payer_email").is_none());
+    assert!(stored.get("first_name").is_none());
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn refund_ipn_whose_custom_order_does_not_own_the_parent_is_dropped(pool: PgPool) {
+async fn a_refund_that_arrives_before_its_payment_is_applied_when_the_payment_lands(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let order = pending_paypal_order(&app).await;
+
+    let status = post_ipn(&app, &refund("refund-full.ipn", &order.id, PAYMENT_TXN)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        inbox_rows(&pool).await,
+        vec![(
+            FULL_REFUND_TXN.to_string(),
+            "unknown_parent".to_string(),
+            Some(order.id.clone()),
+            false
+        )]
+    );
+    let view = read_order(&app, &order.buyer.token, &order.id).await;
+    assert_eq!(view["state"], json!("pending_payment"));
+
+    // PayPal's retry of the payment notification lands afterwards.
+    let status = post_ipn(&app, &fixture("completed.ipn", &order.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = read_order(&app, &order.buyer.token, &order.id).await;
+    assert_eq!(view["state"], json!("refunded_external"), "{view}");
+    assert!(view["receipt_id"].is_string());
+    assert_eq!(view["gateway_refund_unmatched"], json!(false));
+    assert_eq!(
+        inbox_rows(&pool).await,
+        vec![(
+            FULL_REFUND_TXN.to_string(),
+            "unknown_parent".to_string(),
+            Some(order.id.clone()),
+            true
+        )]
+    );
+    assert_eq!(
+        ledger_rows(&pool, &order.id).await,
+        vec![(
+            FULL_REFUND_TXN.to_string(),
+            "Refunded".to_string(),
+            TOTAL_MINOR
+        )]
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn refund_ipn_whose_custom_order_does_not_own_the_parent_is_held(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let first = paid_paypal_order(&app, "1AA00000AA0000001").await;
     let second = paid_paypal_order(&app, "1AA00000AA0000002").await;
@@ -564,12 +782,21 @@ async fn refund_ipn_whose_custom_order_does_not_own_the_parent_is_dropped(pool: 
     assert_eq!(status, StatusCode::OK);
     assert_untouched(&app, &first, &first_before).await;
     assert_untouched(&app, &second, &second_before).await;
+    assert_eq!(
+        inbox_rows(&pool).await,
+        vec![(
+            FULL_REFUND_TXN.to_string(),
+            "custom_mismatch".to_string(),
+            Some(second.id.clone()),
+            false
+        )]
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refund_ipn_without_custom_resolves_by_parent(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
-    let _other = paid_paypal_order(&app, "1AA00000AA0000001").await;
+    let other = paid_paypal_order(&app, "1AA00000AA0000001").await;
     let order = paid_paypal_order(&app, "1AA00000AA0000002").await;
 
     let status = post_ipn(
@@ -583,71 +810,174 @@ async fn refund_ipn_without_custom_resolves_by_parent(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     let view = read_order(&app, &order.buyer.token, &order.id).await;
     assert_eq!(view["state"], json!("refunded_external"), "{view}");
-    let other_view = read_order(&app, &_other.buyer.token, &_other.id).await;
+    let other_view = read_order(&app, &other.buyer.token, &other.id).await;
     assert_eq!(other_view["state"], json!("paid"));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn refund_ipn_with_currency_mismatch_is_dropped(pool: PgPool) {
+async fn refund_ipn_with_currency_mismatch_is_held(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let order = paid_paypal_order(&app, PAYMENT_TXN).await;
     let before = snapshot(&app, &order).await;
 
-    for currency in ["EUR", "usd", ""] {
+    for (index, currency) in ["EUR", "usd", ""].into_iter().enumerate() {
         let body = with(
-            refund("refund-full.ipn", &order.id, PAYMENT_TXN),
-            "mc_currency",
-            currency,
+            with(
+                refund("refund-full.ipn", &order.id, PAYMENT_TXN),
+                "mc_currency",
+                currency,
+            ),
+            "txn_id",
+            &format!("1JJ00000JJ000000{index}"),
         );
         assert_eq!(post_ipn(&app, &body).await, StatusCode::OK);
     }
     assert_untouched(&app, &order, &before).await;
+    let rows = inbox_rows(&pool).await;
+    assert_eq!(rows.len(), 3);
+    assert!(rows
+        .iter()
+        .all(|row| row.1 == "currency_mismatch" && row.2.as_deref() == Some(order.id.as_str())));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn refund_ipn_to_another_receiver_is_dropped(pool: PgPool) {
+async fn refund_ipn_to_another_receiver_is_held(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let order = paid_paypal_order(&app, PAYMENT_TXN).await;
     let before = snapshot(&app, &order).await;
 
     let body = with(
         with(
-            refund("refund-full.ipn", &order.id, PAYMENT_TXN),
-            "receiver_email",
+            with(
+                refund("refund-full.ipn", &order.id, PAYMENT_TXN),
+                "receiver_email",
+                "attacker@example.com",
+            ),
+            "business",
             "attacker@example.com",
         ),
-        "business",
-        "attacker@example.com",
+        "receiver_id",
+        "ATTACKER00001",
     );
     assert_eq!(post_ipn(&app, &body).await, StatusCode::OK);
     assert_untouched(&app, &order, &before).await;
+    assert_eq!(
+        inbox_rows(&pool).await,
+        vec![(
+            FULL_REFUND_TXN.to_string(),
+            "receiver_mismatch".to_string(),
+            Some(order.id.clone()),
+            false
+        )]
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn refund_ipn_with_a_non_negative_or_malformed_gross_is_dropped(pool: PgPool) {
+async fn refunds_validate_against_the_receiver_snapshot_not_current_config(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let snapshot_of = |order_id: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT paypal_receiver_email, paypal_receiver_id FROM orders WHERE id = $1::uuid",
+            )
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    // The seller changes the configured email after the payment.
+    let changed = paid_paypal_order(&app, "1KK00000KK0000001").await;
+    assert_eq!(
+        snapshot_of(changed.id.clone()).await,
+        (
+            Some("merchant@example.com".to_string()),
+            Some("S8XGHLYDW9T3S".to_string())
+        )
+    );
+    put_paypal_email(&app, &changed.seller, Some("new-merchant@example.com")).await;
+    let status = post_ipn(
+        &app,
+        &refund("refund-full.ipn", &changed.id, "1KK00000KK0000001"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let view = read_order(&app, &changed.buyer.token, &changed.id).await;
+    assert_eq!(view["state"], json!("refunded_external"), "{view}");
+
+    // The seller removes PayPal entirely.
+    let cleared = paid_paypal_order(&app, "1KK00000KK0000002").await;
+    put_paypal_email(&app, &cleared.seller, None).await;
+    let status = post_ipn(
+        &app,
+        &with(
+            refund("refund-full.ipn", &cleared.id, "1KK00000KK0000002"),
+            "txn_id",
+            "1KK00000KK0000003",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let view = read_order(&app, &cleared.buyer.token, &cleared.id).await;
+    assert_eq!(view["state"], json!("refunded_external"), "{view}");
+
+    // The PayPal account renamed its email: the account id still matches.
+    let renamed = paid_paypal_order(&app, "1KK00000KK0000004").await;
+    let body = with(
+        with(
+            with(
+                refund("refund-full.ipn", &renamed.id, "1KK00000KK0000004"),
+                "receiver_email",
+                "renamed@example.com",
+            ),
+            "business",
+            "renamed@example.com",
+        ),
+        "txn_id",
+        "1KK00000KK0000005",
+    );
+    assert_eq!(post_ipn(&app, &body).await, StatusCode::OK);
+    let view = read_order(&app, &renamed.buyer.token, &renamed.id).await;
+    assert_eq!(view["state"], json!("refunded_external"), "{view}");
+    assert!(inbox_rows(&pool).await.is_empty());
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn refund_ipn_with_a_non_negative_or_malformed_gross_is_held(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let order = paid_paypal_order(&app, PAYMENT_TXN).await;
     let before = snapshot(&app, &order).await;
 
-    for gross in [
+    let grosses = [
         "137.00", "0.00", "-0.00", "-137", "-137.0", "-137.000", "-1,37", "", "--137.00",
-    ] {
+    ];
+    for (index, gross) in grosses.into_iter().enumerate() {
         let body = with(
-            refund("refund-full.ipn", &order.id, PAYMENT_TXN),
-            "mc_gross",
-            gross,
+            with(
+                refund("refund-full.ipn", &order.id, PAYMENT_TXN),
+                "mc_gross",
+                gross,
+            ),
+            "txn_id",
+            &format!("1LL00000LL000000{index}"),
         );
         assert_eq!(post_ipn(&app, &body).await, StatusCode::OK, "{gross}");
     }
     assert_untouched(&app, &order, &before).await;
+    let rows = inbox_rows(&pool).await;
+    assert_eq!(rows.len(), grosses.len());
+    assert!(rows.iter().all(|row| row.1 == "amount_invalid"));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn refund_ipn_with_malformed_transaction_ids_is_dropped(pool: PgPool) {
+async fn refund_ipn_transaction_ids(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let order = paid_paypal_order(&app, PAYMENT_TXN).await;
     let before = snapshot(&app, &order).await;
 
+    // No usable `txn_id`: nothing can key a record (PayPal always sends one).
     let full = || refund("refund-full.ipn", &order.id, PAYMENT_TXN);
     let too_long = "A".repeat(65);
     for body in [
@@ -655,16 +985,31 @@ async fn refund_ipn_with_malformed_transaction_ids_is_dropped(pool: PgPool) {
         with(full(), "txn_id", &too_long),
         with(full(), "txn_id", "2WF58163 VJ0384519"),
         without(full(), "txn_id"),
-        with(full(), "parent_txn_id", ""),
-        without(full(), "parent_txn_id"),
     ] {
         assert_eq!(post_ipn(&app, &body).await, StatusCode::OK);
     }
+    assert!(inbox_rows(&pool).await.is_empty());
+
+    // No usable parent: held under the refund's own id.
+    for (txn, body) in [
+        ("1MM00000MM0000001", with(full(), "parent_txn_id", "")),
+        ("1MM00000MM0000002", without(full(), "parent_txn_id")),
+    ] {
+        assert_eq!(
+            post_ipn(&app, &with(body, "txn_id", txn)).await,
+            StatusCode::OK
+        );
+    }
     assert_untouched(&app, &order, &before).await;
+    let rows = inbox_rows(&pool).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|row| row.1 == "missing_parent" && row.2.as_deref() == Some(order.id.as_str())));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn refund_ipn_exceeding_the_remaining_total_is_dropped(pool: PgPool) {
+async fn refund_ipn_exceeding_the_total_is_recorded_and_flagged(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let order = paid_paypal_order(&app, PAYMENT_TXN).await;
 
@@ -674,23 +1019,28 @@ async fn refund_ipn_exceeding_the_remaining_total_is_dropped(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let partial = snapshot(&app, &order).await;
 
-    // 40.00 recorded; a further 137.00 would exceed the total.
+    // 40.00 recorded; a further 137.00 is past the total.
     let status = post_ipn(&app, &refund("refund-full.ipn", &order.id, PAYMENT_TXN)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_untouched(&app, &order, &partial).await;
-
-    // The exact remainder still completes the refund.
-    let status = post_ipn(
-        &app,
-        &refund("refund-partial-2.ipn", &order.id, PAYMENT_TXN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let view = read_order(&app, &order.buyer.token, &order.id).await;
-    assert_eq!(view["state"], json!("refunded_external"));
+    let view = read_order(&app, &order.seller.token, &order.id).await;
+    assert_eq!(view["state"], json!("refunded_external"), "{view}");
     assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_MINOR));
+    assert_eq!(
+        view["gateway_refund_review_at"],
+        json!(format_timestamp(app.clock.now()))
+    );
+    assert_eq!(
+        ledger_rows(&pool, &order.id).await,
+        vec![
+            (
+                FULL_REFUND_TXN.to_string(),
+                "Refunded".to_string(),
+                TOTAL_MINOR
+            ),
+            (PARTIAL_1_TXN.to_string(), "Refunded".to_string(), 4_000),
+        ]
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -763,25 +1113,191 @@ async fn reversed_ipn_records_the_refund_and_flags_the_order(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn canceled_reversal_ipn_changes_nothing(pool: PgPool) {
+async fn canceled_reversal_restores_the_order_and_clears_the_flag(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
-    let order = paid_paypal_order(&app, PAYMENT_TXN).await;
-    let partial_reversal = with(
-        refund("reversal-full.ipn", &order.id, PAYMENT_TXN),
-        "mc_gross",
-        "-40.00",
-    );
-    assert_eq!(post_ipn(&app, &partial_reversal).await, StatusCode::OK);
-    let flagged = snapshot(&app, &order).await;
-    assert!(flagged["payment_reversed_at"].is_string());
+    let app = with_attestor(app);
 
-    let status = post_ipn(&app, &fixture("canceled-reversal.ipn", &order.id)).await;
+    // A full chargeback on a shipped order, then PayPal cancels it.
+    let order = paid_paypal_order(&app, "1NN00000NN0000001").await;
+    ship(&app, &order).await;
+    let status = post_ipn(
+        &app,
+        &refund("reversal-full.ipn", &order.id, "1NN00000NN0000001"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_untouched(&app, &order, &flagged).await;
+    assert_eq!(
+        read_order(&app, &order.buyer.token, &order.id).await["state"],
+        json!("refunded_external")
+    );
+    app.clock.advance_seconds(3_600);
+    let status = post_ipn(
+        &app,
+        &refund("canceled-reversal.ipn", &order.id, "1NN00000NN0000001"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let now = json!(format_timestamp(app.clock.now()));
+    for token in [&order.buyer.token, &order.seller.token] {
+        let view = read_order(&app, token, &order.id).await;
+        assert_eq!(view["state"], json!("shipped"), "{view}");
+        assert_eq!(view["payment_reversed_at"], Value::Null);
+        assert_eq!(view["payment_reversal_cancelled_at"], now);
+        assert_eq!(view["external_refund"], Value::Null);
+        assert_eq!(view["gateway_refund_review_at"], Value::Null);
+    }
+    assert_eq!(
+        order_events(&pool, &order.id, "refund.reversal_cancelled").await,
+        vec!["paypal-ipn".to_string()]
+    );
+    assert_eq!(
+        notification_recipients(&pool, &order.id, "payment_reversal_cancelled").await,
+        vec![order.buyer.pubky.clone(), order.seller.pubky.clone()]
+    );
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM attestation_annotations ORDER BY annotated_at, outcome",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes, vec!["refunded", "refund_reversal_cancelled"]);
+    // The restored order continues normally.
+    act(
+        &app,
+        &order.buyer.token,
+        "fulfillment.confirm_delivery",
+        &order.id,
+        json!({}),
+    )
+    .await;
+
+    // A partial refund and a partial reversal: cancelling the reversal
+    // keeps the refund and reopens the order in its prior state.
+    let order = paid_paypal_order(&app, "1NN00000NN0000002").await;
+    receive_return(&app, &order).await;
+    let status = post_ipn(
+        &app,
+        &refund("refund-partial-1.ipn", &order.id, "1NN00000NN0000002"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let reversal = with(
+        with(
+            refund("reversal-full.ipn", &order.id, "1NN00000NN0000002"),
+            "mc_gross",
+            "-97.00",
+        ),
+        "txn_id",
+        "5MC93249NP7742888",
+    );
+    assert_eq!(post_ipn(&app, &reversal).await, StatusCode::OK);
+    let view = read_order(&app, &order.buyer.token, &order.id).await;
+    assert_eq!(view["state"], json!("refunded_external"));
+    assert_eq!(view["return_request"]["state"], json!("refunded"));
+    let cancel = with(
+        with(
+            refund("canceled-reversal.ipn", &order.id, "1NN00000NN0000002"),
+            "mc_gross",
+            "97.00",
+        ),
+        "txn_id",
+        "6ND04350PQ8853888",
+    );
+    assert_eq!(post_ipn(&app, &cancel).await, StatusCode::OK);
+    let view = read_order(&app, &order.buyer.token, &order.id).await;
+    assert_eq!(view["state"], json!("return_received"), "{view}");
+    assert_eq!(view["return_request"]["state"], json!("received"));
+    assert_eq!(view["external_refund"]["amount_minor"], json!(4_000));
+    assert_eq!(
+        view["external_refund"]["transaction_id"],
+        json!(PARTIAL_1_TXN)
+    );
+    assert_eq!(view["payment_reversed_at"], Value::Null);
+
+    // A canceled reversal with nothing reversed is recorded for review.
+    let order = paid_paypal_order(&app, "1NN00000NN0000003").await;
+    let stray = with(
+        refund("canceled-reversal.ipn", &order.id, "1NN00000NN0000003"),
+        "txn_id",
+        "6ND04350PQ8853777",
+    );
+    assert_eq!(post_ipn(&app, &stray).await, StatusCode::OK);
+    let view = read_order(&app, &order.seller.token, &order.id).await;
+    assert_eq!(view["state"], json!("paid"));
+    assert_eq!(view["external_refund"], Value::Null);
+    assert!(view["gateway_refund_review_at"].is_string());
+    assert_eq!(
+        ledger_rows(&pool, &order.id).await,
+        vec![(
+            "6ND04350PQ8853777".to_string(),
+            "Canceled_Reversal".to_string(),
+            TOTAL_MINOR
+        )]
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn refund_ipn_applies_in_every_allowed_state(pool: PgPool) {
+async fn a_canceled_reversal_removes_the_reputation_penalty(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let attestor = test_attestor();
+
+    // Seller A: a delivered order reversed, then the reversal canceled.
+    let restored = paid_paypal_order(&app, "1OO00000OO0000001").await;
+    deliver(&app, &restored).await;
+    let status = post_ipn(
+        &app,
+        &refund("reversal-full.ipn", &restored.id, "1OO00000OO0000001"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let status = post_ipn(
+        &app,
+        &refund("canceled-reversal.ipn", &restored.id, "1OO00000OO0000001"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Seller B: the same reversal, still standing.
+    let reversed = paid_paypal_order(&app, "1OO00000OO0000002").await;
+    deliver(&app, &reversed).await;
+    let status = post_ipn(
+        &app,
+        &with(
+            refund("reversal-full.ipn", &reversed.id, "1OO00000OO0000002"),
+            "txn_id",
+            "5MC93249NP7742666",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let signed = marketplace_service::workers::generate_due_stat_attestations(
+        &app.pool,
+        &attestor,
+        app.clock.now(),
+    )
+    .await
+    .expect("stat job runs");
+    assert_eq!(signed, 2);
+    let rate = |seller: String| {
+        let pool = pool.clone();
+        async move {
+            let body: Value = sqlx::query_scalar(
+                "SELECT body FROM seller_stat_attestations WHERE seller_pubky = $1",
+            )
+            .bind(seller)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            body["completionRatePermille"].clone()
+        }
+    };
+    assert_eq!(rate(restored.seller.pubky.clone()).await, json!(1000));
+    assert_eq!(rate(reversed.seller.pubky.clone()).await, json!(500));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn refund_ipn_is_recorded_in_every_paid_state(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     for (index, target) in [
         "paid",
@@ -790,11 +1306,15 @@ async fn refund_ipn_applies_in_every_allowed_state(pool: PgPool) {
         "delivered",
         "completed",
         "return_received",
+        "cancel_requested",
+        "cancelled",
+        "return_requested",
+        "return_approved",
     ]
     .into_iter()
     .enumerate()
     {
-        let payment_txn = format!("2BB00000BB000000{index}");
+        let payment_txn = format!("2BB00000BB00000{index:02}");
         let order = paid_paypal_order(&app, &payment_txn).await;
         match target {
             "paid" => {}
@@ -811,70 +1331,6 @@ async fn refund_ipn_applies_in_every_allowed_state(pool: PgPool) {
             "delivered" => deliver(&app, &order).await,
             "completed" => complete(&app, &order).await,
             "return_received" => receive_return(&app, &order).await,
-            _ => unreachable!(),
-        }
-        let view = read_order(&app, &order.buyer.token, &order.id).await;
-        assert_eq!(view["state"], json!(target));
-
-        let partial = with(
-            refund("refund-partial-1.ipn", &order.id, &payment_txn),
-            "txn_id",
-            &format!("3CC00000CC000000{index}"),
-        );
-        assert_eq!(post_ipn(&app, &partial).await, StatusCode::OK);
-        let view = read_order(&app, &order.buyer.token, &order.id).await;
-        assert_eq!(view["state"], json!(target), "partial in {target}: {view}");
-        assert_eq!(view["external_refund"]["amount_minor"], json!(4_000));
-
-        let rest = with(
-            refund("refund-partial-2.ipn", &order.id, &payment_txn),
-            "txn_id",
-            &format!("4DD00000DD000000{index}"),
-        );
-        assert_eq!(post_ipn(&app, &rest).await, StatusCode::OK);
-        let view = read_order(&app, &order.buyer.token, &order.id).await;
-        assert_eq!(
-            view["state"],
-            json!("refunded_external"),
-            "full in {target}: {view}"
-        );
-        assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_MINOR));
-    }
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn full_refund_ipn_resolves_a_received_return(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
-    let order = paid_paypal_order(&app, PAYMENT_TXN).await;
-    receive_return(&app, &order).await;
-
-    let status = post_ipn(&app, &refund("refund-full.ipn", &order.id, PAYMENT_TXN)).await;
-    assert_eq!(status, StatusCode::OK);
-    let view = read_order(&app, &order.buyer.token, &order.id).await;
-    assert_eq!(view["state"], json!("refunded_external"), "{view}");
-    assert_eq!(view["return_request"]["state"], json!("refunded"));
-    assert_eq!(
-        view["return_request"]["updated_at"],
-        json!(format_timestamp(app.clock.now()))
-    );
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn refund_ipn_in_a_refused_state_records_nothing(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
-    for (index, target) in [
-        "cancel_requested",
-        "cancelled",
-        "return_requested",
-        "return_approved",
-        "refunded_external",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let payment_txn = format!("5EE00000EE000000{index}");
-        let order = paid_paypal_order(&app, &payment_txn).await;
-        match target {
             "cancel_requested" | "cancelled" => {
                 act(
                     &app,
@@ -907,37 +1363,98 @@ async fn refund_ipn_in_a_refused_state_records_nothing(pool: PgPool) {
                 )
                 .await;
             }
-            "refunded_external" => {
-                let status = post_ipn(
-                    &app,
-                    &with(
-                        refund("refund-full.ipn", &order.id, &payment_txn),
-                        "txn_id",
-                        &format!("6FF00000FF000000{index}"),
-                    ),
-                )
-                .await;
-                assert_eq!(status, StatusCode::OK);
-            }
             _ => unreachable!(),
         }
-        let before = snapshot(&app, &order).await;
-        assert_eq!(before["state"], json!(target));
+        let view = read_order(&app, &order.buyer.token, &order.id).await;
+        assert_eq!(view["state"], json!(target));
+        let return_before = view["return_request"]["state"].clone();
 
-        let reversal = with(
-            refund("reversal-full.ipn", &order.id, &payment_txn),
-            "mc_gross",
-            "-40.00",
+        let partial = with(
+            refund("refund-partial-1.ipn", &order.id, &payment_txn),
+            "txn_id",
+            &format!("3CC00000CC00000{index:02}"),
         );
-        assert_eq!(post_ipn(&app, &reversal).await, StatusCode::OK);
-        let partial = refund("refund-partial-1.ipn", &order.id, &payment_txn);
         assert_eq!(post_ipn(&app, &partial).await, StatusCode::OK);
-        assert_untouched(&app, &order, &before).await;
+        let view = read_order(&app, &order.buyer.token, &order.id).await;
+        assert_eq!(view["state"], json!(target), "partial in {target}: {view}");
+        assert_eq!(view["external_refund"]["amount_minor"], json!(4_000));
+        assert_eq!(view["return_request"]["state"], return_before);
+        assert_eq!(view["gateway_refund_review_at"], Value::Null);
+
+        let rest = with(
+            refund("refund-partial-2.ipn", &order.id, &payment_txn),
+            "txn_id",
+            &format!("4DD00000DD00000{index:02}"),
+        );
+        assert_eq!(post_ipn(&app, &rest).await, StatusCode::OK);
+        let view = read_order(&app, &order.buyer.token, &order.id).await;
+        assert_eq!(
+            view["state"],
+            json!("refunded_external"),
+            "full in {target}: {view}"
+        );
+        assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_MINOR));
+        if return_before.is_string() {
+            assert_eq!(view["return_request"]["state"], json!("refunded"));
+        }
+        assert_eq!(view["gateway_refund_review_at"], Value::Null);
     }
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn manual_record_after_a_partial_ipn_refund_is_refused(pool: PgPool) {
+async fn full_refund_ipn_resolves_a_received_return(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let order = paid_paypal_order(&app, PAYMENT_TXN).await;
+    receive_return(&app, &order).await;
+
+    let status = post_ipn(&app, &refund("refund-full.ipn", &order.id, PAYMENT_TXN)).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = read_order(&app, &order.buyer.token, &order.id).await;
+    assert_eq!(view["state"], json!("refunded_external"), "{view}");
+    assert_eq!(view["return_request"]["state"], json!("refunded"));
+    assert_eq!(
+        view["return_request"]["updated_at"],
+        json!(format_timestamp(app.clock.now()))
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn refund_ipn_on_a_manually_refunded_order_is_recorded_for_review(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let order = paid_paypal_order(&app, PAYMENT_TXN).await;
+    receive_return(&app, &order).await;
+    act(
+        &app,
+        &order.seller.token,
+        "refund.record_external",
+        &order.id,
+        json!({ "amount_minor": TOTAL_MINOR, "transaction_id": "manual-evidence-123" }),
+    )
+    .await;
+
+    // PayPal then reports the refund the seller already recorded by hand.
+    let status = post_ipn(&app, &refund("refund-full.ipn", &order.id, PAYMENT_TXN)).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = read_order(&app, &order.seller.token, &order.id).await;
+    assert_eq!(view["state"], json!("refunded_external"));
+    assert_eq!(
+        view["external_refund"]["transaction_id"],
+        json!("manual-evidence-123")
+    );
+    assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_MINOR));
+    assert!(view["gateway_refund_review_at"].is_string(), "{view}");
+    assert_eq!(
+        ledger_rows(&pool, &order.id).await,
+        vec![(
+            FULL_REFUND_TXN.to_string(),
+            "Refunded".to_string(),
+            TOTAL_MINOR
+        )]
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_manual_record_closes_a_return_alongside_ipn_partials(pool: PgPool) {
     let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let order = paid_paypal_order(&app, PAYMENT_TXN).await;
     receive_return(&app, &order).await;
@@ -949,16 +1466,26 @@ async fn manual_record_after_a_partial_ipn_refund_is_refused(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     let view = read_order(&app, &order.seller.token, &order.id).await;
     assert_eq!(view["state"], json!("return_received"));
+    assert_eq!(view["return_request"]["state"], json!("received"));
 
+    let record = |amount: i64, number: u64, revision: i64| {
+        order_command(
+            "refund.record_external",
+            &order.id,
+            revision,
+            json!({ "amount_minor": amount, "transaction_id": "manual-evidence-123" }),
+            number,
+        )
+    };
+    // A record below what PayPal already returned is refused.
+    let revision = view["revision"].as_i64().unwrap();
     let (status, body) = execute(
         &app,
         &order.seller.token,
-        &order_command(
-            "refund.record_external",
-            &order.id,
-            view["revision"].as_i64().unwrap(),
-            json!({ "amount_minor": 9_700, "transaction_id": "manual-evidence-123" }),
+        &record(
+            3_999,
             COMMAND_NUMBER.fetch_add(1, Ordering::Relaxed),
+            revision,
         ),
     )
     .await;
@@ -969,15 +1496,39 @@ async fn manual_record_after_a_partial_ipn_refund_is_refused(pool: PgPool) {
         json!("The external refund cannot be recorded.")
     );
 
-    let status = post_ipn(
+    // Settling at the PayPal amount closes the return.
+    let (status, body) = execute(
         &app,
-        &refund("refund-partial-2.ipn", &order.id, PAYMENT_TXN),
+        &order.seller.token,
+        &record(
+            4_000,
+            COMMAND_NUMBER.fetch_add(1, Ordering::Relaxed),
+            revision,
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
     let view = read_order(&app, &order.seller.token, &order.id).await;
     assert_eq!(view["state"], json!("refunded_external"));
     assert_eq!(view["return_request"]["state"], json!("refunded"));
+    assert_eq!(view["external_refund"]["amount_minor"], json!(4_000));
+    assert_eq!(
+        view["external_refund"]["transaction_id"],
+        json!("manual-evidence-123")
+    );
+
+    // A manual record already in place still refuses a second one.
+    let (status, _) = execute(
+        &app,
+        &order.seller.token,
+        &record(
+            TOTAL_MINOR,
+            COMMAND_NUMBER.fetch_add(1, Ordering::Relaxed),
+            view["revision"].as_i64().unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -1087,6 +1638,18 @@ async fn a_buyer_reported_reference_never_matches_a_refund(pool: PgPool) {
         assert_eq!(post_ipn(&app, &body).await, StatusCode::OK);
     }
     assert_untouched(&app, &order, &before).await;
+    // Held, not applied, and visible on the order.
+    assert_eq!(
+        inbox_rows(&pool).await,
+        vec![(
+            FULL_REFUND_TXN.to_string(),
+            "unknown_parent".to_string(),
+            Some(order.id.clone()),
+            false
+        )]
+    );
+    let view = read_order(&app, &order.seller.token, &order.id).await;
+    assert_eq!(view["gateway_refund_unmatched"], json!(true));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -1099,6 +1662,7 @@ async fn a_refund_ipn_that_fails_postback_validation_is_dropped(pool: PgPool) {
     let status = post_ipn(&app, &refund("refund-full.ipn", &order.id, PAYMENT_TXN)).await;
     assert_eq!(status, StatusCode::OK);
     assert_untouched(&app, &order, &before).await;
+    assert!(inbox_rows(&pool).await.is_empty());
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -1157,4 +1721,124 @@ async fn refund_ipn_database_failure_asks_paypal_to_retry(pool: PgPool) {
         refund_notification_recipients(&pool, &order.id).await.len(),
         2
     );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn two_simultaneous_partial_refunds_both_record(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let order = paid_paypal_order(&app, PAYMENT_TXN).await;
+    let statuses = race_on_order_lock(
+        &pool,
+        &order.id,
+        2,
+        vec![
+            spawn_ipn(&app, refund("refund-partial-1.ipn", &order.id, PAYMENT_TXN)),
+            spawn_ipn(&app, refund("refund-partial-2.ipn", &order.id, PAYMENT_TXN)),
+        ],
+    )
+    .await;
+    assert_eq!(statuses, vec![StatusCode::OK, StatusCode::OK]);
+    let view = read_order(&app, &order.buyer.token, &order.id).await;
+    assert_eq!(view["state"], json!("refunded_external"), "{view}");
+    assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_MINOR));
+    assert_eq!(ledger_rows(&pool, &order.id).await.len(), 2);
+    assert_eq!(
+        order_events(&pool, &order.id, "refund.recorded_partial")
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        order_events(&pool, &order.id, "refund.recorded_external")
+            .await
+            .len(),
+        1
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_racing_a_cancel_approval_is_recorded(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let order = paid_paypal_order(&app, PAYMENT_TXN).await;
+    act(
+        &app,
+        &order.buyer.token,
+        "order.cancel_request",
+        &order.id,
+        json!({ "reason": "No longer needed" }),
+    )
+    .await;
+    let approve = spawn_command(
+        &app,
+        &order.seller.token,
+        "order.cancel_approve",
+        &order.id,
+        json!({}),
+    )
+    .await;
+    let statuses = race_on_order_lock(
+        &pool,
+        &order.id,
+        2,
+        vec![
+            spawn_ipn(&app, refund("refund-partial-1.ipn", &order.id, PAYMENT_TXN)),
+            approve,
+        ],
+    )
+    .await;
+    assert_eq!(statuses[0], StatusCode::OK);
+    // Whichever took the lock first, the refund is on the order.
+    let view = read_order(&app, &order.buyer.token, &order.id).await;
+    assert_eq!(view["external_refund"]["amount_minor"], json!(4_000));
+    assert_eq!(ledger_rows(&pool, &order.id).await.len(), 1);
+    match statuses[1] {
+        StatusCode::OK => assert_eq!(view["state"], json!("cancelled")),
+        StatusCode::CONFLICT => assert_eq!(view["state"], json!("cancel_requested")),
+        other => panic!("unexpected approval status {other}"),
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_racing_each_return_step_is_recorded(pool: PgPool) {
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    for (index, (kind, before)) in [
+        ("return.approve", "return_requested"),
+        ("return.receive", "return_approved"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let payment_txn = format!("2PP00000PP000000{index}");
+        let order = paid_paypal_order(&app, &payment_txn).await;
+        request_return(&app, &order).await;
+        if before == "return_approved" {
+            act(
+                &app,
+                &order.seller.token,
+                "return.approve",
+                &order.id,
+                json!({}),
+            )
+            .await;
+        }
+        let step = spawn_command(&app, &order.seller.token, kind, &order.id, json!({})).await;
+        let full = with(
+            refund("refund-full.ipn", &order.id, &payment_txn),
+            "txn_id",
+            &format!("2QQ00000QQ000000{index}"),
+        );
+        let statuses =
+            race_on_order_lock(&pool, &order.id, 2, vec![spawn_ipn(&app, full), step]).await;
+        assert_eq!(statuses[0], StatusCode::OK);
+        let view = read_order(&app, &order.buyer.token, &order.id).await;
+        // The full refund resolves the return from either side of the step.
+        assert_eq!(view["state"], json!("refunded_external"), "{kind}: {view}");
+        assert_eq!(view["return_request"]["state"], json!("refunded"));
+        assert_eq!(ledger_rows(&pool, &order.id).await.len(), 1);
+        assert!(
+            matches!(statuses[1], StatusCode::OK | StatusCode::CONFLICT),
+            "{kind}: {}",
+            statuses[1]
+        );
+    }
 }

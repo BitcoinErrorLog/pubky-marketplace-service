@@ -1280,6 +1280,24 @@ async fn clear_retention_and_terminal_purge(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // While a PayPal reversal is outstanding the exhibit stays: a canceled
+    // reversal can reopen the order. The purge reads only the column.
+    sqlx::query("UPDATE orders SET payment_reversed_at = $2 WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .bind(app.clock.now())
+        .execute(&app.pool)
+        .await
+        .expect("reversal outstanding");
+    let (snapshots_purged, _) =
+        pickup::purge_terminal_pickup_retention(&app.pool, app.clock.now(), 30)
+            .await
+            .expect("purge runs");
+    assert_eq!(snapshots_purged, 0);
+    sqlx::query("UPDATE orders SET payment_reversed_at = NULL WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&app.pool)
+        .await
+        .expect("reversal resolved");
     let (snapshots_purged, versions_purged) =
         pickup::purge_terminal_pickup_retention(&app.pool, app.clock.now(), 30)
             .await
