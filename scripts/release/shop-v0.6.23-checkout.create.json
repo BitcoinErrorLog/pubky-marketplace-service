@@ -1,8 +1,8 @@
 {
   "captured_from": {
-    "shop_tag": "shop-v0.6.22",
-    "shop_sha": "55a084c804450ee3092bd519fac2306ce38d160e",
-    "captured_on": "2026-09-23",
+    "shop_tag": "shop-v0.6.23",
+    "shop_sha": "5f9f20ff7cb3caa06174c4a308a7abc79d60ddd2",
+    "captured_on": "2026-09-24",
     "files": [
       "src/core/application/commerce/commerce.ts (commitCreateMarketplaceCheckout, lines 732-733)",
       "src/hooks/useMarketplaceCheckout/useMarketplaceCheckout.ts (lines 355-365)",
@@ -13,7 +13,7 @@
     ],
     "live_capture": "shop.pubky.app POST /v1/commands checkout.create for order c7e700de on 2026-09-23 (Shop v0.6.21, same line builder): line keys expected_revision, fulfillment, listing_aggregate_id, quantity, variant_id=variant_1",
     "notes": [
-      "Deployed Shop v0.6.22 checkout.create wire (Vercel dpl_2dPZFvkr5GRnKrtQfZCzdEfoT7k7).",
+      "Deployed Shop v0.6.23 checkout.create wire (Vercel dpl_7modYHyqTmmprRzYsERmGGgDnjmt). The checkout wire files (transaction-commands.ts, useMarketplaceCheckout.ts, wire-casing.ts, postal-address.ts, marketplace-transaction.ts, and the checkout builder in commerce.ts) are unchanged from v0.6.22 (55a084c8); v0.6.23 only removed the manual Paykit claim flow.",
       "Wire keys are snake_case. Shop builds camelCase then toSnakeCaseWire at POST /v1/commands.",
       "Every line whose cart item resolves a listing variant carries variant_id; variant_options is added only when that variant has options.",
       "Shipping line includes fulfillment=shipping and a delivery_address object with name, line1, line2, city, region, postal_code, country_code.",
@@ -32,7 +32,11 @@
       "kind",
       "payload"
     ],
-    "payload": ["lines", "delivery_address", "guarantee_policy_version"],
+    "payload": [
+      "lines",
+      "delivery_address",
+      "guarantee_policy_version"
+    ],
     "line": [
       "listing_aggregate_id",
       "expected_revision",
@@ -50,6 +54,10 @@
       "country_code"
     ]
   },
-  "pickup_omits": ["delivery_address"],
-  "bind_body": { "method": "paypal" }
+  "pickup_omits": [
+    "delivery_address"
+  ],
+  "bind_body": {
+    "method": "paypal"
+  }
 }
