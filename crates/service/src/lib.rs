@@ -59,6 +59,14 @@ use crate::payments::PaymentsRuntime;
 use crate::pickup::PickupKeys;
 use crate::refusal_audit::RefusalAuditRuntime;
 
+/// The sealing keys a payment confirmation pins order terms under: the
+/// pickup snapshot and the digital delivery pin.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConfirmKeys<'a> {
+    pub pickup: Option<&'a PickupKeys>,
+    pub digital: Option<&'a DigitalKeys>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
@@ -124,6 +132,13 @@ impl AppState {
     /// does not depend on the sandbox setting.
     pub fn digital_delivery_available(&self) -> bool {
         self.digital.is_some()
+    }
+
+    pub fn confirm_keys(&self) -> ConfirmKeys<'_> {
+        ConfirmKeys {
+            pickup: self.pickup.as_deref(),
+            digital: self.digital.as_deref(),
+        }
     }
 }
 

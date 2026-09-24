@@ -430,8 +430,9 @@ async fn dispatch(
                 command,
                 payload,
                 state.locks.as_deref().map(|runtime| &runtime.keys),
-                crate::handlers::checkout::CheckoutWindows {
+                crate::handlers::checkout::CheckoutContext {
                     drop_claim_seconds: state.config.drop_claim_window_seconds,
+                    digital_available: state.digital_delivery_available(),
                 },
                 now,
             )
@@ -515,7 +516,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.config.sandbox_payment_window_seconds,
-                state.pickup.as_deref(),
+                state.confirm_keys(),
                 now,
             )
             .await

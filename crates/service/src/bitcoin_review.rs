@@ -456,7 +456,7 @@ pub async fn confirm_bitcoin_payment(
             order_id,
             &payment,
             order.clone(),
-            state.pickup.as_deref(),
+            state.confirm_keys(),
             now,
         )
         .await
@@ -1197,7 +1197,7 @@ async fn apply_paid_effects(
         input.resolution_id,
         payment,
         order_for_confirm,
-        state.pickup.as_deref(),
+        state.confirm_keys(),
         now,
     )
     .await
@@ -1369,7 +1369,7 @@ pub(crate) enum LateMoneyOutcome {
 /// path with `review_reason=late_settlement` and does not reacquire.
 pub(crate) async fn apply_late_money(
     tx: &mut Transaction<'_, Postgres>,
-    pickup: Option<&crate::pickup::PickupKeys>,
+    keys: crate::ConfirmKeys<'_>,
     payment: &PaymentRow,
     order: &OrderRow,
     command_id: Uuid,
@@ -1391,77 +1391,136 @@ pub(crate) async fn apply_late_money(
         return Ok(LateMoneyOutcome::HeldLateSettlement);
     }
 
+    // A digital order the seller can no longer deliver takes the stock-gone
+    // shape before any stock is reacquired (digital delivery design §6 D3).
+    let undeliverable = crate::handlers::digital_orders::unpinnable(tx, order)
+        .await
+        .map_err(|e| ResolutionFailure::Internal("digital pin check".into(), e.to_string()))?;
+    if undeliverable {
+        refund_required(
+            tx,
+            payment,
+            order,
+            "digital delivery unavailable at payment",
+            command_id,
+            event_actor,
+            now,
+        )
+        .await?;
+        return Ok(LateMoneyOutcome::RefundRequired);
+    }
     match reacquire_hold(tx, order, now).await {
-        Ok(()) => complete_late_order(tx, pickup, payment, order, command_id, event_actor, now)
+        Ok(()) => complete_late_order(tx, keys, payment, order, command_id, event_actor, now)
             .await
             .map(|_| LateMoneyOutcome::Completed),
         Err(ResolutionFailure::StockUnavailable) => {
-            let event_id = stamp_review_reason(
+            refund_required(
                 tx,
                 payment,
-                "refund_required",
-                "manual_review",
+                order,
+                "payment window elapsed",
                 command_id,
                 event_actor,
                 now,
             )
             .await?;
-            if order.state == "pending_payment" {
-                // Same revision-bumping path as `expire_held_order`: the
-                // event revision is the `RETURNING` value, never in-memory
-                // `order.revision + 1` against an unbumped row.
-                let cas: Option<(i64,)> = sqlx::query_as(
-                    "UPDATE orders SET state = 'cancelled', revision = revision + 1, \
-                     cancellation_reason = 'payment window elapsed', stock_held = false, \
-                     hold_expires_at = NULL, updated_at = $2 \
-                     WHERE id = $1 AND state = 'pending_payment' RETURNING revision",
-                )
-                .bind(order.id)
-                .bind(now)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(|e| ResolutionFailure::Internal("late cancel".into(), e.to_string()))?;
-                if let Some((order_revision,)) = cas {
-                    insert_event(
-                        tx,
-                        command_id,
-                        &ids::order_aggregate_id(order.id),
-                        order_revision,
-                        event_actor,
-                        "order.cancelled",
-                        now,
-                    )
-                    .await
-                    .map_err(|e| {
-                        ResolutionFailure::Internal("late cancel event".into(), e.to_string())
-                    })?;
-                }
-            }
-            for recipient in [&order.buyer_pubky, &order.seller_pubky] {
-                insert_notification_intent(
-                    tx,
-                    event_id,
-                    "payment_refund_required",
-                    recipient,
-                    event_actor,
-                    &ids::order_aggregate_id(order.id),
-                    None,
-                    now,
-                )
-                .await
-                .map_err(|e| {
-                    ResolutionFailure::Internal("refund notification".into(), e.to_string())
-                })?;
-            }
             Ok(LateMoneyOutcome::RefundRequired)
         }
         Err(other) => Err(other),
     }
 }
 
+/// The #50 stock-gone shape: payment `manual_review` with
+/// `review_reason = refund_required`, a pending order cancelled with any
+/// hold it still holds released, both parties notified, no receipt. Shared
+/// by late money whose unit is gone and by a digital order that cannot be
+/// delivered when its money arrives.
+pub(crate) async fn refund_required(
+    tx: &mut Transaction<'_, Postgres>,
+    payment: &PaymentRow,
+    order: &OrderRow,
+    cancellation_reason: &str,
+    command_id: Uuid,
+    event_actor: &str,
+    now: DateTime<Utc>,
+) -> Result<(), ResolutionFailure> {
+    let event_id = stamp_review_reason(
+        tx,
+        payment,
+        "refund_required",
+        "manual_review",
+        command_id,
+        event_actor,
+        now,
+    )
+    .await?;
+    if order.state == "pending_payment" {
+        if order.stock_held && order.auction_aggregate_id.is_none() {
+            crate::handlers::cancellation::credit_order_drop(tx, order, now)
+                .await
+                .map_err(|e| ResolutionFailure::Internal("drop credit".into(), e.to_string()))?
+                .map_err(|failure| {
+                    ResolutionFailure::Internal("drop credit".into(), failure.message().to_string())
+                })?;
+            release_lines(tx, order, HeldQuantity::Reserved, now)
+                .await
+                .map_err(|e| ResolutionFailure::Internal("hold release".into(), e.to_string()))?
+                .map_err(|failure| {
+                    ResolutionFailure::Internal(
+                        "hold release".into(),
+                        failure.message().to_string(),
+                    )
+                })?;
+        }
+        // Same revision-bumping path as `expire_held_order`: the event
+        // revision is the `RETURNING` value, never in-memory
+        // `order.revision + 1` against an unbumped row.
+        let cas: Option<(i64,)> = sqlx::query_as(
+            "UPDATE orders SET state = 'cancelled', revision = revision + 1, \
+             cancellation_reason = $3, stock_held = false, \
+             hold_expires_at = NULL, updated_at = $2 \
+             WHERE id = $1 AND state = 'pending_payment' RETURNING revision",
+        )
+        .bind(order.id)
+        .bind(now)
+        .bind(cancellation_reason)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| ResolutionFailure::Internal("late cancel".into(), e.to_string()))?;
+        if let Some((order_revision,)) = cas {
+            insert_event(
+                tx,
+                command_id,
+                &ids::order_aggregate_id(order.id),
+                order_revision,
+                event_actor,
+                "order.cancelled",
+                now,
+            )
+            .await
+            .map_err(|e| ResolutionFailure::Internal("late cancel event".into(), e.to_string()))?;
+        }
+    }
+    for recipient in [&order.buyer_pubky, &order.seller_pubky] {
+        insert_notification_intent(
+            tx,
+            event_id,
+            "payment_refund_required",
+            recipient,
+            event_actor,
+            &ids::order_aggregate_id(order.id),
+            None,
+            now,
+        )
+        .await
+        .map_err(|e| ResolutionFailure::Internal("refund notification".into(), e.to_string()))?;
+    }
+    Ok(())
+}
+
 async fn complete_late_order(
     tx: &mut Transaction<'_, Postgres>,
-    pickup: Option<&crate::pickup::PickupKeys>,
+    keys: crate::ConfirmKeys<'_>,
     payment: &PaymentRow,
     order: &OrderRow,
     command_id: Uuid,
@@ -1508,7 +1567,7 @@ async fn complete_late_order(
         command_id,
         payment,
         order_for_confirm,
-        pickup,
+        keys,
         now,
     )
     .await

@@ -111,6 +111,10 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::handlers::pickup::get_listing_pickup_details),
         )
         .route(
+            "/v1/orders/{id}/digital-delivery",
+            get(crate::handlers::digital_orders::get_order_digital_delivery),
+        )
+        .route(
             "/v1/listings/{aggregate_id}/digital-delivery",
             get(crate::handlers::digital::get_listing_digital_delivery),
         )

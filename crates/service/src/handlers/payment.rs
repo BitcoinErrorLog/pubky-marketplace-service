@@ -33,7 +33,7 @@ pub async fn advance(
     command: &Command,
     payload: &AdvanceSandboxPaymentPayload,
     sandbox_payment_window_seconds: i64,
-    pickup: Option<&crate::pickup::PickupKeys>,
+    keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let payment: Option<PaymentRow> = sqlx::query_as(&format!(
@@ -157,8 +157,7 @@ pub async fn advance(
 
     let (updated_order, receipt) = if payload.target == SandboxPaymentTarget::Confirmed {
         let (order, receipt, receipt_event_id) =
-            match confirm_order(tx, actor, command.command_id, &payment, order, pickup, now).await?
-            {
+            match confirm_order(tx, actor, command.command_id, &payment, order, keys, now).await? {
                 Ok(confirmed) => confirmed,
                 Err(failure) => return Ok(Err(failure)),
             };
@@ -213,7 +212,7 @@ pub(crate) async fn confirm_order(
     command_id: Uuid,
     payment: &PaymentRow,
     order: OrderRow,
-    pickup: Option<&crate::pickup::PickupKeys>,
+    keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
 ) -> Result<Result<(OrderRow, ReceiptRow, Uuid), CommandFailure>, sqlx::Error> {
     if !can_transition(&order_machine(), &order.state, "paid") {
@@ -221,6 +220,17 @@ pub(crate) async fn confirm_order(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order can no longer be paid.",
+        )));
+    }
+    // The money rails route an undeliverable digital order to the refund
+    // path before calling this (§6 D3); every other caller is refused
+    // here, before any write, so no receipt is ever issued for it.
+    if crate::handlers::digital_orders::unpinnable(tx, &order).await? {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The seller's digital delivery is not set up.",
+            crate::handlers::digital::REASON_NOT_READY,
         )));
     }
 
@@ -396,19 +406,35 @@ pub(crate) async fn confirm_order(
             order.id,
             &order.lines,
             &payment.adapter,
-            pickup,
+            keys.pickup,
             now,
         )
         .await?
     } else {
         order.lines.clone()
     };
+    // Digital instant lines pin in the same transaction; an order whose
+    // every line is instant is delivered at once (§3.6).
+    let is_digital = order.fulfillment == "digital";
+    if is_digital {
+        crate::handlers::digital_orders::pin_digital_lines(
+            tx,
+            &order,
+            &payment.adapter,
+            keys.digital,
+            now,
+        )
+        .await?;
+    }
+    let delivered_now = is_digital && crate::handlers::digital_orders::all_lines_instant(&order);
+    let confirmed_state = if delivered_now { "delivered" } else { "paid" };
 
     // The hold clears with the conversion: the stock is sold now, so no
     // window can release it and no cancellation path treats it as reserved.
     let updated_order: OrderRow = sqlx::query_as(&format!(
-        "UPDATE orders SET revision = revision + 1, state = 'paid', receipt_id = $2, \
-         edition = $3, stock_held = false, hold_expires_at = NULL, lines = $5, updated_at = $4 \
+        "UPDATE orders SET revision = revision + 1, state = $6, receipt_id = $2, \
+         edition = $3, stock_held = false, hold_expires_at = NULL, lines = $5, updated_at = $4, \
+         digital_delivered_at = CASE WHEN $6 = 'delivered' THEN $4 ELSE digital_delivered_at END \
          WHERE id = $1 RETURNING {ORDER_COLUMNS}"
     ))
     .bind(order.id)
@@ -416,6 +442,7 @@ pub(crate) async fn confirm_order(
     .bind(edition)
     .bind(now)
     .bind(&pinned_lines)
+    .bind(confirmed_state)
     .fetch_one(&mut **tx)
     .await?;
     let receipt_event_id = insert_event(
@@ -428,6 +455,19 @@ pub(crate) async fn confirm_order(
         now,
     )
     .await?;
+    if delivered_now {
+        insert_notification_intent(
+            tx,
+            receipt_event_id,
+            "order_delivered",
+            &updated_order.buyer_pubky,
+            actor,
+            &ids::order_aggregate_id(updated_order.id),
+            None,
+            now,
+        )
+        .await?;
+    }
 
     Ok(Ok((updated_order, receipt, receipt_event_id)))
 }
