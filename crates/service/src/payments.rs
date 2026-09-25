@@ -866,12 +866,36 @@ pub fn pubky_app_key(pubky: &str) -> String {
     format!("pubky{pubky}")
 }
 
-/// Crockford base32 (uppercase, no padding) of the order UUID's 16 bytes:
-/// the same encoding `locks-core` bundle identifiers use, so the reference
-/// is accepted verbatim as a `bundle_id` by paykit-server's status lookup.
-pub fn order_reference(order_id: uuid::Uuid) -> String {
+/// The Paykit `reference` of one bind attempt on an order: Crockford base32
+/// of the first 16 bytes of SHA-256 over a domain tag, the order UUID, and
+/// the attempt number. paykit-server holds one invoice per
+/// `(creator, reference)` and refuses any other binding against it, so each
+/// attempt needs its own reference; the same `(order, attempt)` always
+/// derives the same one, so a transport retry of an attempt replays it.
+pub fn attempt_reference(order_id: uuid::Uuid, attempt: i32) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::new()
+        .chain_update(b"pubky-marketplace/paykit-attempt-reference/v1")
+        .chain_update(order_id.as_bytes())
+        .chain_update(attempt.to_be_bytes())
+        .finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    crockford_bundle_id(&bytes)
+}
+
+/// The single per-order reference every bind used before per-attempt
+/// references: Crockford base32 of the order UUID. Attempts released
+/// under it are polled by it.
+pub fn legacy_order_reference(order_id: uuid::Uuid) -> String {
+    crockford_bundle_id(order_id.as_bytes())
+}
+
+/// Crockford base32 (uppercase, no padding) of 16 bytes: the encoding
+/// `locks-core` bundle identifiers use, so the value is accepted verbatim
+/// as a `bundle_id` by paykit-server.
+fn crockford_bundle_id(bytes: &[u8; 16]) -> String {
     const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let bytes = order_id.as_bytes();
     let mut output = String::with_capacity(26);
     let mut buffer: u64 = 0;
     let mut bits: u32 = 0;
@@ -991,8 +1015,9 @@ impl PaykitClient {
 
     /// Phase 1 (§B.11.3): prepares (or idempotently replays) the Paykit
     /// payment request for a physical bitcoin order. `expires_at` is the
-    /// exact hold deadline the bind armed; `idempotency_key` is
-    /// `{order_reference}:{bind_attempt}`. The 200 body is the verbatim
+    /// exact hold deadline the bind armed; `reference` is the bind
+    /// attempt's [`attempt_reference`] and `idempotency_key` is
+    /// `{reference}:{bind_attempt}`. The 200 body is the verbatim
     /// prepared shape; a legacy 204 or a body missing any field is a
     /// hard refusal.
     pub async fn create_payment_request(
@@ -1502,17 +1527,26 @@ mod tests {
     }
 
     #[test]
-    fn order_references_are_canonical_crockford_bundle_identifiers() {
-        // The all-zero UUID encodes to 26 zeros — the canonical fixture shape.
-        assert_eq!(order_reference(uuid::Uuid::nil()), "0".repeat(26));
-        let reference =
-            order_reference(uuid::Uuid::parse_str("018f47d2-6a27-7c23-a49d-6b21bb770120").unwrap());
+    fn attempt_references_are_canonical_crockford_bundle_identifiers() {
+        // All-zero bytes encode to 26 zeros — the canonical fixture shape.
+        assert_eq!(crockford_bundle_id(&[0; 16]), "0".repeat(26));
+        assert_eq!(
+            crockford_bundle_id(&[0xff; 16]),
+            format!("{}W", "Z".repeat(25))
+        );
+        let order = uuid::Uuid::parse_str("018f47d2-6a27-7c23-a49d-6b21bb770120").unwrap();
+        let reference = attempt_reference(order, 1);
         assert_eq!(reference.len(), 26);
         assert!(reference
             .chars()
             .all(|c| "0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(c)));
-        // Distinct UUIDs must map to distinct references.
-        assert_ne!(reference, order_reference(uuid::Uuid::new_v4()));
+        assert_eq!(reference, attempt_reference(order, 1), "deterministic");
+        assert_ne!(reference, attempt_reference(order, 2), "per attempt");
+        assert_ne!(
+            reference,
+            attempt_reference(uuid::Uuid::new_v4(), 1),
+            "per order"
+        );
     }
 
     #[test]

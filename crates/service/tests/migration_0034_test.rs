@@ -243,7 +243,7 @@ async fn migration_0034_caps_conflicts_and_indexes_the_count_prefix(pool: PgPool
 }
 
 #[test]
-fn migration_catalog_is_contiguous_through_0039() {
+fn migration_catalog_is_contiguous_through_0039_then_0042() {
     let mut numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -254,5 +254,6 @@ fn migration_catalog_is_contiguous_through_0039() {
         })
         .collect();
     numbers.sort_unstable();
-    assert_eq!(numbers, (1..=39).collect::<Vec<_>>());
+    // 0040 and 0041 belong to digital delivery.
+    assert_eq!(numbers, (1..=39).chain([42]).collect::<Vec<_>>());
 }

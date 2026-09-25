@@ -1,0 +1,106 @@
+# Bitcoin binds against a live paykit-server (tests/paykit_live_test.rs).
+#
+# Boots paykit-server's `marketplace_live_harness` (the production server
+# composition over Postgres and an ephemeral pubky testnet, trusting the
+# marketplace test signing key) from a pinned commit, then runs the ignored
+# live tests against it. Scheduled, on demand, and on pull requests that
+# touch the Bitcoin bind, activation, or poll paths.
+
+name: paykit-live
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/service/src/payment_methods.rs'
+      - 'crates/service/src/payments.rs'
+      - 'crates/service/src/paykit_attempts.rs'
+      - 'crates/service/src/workers.rs'
+      - 'crates/service/tests/paykit_live_test.rs'
+      - 'crates/service/tests/common/**'
+      - '.github/workflows/paykit-live.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # BitcoinErrorLog/paykit-server commit carrying marketplace_live_harness.
+  PAYKIT_SERVER_REF: fc42bd234f6d4e37e4af9c1c74607643ed18ebd9
+  # tests/common TEST_PAYKIT_SIGNING_SEED: the key the harness trusts.
+  PAYKIT_HARNESS_TRUSTED_SEED: '6666666666666666666666666666666666666666666666666666666666666666'
+
+jobs:
+  live:
+    name: live paykit-server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --shm-size=256m
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: marketplace
+      - uses: actions/checkout@v4
+        with:
+          repository: BitcoinErrorLog/paykit-server
+          ref: ${{ env.PAYKIT_SERVER_REF }}
+          path: paykit-server
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            paykit-server
+            marketplace
+      - name: Build the paykit-server harness
+        working-directory: paykit-server
+        run: cargo test --locked -p paykit-server-e2e --test marketplace_live_harness --no-run
+      - name: Start the paykit-server harness
+        working-directory: paykit-server
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          PAYKIT_HARNESS_HANDOFF: ${{ runner.temp }}/paykit-handoff.json
+          PAYKIT_HARNESS_SERVE_SECONDS: '2400'
+        run: |
+          nohup cargo test --locked -p paykit-server-e2e --test marketplace_live_harness \
+            -- --ignored --nocapture > "$RUNNER_TEMP/paykit-harness.log" 2>&1 &
+          for _ in $(seq 1 180); do
+            [ -s "$PAYKIT_HARNESS_HANDOFF" ] && exit 0
+            sleep 2
+          done
+          cat "$RUNNER_TEMP/paykit-harness.log"
+          exit 1
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - name: Live bind tests
+        working-directory: marketplace
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          PAYKIT_LIVE_HANDOFF: ${{ runner.temp }}/paykit-handoff.json
+        run: cargo test -p marketplace-service --test paykit_live_test -- --ignored --test-threads=1
+      - name: Stop the harness
+        if: always()
+        run: touch "$RUNNER_TEMP/paykit-handoff.json.stop"
+      - name: Harness log
+        if: failure()
+        run: cat "$RUNNER_TEMP/paykit-harness.log"

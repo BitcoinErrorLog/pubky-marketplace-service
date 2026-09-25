@@ -11,7 +11,7 @@ use common::paykit_review::{
 use common::*;
 use common::{FakePaykit, FakeStripeSession, TestActor};
 use marketplace_service::clock::Clock;
-use marketplace_service::payments::order_reference;
+use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -256,7 +256,7 @@ async fn bound_sat_qty_one(
         .expect("activation delivers");
     (
         order_id.clone(),
-        order_reference(Uuid::parse_str(&order_id).unwrap()),
+        attempt_reference(Uuid::parse_str(&order_id).unwrap(), 1),
     )
 }
 
@@ -517,7 +517,7 @@ async fn same_ms_bitcoin_exclusive_pipelines_one_winner(pool: PgPool) {
     drain_outbox(&app.pool, client, app.clock.now(), 30)
         .await
         .expect("activation");
-    let reference = order_reference(Uuid::parse_str(&order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order_id).unwrap(), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true, 2));
     assert!(poll_now(&app, app.clock.now()).await >= 1);
     let paid: String = sqlx::query_scalar("SELECT state FROM orders WHERE id = $1::uuid")
@@ -547,7 +547,7 @@ async fn same_ms_bitcoin_ln_pipelines_one_winner(pool: PgPool) {
     drain_outbox(&app.pool, client, app.clock.now(), 30)
         .await
         .expect("activation");
-    let reference = order_reference(Uuid::parse_str(&order_id).unwrap());
+    let reference = attempt_reference(Uuid::parse_str(&order_id).unwrap(), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true, 1));
     assert!(poll_now(&app, app.clock.now()).await >= 1);
     let paid: String = sqlx::query_scalar("SELECT state FROM orders WHERE id = $1::uuid")
@@ -922,7 +922,7 @@ async fn bitcoin_exclusive_confirm_inside_window_pays(pool: PgPool) {
         .await
         .expect("state");
     assert_eq!(state, "paid");
-    let _ = order_reference(Uuid::parse_str(&order_id).unwrap());
+    let _ = attempt_reference(Uuid::parse_str(&order_id).unwrap(), 1);
     let client = app
         .state
         .payments

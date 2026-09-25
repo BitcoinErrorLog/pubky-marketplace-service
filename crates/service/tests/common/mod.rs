@@ -1740,6 +1740,12 @@ pub struct FakePaykitInvoice {
     pub prepare_expires_at: String,
 }
 
+struct FakePaykitPrepared {
+    binding: Value,
+    invoice_id: uuid::Uuid,
+    body: Value,
+}
+
 /// One recorded call: method, path, the Host the client dialed, and the
 /// canonical body as received.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1766,6 +1772,10 @@ struct FakePaykitState {
     fingerprint: String,
     requests: Vec<FakePaykitRequest>,
     invoices: HashMap<uuid::Uuid, FakePaykitInvoice>,
+    /// One invoice per `(creator, reference)`, as paykit-server's
+    /// `UNIQUE (creator_id, bundle_lookup_hash)`: the request binding the
+    /// invoice was created under, its id, and the phase-1 body it answered.
+    prepared: HashMap<(String, String), FakePaykitPrepared>,
     activate_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
     void_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
     resolve_scripts: HashMap<uuid::Uuid, std::collections::VecDeque<FakePaykitReply>>,
@@ -1776,6 +1786,8 @@ struct FakePaykitState {
     /// Scripted transaction-status bodies by bundle id (the strict
     /// `paykit.bitcoin_status/v2` shape the real client consumes).
     status_bodies: HashMap<String, Value>,
+    /// Status every transaction-status call answers with, when forced.
+    status_failure: Option<u16>,
     calls: Vec<FakePaykitCall>,
     rail_health: Value,
     rail_health_requests: usize,
@@ -1986,6 +1998,11 @@ impl FakePaykit {
             .insert(bundle_id.to_string(), body);
     }
 
+    /// Force every transaction-status call to answer `status` (e.g. 503).
+    pub fn fail_status_with(&self, status: u16) {
+        self.state.lock().expect("fake paykit lock").status_failure = Some(status);
+    }
+
     /// Every call the double received, with the body and the Host header
     /// the client dialed (the repoint assertion).
     pub fn calls(&self) -> Vec<FakePaykitCall> {
@@ -2122,6 +2139,38 @@ async fn serve_paykit_payment_request(
             .unwrap_or_default()
             .to_string(),
     });
+    // paykit-server's phase-1 preflight: the (creator, reference) pair
+    // names at most one invoice. A changed binding against it is
+    // `invoice_conflict`; an identical one replays by the invoice's state.
+    let creator_reference = (
+        parsed["creator"].as_str().unwrap_or_default().to_string(),
+        parsed["reference"].as_str().unwrap_or_default().to_string(),
+    );
+    let binding = json!({
+        "amount_sats": parsed["amount_sats"],
+        "creator": parsed["creator"],
+        "reader": parsed["reader"],
+        "reference": parsed["reference"],
+        "expires_at": parsed["expires_at"],
+        "idempotency_key": parsed["idempotency_key"],
+    });
+    if let Some(prepared) = guard.prepared.get(&creator_reference) {
+        if prepared.binding != binding {
+            return paykit_error(StatusCode::CONFLICT, "invoice_conflict");
+        }
+        let state = guard
+            .invoices
+            .get(&prepared.invoice_id)
+            .map(|invoice| invoice.state.clone())
+            .unwrap_or_default();
+        return match state.as_str() {
+            "prepared" | "observing" | "expired_tail" => {
+                (StatusCode::OK, axum::Json(prepared.body.clone())).into_response()
+            }
+            "void_prepare_expired" => paykit_error(StatusCode::CONFLICT, "prepare_expired"),
+            _ => paykit_error(StatusCode::CONFLICT, "invoice_finalized"),
+        };
+    }
     match guard.create_shape {
         FakePaykitCreateShape::LegacyNoContent => StatusCode::NO_CONTENT.into_response(),
         _ => {
@@ -2185,6 +2234,14 @@ async fn serve_paykit_payment_request(
                 }
                 _ => {}
             }
+            guard.prepared.insert(
+                creator_reference,
+                FakePaykitPrepared {
+                    binding,
+                    invoice_id,
+                    body: body.clone(),
+                },
+            );
             (StatusCode::OK, axum::Json(body)).into_response()
         }
     }
@@ -2545,6 +2602,12 @@ async fn serve_paykit_status(
     let bundle_id = parsed["bundle_id"].as_str().unwrap_or_default();
     let body = {
         let guard = state.lock().expect("fake paykit lock");
+        if let Some(status) = guard.status_failure {
+            return paykit_error(
+                StatusCode::from_u16(status).expect("valid fake status"),
+                "unavailable",
+            );
+        }
         guard.status_bodies.get(bundle_id).cloned()
     };
     match body {
@@ -2567,12 +2630,14 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         fingerprint: "3f7a1c9e5b204d86".to_string(),
         requests: Vec::new(),
         invoices: HashMap::new(),
+        prepared: HashMap::new(),
         activate_scripts: HashMap::new(),
         void_scripts: HashMap::new(),
         resolve_scripts: HashMap::new(),
         activate_gates: HashMap::new(),
         resolutions: HashMap::new(),
         status_bodies: HashMap::new(),
+        status_failure: None,
         calls: Vec::new(),
         rail_health: json!({
             "status": "ready",
@@ -2693,6 +2758,80 @@ pub async fn test_app_with_payments_full(
     pool: PgPool,
 ) -> (TestApp, FakeStripe, FakePaykit, FakePaypalIpn, FakeShippo) {
     test_app_with_payments_config(pool, Config::for_tests()).await
+}
+
+/// A payments-enabled app whose Paykit client dials a live paykit-server at
+/// `paykit_base_url`. The clock starts at the current second: paykit-server
+/// refuses a payment request whose `expires_at` is in its past.
+pub async fn test_app_with_live_paykit(pool: PgPool, paykit_base_url: &str) -> TestApp {
+    let stripe = spawn_fake_stripe().await;
+    let ipn = spawn_fake_paypal_ipn().await;
+    let shippo = spawn_fake_shippo().await;
+    let runtime = Arc::new(PaymentsRuntime {
+        stripe_key_cipher: StripeKeyCipher::from_hex(TEST_STRIPE_ENCRYPTION_KEY)
+            .expect("test stripe key parses"),
+        stripe: StripeClient::new(&stripe.base_url).expect("fake stripe client builds"),
+        paykit: Some(
+            PaykitClient::new(paykit_base_url, TEST_PAYKIT_SIGNING_SEED)
+                .expect("live paykit client builds"),
+        ),
+        paypal_ipn: PaypalIpnVerifier::new(&ipn.base_url).expect("fake ipn verifier builds"),
+        shippo: ShippoClient::new(&shippo.base_url).expect("fake shippo client builds"),
+    });
+    let now = DateTime::from_timestamp(Utc::now().timestamp(), 0).expect("current second");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
+        .with_payments(Some(runtime))
+        .with_homeserver(Some(Arc::new(CommandMirrorHomeserver)));
+    TestApp {
+        router: build_router(state.clone()),
+        pool,
+        clock,
+        state,
+    }
+}
+
+/// Makes every `paykit.activate` outbox insert fail, so a bitcoin bind
+/// whose phase 1 succeeded rolls back (and fires its courtesy void).
+pub async fn fail_activation_intent_inserts(pool: &PgPool) {
+    sqlx::query(
+        "CREATE FUNCTION fail_paykit_activate() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.kind = 'paykit.activate' THEN \
+         RAISE EXCEPTION 'injected bind persistence failure'; END IF; RETURN NEW; END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_paykit_activate BEFORE INSERT ON outbox \
+         FOR EACH ROW EXECUTE FUNCTION fail_paykit_activate()",
+    )
+    .execute(pool)
+    .await
+    .expect("fault trigger");
+}
+
+pub async fn restore_activation_intent_inserts(pool: &PgPool) {
+    sqlx::query("DROP TRIGGER fail_paykit_activate ON outbox")
+        .execute(pool)
+        .await
+        .expect("fault trigger dropped");
+}
+
+/// An authenticated actor for a known ed25519 secret (hex).
+pub async fn actor_from_secret(app: &TestApp, secret_hex: &str) -> TestActor {
+    let secret: [u8; 32] = hex::decode(secret_hex)
+        .expect("secret is hex")
+        .try_into()
+        .expect("secret is 32 bytes");
+    let keypair = Keypair::from_secret(&secret);
+    let pubky = keypair.public_key().z32();
+    let token = authenticate(app, &keypair).await;
+    TestActor {
+        keypair,
+        pubky,
+        token,
+    }
 }
 
 /// [`test_app_with_payments_full`] with a caller-supplied `Config` so bind

@@ -48,7 +48,7 @@ use crate::handlers::{
 };
 use crate::model::{OrderRow, PaymentRow};
 use crate::payments::{
-    order_reference, validate_paypal_email, validate_stripe_payment_link,
+    attempt_reference, validate_paypal_email, validate_stripe_payment_link,
     validate_stripe_restricted_key, PaykitRequestError, PaymentsRuntime, StripeError,
 };
 use crate::queries::PAYMENT_COLUMNS;
@@ -538,6 +538,27 @@ pub async fn bind_payment_method(
         );
     }
     let now = state.clock.now();
+    // A bitcoin bind spends its attempt number in a committed statement of
+    // its own, before the bind transaction: a bind that rolls back after
+    // paykit prepared (and courtesy-voided) its invoice has still used that
+    // attempt, so the retry prepares a new reference instead of replaying
+    // the voided one. Concurrent binds on one order reserve distinct numbers.
+    let reserved_attempt: Option<i32> = if method == "bitcoin" {
+        match sqlx::query_scalar(
+            "UPDATE orders SET paykit_bind_attempt = paykit_bind_attempt + 1 \
+             WHERE id = $1 AND buyer_pubky = $2 RETURNING paykit_bind_attempt",
+        )
+        .bind(order_id)
+        .bind(&actor.0)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(attempt) => attempt,
+            Err(error) => return internal("paykit bind attempt reservation", &error),
+        }
+    } else {
+        None
+    };
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(error) => return internal("payment method transaction", &error),
@@ -704,7 +725,14 @@ pub async fn bind_payment_method(
 
     let (fiat_checkout_url, paykit_reference, adapter): (Option<String>, Option<String>, &str) =
         match method {
-            "bitcoin" => (None, Some(order_reference(order.id)), "paykit"),
+            "bitcoin" => {
+                // Reached only by the order's buyer, whose reservation
+                // above therefore returned a row.
+                let Some(attempt) = reserved_attempt else {
+                    return internal("paykit bind attempt", &"no attempt was reserved");
+                };
+                (None, Some(attempt_reference(order.id, attempt)), "paykit")
+            }
             "stripe" => {
                 let Some(link) = config
                     .as_ref()
@@ -768,12 +796,20 @@ pub async fn bind_payment_method(
             _ => unreachable!("method validated above"),
         };
 
+    // Pins still on an unbound order belong to a released attempt; they are
+    // recorded (idempotently) before this bind overwrites them, so that
+    // attempt stays polled.
+    if order.paykit_invoice_id.is_some() {
+        if let Err(error) =
+            crate::paykit_attempts::record_released_attempt(&mut tx, order.id, now).await
+        {
+            return internal("released paykit attempt record", &error);
+        }
+    }
     let updated_order: OrderRow = match sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, payment_method = $2, \
          fiat_checkout_url = $3, paykit_request_reference = $4, \
          paykit_request_state = CASE WHEN $4::text IS NULL THEN NULL ELSE 'preparing' END, \
-         paykit_bind_attempt = CASE WHEN $4::text IS NULL \
-             THEN paykit_bind_attempt ELSE paykit_bind_attempt + 1 END, \
          updated_at = $5 WHERE id = $1 RETURNING {}",
         crate::queries::ORDER_COLUMNS
     ))
@@ -830,17 +866,18 @@ pub async fn bind_payment_method(
 
     // Bitcoin phase 1 (§B.11.2/§B.11.3): the Paykit prepare call happens
     // before commit so a refusal leaves the order unbound (the fail-closed
-    // baseline). `expires_at` is the exact hold deadline armed above;
-    // `idempotency_key` is `{order_reference}:{bind_attempt}` with the
-    // attempt counter incremented by the bind UPDATE, so a transport retry
-    // replays the same prepared invoice while a re-bind after a void gets
-    // a fresh key. The bind AND the `paykit.activate` outbox row commit
-    // atomically or not at all.
+    // baseline). `expires_at` is the exact hold deadline armed above. The
+    // attempt reserved before the transaction is the operation identity:
+    // `reference` is derived from it and `idempotency_key` is
+    // `{reference}:{attempt}`, so every attempt — a re-bind after a void,
+    // or a retry after a rolled-back bind — is a new Paykit invoice, never
+    // a second binding against an old one. The bind AND the
+    // `paykit.activate` outbox row commit atomically or not at all.
     let mut prepared: Option<(uuid::Uuid, String, String)> = None;
-    // The re-read key for an ambiguous COMMIT: `{reference}:{bind_attempt}`
+    // The re-read key for an ambiguous COMMIT: the attempt's reference
     // plus the invoice id, captured when phase 1 runs.
-    let mut bind_key: Option<(String, i32)> = None;
-    if let Some(reference) = &paykit_reference {
+    let mut bind_reference: Option<String> = None;
+    if let (Some(reference), Some(attempt)) = (&paykit_reference, reserved_attempt) {
         let paykit = payments.paykit.as_ref().expect("checked above");
         let amount_sats = bitcoin_quote
             .as_ref()
@@ -850,7 +887,7 @@ pub async fn bind_payment_method(
         let expires_at = updated_order.hold_expires_at.unwrap_or_else(|| {
             now + chrono::Duration::seconds(state.config.bitcoin_payment_window_seconds)
         });
-        let idempotency_key = format!("{reference}:{}", updated_order.paykit_bind_attempt);
+        let idempotency_key = format!("{reference}:{attempt}");
         let phase1 = paykit
             .create_payment_request(
                 &order.seller_pubky,
@@ -905,7 +942,7 @@ pub async fn bind_payment_method(
             );
         }
         prepared = Some((phase1.invoice_id, phase1.stack_id.clone(), endpoint.clone()));
-        bind_key = Some((reference.clone(), updated_order.paykit_bind_attempt));
+        bind_reference = Some(reference.clone());
         // The echoed `expires_at` must equal the hold deadline this call
         // sent (the wire format truncates to UTC seconds, so the comparison
         // is exact at second precision): a stack answering with a later
@@ -1092,7 +1129,12 @@ pub async fn bind_payment_method(
             // committed before the connection dropped), so the courtesy
             // void fires only after the bind is confirmed absent.
             resolve_ambiguous_bind_commit(
-                &state, &payments, &prepared, order.id, &bind_key, &error,
+                &state,
+                &payments,
+                &prepared,
+                order.id,
+                &bind_reference,
+                &error,
             )
             .await;
             internal("payment method commit", &error)
@@ -1147,19 +1189,21 @@ async fn resolve_ambiguous_bind_commit(
     payments: &std::sync::Arc<PaymentsRuntime>,
     prepared: &Option<(uuid::Uuid, String, String)>,
     order_id: Uuid,
-    bind_key: &Option<(String, i32)>,
+    bind_reference: &Option<String>,
     commit_error: &sqlx::Error,
 ) {
-    let (Some((invoice_id, _, _)), Some((reference, bind_attempt))) = (prepared, bind_key) else {
+    let (Some((invoice_id, _, _)), Some(reference)) = (prepared, bind_reference) else {
         return;
     };
+    // The reference names the attempt. `paykit_bind_attempt` is not
+    // compared: a concurrent bind may reserve the next number after this
+    // one committed.
     let bind_present = sqlx::query_scalar::<_, i64>(
         "SELECT 1::bigint FROM orders WHERE id = $1 AND paykit_request_reference = $2 \
-         AND paykit_bind_attempt = $3 AND paykit_invoice_id = $4",
+         AND paykit_invoice_id = $3",
     )
     .bind(order_id)
     .bind(reference.as_str())
-    .bind(bind_attempt)
     .bind(invoice_id)
     .fetch_optional(&state.pool)
     .await;

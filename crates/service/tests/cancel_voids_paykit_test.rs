@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use common::paykit_review::{enable_bitcoin, poll_now, status_confirmed, status_detected};
 use common::*;
 use marketplace_service::clock::Clock;
-use marketplace_service::payments::order_reference;
+use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection, PgPool};
@@ -310,7 +310,7 @@ async fn cancel_racing_a_committed_activation_keeps_the_invoice_observed(pool: P
     assert_eq!(facts(&pool, &order_id).await.3.as_deref(), Some("pending"));
 
     // Money arrives anyway: the #50 fork completes the order (unit free).
-    let reference = order_reference(order_uuid(&order_id));
+    let reference = attempt_reference(order_uuid(&order_id), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true, 2));
     assert!(poll_now(&app, app.clock.now() + chrono::Duration::seconds(60)).await >= 1);
     let (order_state, payment_state, ..) = facts(&pool, &order_id).await;
@@ -366,7 +366,7 @@ async fn cancel_after_activation_expires_the_payment_and_keeps_tail_observation(
     bind_bitcoin(&app, &second.token, &second_order).await;
     assert_eq!(listing_available(&pool, &seller.pubky).await, 0);
 
-    let reference = order_reference(order_uuid(&order_id));
+    let reference = attempt_reference(order_uuid(&order_id), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true, 2));
     assert!(poll_now(&app, app.clock.now() + chrono::Duration::seconds(60)).await >= 1);
     let (order_state, payment_state, reason): (String, String, Option<String>) = sqlx::query_as(
@@ -391,7 +391,7 @@ async fn cancel_is_refused_once_bitcoin_money_is_observed(pool: PgPool) {
     let buyer = new_actor(&app).await;
     let (order_id, _invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
     drain(&app).await;
-    let reference = order_reference(order_uuid(&order_id));
+    let reference = attempt_reference(order_uuid(&order_id), 1);
     paykit.set_status(&reference, status_detected("exclusive", 0));
     poll_now(&app, app.clock.now() + chrono::Duration::seconds(60)).await;
     assert_eq!(facts(&pool, &order_id).await.3.as_deref(), Some("detected"));
@@ -423,7 +423,7 @@ async fn cancel_is_refused_once_bitcoin_money_is_observed(pool: PgPool) {
     paykit.set_allocation_mode("shared_manual");
     let (shared_order, _) = preparing_order(&app, &paykit, &shared_seller, &shared_buyer).await;
     drain(&app).await;
-    let reference = order_reference(order_uuid(&shared_order));
+    let reference = attempt_reference(order_uuid(&shared_order), 1);
     paykit.set_status(&reference, status_detected("shared_manual", 0));
     assert_eq!(poll_now(&app, app.clock.now()).await, 1);
     assert_eq!(

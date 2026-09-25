@@ -10,7 +10,7 @@ use marketplace_service::bitcoin_review::{
     route_due_seller_confirmation_windows, SELLER_CONFIRMATION_WINDOW_SECONDS,
 };
 use marketplace_service::clock::Clock;
-use marketplace_service::payments::order_reference;
+use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{
     drain_outbox, expire_due_payment_windows, verify_due_paykit_payments,
 };
@@ -125,7 +125,7 @@ pub async fn bound_order(
     drain_outbox(&app.pool, client, app.clock.now(), 30)
         .await
         .expect("activation delivers");
-    let reference = order_reference(Uuid::parse_str(&order.order_id).expect("order uuid"));
+    let reference = attempt_reference(Uuid::parse_str(&order.order_id).expect("order uuid"), 1);
     (order.order_id, order.payment_id, reference)
 }
 
