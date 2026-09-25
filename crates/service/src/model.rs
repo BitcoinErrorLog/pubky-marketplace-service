@@ -375,6 +375,9 @@ pub struct OfferRow {
     pub accepted_subtotal_minor: Option<i64>,
     pub accepted_total_minor: Option<i64>,
     pub accepted_fulfillment: Option<String>,
+    /// The physical methods the accepted snapshot published; NULL for awards
+    /// accepted before 0044, which are shipping-only.
+    pub accepted_fulfillment_methods: Option<Vec<String>>,
     pub converted_order_id: Option<Uuid>,
     pub converted_at: Option<DateTime<Utc>>,
     pub expiry_reason: Option<String>,
@@ -383,6 +386,15 @@ pub struct OfferRow {
 impl OfferRow {
     pub fn amount_json(&self) -> Value {
         money_json(self.amount_minor, &self.currency, self.exponent)
+    }
+
+    /// The fulfillment methods award checkout may settle this award with:
+    /// the accepted snapshot's, or shipping only for awards accepted before
+    /// the snapshot recorded them.
+    pub fn award_fulfillment_methods(&self) -> Vec<String> {
+        self.accepted_fulfillment_methods
+            .clone()
+            .unwrap_or_else(|| vec!["shipping".to_string()])
     }
 
     pub fn view(&self, now: DateTime<Utc>) -> Value {
@@ -470,6 +482,7 @@ impl OfferRow {
                     money_json(shipping, award_currency, award_exponent)
                 }),
                 "merchandise_total": accepted_total,
+                "fulfillment_methods": self.award_fulfillment_methods(),
                 "quantity": self.accepted_quantity,
                 "accepted_at": self.accepted_at.map(format_timestamp),
                 "convert_by": self.award_expires_at.map(format_timestamp),

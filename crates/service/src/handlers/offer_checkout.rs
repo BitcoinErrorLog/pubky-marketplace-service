@@ -163,18 +163,20 @@ pub async fn handle(
         )));
     }
     // The award settles through the fulfillment the buyer chose, validated
-    // against what the listing publishes exactly as `checkout.create` does:
-    // a disallowed choice is a typed refusal, never a silent fall back.
+    // against the methods the ACCEPTED snapshot published — the same snapshot
+    // that priced its shipping — never the mutable listing row, which can
+    // diverge from it or change after acceptance. A disallowed choice is a
+    // typed refusal, never a silent fall back.
     let fulfillment = payload.fulfillment.unwrap_or(FulfillmentMethod::Shipping);
-    if !listing
-        .fulfillment_methods
+    if !offer
+        .award_fulfillment_methods()
         .iter()
-        .any(|published| published == fulfillment.as_str())
+        .any(|accepted| accepted == fulfillment.as_str())
     {
         return Ok(Err(CommandFailure::refused_with_reason(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
-            "A checkout line's listing does not publish the chosen fulfillment method.",
+            "The accepted offer does not include the chosen fulfillment method.",
             "fulfillment_not_published",
         )));
     }

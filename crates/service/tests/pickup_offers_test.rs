@@ -497,3 +497,241 @@ async fn award_checkout_refuses_a_fulfillment_the_listing_does_not_publish(pool:
         .expect("order count");
     assert_eq!(orders, 0, "refused award checkouts write nothing");
 }
+
+async fn award_checkout_count(app: &TestApp) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM orders")
+        .fetch_one(&app.pool)
+        .await
+        .expect("order count")
+}
+
+async fn accepted_methods(app: &TestApp) -> Option<Vec<String>> {
+    sqlx::query_scalar("SELECT accepted_fulfillment_methods FROM offers WHERE id = $1")
+        .bind(Uuid::parse_str(OFFER_COMMAND_ID).expect("offer id"))
+        .fetch_one(&app.pool)
+        .await
+        .expect("accepted methods")
+}
+
+// Split authority, one way: the durable row still publishes shipping, but the
+// seller-signed record the award was priced from is pickup-only (shipping 0).
+// Omitting `fulfillment` (= shipping) must not create a free-shipping order.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn durable_shipping_row_with_a_pickup_snapshot_never_ships_free(pool: PgPool) {
+    let (app, _ipn) = pickup_offer_app(pool, &["pickup"], false).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let award = accepted_award(&app, &seller, &buyer, &["shipping"], SHIPPING_MINOR).await;
+    assert_eq!(award.shipping_minor, 0);
+    assert_eq!(
+        accepted_methods(&app).await,
+        Some(vec!["pickup".to_string()])
+    );
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &offer_checkout(&seller.pubky, &award, None, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("fulfillment_not_published"));
+    assert_eq!(award_checkout_count(&app).await, 0);
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &offer_checkout(&seller.pubky, &award, Some("pickup"), false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["order"]["lines"][0]["fulfillment"],
+        json!("pickup")
+    );
+    assert_eq!(
+        body["result"]["order"]["shipping"]["amount_minor"],
+        json!(0)
+    );
+}
+
+// Split authority, the other way: the durable row is pickup-only, but the
+// signed record the award was priced from ships (shipping 12.00). A pickup
+// order must not be created from a shipped award.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn durable_pickup_row_with_a_shipping_snapshot_never_makes_a_pickup_order(pool: PgPool) {
+    let (app, _ipn) = pickup_offer_app(pool, &["physical", "shipping"], true).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let award = accepted_award(&app, &seller, &buyer, &["pickup"], 0).await;
+    assert_eq!(award.shipping_minor, SHIPPING_MINOR);
+    assert_eq!(
+        accepted_methods(&app).await,
+        Some(vec!["shipping".to_string()])
+    );
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &offer_checkout(&seller.pubky, &award, Some("pickup"), false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("fulfillment_not_published"));
+    assert_eq!(award_checkout_count(&app).await, 0);
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &offer_checkout(&seller.pubky, &award, None, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["order"]["shipping"]["amount_minor"],
+        json!(SHIPPING_MINOR)
+    );
+}
+
+// The award keeps the fulfillment authority it was accepted with: a later
+// change to the listing row's methods neither removes an accepted method nor
+// adds one. The projection shows the accepted methods.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn award_keeps_its_accepted_fulfillment_after_the_listing_changes(pool: PgPool) {
+    let (app, _ipn) = pickup_offer_app(pool, &["physical", "shipping", "pickup"], true).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let award = accepted_award(
+        &app,
+        &seller,
+        &buyer,
+        &["shipping", "pickup"],
+        SHIPPING_MINOR,
+    )
+    .await;
+
+    let (status, offers) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/offers",
+        Some(&buyer.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{offers}");
+    assert_eq!(
+        offers["offers"][0]["award"]["fulfillment_methods"],
+        json!(["shipping", "pickup"])
+    );
+
+    sqlx::query("UPDATE listings SET fulfillment_methods = '{shipping}' WHERE aggregate_id = $1")
+        .bind(format!("listing:{}_boots_01", seller.pubky))
+        .execute(&app.pool)
+        .await
+        .expect("listing methods change after acceptance");
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &offer_checkout(&seller.pubky, &award, Some("pickup"), false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["order"]["lines"][0]["fulfillment"],
+        json!("pickup")
+    );
+    assert_eq!(
+        body["result"]["order"]["total"]["amount_minor"],
+        json!(OFFER_MINOR)
+    );
+}
+
+// An award accepted before the snapshot recorded its methods (NULL) is
+// shipping-only, as it was priced.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn award_accepted_before_0044_stays_shipping_only(pool: PgPool) {
+    let (app, _ipn) = pickup_offer_app(pool, &["physical", "shipping", "pickup"], true).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let award = accepted_award(
+        &app,
+        &seller,
+        &buyer,
+        &["shipping", "pickup"],
+        SHIPPING_MINOR,
+    )
+    .await;
+    sqlx::query("UPDATE offers SET accepted_fulfillment_methods = NULL WHERE id = $1")
+        .bind(Uuid::parse_str(OFFER_COMMAND_ID).expect("offer id"))
+        .execute(&app.pool)
+        .await
+        .expect("legacy award");
+
+    let (status, offers) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/offers",
+        Some(&buyer.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{offers}");
+    assert_eq!(
+        offers["offers"][0]["award"]["fulfillment_methods"],
+        json!(["shipping"])
+    );
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &offer_checkout(&seller.pubky, &award, Some("pickup"), false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("fulfillment_not_published"));
+}
+
+// 0044's constraints: only physical methods, and an award whose snapshot does
+// not ship carries zero shipping.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn migration_0044_constrains_the_accepted_methods(pool: PgPool) {
+    let (app, _ipn) = pickup_offer_app(pool, &["pickup"], false).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    accepted_award(&app, &seller, &buyer, &["pickup"], 0).await;
+    let offer_id = Uuid::parse_str(OFFER_COMMAND_ID).expect("offer id");
+    for (methods, shipping) in [
+        (vec!["digital"], 0_i64),
+        (vec!["pickup"], SHIPPING_MINOR),
+        (vec![], 0),
+    ] {
+        let result = sqlx::query(
+            "UPDATE offers SET accepted_fulfillment_methods = $2, accepted_shipping_minor = $3 \
+             WHERE id = $1",
+        )
+        .bind(offer_id)
+        .bind(&methods)
+        .bind(shipping)
+        .execute(&app.pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "methods {methods:?} with shipping {shipping} must be refused"
+        );
+    }
+    sqlx::query(
+        "UPDATE offers SET accepted_fulfillment_methods = '{shipping,pickup}', \
+         accepted_shipping_minor = $2 WHERE id = $1",
+    )
+    .bind(offer_id)
+    .bind(SHIPPING_MINOR)
+    .execute(&app.pool)
+    .await
+    .expect("shipping-and-pickup award may carry shipping");
+    sqlx::raw_sql(include_str!(
+        "../migrations/0044_offer_accepted_fulfillment_methods.sql"
+    ))
+    .execute(&app.pool)
+    .await
+    .expect("0044 must be directly rerunnable");
+}

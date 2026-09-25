@@ -34,7 +34,7 @@ pub const OFFER_COLUMNS: &str = "id, aggregate_id, listing_aggregate_id, buyer_p
      accepted_listing_title, accepted_listing_revision, accepted_listing_record_sha256, \
      accepted_variant_id, accepted_variant_sku, accepted_variant_options, accepted_shipping_minor, \
      accepted_subtotal_minor, accepted_total_minor, accepted_fulfillment, converted_order_id, \
-     converted_at, expiry_reason";
+     converted_at, expiry_reason, accepted_fulfillment_methods";
 
 /// Acceptance holds the inventory for 30 minutes, as in the prototype engine.
 const ACCEPTED_OFFER_HOLD_SECONDS: i64 = 30 * 60;
@@ -553,6 +553,9 @@ pub async fn accept(
                 currency: locator.currency.clone(),
                 exponent: locator.exponent,
                 shipping_minor: 0,
+                // Without a seller-signed record there is no pickup authority:
+                // the award stays shipping-only, as before.
+                fulfillment_methods: vec!["shipping".to_string()],
                 variants: vec![AwardVariantSnapshot {
                     id: locator
                         .variant_id
@@ -725,7 +728,7 @@ pub async fn accept(
          accepted_listing_record_sha256 = $9, accepted_variant_id = $10,
          accepted_variant_sku = $11, accepted_variant_options = $12, accepted_shipping_minor = $13,
          accepted_subtotal_minor = $14, accepted_total_minor = $15,
-         accepted_fulfillment = 'shipping',
+         accepted_fulfillment = 'shipping', accepted_fulfillment_methods = $17,
          history = history || $16::jsonb
          WHERE id = $1 RETURNING {OFFER_COLUMNS}"
     ))
@@ -764,6 +767,7 @@ pub async fn accept(
         "",
         now,
     )]))
+    .bind(&snapshot.fulfillment_methods)
     .fetch_one(&mut **tx)
     .await?;
 

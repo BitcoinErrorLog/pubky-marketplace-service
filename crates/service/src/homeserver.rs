@@ -75,26 +75,34 @@ pub struct AwardListingSnapshot {
     pub currency: String,
     pub exponent: i32,
     pub shipping_minor: i64,
+    /// The physical methods (`shipping`, `pickup`) the record publishes, in
+    /// record order. Award checkout is authorized from these alone.
+    pub fulfillment_methods: Vec<String>,
     pub variants: Vec<AwardVariantSnapshot>,
 }
 
-/// Whether the record's physical fulfillment methods include shipping. As in
-/// [`registration_payload_from_record`], only `shipping`/`pickup` count, and
-/// a record naming neither (older records, `physical`, Locks listings) is
-/// shipping-only. Digital listings take no offers, so they never reach this.
-fn record_publishes_shipping(object: &serde_json::Map<String, Value>) -> bool {
-    let methods: Vec<&str> = object
+/// The record's physical fulfillment methods. As in
+/// [`registration_payload_from_record`], only `shipping`/`pickup` count, in
+/// first-seen order, and a record naming neither (older records, `physical`,
+/// Locks listings) is shipping-only. Digital listings take no offers, so
+/// they never reach this.
+fn record_physical_fulfillment_methods(object: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut methods: Vec<String> = Vec::new();
+    for method in object
         .get("fulfillmentMethods")
         .and_then(Value::as_array)
-        .map(|methods| {
-            methods
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|method| matches!(*method, "shipping" | "pickup"))
-                .collect()
-        })
-        .unwrap_or_default();
-    methods.is_empty() || methods.contains(&"shipping")
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if matches!(method, "shipping" | "pickup") && !methods.iter().any(|seen| seen == method) {
+            methods.push(method.to_string());
+        }
+    }
+    if methods.is_empty() {
+        methods.push("shipping".to_string());
+    }
+    methods
 }
 
 /// Extracts only the authority-bearing fixed-price terms from the exact
@@ -274,10 +282,16 @@ pub fn award_terms_from_bytes_for_variant(
     }) {
         return Err("variant money mismatch");
     }
+    let fulfillment_methods = record_physical_fulfillment_methods(object);
     let shipping_minor = match object.get("shippingOptions") {
         // A record that does not publish shipping settles only by pickup, so
         // its (empty) shipping options price nothing.
-        _ if !record_publishes_shipping(object) => 0,
+        _ if !fulfillment_methods
+            .iter()
+            .any(|method| method == "shipping") =>
+        {
+            0
+        }
         None => 0,
         Some(value) => {
             let options = value.as_array().ok_or("invalid shipping options")?;
@@ -315,6 +329,7 @@ pub fn award_terms_from_bytes_for_variant(
         currency: unit.currency,
         exponent: unit.exponent,
         shipping_minor,
+        fulfillment_methods,
         variants,
     })
 }
