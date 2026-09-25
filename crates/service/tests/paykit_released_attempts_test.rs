@@ -543,7 +543,7 @@ async fn released_attempt_checks_back_off_and_a_stale_detection_escalates(pool: 
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let (order_id, _first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
+    let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
     let reference = attempt_reference(order_id, 1);
     let every = chrono::Duration::seconds(app.state.config.paykit_poll_seconds);
     let t0 = app.clock.now();
@@ -583,6 +583,15 @@ async fn released_attempt_checks_back_off_and_a_stale_detection_escalates(pool: 
     // A detection that never confirms goes to an operator after seven days.
     poll_now(&app, t1 + chrono::Duration::days(6)).await;
     assert_eq!(released(&pool, order_id).await[0].2, "watching");
+    // By day seven paykit's status endpoint is failing and no check is due:
+    // the escalation runs on elapsed time alone.
+    paykit.fail_status_with(503);
+    sqlx::query("UPDATE paykit_superseded_attempts SET next_check_at = $2 WHERE order_id = $1")
+        .bind(order_id)
+        .bind(t1 + chrono::Duration::days(30))
+        .execute(&pool)
+        .await
+        .expect("no check due");
     poll_now(&app, t1 + chrono::Duration::days(7)).await;
     let (state, reason): (String, Option<String>) = sqlx::query_as(
         "SELECT state, review_reason FROM paykit_superseded_attempts WHERE order_id = $1",
@@ -596,12 +605,79 @@ async fn released_attempt_checks_back_off_and_a_stale_detection_escalates(pool: 
         ("needs_review", Some("detected_unconfirmed"))
     );
     let calls = status_calls(&paykit, &reference).await;
-    poll_now(&app, t1 + chrono::Duration::days(8)).await;
+    poll_now(&app, t1 + chrono::Duration::days(31)).await;
     assert_eq!(
         status_calls(&paykit, &reference).await,
         calls,
         "a held attempt is no longer polled"
     );
+
+    // No money was confirmed: the operator may dismiss it.
+    assert!(resolve_needs_review(
+        &pool,
+        order_id,
+        first,
+        ReviewOutcome::Dismissed,
+        "transaction replaced; never confirmed",
+        "ops@synonym",
+        t1 + chrono::Duration::days(8)
+    )
+    .await
+    .expect("dismiss"));
+    let resolved: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, resolution_outcome FROM paykit_superseded_attempts WHERE order_id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("attempt row");
+    assert_eq!(
+        (resolved.0.as_str(), resolved.1.as_deref()),
+        ("resolved", Some("dismissed"))
+    );
+}
+
+/// A confirmed-money review cannot be dismissed: the refusal leaves it
+/// waiting, and it still closes as refunded.
+async fn dismissal_is_refused_then_refund_resolves(pool: &PgPool, order_id: Uuid, invoice: Uuid) {
+    let now = Utc::now();
+    let refused = resolve_needs_review(
+        pool,
+        order_id,
+        invoice,
+        ReviewOutcome::Dismissed,
+        "not ours",
+        "ops@synonym",
+        now,
+    )
+    .await;
+    assert!(refused.is_err(), "confirmed money cannot be dismissed");
+    assert_eq!(
+        attempt_state(pool, order_id, invoice).await.0,
+        "needs_review"
+    );
+    let direct = sqlx::query(
+        "UPDATE paykit_superseded_attempts SET state = 'resolved', \
+         resolution_outcome = 'dismissed', resolution_note = 'x', resolved_by = 'x', \
+         resolved_at = now() WHERE order_id = $1 AND invoice_id = $2",
+    )
+    .bind(order_id)
+    .bind(invoice)
+    .execute(pool)
+    .await;
+    assert!(direct.is_err(), "the database refuses the dismissal too");
+    assert!(resolve_needs_review(
+        pool,
+        order_id,
+        invoice,
+        ReviewOutcome::Refunded,
+        "refund-txid-7a1b",
+        "ops@synonym",
+        now,
+    )
+    .await
+    .expect("refund resolves"));
+    assert_eq!(attempt_state(pool, order_id, invoice).await.0, "resolved");
 }
 
 // Money on a released attempt after the order was already paid by its
@@ -639,6 +715,24 @@ async fn an_operator_resolves_a_released_attempt_held_for_review(pool: PgPool) {
     assert_eq!(held[0].buyer_pubky, buyer.pubky);
 
     let now = app.clock.now();
+    assert!(
+        resolve_needs_review(
+            &pool,
+            order_id,
+            first,
+            ReviewOutcome::Dismissed,
+            "duplicate",
+            "ops",
+            now
+        )
+        .await
+        .is_err(),
+        "payment_settled is confirmed money and cannot be dismissed"
+    );
+    assert_eq!(
+        attempt_state(&pool, order_id, first).await.0,
+        "needs_review"
+    );
     assert!(resolve_needs_review(
         &pool,
         order_id,
@@ -755,6 +849,7 @@ async fn money_on_a_released_attempt_of_a_locks_payment_is_held_for_review(pool:
         ("locks", "awaiting_entitlement", None, Some("voided")),
         "the Locks payment and the order are untouched"
     );
+    dismissal_is_refused_then_refund_resolves(&pool, order_id, first).await;
 }
 
 // Money of the wrong amount on a released attempt restores that attempt and

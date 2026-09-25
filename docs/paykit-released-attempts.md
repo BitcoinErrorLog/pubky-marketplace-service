@@ -26,7 +26,7 @@ A released invoice can still receive money, for example when an activation commi
 
 ## Polling cadence
 
-A released attempt is first checked on the next Paykit poll pass. After each check, the interval to the next one doubles, starting from `PAYKIT_POLL_SECONDS` and capped at one hour. An attempt with no detection closes on the first check at least 24 h after its expiry. A detection keeps the attempt watched for up to 7 days, after which it moves to `needs_review` with an `ALERT`.
+A released attempt is first checked on the next Paykit poll pass. After each check, the interval to the next one doubles, starting from `PAYKIT_POLL_SECONDS` and capped at one hour. An attempt with no detection closes on the first check at least 24 h after its expiry. A detection keeps the attempt watched for up to 7 days. After that the attempt moves to `needs_review` with an `ALERT`, by elapsed time alone: every poll pass sweeps detections older than 7 days, whether or not Paykit answered.
 
 ## Alerts
 
@@ -48,7 +48,9 @@ cargo run -p marketplace-service --bin paykit-attempts-admin -- list
 PAYKIT_ADMIN_OPERATOR=<operator> cargo run -p marketplace-service --bin paykit-attempts-admin -- \
   resolve <order_id> <invoice_id> refunded '<refund reference>'
 
-# No refund is due (for example the detected transaction never settled).
+# detected_unconfirmed only: no money was confirmed (the detected transaction
+# was dropped or replaced), so no refund is due. Refused for payment_settled
+# and other_rail, which close only as refunded.
 PAYKIT_ADMIN_OPERATOR=<operator> cargo run -p marketplace-service --bin paykit-attempts-admin -- \
   resolve <order_id> <invoice_id> dismissed '<reason>'
 ```
@@ -57,6 +59,6 @@ For each entry:
 
 1. Read the frozen observation (`txid`, `observed_sats`) and confirm the transaction on-chain against the invoice total.
 2. `payment_settled` and `other_rail`: the seller holds funds the order cannot take. Ask the seller to return them to the buyer, then record the refund reference.
-3. `detected_unconfirmed`: if the transaction was dropped or replaced, dismiss with the reason. If it has since confirmed, the buyer's money is real: handle it as `payment_settled`.
+3. `detected_unconfirmed`: if the transaction was dropped or replaced, dismiss with the reason. If it has since confirmed, the buyer's money is real: have the seller refund it and resolve as `refunded` with the reference.
 
-A resolution is recorded once. Resolving an entry that is not waiting for review fails, and the row is left unchanged.
+A resolution is recorded once. Resolving an entry that is not waiting for review fails, and the row is left unchanged. `dismissed` is refused for `payment_settled` and `other_rail`, which close only as `refunded`; the database enforces the same rule.

@@ -1786,6 +1786,8 @@ struct FakePaykitState {
     /// Scripted transaction-status bodies by bundle id (the strict
     /// `paykit.bitcoin_status/v2` shape the real client consumes).
     status_bodies: HashMap<String, Value>,
+    /// Status every transaction-status call answers with, when forced.
+    status_failure: Option<u16>,
     calls: Vec<FakePaykitCall>,
     rail_health: Value,
     rail_health_requests: usize,
@@ -1994,6 +1996,11 @@ impl FakePaykit {
             .expect("fake paykit lock")
             .status_bodies
             .insert(bundle_id.to_string(), body);
+    }
+
+    /// Force every transaction-status call to answer `status` (e.g. 503).
+    pub fn fail_status_with(&self, status: u16) {
+        self.state.lock().expect("fake paykit lock").status_failure = Some(status);
     }
 
     /// Every call the double received, with the body and the Host header
@@ -2595,6 +2602,12 @@ async fn serve_paykit_status(
     let bundle_id = parsed["bundle_id"].as_str().unwrap_or_default();
     let body = {
         let guard = state.lock().expect("fake paykit lock");
+        if let Some(status) = guard.status_failure {
+            return paykit_error(
+                StatusCode::from_u16(status).expect("valid fake status"),
+                "unavailable",
+            );
+        }
         guard.status_bodies.get(bundle_id).cloned()
     };
     match body {
@@ -2624,6 +2637,7 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         activate_gates: HashMap::new(),
         resolutions: HashMap::new(),
         status_bodies: HashMap::new(),
+        status_failure: None,
         calls: Vec::new(),
         rail_health: json!({
             "status": "ready",

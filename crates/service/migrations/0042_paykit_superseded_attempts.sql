@@ -17,7 +17,8 @@
 --   late_money     confirmed money routed to the late-money path
 --   needs_review   money the order can no longer take, or a detection that
 --                  never confirmed; an operator records the outcome
---   resolved       an operator recorded a refund or dismissed the case
+--   resolved       an operator recorded a refund, or dismissed a detection
+--                  that never confirmed
 --
 -- `reference` is NULL only for attempts released before per-attempt
 -- references whose column a fiat bind later cleared: those used the
@@ -63,7 +64,11 @@ CREATE TABLE IF NOT EXISTS paykit_superseded_attempts (
         (state = 'resolved')
         = (resolution_outcome IS NOT NULL AND resolution_note IS NOT NULL
            AND resolved_by IS NOT NULL AND resolved_at IS NOT NULL)
-    )
+    ),
+    -- Confirmed money closes only as a refund; a dismissal is for a
+    -- detection that never confirmed.
+    CHECK (resolution_outcome IS DISTINCT FROM 'dismissed'
+           OR review_reason = 'detected_unconfirmed')
 );
 
 CREATE INDEX IF NOT EXISTS paykit_superseded_attempts_due

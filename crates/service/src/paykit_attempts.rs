@@ -19,7 +19,8 @@
 //!   managed by Locks or any adapter but paykit or sandbox) goes to
 //!   `needs_review`, alerted, with the order and payment untouched;
 //! - a detection keeps the attempt watched past its tail, up to
-//!   [`DETECTION_WINDOW_DAYS`], after which it goes to `needs_review`;
+//!   [`DETECTION_WINDOW_DAYS`] by our clock, after which every poll pass
+//!   moves it to `needs_review` whether or not paykit answers;
 //! - no money by the end of the tail closes the attempt `closed_unpaid`.
 //!
 //! Checks start at the paykit poll interval and double per check up to
@@ -170,7 +171,35 @@ pub async fn verify_due_released_attempts(
             ),
         }
     }
+    escalate_stale_detections(&state.pool, now).await?;
     Ok(routed)
+}
+
+/// Moves every watched attempt whose detection is older than
+/// [`DETECTION_WINDOW_DAYS`] to `needs_review`, by elapsed time alone: it
+/// neither polls paykit nor waits for a due check, so an unavailable status
+/// endpoint cannot hold an unconfirmed detection open. The frozen
+/// observation stays for the operator.
+async fn escalate_stale_detections(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
+    let escalated: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "UPDATE paykit_superseded_attempts SET state = 'needs_review', \
+         review_reason = 'detected_unconfirmed', closed_at = $1 \
+         WHERE state = 'watching' AND detected_at <= $2 \
+         RETURNING order_id, invoice_id",
+    )
+    .bind(now)
+    .bind(now - chrono::Duration::days(DETECTION_WINDOW_DAYS))
+    .fetch_all(pool)
+    .await?;
+    for (order_id, invoice_id) in &escalated {
+        tracing::error!(
+            order_id = %order_id,
+            invoice_id = %invoice_id,
+            code = "paykit_released_attempt_detected_unconfirmed",
+            "ALERT money detected on a released paykit attempt never confirmed; held for review"
+        );
+    }
+    Ok(escalated.len() as u64)
 }
 
 async fn apply_attempt_status(
@@ -179,9 +208,6 @@ async fn apply_attempt_status(
     attempt: &WatchedAttempt,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    let detection_expired = attempt
-        .detected_at
-        .is_some_and(|detected| now >= detected + chrono::Duration::days(DETECTION_WINDOW_DAYS));
     match source
         .status(&attempt.seller_pubky, &attempt.reference())
         .await
@@ -194,9 +220,6 @@ async fn apply_attempt_status(
         }
         PaykitStatusOutcome::Detected { facts } => {
             let observation = observation_json("detected", true, &facts.observation, now, false);
-            if detection_expired {
-                return escalate_unconfirmed(&state.pool, attempt, Some(&observation), now).await;
-            }
             let first = sqlx::query(
                 "UPDATE paykit_superseded_attempts SET detected_at = $3, observation = $4 \
                  WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching' \
@@ -228,9 +251,6 @@ async fn apply_attempt_status(
             Ok(false)
         }
         PaykitStatusOutcome::Undetected | PaykitStatusOutcome::NotFound => {
-            if detection_expired {
-                return escalate_unconfirmed(&state.pool, attempt, None, now).await;
-            }
             let tail_ends = attempt.expires_at.unwrap_or(attempt.released_at)
                 + chrono::Duration::hours(OBSERVATION_TAIL_HOURS);
             if attempt.detected_at.is_none() && now >= tail_ends {
@@ -250,37 +270,6 @@ async fn apply_attempt_status(
         }
         PaykitStatusOutcome::Unavailable => Ok(false),
     }
-}
-
-/// A detection that never confirmed within [`DETECTION_WINDOW_DAYS`]: the
-/// attempt stops polling and goes to an operator.
-async fn escalate_unconfirmed(
-    pool: &PgPool,
-    attempt: &WatchedAttempt,
-    observation: Option<&serde_json::Value>,
-    now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
-    let escalated = sqlx::query(
-        "UPDATE paykit_superseded_attempts SET state = 'needs_review', \
-         review_reason = 'detected_unconfirmed', closed_at = $3, \
-         observation = COALESCE($4, observation) \
-         WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching'",
-    )
-    .bind(attempt.order_id)
-    .bind(attempt.invoice_id)
-    .bind(now)
-    .bind(observation)
-    .execute(pool)
-    .await?;
-    if escalated.rows_affected() == 1 {
-        tracing::error!(
-            order_id = %attempt.order_id,
-            invoice_id = %attempt.invoice_id,
-            code = "paykit_released_attempt_detected_unconfirmed",
-            "ALERT money detected on a released paykit attempt never confirmed; held for review"
-        );
-    }
-    Ok(false)
 }
 
 /// The released attempt's pins and bind-time quote, read under the row lock.
@@ -569,10 +558,12 @@ pub async fn list_needs_review(pool: &PgPool) -> Result<Vec<NeedsReview>, sqlx::
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewOutcome {
     /// The buyer's money was returned; the note is the external refund
-    /// reference.
+    /// reference. Allowed for every review reason.
     Refunded,
-    /// No refund is due (for example a detection that never settled); the
-    /// note is the reason.
+    /// No money was confirmed, so no refund is due; the note is the reason.
+    /// Allowed only for `detected_unconfirmed` (a detection that never
+    /// confirmed). Confirmed money (`payment_settled`, `other_rail`) is
+    /// closed only by a refund.
     Dismissed,
 }
 
@@ -596,7 +587,7 @@ impl ReviewOutcome {
 /// Records an operator's outcome for one `needs_review` attempt. Returns
 /// false when the attempt is not waiting for review (unknown, or already
 /// resolved). The note (refund reference or reason) and the operator are
-/// required.
+/// required, and `Dismissed` is refused unless no money was confirmed.
 pub async fn resolve_needs_review(
     pool: &PgPool,
     order_id: Uuid,
@@ -614,10 +605,31 @@ pub async fn resolve_needs_review(
     if operator.is_empty() || operator.chars().count() > 128 {
         anyhow::bail!("the operator must be 1 to 128 characters");
     }
+    let mut tx = pool.begin().await?;
+    let reason: Option<String> = sqlx::query_scalar(
+        "SELECT review_reason FROM paykit_superseded_attempts \
+         WHERE order_id = $1 AND invoice_id = $2 AND state = 'needs_review' FOR UPDATE",
+    )
+    .bind(order_id)
+    .bind(invoice_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(reason) = reason else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    if outcome == ReviewOutcome::Dismissed && reason != "detected_unconfirmed" {
+        tx.rollback().await?;
+        anyhow::bail!(
+            "{reason} is confirmed money the order did not take: it closes only as refunded \
+             with the refund reference"
+        );
+    }
     let resolved = sqlx::query(
         "UPDATE paykit_superseded_attempts SET state = 'resolved', resolution_outcome = $3, \
          resolution_note = $4, resolved_by = $5, resolved_at = $6 \
-         WHERE order_id = $1 AND invoice_id = $2 AND state = 'needs_review'",
+         WHERE order_id = $1 AND invoice_id = $2 AND state = 'needs_review' \
+         AND ($3 = 'refunded' OR review_reason = 'detected_unconfirmed')",
     )
     .bind(order_id)
     .bind(invoice_id)
@@ -625,8 +637,9 @@ pub async fn resolve_needs_review(
     .bind(note)
     .bind(operator)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     if resolved.rows_affected() == 1 {
         tracing::info!(
             order_id = %order_id,

@@ -7,9 +7,24 @@
 # released shape, applies the pending migrations with the service migrator,
 # and routes confirmed money on one of them.
 #
-# Required: RAILWAY_PROJECT_ID, RAILWAY_ENVIRONMENT, RAILWAY_DATABASE_SERVICE
-# (exact IDs). Optional: MARKETPLACE_PG_BIN (local PostgreSQL bin directory
-# matching production's major), CARGO_TARGET_DIR.
+# Required:
+#   RAILWAY_PROJECT_ID           project id
+#   RAILWAY_ENVIRONMENT          environment id
+#   RAILWAY_DATABASE_SERVICE     database service name (what `railway connect` takes)
+#   RAILWAY_DATABASE_SERVICE_ID  that service's expected id
+# The target is verified before the tunnel opens: the project id, the
+# environment belonging to it, and the named service resolving to exactly
+# the expected id; any mismatch aborts.
+# Optional: MARKETPLACE_PG_BIN (local PostgreSQL bin directory matching
+# production's major), CARGO_TARGET_DIR.
+#
+# Production:
+#   RAILWAY_PROJECT_ID=75faa4fe-466c-4277-977f-1d8e4e31df8c \
+#   RAILWAY_ENVIRONMENT=404919ad-fb95-4621-9f45-b7f993dfa8ae \
+#   RAILWAY_DATABASE_SERVICE=Postgres \
+#   RAILWAY_DATABASE_SERVICE_ID=6833471b-a73c-403f-a7c4-64a26dc8e155 \
+#   MARKETPLACE_PG_BIN=/opt/homebrew/opt/postgresql@18/bin \
+#   scripts/release/rehearse-0042-production-clone.sh
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
@@ -21,7 +36,8 @@ readonly CLONE_BOOTSTRAP_USER="postgres"
 
 : "${RAILWAY_PROJECT_ID:?RAILWAY_PROJECT_ID is required}"
 : "${RAILWAY_ENVIRONMENT:?RAILWAY_ENVIRONMENT is required}"
-: "${RAILWAY_DATABASE_SERVICE:?RAILWAY_DATABASE_SERVICE is required}"
+: "${RAILWAY_DATABASE_SERVICE:?RAILWAY_DATABASE_SERVICE is required (the service name)}"
+: "${RAILWAY_DATABASE_SERVICE_ID:?RAILWAY_DATABASE_SERVICE_ID is required (the expected service id)}"
 
 pg_bin="${MARKETPLACE_PG_BIN:-/opt/homebrew/opt/postgresql@17/bin}"
 export PATH="$pg_bin:$PATH"
@@ -59,6 +75,12 @@ cleanup() {
   exit "$exit_code"
 }
 trap cleanup EXIT INT TERM
+
+railway status --project "$RAILWAY_PROJECT_ID" --environment "$RAILWAY_ENVIRONMENT" --json \
+  >"$scratch/railway-status.json"
+python3 "$root/scripts/release/railway_target.py" "$RAILWAY_PROJECT_ID" \
+  "$RAILWAY_ENVIRONMENT" "$RAILWAY_DATABASE_SERVICE" "$RAILWAY_DATABASE_SERVICE_ID" \
+  <"$scratch/railway-status.json"
 
 tunnel_log="$scratch/railway-tunnel.log"
 : >"$tunnel_log"
