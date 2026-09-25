@@ -180,12 +180,13 @@ async fn migration_0043_backfills_ended_orders_that_break_the_total_balance(pool
     .execute(&pool)
     .await
     .expect("stage a historical unbalanced order");
-    let (total, subtotal, shipping): (i64, i64, i64) =
-        sqlx::query_as("SELECT total_minor, subtotal_minor, shipping_minor FROM orders WHERE id = $1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .expect("totals");
+    let (total, subtotal, shipping): (i64, i64, i64) = sqlx::query_as(
+        "SELECT total_minor, subtotal_minor, shipping_minor FROM orders WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("totals");
     assert_eq!(total, subtotal + shipping + 100);
     assert_eq!(ended_at(&pool, id).await, None);
 
@@ -202,21 +203,25 @@ async fn migration_0043_backfills_ended_orders_that_break_the_total_balance(pool
         .fetch_one(&pool)
         .await
         .expect("total after");
-    assert_eq!(after, total, "the paid total is history and stays as it was");
+    assert_eq!(
+        after, total,
+        "the paid total is history and stays as it was"
+    );
     assert_eq!(
         total_balance_validated(&pool).await,
         Some(false),
         "orders_total_balance is back, NOT VALID"
     );
-    let unbalanced_write = sqlx::query(
-        "UPDATE orders SET total_minor = total_minor + 1 WHERE id = $1",
-    )
-    .bind(id)
-    .execute(&pool)
-    .await
-    .expect_err("new writes are still balance-checked");
+    let unbalanced_write =
+        sqlx::query("UPDATE orders SET total_minor = total_minor + 1 WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect_err("new writes are still balance-checked");
     assert!(
-        unbalanced_write.to_string().contains("orders_total_balance"),
+        unbalanced_write
+            .to_string()
+            .contains("orders_total_balance"),
         "{unbalanced_write}"
     );
 }
