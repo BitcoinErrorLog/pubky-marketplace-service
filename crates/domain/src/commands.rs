@@ -477,7 +477,14 @@ pub struct OfferCheckoutPayload {
     pub listing_record_sha256: String,
     pub variant_id: String,
     pub quantity: i64,
-    pub delivery_address: DeliveryAddress,
+    /// Required when the award ships; absent for a pickup award (§A2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_address: Option<DeliveryAddress>,
+    /// The buyer's fulfillment choice. Absent means `shipping` — old clients
+    /// are unaffected. The service validates it against the methods the
+    /// listing publishes and never silently rewrites it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulfillment: Option<FulfillmentMethod>,
     pub guarantee_policy_version: u32,
 }
 
@@ -1516,11 +1523,27 @@ fn validate_offer_checkout(
             "Expected a quantity between 1 and 1000000",
         ));
     }
-    validate_delivery_address(
-        "payload.delivery_address",
+    match (
+        payload.fulfillment.unwrap_or(FulfillmentMethod::Shipping),
         &mut payload.delivery_address,
-        &mut issues,
-    );
+    ) {
+        (FulfillmentMethod::Shipping, Some(address)) => {
+            validate_delivery_address("payload.delivery_address", address, &mut issues)
+        }
+        (FulfillmentMethod::Shipping, None) => issues.push(issue(
+            "payload.delivery_address",
+            "A delivery address is required when the offer ships",
+        )),
+        (FulfillmentMethod::Pickup, Some(_)) => issues.push(issue(
+            "payload.delivery_address",
+            "A pickup offer checkout must not carry a delivery address",
+        )),
+        (FulfillmentMethod::Pickup, None) => {}
+        (FulfillmentMethod::Digital, _) => issues.push(issue(
+            "payload.fulfillment",
+            "Offer checkout supports shipping or pickup",
+        )),
+    }
     if payload.guarantee_policy_version != 1 {
         issues.push(issue(
             "payload.guarantee_policy_version",

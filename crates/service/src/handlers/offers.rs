@@ -104,22 +104,19 @@ pub async fn create(
             "Offer amount must use the listing asset and exponent.",
         )));
     }
-    // Offers settle through the shipping flow only (§A2 v1 scope): an offer
-    // on a listing that does not publish `shipping` is refused with a typed
-    // error, never silently converted to shipping.
-    if !listing.fulfillment_methods.iter().any(|m| m == "shipping") {
-        if listing.fulfillment_methods.iter().any(|m| m == "digital") {
-            return Ok(Err(CommandFailure::refused_with_reason(
-                crate::refusal_audit::RefusalKind::InvalidState,
-                ErrorCode::InvalidState,
-                "Offers are not available on digital items.",
-                "offers_unavailable_for_digital",
-            )));
-        }
-        return Ok(Err(CommandFailure::refused(
+    // Offers settle through the listing's physical fulfillment: shipping or
+    // local pickup, chosen by the buyer at offer checkout (§A2). Digital
+    // items, the only other published method, take no offers.
+    if !listing
+        .fulfillment_methods
+        .iter()
+        .any(|m| m == "shipping" || m == "pickup")
+    {
+        return Ok(Err(CommandFailure::refused_with_reason(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
-            "Offers are available only on listings that ship.",
+            "Offers are not available on digital items.",
+            "offers_unavailable_for_digital",
         )));
     }
 

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use marketplace_domain::commands::{Command, OfferCheckoutPayload};
+use marketplace_domain::commands::{Command, FulfillmentMethod, OfferCheckoutPayload};
 use marketplace_domain::{ids, ErrorCode};
 use serde_json::json;
 use sqlx::{Postgres, Transaction};
@@ -162,16 +162,59 @@ pub async fn handle(
             "The inventory reserved for this accepted offer is no longer held.",
         )));
     }
+    // The award settles through the fulfillment the buyer chose, validated
+    // against what the listing publishes exactly as `checkout.create` does:
+    // a disallowed choice is a typed refusal, never a silent fall back.
+    let fulfillment = payload.fulfillment.unwrap_or(FulfillmentMethod::Shipping);
+    if !listing
+        .fulfillment_methods
+        .iter()
+        .any(|published| published == fulfillment.as_str())
+    {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "A checkout line's listing does not publish the chosen fulfillment method.",
+            "fulfillment_not_published",
+        )));
+    }
+    let pickup = fulfillment == FulfillmentMethod::Pickup;
+    let delivery_address = match (&payload.delivery_address, pickup) {
+        (Some(address), false) => Some(serde_json::to_value(address).expect("address serializes")),
+        (None, true) => None,
+        (Some(_), true) => {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                "A checkout with no shipped group must not carry a delivery address.",
+            )));
+        }
+        (None, false) => {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                "A delivery address is required when any checkout group ships.",
+            )));
+        }
+    };
 
     let order_id = Uuid::new_v4();
     let payment_id = Uuid::new_v4();
     let subtotal = offer
         .accepted_subtotal_minor
         .ok_or_else(|| sqlx::Error::Protocol("accepted offer has no subtotal".to_string()))?;
-    let shipping = offer.accepted_shipping_minor.unwrap_or(0);
-    let total = offer
-        .accepted_total_minor
-        .ok_or_else(|| sqlx::Error::Protocol("accepted offer has no total".to_string()))?;
+    // A pickup order's shipping is zero, never charged and refunded later
+    // (§A2): the buyer pays the accepted merchandise subtotal only.
+    let (shipping, total) = if pickup {
+        (0, subtotal)
+    } else {
+        (
+            offer.accepted_shipping_minor.unwrap_or(0),
+            offer
+                .accepted_total_minor
+                .ok_or_else(|| sqlx::Error::Protocol("accepted offer has no total".to_string()))?,
+        )
+    };
     let currency = offer
         .accepted_currency
         .as_deref()
@@ -189,7 +232,7 @@ pub async fn handle(
         "offer_id": offer.id,
         "award_id": payload.award_id,
         "variant_id": payload.variant_id,
-        "fulfillment": "shipping"
+        "fulfillment": fulfillment.as_str()
     }]);
     let hold_expires_at = lock_now + chrono::Duration::seconds(hold_window_seconds);
     let converted_reservation: Option<Uuid> = sqlx::query_scalar(
@@ -213,7 +256,7 @@ pub async fn handle(
          shipping_minor, total_minor, currency, exponent, guarantee_policy_version, payment_id, \
          stock_held, hold_expires_at, fulfillment, created_at, updated_at) \
          VALUES ($1, $2, $3, 'offer', $4, $5, 1, 'pending_payment', $6, $7, $8, $9, $10, \
-         $11, $12, $13, $14, TRUE, $15, 'shipping', $16, $16)",
+         $11, $12, $13, $14, TRUE, $15, $17, $16, $16)",
     )
     .bind(order_id)
     .bind(command.command_id)
@@ -221,7 +264,7 @@ pub async fn handle(
     .bind(actor)
     .bind(&offer.seller_pubky)
     .bind(&lines)
-    .bind(serde_json::to_value(&payload.delivery_address).expect("address serializes"))
+    .bind(&delivery_address)
     .bind(subtotal)
     .bind(shipping)
     .bind(total)
@@ -231,6 +274,7 @@ pub async fn handle(
     .bind(payment_id)
     .bind(hold_expires_at)
     .bind(lock_now)
+    .bind(fulfillment.as_str())
     .execute(&mut **tx)
     .await?;
     sqlx::query(

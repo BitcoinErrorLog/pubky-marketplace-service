@@ -78,6 +78,25 @@ pub struct AwardListingSnapshot {
     pub variants: Vec<AwardVariantSnapshot>,
 }
 
+/// Whether the record's physical fulfillment methods include shipping. As in
+/// [`registration_payload_from_record`], only `shipping`/`pickup` count, and
+/// a record naming neither (older records, `physical`, Locks listings) is
+/// shipping-only. Digital listings take no offers, so they never reach this.
+fn record_publishes_shipping(object: &serde_json::Map<String, Value>) -> bool {
+    let methods: Vec<&str> = object
+        .get("fulfillmentMethods")
+        .and_then(Value::as_array)
+        .map(|methods| {
+            methods
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|method| matches!(*method, "shipping" | "pickup"))
+                .collect()
+        })
+        .unwrap_or_default();
+    methods.is_empty() || methods.contains(&"shipping")
+}
+
 /// Extracts only the authority-bearing fixed-price terms from the exact
 /// seller record bytes. Unknown display fields remain forward-compatible;
 /// malformed money, variants, or shipping are rejected.
@@ -256,6 +275,9 @@ pub fn award_terms_from_bytes_for_variant(
         return Err("variant money mismatch");
     }
     let shipping_minor = match object.get("shippingOptions") {
+        // A record that does not publish shipping settles only by pickup, so
+        // its (empty) shipping options price nothing.
+        _ if !record_publishes_shipping(object) => 0,
         None => 0,
         Some(value) => {
             let options = value.as_array().ok_or("invalid shipping options")?;
