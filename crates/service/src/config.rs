@@ -161,6 +161,13 @@ pub struct Config {
     /// (`DIGITAL_DELIVERY_MAX_BYTES`, default 52,428,800). Exposed as
     /// `/health.digital_delivery_max_bytes`.
     pub digital_delivery_max_bytes: i64,
+    /// Days a buyer's sealed delivery email outlives the end of its order
+    /// (`BUYER_EMAIL_RETENTION_DAYS`, default 30, minimum 1).
+    pub buyer_email_retention_days: i64,
+    /// Days a buyer's sealed delivery email outlives an unpaid checkout
+    /// that was cancelled or expired (`BUYER_EMAIL_UNPAID_RETENTION_DAYS`,
+    /// default 7, minimum 1).
+    pub buyer_email_unpaid_retention_days: i64,
     /// Days a Locks checkout snapshot is retained after its payment went
     /// terminal before the worker's locks pass hard-deletes it
     /// (`LOCKS_SNAPSHOT_RETENTION_DAYS`, default 90, minimum 1). The purge
@@ -303,6 +310,8 @@ impl Config {
         )?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         let pickup_dispute_retention_days = env_days("PICKUP_DISPUTE_RETENTION_DAYS", 30)?;
+        let buyer_email_retention_days = env_days("BUYER_EMAIL_RETENTION_DAYS", 30)?;
+        let buyer_email_unpaid_retention_days = env_days("BUYER_EMAIL_UNPAID_RETENTION_DAYS", 7)?;
         let digital_delivery_max_bytes = parse_positive(
             "DIGITAL_DELIVERY_MAX_BYTES",
             std::env::var("DIGITAL_DELIVERY_MAX_BYTES").ok().as_deref(),
@@ -360,6 +369,8 @@ impl Config {
             sandbox_payments_enabled,
             pickup_dispute_retention_days,
             digital_delivery_max_bytes,
+            buyer_email_retention_days,
+            buyer_email_unpaid_retention_days,
             locks_snapshot_retention_days,
             fx_feed_url,
             paypal_checkout_url,
@@ -418,6 +429,8 @@ impl Config {
             sandbox_payments_enabled: true,
             pickup_dispute_retention_days: 30,
             digital_delivery_max_bytes: DEFAULT_DIGITAL_DELIVERY_MAX_BYTES,
+            buyer_email_retention_days: 30,
+            buyer_email_unpaid_retention_days: 7,
             locks_snapshot_retention_days: 90,
             fx_feed_url: crate::fx::FX_URL.to_string(),
             paypal_checkout_url: DEFAULT_PAYPAL_CHECKOUT_URL.to_string(),

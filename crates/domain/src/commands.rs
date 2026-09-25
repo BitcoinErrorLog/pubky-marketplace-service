@@ -80,6 +80,8 @@ pub enum CommandPayload {
     ClearPickupDetails(ClearPickupDetailsPayload),
     SetDigitalDelivery(SetDigitalDeliveryPayload),
     ClearDigitalDelivery(ClearDigitalDeliveryPayload),
+    SetDeliveryEmail(SetDeliveryEmailPayload),
+    DeliverDigital(DeliverDigitalPayload),
     MarkReadyForPickup(OrderActionPayload),
     ConfirmPickup(OrderActionPayload),
     RequestReturn(RequestReturnPayload),
@@ -120,6 +122,8 @@ impl Command {
             CommandPayload::ClearPickupDetails(_) => "pickup_details.clear",
             CommandPayload::SetDigitalDelivery(_) => "digital_delivery.set",
             CommandPayload::ClearDigitalDelivery(_) => "digital_delivery.clear",
+            CommandPayload::SetDeliveryEmail(_) => "order.set_delivery_email",
+            CommandPayload::DeliverDigital(_) => "fulfillment.deliver_digital",
             CommandPayload::MarkReadyForPickup(_) => "fulfillment.mark_ready",
             CommandPayload::ConfirmPickup(_) => "fulfillment.confirm_pickup",
             CommandPayload::RequestReturn(_) => "return.request",
@@ -161,6 +165,8 @@ impl Command {
             CommandPayload::ClearPickupDetails(p) => serde_json::to_value(p),
             CommandPayload::SetDigitalDelivery(p) => serde_json::to_value(p),
             CommandPayload::ClearDigitalDelivery(p) => serde_json::to_value(p),
+            CommandPayload::SetDeliveryEmail(p) => serde_json::to_value(p),
+            CommandPayload::DeliverDigital(p) => serde_json::to_value(p),
             CommandPayload::ConfirmDelivery(p)
             | CommandPayload::ApproveCancellation(p)
             | CommandPayload::ApproveReturn(p)
@@ -435,7 +441,78 @@ pub struct CreateCheckoutPayload {
     /// malicious client cannot smuggle one into storage (§A2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_address: Option<DeliveryAddress>,
+    /// Where the seller of an email-kind digital line sends the purchase
+    /// (digital delivery design §4.3). Required exactly when a line is
+    /// email-kind; the handler refuses it otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_email: Option<DeliveryEmail>,
     pub guarantee_policy_version: u32,
+}
+
+/// Longest accepted delivery email address.
+pub const DELIVERY_EMAIL_MAX_CHARS: usize = 254;
+
+/// A buyer's delivery email address. Personal data: redacted from Debug so
+/// it cannot reach logs or traces, and sealed at rest by the service.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeliveryEmail(pub String);
+
+impl std::fmt::Debug for DeliveryEmail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeliveryEmail(<redacted>)")
+    }
+}
+
+impl DeliveryEmail {
+    /// At most 254 characters, exactly one `@` with text on both sides, no
+    /// whitespace or control characters. No network lookup.
+    pub fn is_well_formed(&self) -> bool {
+        let value = self.0.as_str();
+        let Some((local, domain)) = value.split_once('@') else {
+            return false;
+        };
+        value.chars().count() <= DELIVERY_EMAIL_MAX_CHARS
+            && !local.is_empty()
+            && !domain.is_empty()
+            && !domain.contains('@')
+            && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+    }
+}
+
+/// `order.set_delivery_email` (buyer, own order only): replaces the sealed
+/// delivery address until the seller marks the purchase emailed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetDeliveryEmailPayload {
+    pub order_id: Uuid,
+    pub delivery_email: DeliveryEmail,
+}
+
+/// How the seller delivered a manual digital line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigitalDeliveryChannel {
+    Email,
+    Message,
+}
+
+impl DigitalDeliveryChannel {
+    pub fn kind(self) -> DigitalDeliveryKind {
+        match self {
+            DigitalDeliveryChannel::Email => DigitalDeliveryKind::Email,
+            DigitalDeliveryChannel::Message => DigitalDeliveryKind::Message,
+        }
+    }
+}
+
+/// `fulfillment.deliver_digital` (seller, own order only): marks the
+/// order's email or message lines delivered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliverDigitalPayload {
+    pub order_id: Uuid,
+    pub channel: DigitalDeliveryChannel,
 }
 
 /// Offer terms shared by `offer.create` and `offer.counter`
@@ -1059,6 +1136,12 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         }
         "digital_delivery.clear" => {
             parse_payload(&envelope.payload).and_then(validate_clear_digital_delivery)?
+        }
+        "order.set_delivery_email" => {
+            parse_payload(&envelope.payload).map(CommandPayload::SetDeliveryEmail)?
+        }
+        "fulfillment.deliver_digital" => {
+            parse_payload(&envelope.payload).map(CommandPayload::DeliverDigital)?
         }
         "fulfillment.mark_ready" => {
             parse_payload(&envelope.payload).map(CommandPayload::MarkReadyForPickup)?

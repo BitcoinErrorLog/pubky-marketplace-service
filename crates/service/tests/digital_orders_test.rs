@@ -392,15 +392,7 @@ async fn checkout_refused_when_deliverable_missing(pool: PgPool) {
     let (status, body) = checkout(&app, &buyer, lines.clone(), false).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["reason"], json!("digital_delivery_not_ready"));
-    // Manual kinds are not sold until the email and mark-delivered paths
-    // exist; the reason names the item, not the deployment (Kimi P4-1).
-    let (status, body) =
-        set_delivery(&app, &seller, "guide_01", 0, json!({ "kind": "email" })).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = checkout(&app, &buyer, lines.clone(), false).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["reason"], json!("digital_delivery_not_ready"));
-    set_text(&app, &seller, "guide_01", 1, TEXT_V1).await;
+    set_text(&app, &seller, "guide_01", 0, TEXT_V1).await;
     let (status, body) = checkout(&app, &buyer, lines, false).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
