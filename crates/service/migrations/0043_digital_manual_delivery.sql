@@ -1,5 +1,4 @@
 -- Manual digital delivery (digital-delivery-design.md §4.3, §6 F13, F17).
--- Numbered 0043: 0042 is reserved for the Paykit attempt fix (PR #42).
 --
 -- The instant the seller marked an order's message-delivered lines
 -- delivered (email lines stamp `order_delivery_emails.emailed_at`), the

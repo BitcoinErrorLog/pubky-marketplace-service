@@ -15,7 +15,7 @@ use marketplace_service::handlers::digital_manual::{
     overdue_delivery_emails, purge_delivery_emails, read_delivery_email_with_hook,
     DeliveryEmailReadHook,
 };
-use marketplace_service::payments::order_reference;
+use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -973,7 +973,7 @@ async fn paykit_pay(app: &TestApp, paykit: &FakePaykit, buyer: &TestActor, order
     drain_outbox(&app.pool, client, app.clock.now(), 30)
         .await
         .expect("activation delivers");
-    let reference = order_reference(Uuid::parse_str(&order.id).expect("order uuid"));
+    let reference = attempt_reference(Uuid::parse_str(&order.id).expect("order uuid"), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true, 2));
     assert!(poll_now(app, app.clock.now()).await >= 1);
 }
@@ -1144,7 +1144,7 @@ async fn late_completion_after_email_purge(pool: PgPool) {
         .await
         .expect("activation");
     // Detected inside the window: the poller keeps watching after expiry.
-    let reference = order_reference(Uuid::parse_str(&order.id).expect("uuid"));
+    let reference = attempt_reference(Uuid::parse_str(&order.id).expect("uuid"), 1);
     paykit.set_status(&reference, status_detected("exclusive", 1));
     poll_now(&app, app.clock.now()).await;
     let (request_state,): (String,) =
