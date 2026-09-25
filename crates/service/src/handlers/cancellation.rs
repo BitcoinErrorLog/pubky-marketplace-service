@@ -72,6 +72,14 @@ pub async fn request(
             "Only the buyer may request cancellation.",
         )));
     }
+    if order.fulfillment == "digital" && matches!(order.state.as_str(), "delivered" | "completed") {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "A delivered digital order cannot be cancelled.",
+            "digital_order_delivered",
+        )));
+    }
     if !matches!(
         order.state.as_str(),
         "pending_payment" | "paid" | "processing" | "ready_for_pickup"

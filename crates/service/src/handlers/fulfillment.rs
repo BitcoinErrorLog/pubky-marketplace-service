@@ -50,6 +50,13 @@ pub async fn ship(
             "A pickup order cannot be shipped; use the pickup handover commands.",
         )));
     }
+    if order.fulfillment == "digital" {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "A digital order is not shipped.",
+        )));
+    }
     if !matches!(order.state.as_str(), "paid" | "processing") {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,
@@ -119,6 +126,13 @@ pub async fn confirm_delivery(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "A pickup order has no shipment to confirm; use fulfillment.confirm_pickup.",
+        )));
+    }
+    if order.fulfillment == "digital" {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "A digital order has no shipment to confirm.",
         )));
     }
     let Some(shipment) = order.shipment.clone().filter(|_| order.state == "shipped") else {

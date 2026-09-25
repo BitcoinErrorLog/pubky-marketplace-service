@@ -47,6 +47,14 @@ pub async fn request(
             "Only the buyer may request a return.",
         )));
     }
+    if order.fulfillment == "digital" {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "Digital purchases cannot be returned.",
+            "returns_unavailable_for_digital",
+        )));
+    }
     if !matches!(order.state.as_str(), "delivered" | "completed")
         || payload.requested_amount_minor > order.total_minor
     {
@@ -276,7 +284,13 @@ pub async fn record_external_refund(
             gateway.and(existing["amount_minor"].as_i64())
         }
     };
-    if !matches!(order.state.as_str(), "return_received" | "cancelled")
+    // A digital order never enters the return states: the seller's refund
+    // after delivery is recorded straight from `delivered` or `completed`
+    // (digital delivery design §3.6, §6 E9).
+    let refundable_state = matches!(order.state.as_str(), "return_received" | "cancelled")
+        || (order.fulfillment == "digital"
+            && matches!(order.state.as_str(), "delivered" | "completed"));
+    if !refundable_state
         || payload.amount_minor > order.total_minor
         || recorded_minor.is_none_or(|recorded| payload.amount_minor < recorded)
     {
