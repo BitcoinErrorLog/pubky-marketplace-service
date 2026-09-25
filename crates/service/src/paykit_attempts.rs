@@ -475,7 +475,7 @@ async fn route_released_settlement(
 
     match apply_late_money(
         &mut tx,
-        state.pickup.as_deref(),
+        state.confirm_keys(),
         &payment,
         &order,
         attempt.order_id,

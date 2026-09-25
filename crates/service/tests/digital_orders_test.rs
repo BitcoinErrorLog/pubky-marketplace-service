@@ -16,7 +16,7 @@ use marketplace_service::clock::Clock;
 use marketplace_service::config::Config;
 use marketplace_service::digital::{version_aad, DigitalKeys};
 use marketplace_service::http::build_router;
-use marketplace_service::payments::order_reference;
+use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{
     assume_due_deliveries, complete_due_delivered_orders, drain_outbox, expire_due_payment_windows,
 };
@@ -555,7 +555,7 @@ async fn instant_confirm_delivers_on_every_path(pool: PgPool) {
     let btc_buyer = new_actor(&app).await;
     let (order_id, _reference) =
         bitcoin_digital_order(&app, &paykit, &btc_seller, &btc_buyer).await;
-    let reference = order_reference(Uuid::parse_str(&order_id).expect("order uuid"));
+    let reference = attempt_reference(Uuid::parse_str(&order_id).expect("order uuid"), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true, 2));
     assert!(poll_now(&app, app.clock.now()).await >= 1);
     let (state, receipt, payment, _) = order_facts(&app, &order_id).await;
@@ -721,7 +721,7 @@ async fn late_completion_instant_ends_delivered(pool: PgPool) {
             >= 1
     );
     assert_eq!(order_facts(&app, &order_id).await.0, "cancelled");
-    let reference = order_reference(Uuid::parse_str(&order_id).expect("order uuid"));
+    let reference = attempt_reference(Uuid::parse_str(&order_id).expect("order uuid"), 1);
     let mut late = status_confirmed("exclusive", true, 2);
     late["late_settlement"] = json!(true);
     paykit.set_status(&reference, late);
@@ -788,7 +788,7 @@ async fn refund_required_never_delivers(pool: PgPool) {
     let second_order = digital_checkout(&app, &seller, &second, "guide_01").await;
     sandbox_confirm(&app, &second, &second_order).await;
     // The first buyer's money arrives late: nothing left to deliver.
-    let reference = order_reference(Uuid::parse_str(&first_order.order_id).expect("uuid"));
+    let reference = attempt_reference(Uuid::parse_str(&first_order.order_id).expect("uuid"), 1);
     let mut late = status_confirmed("exclusive", true, 2);
     late["late_settlement"] = json!(true);
     paykit.set_status(&reference, late);
@@ -839,7 +839,7 @@ async fn confirm_with_nothing_to_pin_refund_required(pool: PgPool) {
         "held at bind"
     );
     drop_current_version(&app, &seller.pubky).await;
-    let reference = order_reference(Uuid::parse_str(&order_id).expect("uuid"));
+    let reference = attempt_reference(Uuid::parse_str(&order_id).expect("uuid"), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true, 2));
     assert!(poll_now(&app, app.clock.now()).await >= 1);
     let (state, receipt, payment, reason) = order_facts(&app, &order_id).await;
@@ -938,7 +938,7 @@ async fn nothing_to_pin_not_retried(pool: PgPool) {
     let buyer = new_actor(&app).await;
     let (order_id, _) = bitcoin_digital_order(&app, &paykit, &seller, &buyer).await;
     drop_current_version(&app, &seller.pubky).await;
-    let reference = order_reference(Uuid::parse_str(&order_id).expect("uuid"));
+    let reference = attempt_reference(Uuid::parse_str(&order_id).expect("uuid"), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true, 2));
     assert!(poll_now(&app, app.clock.now()).await >= 1);
     let payment_id = order_facts_payment_id(&app.pool, &order_id).await;
@@ -1002,7 +1002,7 @@ async fn version_open_failure_aborts_and_retries(pool: PgPool) {
         .execute(&app.pool)
         .await
         .expect("corrupt version");
-    let reference = order_reference(Uuid::parse_str(&order_id).expect("uuid"));
+    let reference = attempt_reference(Uuid::parse_str(&order_id).expect("uuid"), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true, 2));
     poll_now(&app, app.clock.now()).await;
     let (state, receipt, payment, _) = order_facts(&app, &order_id).await;
@@ -1093,7 +1093,7 @@ async fn buyer_reads_pinned_deliverable_after_receipt(pool: PgPool) {
 
 /// Confirms a bound Bitcoin order through the Paykit worker poll.
 async fn paykit_confirm(app: &TestApp, paykit: &FakePaykit, order_id: &str) {
-    let reference = order_reference(Uuid::parse_str(order_id).expect("order uuid"));
+    let reference = attempt_reference(Uuid::parse_str(order_id).expect("order uuid"), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true, 2));
     assert!(poll_now(app, app.clock.now()).await >= 1);
 }
@@ -1575,7 +1575,7 @@ async fn still_held_late_money_with_nothing_to_pin_refund_required(pool: PgPool)
         "held at bind"
     );
     drop_current_version(&app, &seller.pubky).await;
-    let reference = order_reference(Uuid::parse_str(&order_id).expect("uuid"));
+    let reference = attempt_reference(Uuid::parse_str(&order_id).expect("uuid"), 1);
     let mut late = status_confirmed("exclusive", true, 2);
     late["late_settlement"] = json!(true);
     paykit.set_status(&reference, late);
