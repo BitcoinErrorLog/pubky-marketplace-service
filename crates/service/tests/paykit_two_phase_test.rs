@@ -574,6 +574,48 @@ async fn phase_one_refusals_keep_their_semantics(pool: PgPool) {
     );
 }
 
+// The buyer publishes no Paykit receiver that takes payment requests
+// (paykit `reader_not_payable`): the refusal names the fix and writes
+// nothing, never "the Paykit server is unavailable".
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_buyer_without_a_payable_paykit_wallet_is_told_to_connect_one(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    paykit.fail_creation_with_status(409, "reader_not_payable");
+
+    let (status, body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"]["reason"],
+        json!("buyer_paykit_wallet_required")
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Connect Bitkit")),
+        "{body}"
+    );
+    let (payment_method, activation): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT payment_method, paykit_activation_state FROM orders WHERE id = $1")
+            .bind(order_uuid(&order.order_id))
+            .fetch_one(&pool)
+            .await
+            .expect("order row exists");
+    assert_eq!(
+        (payment_method, activation),
+        (None, None),
+        "nothing is bound"
+    );
+
+    // Once the buyer's wallet is connected, the same order binds.
+    paykit.clear_creation_failure();
+    let (status, body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 // 5. A bodyless 204, a missing field, or an inconsistent total: refused,
 //    nothing persisted.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
