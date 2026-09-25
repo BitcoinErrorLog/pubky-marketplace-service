@@ -108,6 +108,14 @@ pub async fn create(
     // on a listing that does not publish `shipping` is refused with a typed
     // error, never silently converted to shipping.
     if !listing.fulfillment_methods.iter().any(|m| m == "shipping") {
+        if listing.fulfillment_methods.iter().any(|m| m == "digital") {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "Offers are not available on digital items.",
+                "offers_unavailable_for_digital",
+            )));
+        }
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,

@@ -32,6 +32,11 @@ use sha2::{Digest, Sha256};
 pub const ENV_HOMESERVER_URL: &str = "HOMESERVER_URL";
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// A deliverable is up to `DIGITAL_DELIVERY_MAX_BYTES` of ciphertext, read
+/// once at `digital_delivery.set`; the record timeout would cut it short.
+const DELIVERABLE_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Where Shop writes a seller's encrypted deliverable.
+pub const DELIVERABLES_PATH: &str = "/pub/pubky.app/marketplace/v1/deliverables/";
 const MAX_AWARD_LISTING_BYTES: usize = 1024 * 1024;
 
 /// One listing-record fetch result. Transport failures, non-2xx responses
@@ -292,6 +297,21 @@ pub fn award_terms_from_bytes_for_variant(
     })
 }
 
+/// The setup read of a seller's encrypted deliverable: its BLAKE3 and
+/// length. The bytes are hashed as they stream in and dropped; nothing
+/// keeps them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliverableFetchOutcome {
+    Found {
+        blake3: String,
+        len: u64,
+    },
+    NotFound,
+    /// The body exceeded the length the seller declared.
+    TooLarge,
+    Unavailable,
+}
+
 /// The homeserver record fetch (listings and drops). The trait exists so
 /// integration tests can stand in a local listener; production only ever
 /// constructs [`HttpHomeserverClient`].
@@ -351,6 +371,19 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
         let _ = (creator_pubky, content_path);
         Box::pin(async { HomeserverFetchOutcome::Unavailable })
+    }
+
+    /// Reads `{DELIVERABLES_PATH}{deliverable_id}/{version}` from the
+    /// seller's homeserver, hashing at most `max_len` bytes.
+    fn fetch_deliverable_digest<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        deliverable_id: &'a str,
+        version: i64,
+        max_len: u64,
+    ) -> Pin<Box<dyn Future<Output = DeliverableFetchOutcome> + Send + 'a>> {
+        let _ = (seller_pubky, deliverable_id, version, max_len);
+        Box::pin(async { DeliverableFetchOutcome::Unavailable })
     }
 }
 
@@ -590,6 +623,70 @@ impl HomeserverListingClient for HttpHomeserverClient {
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
         Box::pin(async move { self.fetch_inner(creator_pubky, content_path).await })
     }
+
+    fn fetch_deliverable_digest<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        deliverable_id: &'a str,
+        version: i64,
+        max_len: u64,
+    ) -> Pin<Box<dyn Future<Output = DeliverableFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let path = format!("{DELIVERABLES_PATH}{deliverable_id}/{version}");
+            let response = match self
+                .http
+                .get(format!("{}{path}", self.base_url))
+                .header("pubky-host", seller_pubky)
+                .timeout(DELIVERABLE_FETCH_TIMEOUT)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    tracing::warn!("homeserver deliverable fetch transport failure");
+                    return DeliverableFetchOutcome::Unavailable;
+                }
+            };
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return DeliverableFetchOutcome::NotFound;
+            }
+            if !status.is_success() {
+                tracing::warn!(
+                    pubky_host_prefix = %pubky_host_prefix(seller_pubky),
+                    status = %status,
+                    "homeserver deliverable fetch rejected"
+                );
+                return DeliverableFetchOutcome::Unavailable;
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > max_len)
+            {
+                return DeliverableFetchOutcome::TooLarge;
+            }
+            let mut response = response;
+            let mut hasher = blake3::Hasher::new();
+            let mut len = 0u64;
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        len += chunk.len() as u64;
+                        if len > max_len {
+                            return DeliverableFetchOutcome::TooLarge;
+                        }
+                        hasher.update(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(_) => return DeliverableFetchOutcome::Unavailable,
+                }
+            }
+            DeliverableFetchOutcome::Found {
+                blake3: hasher.finalize().to_hex().to_string(),
+                len,
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -790,12 +887,19 @@ pub fn registration_payload_from_record(
     };
     let shipping_minor =
         shipping_minor_from_options(&record.shipping_options, &unit_price.currency);
+    // A Locks listing (`digital` with `digitalLock`) keeps its current
+    // derivation: `digital` is skipped, so it converges to shipping as it
+    // always has (digital delivery design §6 A2).
+    let locks_listing = record.digital_lock.is_some();
     let mut fulfillment_methods: Vec<marketplace_domain::commands::FulfillmentMethod> = record
         .fulfillment_methods
         .iter()
         .filter_map(|method| match method.as_str() {
             "shipping" => Some(marketplace_domain::commands::FulfillmentMethod::Shipping),
             "pickup" => Some(marketplace_domain::commands::FulfillmentMethod::Pickup),
+            "digital" if !locks_listing => {
+                Some(marketplace_domain::commands::FulfillmentMethod::Digital)
+            }
             // An unrecognized method is not a parse failure: the record may
             // come from a newer client vocabulary; ignoring it converges to
             // the methods this service understands.

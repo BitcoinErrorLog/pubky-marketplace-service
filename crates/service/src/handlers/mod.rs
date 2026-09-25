@@ -2,6 +2,7 @@ pub mod attestation;
 pub mod auction;
 pub mod cancellation;
 pub mod checkout;
+pub mod digital;
 pub mod drops;
 pub mod fulfillment;
 pub mod holds;
@@ -31,7 +32,8 @@ pub const LISTING_COLUMNS: &str = "aggregate_id, seller_pubky, listing_id, title
      listing_revision, content_hash, server_revision, state, total_quantity, \
      available_quantity, reserved_quantity, sold_quantity, unit_price_amount_minor, \
      unit_price_currency, unit_price_exponent, shipping_minor, sale_format, auction, \
-     fulfillment_methods, digital_lock_policy_uri, digital_lock_criterion_id, updated_at";
+     fulfillment_methods, digital_lock_policy_uri, digital_lock_criterion_id, updated_at, \
+     digital_delivery_kind, digital_delivery_content_type, digital_delivery_size_bytes";
 
 pub const AUCTION_RESERVE_COLUMNS: &str = "listing_aggregate_id, listing_revision, \
      record_revision, reserve_amount_minor, reserve_currency, reserve_exponent, \

@@ -139,6 +139,7 @@
         },
         "available_quantity": 1,
         "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "digital_delivery": null,
         "fulfillment_methods": [
           "shipping"
         ],
@@ -213,6 +214,7 @@
         },
         "available_quantity": 1,
         "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "digital_delivery": null,
         "fulfillment_methods": [
           "shipping"
         ],

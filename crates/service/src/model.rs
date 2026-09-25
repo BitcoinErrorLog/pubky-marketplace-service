@@ -87,6 +87,12 @@ pub struct ListingRow {
     pub digital_lock_policy_uri: Option<String>,
     pub digital_lock_criterion_id: Option<String>,
     pub updated_at: DateTime<Utc>,
+    /// The current digital deliverable's public description: its kind, and
+    /// for a file its content type and size. NULL without a current
+    /// deliverable. Written only by `digital_delivery.set` / `.clear`.
+    pub digital_delivery_kind: Option<String>,
+    pub digital_delivery_content_type: Option<String>,
+    pub digital_delivery_size_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -152,6 +158,22 @@ impl ListingRow {
         )
     }
 
+    /// `{ kind, content_type?, size_bytes? }`, or null (digital delivery
+    /// design §7). Never carries the deliverable id, key, link or text.
+    pub fn digital_delivery_projection(&self) -> Value {
+        let Some(kind) = &self.digital_delivery_kind else {
+            return Value::Null;
+        };
+        let mut projection = json!({ "kind": kind });
+        if let Some(content_type) = &self.digital_delivery_content_type {
+            projection["content_type"] = json!(content_type);
+        }
+        if let Some(size_bytes) = self.digital_delivery_size_bytes {
+            projection["size_bytes"] = json!(size_bytes);
+        }
+        projection
+    }
+
     pub fn public_projection(&self) -> Result<Value, ListingProjectionError> {
         let auction = match self.auction.as_ref() {
             Some(value) => AuctionState::from_value(value)
@@ -181,6 +203,7 @@ impl ListingRow {
             "sale_format": self.sale_format,
             "auction": auction,
             "fulfillment_methods": self.fulfillment_methods,
+            "digital_delivery": self.digital_delivery_projection(),
             "updated_at": format_timestamp(self.updated_at),
         });
         crate::reserve_secrecy::ensure_reserve_free(&projection)
