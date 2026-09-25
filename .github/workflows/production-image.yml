@@ -20,7 +20,7 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/bitcoinerrorlog/pubky-marketplace-service
-  SOURCE_SHA: ${{ github.event.inputs.source_sha || '2f844c1084c432d8dd6d7e66c320dcaeeb9eb02e' }}
+  SOURCE_SHA: ${{ github.event.inputs.source_sha || '8d9fb903d8cca7c52fd10b637f74357adb66f6b4' }}
 
 jobs:
   publish:
@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.inputs.source_sha || '2f844c1084c432d8dd6d7e66c320dcaeeb9eb02e' }}
+          ref: ${{ github.event.inputs.source_sha || '8d9fb903d8cca7c52fd10b637f74357adb66f6b4' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
