@@ -62,7 +62,20 @@ async fn command_events_are_structured_and_privacy_safe(pool: PgPool) {
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     drop(guard);
 
-    let logs = String::from_utf8(buffer.lock().expect("log buffer lock").clone()).unwrap();
+    let raw = String::from_utf8(buffer.lock().expect("log buffer lock").clone()).unwrap();
+    // Timestamps are clock noise: their fractional seconds can contain the
+    // digit runs the money checks below reject.
+    let logs = raw
+        .lines()
+        .map(|line| {
+            let mut event: Value = serde_json::from_str(line).expect("JSON log line");
+            if let Some(event) = event.as_object_mut() {
+                event.remove("timestamp");
+            }
+            event.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(logs.contains("\"message\":\"command.executed\""), "{logs}");
     assert!(logs.contains("\"outcome\":\"refused\""), "{logs}");
     assert!(logs.contains("\"error_code\":\"UNAUTHORIZED\""), "{logs}");
