@@ -17,6 +17,7 @@ const stagingEnv = {
   CHECKOUT_HOLD_WINDOW_SECONDS: preserve(),
   FIAT_PAYMENT_WINDOW_SECONDS: preserve(),
   DATABASE_URL: preserve(),
+  DIGITAL_DELIVERY_ENCRYPTION_KEY: preserve(),
   GRANT_FLOW_ENCRYPTION_KEY_B64: preserve(),
   GRANT_FLOW_KEY_EPOCH: preserve(),
   GRANT_RESULT_HMAC_KEY_EPOCH: preserve(),

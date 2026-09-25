@@ -33,6 +33,7 @@ const sharedEnv = {
   ATTESTOR_ORDER_SALT: preserve(),
   ATTESTOR_SECRET_KEY: preserve(),
   DATABASE_URL: preserve(),
+  DIGITAL_DELIVERY_ENCRYPTION_KEY: preserve(),
   HOMESERVER_URL: preserve(),
   LOCKS_BUNDLE_ENCRYPTION_KEY: preserve(),
   LOCKS_LOOKUP_HMAC_KEY: preserve(),
