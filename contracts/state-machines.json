@@ -821,6 +821,8 @@
         "fulfillment.confirm_delivery",
         "fulfillment.mark_ready",
         "fulfillment.confirm_pickup",
+        "fulfillment.deliver_digital",
+        "order.set_delivery_email",
         "return.request",
         "return.approve",
         "return.receive",

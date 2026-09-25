@@ -11,12 +11,16 @@ use axum::http::{Request, StatusCode};
 use common::paykit_review::{poll_now, status_confirmed, status_detected};
 use common::*;
 use marketplace_service::clock::Clock;
-use marketplace_service::handlers::digital_manual::purge_delivery_emails;
+use marketplace_service::handlers::digital_manual::{
+    overdue_delivery_emails, purge_delivery_emails, read_delivery_email_with_hook,
+    DeliveryEmailReadHook,
+};
 use marketplace_service::payments::order_reference;
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
@@ -1240,4 +1244,277 @@ async fn cancel_racing_seller_email_read_never_reveals(pool: PgPool) {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("delivery_ended"), "{body}");
     assert!(!body.contains(EMAIL), "the address was revealed: {body}");
+}
+
+/// What a write attempted while a delivery-email read was in flight did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    /// The write waited on the read's locks and timed out.
+    Blocked,
+    /// The write committed while the read still held the address.
+    Committed,
+}
+
+#[derive(Clone, Copy)]
+enum ConcurrentWrite {
+    /// The cancel's order-row write.
+    Cancel,
+    /// The real purge SQL, run past the retention window.
+    Purge { now: chrono::DateTime<chrono::Utc> },
+}
+
+/// At the read's release point, tries one concurrent write on another
+/// connection under a short lock timeout and records what happened.
+struct WriteDuringRead {
+    pool: PgPool,
+    write: ConcurrentWrite,
+    outcome: Mutex<Option<Attempt>>,
+}
+
+impl WriteDuringRead {
+    fn new(pool: &PgPool, write: ConcurrentWrite) -> Self {
+        Self {
+            pool: pool.clone(),
+            write,
+            outcome: Mutex::new(None),
+        }
+    }
+
+    fn outcome(&self) -> Attempt {
+        self.outcome
+            .lock()
+            .expect("outcome")
+            .expect("the read reached its release point")
+    }
+}
+
+impl DeliveryEmailReadHook for WriteDuringRead {
+    fn before_release<'a>(
+        &'a self,
+        order_id: Uuid,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut tx = self.pool.begin().await.expect("write transaction");
+            sqlx::query("SET LOCAL lock_timeout = '300ms'")
+                .execute(&mut *tx)
+                .await
+                .expect("lock timeout");
+            let wrote = match self.write {
+                ConcurrentWrite::Cancel => {
+                    sqlx::query("UPDATE orders SET state = 'cancelled' WHERE id = $1")
+                        .bind(order_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map(|done| done.rows_affected())
+                }
+                ConcurrentWrite::Purge { now } => purge_delivery_emails(&mut *tx, now, 30, 7).await,
+            };
+            let outcome = match wrote {
+                Ok(1) => {
+                    tx.commit().await.expect("write commits");
+                    Attempt::Committed
+                }
+                Ok(rows) => panic!("the concurrent write matched {rows} rows"),
+                Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                    Attempt::Blocked
+                }
+                Err(error) => panic!("the concurrent write failed: {error}"),
+            };
+            *self.outcome.lock().expect("outcome") = Some(outcome);
+        })
+    }
+}
+
+async fn read_with(
+    app: &TestApp,
+    actor: &TestActor,
+    order_id: &str,
+    hook: &WriteDuringRead,
+) -> (StatusCode, String) {
+    let response = read_delivery_email_with_hook(
+        &app.state,
+        &actor.pubky,
+        Uuid::parse_str(order_id).expect("order uuid"),
+        hook,
+    )
+    .await;
+    let status = response.status();
+    let bytes = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .expect("body")
+        .to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+// A cancel that arrives while the seller's read holds the address waits for
+// the read to finish: it cannot commit an ended state underneath a read that
+// then reveals the address.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn seller_read_in_flight_holds_off_cancel(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool.clone()).await;
+    let (seller, buyer, order) = email_order(&app, &paykit).await;
+    paykit_pay(&app, &paykit, &buyer, &order).await;
+    let hook = WriteDuringRead::new(&pool, ConcurrentWrite::Cancel);
+    let (status, body) = read_with(&app, &seller, &order.id, &hook).await;
+    assert_eq!(
+        hook.outcome(),
+        Attempt::Blocked,
+        "the cancel committed during the read; the read returned {status}: {body}"
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(EMAIL), "{body}");
+    // Once the read is done the cancel goes through and ends the seller's access.
+    sqlx::query("UPDATE orders SET state = 'cancelled' WHERE id = $1::uuid")
+        .bind(&order.id)
+        .execute(&pool)
+        .await
+        .expect("cancel");
+    let (status, _, body) = read_email(&app, &seller.token, &order.id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("delivery_ended"));
+}
+
+// A purge that arrives while the buyer's read holds the address waits for
+// the read: it cannot delete the ciphertext underneath a read that then
+// reveals it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn buyer_read_in_flight_holds_off_purge(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool.clone()).await;
+    let (_seller, buyer, order) = email_order(&app, &paykit).await;
+    paykit_pay(&app, &paykit, &buyer, &order).await;
+    sqlx::query("UPDATE orders SET state = 'cancelled' WHERE id = $1::uuid")
+        .bind(&order.id)
+        .execute(&pool)
+        .await
+        .expect("ended");
+    let past_retention = app.clock.now() + chrono::Duration::days(31);
+    let hook = WriteDuringRead::new(
+        &pool,
+        ConcurrentWrite::Purge {
+            now: past_retention,
+        },
+    );
+    let (status, body) = read_with(&app, &buyer, &order.id, &hook).await;
+    assert_eq!(
+        hook.outcome(),
+        Attempt::Blocked,
+        "the purge committed during the read; the read returned {status}: {body}"
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(EMAIL), "{body}");
+    // Once the read is done the purge deletes the address.
+    assert_eq!(
+        purge_delivery_emails(&pool, past_retention, 30, 7)
+            .await
+            .expect("purge"),
+        1
+    );
+    let (status, _, body) = read_email(&app, &buyer.token, &order.id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("email_missing"));
+}
+
+async fn delivered_notifications(app: &TestApp, buyer: &TestActor) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.order_delivered' \
+         AND payload->>'recipient_pubky' = $1",
+    )
+    .bind(&buyer.pubky)
+    .fetch_one(&app.pool)
+    .await
+    .expect("notifications")
+}
+
+// An order with an email line and a message line is delivered, and the
+// buyer told once, only when the second channel is marked.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn two_manual_channels_notify_once_when_both_marked(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool).await;
+    let seller = bitcoin_seller(&app, &paykit).await;
+    let buyer = new_actor(&app).await;
+    listing(&app, &seller, "guide_01", email_kind()).await;
+    listing(&app, &seller, "guide_02", json!({ "kind": "message" })).await;
+    let order = one_order(
+        &app,
+        &buyer,
+        &[(&seller, "guide_01"), (&seller, "guide_02")],
+        Some(EMAIL),
+    )
+    .await;
+    paykit_pay(&app, &paykit, &buyer, &order).await;
+    let stamps = |app: &TestApp| {
+        let pool = app.pool.clone();
+        let id = order.id.clone();
+        async move {
+            sqlx::query_as::<_, (bool, bool, bool)>(
+                "SELECT e.emailed_at IS NOT NULL, o.digital_message_delivered_at IS NOT NULL, \
+                 o.digital_delivered_at IS NOT NULL FROM orders o \
+                 JOIN order_delivery_emails e ON e.order_id = o.id WHERE o.id = $1::uuid",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("stamps")
+        }
+    };
+
+    let (status, body) = mark(&app, &seller, &order.id, "email").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["order"]["state"], json!("paid"));
+    assert_eq!(stamps(&app).await, (true, false, false));
+    assert_eq!(
+        delivered_notifications(&app, &buyer).await,
+        0,
+        "a partial mark does not tell the buyer the order is delivered"
+    );
+
+    let (status, body) = mark(&app, &seller, &order.id, "message").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["order"]["state"], json!("delivered"));
+    assert_eq!(stamps(&app).await, (true, true, true));
+    assert_eq!(delivered_notifications(&app, &buyer).await, 1);
+}
+
+// The purge clock is when the order ended, not its last write: a review
+// that lands 20 days after completion does not extend the address's life.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn later_review_does_not_extend_email_retention(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool).await;
+    let (seller, buyer, order) = email_order(&app, &paykit).await;
+    paykit_pay(&app, &paykit, &buyer, &order).await;
+    let (status, body) = mark(&app, &seller, &order.id, "email").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let completed_at = app.clock.now();
+    let review = json!({ "rating": 5, "text": "Arrived by email." });
+    let (status, body) = act(
+        &app,
+        &buyer.token,
+        "review.create",
+        &order.id,
+        review.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(state_of(&app, &order.id).await, "completed");
+    app.clock.set(completed_at + chrono::Duration::days(20));
+    let (status, body) = act(&app, &seller.token, "review.create", &order.id, review).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(state_of(&app, &order.id).await, "completed");
+
+    let past_retention = completed_at + chrono::Duration::days(32);
+    assert_eq!(
+        overdue_delivery_emails(&app.pool, past_retention, 30, 7)
+            .await
+            .expect("overdue"),
+        1,
+        "readiness counts the address as overdue from completion"
+    );
+    assert_eq!(
+        purge_delivery_emails(&app.pool, completed_at + chrono::Duration::days(31), 30, 7)
+            .await
+            .expect("purge"),
+        1,
+        "the address is purged 30 days after completion"
+    );
+    assert_eq!(email_rows(&app).await, vec![(order.id.clone(), false)]);
 }

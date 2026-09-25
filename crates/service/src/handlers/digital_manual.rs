@@ -383,20 +383,17 @@ pub async fn deliver_digital(
     .fetch_one(&mut **tx)
     .await?;
     let buyer = updated.buyer_pubky.clone();
-    order_action_success(
-        tx,
-        actor,
-        command,
-        &updated,
-        if delivered {
-            "fulfillment.digital_delivered"
-        } else {
-            "fulfillment.digital_channel_delivered"
-        },
-        Some(("order_delivered", buyer.as_str())),
-        now,
-    )
-    .await
+    // The buyer hears once, when the last manual channel is marked; a
+    // partial mark leaves the order paid with lines still to deliver.
+    let (event_kind, notify) = if delivered {
+        (
+            "fulfillment.digital_delivered",
+            Some(("order_delivered", buyer.as_str())),
+        )
+    } else {
+        ("fulfillment.digital_channel_delivered", None)
+    };
+    order_action_success(tx, actor, command, &updated, event_kind, notify, now).await
 }
 
 fn read_error(code: ErrorCode, message: &str, reason: Option<&str>) -> Response {
@@ -427,14 +424,46 @@ fn internal_error(context: &str) -> Response {
     )
 }
 
-/// `GET /v1/orders/{id}/delivery-email` (§6 F5–F10). The entitlement check
-/// and the open run in one transaction holding the order `FOR SHARE`, so a
-/// cancel or refund that commits first ends the seller's read, and one that
-/// arrives later waits for it.
+/// Runs inside a delivery-email read after the address is opened and before
+/// its transaction commits. Tests use this seam to attempt a concurrent
+/// cancel or purge at exactly that point.
+pub trait DeliveryEmailReadHook: Send + Sync {
+    fn before_release<'a>(
+        &'a self,
+        order_id: Uuid,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
+struct NoReadHook;
+
+impl DeliveryEmailReadHook for NoReadHook {
+    fn before_release<'a>(
+        &'a self,
+        _order_id: Uuid,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+}
+
+/// `GET /v1/orders/{id}/delivery-email` (§6 F5–F10).
 pub async fn get_order_delivery_email(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Path(id): Path<Uuid>,
+) -> Response {
+    read_delivery_email_with_hook(&state, &actor.0, id, &NoReadHook).await
+}
+
+/// The delivery-email read. The entitlement check, the open and the decode
+/// run in one transaction holding the order and the email row `FOR SHARE`,
+/// and the address leaves only after it commits: a cancel, refund, purge or
+/// replacement that commits first is seen, and one that arrives later waits
+/// until the read is done.
+pub async fn read_delivery_email_with_hook(
+    state: &AppState,
+    actor: &str,
+    id: Uuid,
+    hook: &dyn DeliveryEmailReadHook,
 ) -> Response {
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
@@ -445,7 +474,7 @@ pub async fn get_order_delivery_email(
          WHERE id = $1 AND (buyer_pubky = $2 OR seller_pubky = $2) FOR SHARE"
     ))
     .bind(id)
-    .bind(&actor.0)
+    .bind(actor)
     .fetch_optional(&mut *tx)
     .await;
     let order = match order {
@@ -453,7 +482,7 @@ pub async fn get_order_delivery_email(
         Ok(_) => return read_error(ErrorCode::NotFound, "The order was not found.", None),
         Err(_) => return internal_error("delivery email order read"),
     };
-    let is_buyer = order.buyer_pubky == actor.0;
+    let is_buyer = order.buyer_pubky == actor;
     if !is_buyer {
         if order.receipt_id.is_none() {
             return read_error(
@@ -479,7 +508,7 @@ pub async fn get_order_delivery_email(
     };
     let row: Result<Option<EmailRow>, sqlx::Error> = sqlx::query_as(
         "SELECT buyer_pubky, email_ciphertext, emailed_at FROM order_delivery_emails \
-         WHERE order_id = $1",
+         WHERE order_id = $1 FOR SHARE",
     )
     .bind(order.id)
     .fetch_optional(&mut *tx)
@@ -488,9 +517,6 @@ pub async fn get_order_delivery_email(
         Ok(row) => row,
         Err(_) => return internal_error("delivery email row read"),
     };
-    if tx.commit().await.is_err() {
-        return internal_error("delivery email read commit");
-    }
     let emailed_at = row.as_ref().and_then(|row| row.emailed_at);
     let Some((buyer, ciphertext)) =
         row.and_then(|row| Some((row.buyer_pubky, row.email_ciphertext?)))
@@ -507,6 +533,10 @@ pub async fn get_order_delivery_email(
     let Ok(email) = String::from_utf8(plaintext) else {
         return internal_error("delivery email decode");
     };
+    hook.before_release(order.id).await;
+    if tx.commit().await.is_err() {
+        return internal_error("delivery email read commit");
+    }
     no_store(
         (
             StatusCode::OK,
@@ -522,9 +552,10 @@ pub async fn get_order_delivery_email(
 
 /// The purge (§4.3 step 7): deletes the sealed address 30 days after the
 /// order ends and 7 days after an unpaid checkout ends, keeping
-/// `emailed_at` and `purged_at`.
-pub async fn purge_delivery_emails(
-    pool: &PgPool,
+/// `emailed_at` and `purged_at`. Both clocks run from `orders.ended_at`,
+/// which later writes that keep the state (a review) do not move.
+pub async fn purge_delivery_emails<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     now: DateTime<Utc>,
     retention_days: i64,
     unpaid_retention_days: i64,
@@ -535,13 +566,13 @@ pub async fn purge_delivery_emails(
          WHERE o.id = e.order_id AND e.email_ciphertext IS NOT NULL AND ( \
            (o.receipt_id IS NOT NULL \
             AND o.state IN ('completed', 'cancelled', 'refunded_external', 'closed') \
-            AND o.updated_at <= $2) \
-           OR (o.receipt_id IS NULL AND o.state = 'cancelled' AND o.updated_at <= $3))",
+            AND o.ended_at <= $2) \
+           OR (o.receipt_id IS NULL AND o.state = 'cancelled' AND o.ended_at <= $3))",
     )
     .bind(now)
     .bind(now - chrono::Duration::days(retention_days))
     .bind(now - chrono::Duration::days(unpaid_retention_days))
-    .execute(pool)
+    .execute(executor)
     .await?
     .rows_affected();
     Ok(purged)
@@ -564,8 +595,8 @@ pub async fn overdue_delivery_emails(
          WHERE e.email_ciphertext IS NOT NULL AND ( \
            (o.receipt_id IS NOT NULL \
             AND o.state IN ('completed', 'cancelled', 'refunded_external', 'closed') \
-            AND o.updated_at <= $1) \
-           OR (o.receipt_id IS NULL AND o.state = 'cancelled' AND o.updated_at <= $2))",
+            AND o.ended_at <= $1) \
+           OR (o.receipt_id IS NULL AND o.state = 'cancelled' AND o.ended_at <= $2))",
     )
     .bind(now - chrono::Duration::days(retention_days + PURGE_GRACE_DAYS))
     .bind(now - chrono::Duration::days(unpaid_retention_days + PURGE_GRACE_DAYS))

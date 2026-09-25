@@ -473,6 +473,8 @@ pub fn order_machine() -> AggregateMachine {
             "fulfillment.confirm_delivery",
             "fulfillment.mark_ready",
             "fulfillment.confirm_pickup",
+            "fulfillment.deliver_digital",
+            "order.set_delivery_email",
             "return.request",
             "return.approve",
             "return.receive",
@@ -1059,6 +1061,30 @@ mod tests {
         }
         // Digital orders never need a return edge of their own.
         assert!(!can_transition(&machine, "paid", "return_requested"));
+        // Change email moves no state, so only the catalog names it.
+        for command in ["fulfillment.deliver_digital", "order.set_delivery_email"] {
+            assert!(machine.commands.contains(&command), "{command}");
+        }
+    }
+
+    // Other machines move on commands another aggregate accepts (a listing
+    // releases stock on `order.cancel_request`); every order edge is driven
+    // by an order command.
+    #[test]
+    fn every_order_transition_command_is_in_the_order_catalog() {
+        let machine = order_machine();
+        for transition in &machine.transitions {
+            for via in &transition.via {
+                if let Command(command) = via {
+                    assert!(
+                        machine.commands.contains(command),
+                        "{} -> {} via {command} is missing from the order command catalog",
+                        transition.from,
+                        transition.to,
+                    );
+                }
+            }
+        }
     }
 
     #[test]
