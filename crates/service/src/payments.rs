@@ -727,10 +727,13 @@ pub enum PaykitRequestError {
     /// The seller has no claimed watch-only account (or its homeserver
     /// session lapsed); the seller must (re-)claim through Paykit setup.
     SellerAccountUnavailable,
-    /// The buyer has no Paykit receiver marker (no Bitkit wallet published
-    /// one), the request was refused, or the 200 body violated the
-    /// two-phase contract shape (missing field, a legacy 204).
+    /// The request was refused, or the 200 body violated the two-phase
+    /// contract shape (missing field, a legacy 204).
     Rejected,
+    /// The buyer publishes no Paykit receiver that takes payment requests
+    /// (`reader_not_payable`): they must connect a Paykit wallet such as
+    /// Bitkit. Not retryable as is.
+    ReaderNotPayable,
     /// Phase 1 returned `total_sats != amount_sats + nonce_sats`: the two
     /// services disagree about money. Refused, alerted, never retried.
     TotalInconsistent,
@@ -1075,6 +1078,7 @@ impl PaykitClient {
             .unwrap_or_default();
         match code.as_str() {
             "creator_session_invalid" => Err(PaykitRequestError::SellerAccountUnavailable),
+            "reader_not_payable" => Err(PaykitRequestError::ReaderNotPayable),
             "invalid_request" | "invoice_conflict" => Err(PaykitRequestError::Rejected),
             // `bitcoin_creation_disabled` (503, §C.16) and everything else:
             // refused cleanly as an availability failure, as today.

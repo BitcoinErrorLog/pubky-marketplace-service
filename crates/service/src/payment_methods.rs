@@ -908,6 +908,11 @@ pub async fn bind_payment_method(
                         "seller_account_unclaimed",
                         "The seller has no claimed Bitcoin receiving account.",
                     ),
+                    PaykitRequestError::ReaderNotPayable => method_error(
+                        ErrorCode::InvalidState,
+                        "buyer_paykit_wallet_required",
+                        "Connect Bitkit (or another Paykit wallet) to pay with Bitcoin.",
+                    ),
                     PaykitRequestError::Rejected => method_error(
                         ErrorCode::InvalidState,
                         "paykit_rejected",
