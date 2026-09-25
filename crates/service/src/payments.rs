@@ -704,6 +704,40 @@ pub struct PaykitStatusFacts {
     pub observation: PaykitObservation,
 }
 
+/// Whether the payment request reached the buyer's wallet, normalized from
+/// paykit-server's `paykit_delivery_state`. `cancelled` and
+/// `contract_error` are not delivery facts about a live request and map to
+/// nothing (the stored state stays).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaykitDeliveryState {
+    /// Paykit is still establishing the Encrypted Link or sending.
+    Pending,
+    /// The request and endpoint were sent over the Encrypted Link.
+    Delivered,
+    /// Paykit gave up delivering (for example the wallet never answered
+    /// the link).
+    Failed,
+}
+
+impl PaykitDeliveryState {
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "pending_delivery" => Some(Self::Pending),
+            "delivered" => Some(Self::Delivered),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Paykit payment-request status as this service consumes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaykitStatusOutcome {
@@ -1282,11 +1316,25 @@ impl PaykitClient {
     /// a malformed body all fail CLOSED as `Unavailable` — never an
     /// automatic transition input.
     pub async fn payment_status(&self, seller_pubky: &str, reference: &str) -> PaykitStatusOutcome {
+        self.payment_status_with_delivery(seller_pubky, reference)
+            .await
+            .0
+    }
+
+    /// [`Self::payment_status`] plus the request's delivery state from the
+    /// same response (`paykit_delivery_state`), when the body carries a
+    /// known one. The delivery state is reported even when the status
+    /// itself fails closed on the payment contract.
+    pub async fn payment_status_with_delivery(
+        &self,
+        seller_pubky: &str,
+        reference: &str,
+    ) -> (PaykitStatusOutcome, Option<PaykitDeliveryState>) {
         let Ok((body, signature)) = self.signed_body(&serde_json::json!({
             "bundle_id": reference,
             "creator": pubky_app_key(seller_pubky),
         })) else {
-            return PaykitStatusOutcome::Unavailable;
+            return (PaykitStatusOutcome::Unavailable, None);
         };
         let response = self
             .http
@@ -1299,15 +1347,15 @@ impl PaykitClient {
             Ok(response) => response,
             Err(_) => {
                 tracing::warn!("paykit payment status transport failure");
-                return PaykitStatusOutcome::Unavailable;
+                return (PaykitStatusOutcome::Unavailable, None);
             }
         };
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return PaykitStatusOutcome::NotFound;
+            return (PaykitStatusOutcome::NotFound, None);
         }
         if !response.status().is_success() {
             tracing::warn!(status = %response.status(), "paykit payment status rejected");
-            return PaykitStatusOutcome::Unavailable;
+            return (PaykitStatusOutcome::Unavailable, None);
         }
         #[derive(Deserialize)]
         struct StatusBody {
@@ -1326,21 +1374,27 @@ impl PaykitClient {
             confirmations: Option<u32>,
             #[serde(default)]
             txid: Option<String>,
+            #[serde(default)]
+            paykit_delivery_state: Option<String>,
         }
         let body = match response.json::<StatusBody>().await {
             Ok(body) => body,
             Err(_) => {
                 tracing::warn!("paykit payment status returned a malformed body; failing closed");
-                return PaykitStatusOutcome::Unavailable;
+                return (PaykitStatusOutcome::Unavailable, None);
             }
         };
+        let delivery = body
+            .paykit_delivery_state
+            .as_deref()
+            .and_then(PaykitDeliveryState::from_wire);
         // Contract validation, fail closed: the version must be the strict
         // v2 marker and the mode exactly one of the two known values.
         if body.contract_version.as_deref() != Some(PAYKIT_STATUS_CONTRACT) {
             tracing::warn!(
                 "paykit payment status violated the status contract version; failing closed"
             );
-            return PaykitStatusOutcome::Unavailable;
+            return (PaykitStatusOutcome::Unavailable, delivery);
         }
         let Some(allocation_mode) = body
             .allocation_mode
@@ -1349,7 +1403,7 @@ impl PaykitClient {
             tracing::warn!(
                 "paykit payment status carried a missing or unknown allocation_mode; failing closed"
             );
-            return PaykitStatusOutcome::Unavailable;
+            return (PaykitStatusOutcome::Unavailable, delivery);
         };
         let facts = PaykitStatusFacts {
             allocation_mode,
@@ -1360,7 +1414,7 @@ impl PaykitClient {
                 confirmations: body.confirmations,
             },
         };
-        match body.status.as_deref() {
+        let outcome = match body.status.as_deref() {
             Some("undetected") => PaykitStatusOutcome::Undetected,
             Some("detected") => PaykitStatusOutcome::Detected { facts },
             Some("confirmed") => PaykitStatusOutcome::Confirmed {
@@ -1368,7 +1422,8 @@ impl PaykitClient {
                 facts,
             },
             _ => PaykitStatusOutcome::Unavailable,
-        }
+        };
+        (outcome, delivery)
     }
 }
 
@@ -1443,6 +1498,17 @@ pub trait PaykitStatusSource: Send + Sync + 'static {
         seller_pubky: &'a str,
         reference: &'a str,
     ) -> Pin<Box<dyn Future<Output = PaykitStatusOutcome> + Send + 'a>>;
+
+    /// The status plus the request's delivery state, when the source knows
+    /// it. Sources without delivery facts report none.
+    fn status_with_delivery<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        reference: &'a str,
+    ) -> Pin<Box<dyn Future<Output = (PaykitStatusOutcome, Option<PaykitDeliveryState>)> + Send + 'a>>
+    {
+        Box::pin(async move { (self.status(seller_pubky, reference).await, None) })
+    }
 }
 
 impl PaykitStatusSource for PaykitClient {
@@ -1452,6 +1518,15 @@ impl PaykitStatusSource for PaykitClient {
         reference: &'a str,
     ) -> Pin<Box<dyn Future<Output = PaykitStatusOutcome> + Send + 'a>> {
         Box::pin(self.payment_status(seller_pubky, reference))
+    }
+
+    fn status_with_delivery<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        reference: &'a str,
+    ) -> Pin<Box<dyn Future<Output = (PaykitStatusOutcome, Option<PaykitDeliveryState>)> + Send + 'a>>
+    {
+        Box::pin(self.payment_status_with_delivery(seller_pubky, reference))
     }
 }
 
@@ -1528,6 +1603,26 @@ mod tests {
             .decrypt(&"o".repeat(52), &sealed)
             .expect_err("a transplanted ciphertext must not decrypt");
         StripeKeyCipher::from_hex("abcd").expect_err("short key rejected");
+    }
+
+    #[test]
+    fn delivery_states_normalize_only_live_request_facts() {
+        assert_eq!(
+            PaykitDeliveryState::from_wire("pending_delivery"),
+            Some(PaykitDeliveryState::Pending)
+        );
+        assert_eq!(
+            PaykitDeliveryState::from_wire("delivered"),
+            Some(PaykitDeliveryState::Delivered)
+        );
+        assert_eq!(
+            PaykitDeliveryState::from_wire("failed"),
+            Some(PaykitDeliveryState::Failed)
+        );
+        for other in ["cancelled", "contract_error", "pending", ""] {
+            assert_eq!(PaykitDeliveryState::from_wire(other), None, "{other}");
+        }
+        assert_eq!(PaykitDeliveryState::Pending.as_str(), "pending");
     }
 
     #[test]

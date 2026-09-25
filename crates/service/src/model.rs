@@ -605,6 +605,9 @@ pub struct OrderRow {
     /// (Crockford base32 of the order UUID; the status-lookup bundle id).
     pub paykit_request_reference: Option<String>,
     pub paykit_request_state: Option<String>,
+    /// Whether the payment request reached the buyer's wallet (`pending`,
+    /// `delivered`, `failed`), from paykit's status poll; NULL before it.
+    pub paykit_delivery_state: Option<String>,
     /// Poll stamp for the paykit verification worker; never serialized.
     pub paykit_last_checked_at: Option<DateTime<Utc>>,
     /// Two-phase paykit protocol (§B.11): the invoice phase 1 prepared.
@@ -713,6 +716,7 @@ impl std::fmt::Debug for OrderRow {
             .field("gateway_refund_unmatched", &self.gateway_refund_unmatched)
             .field("paykit_request_reference", &self.paykit_request_reference)
             .field("paykit_request_state", &self.paykit_request_state)
+            .field("paykit_delivery_state", &self.paykit_delivery_state)
             .field("paykit_last_checked_at", &self.paykit_last_checked_at)
             .field("paykit_invoice_id", &self.paykit_invoice_id)
             .field("paykit_stack_id", &self.paykit_stack_id)
@@ -819,6 +823,7 @@ impl OrderRow {
             shipping_label: None,
             paykit_request_reference: None,
             paykit_request_state: None,
+            paykit_delivery_state: None,
             paykit_last_checked_at: None,
             paykit_invoice_id: None,
             paykit_stack_id: None,
@@ -1070,6 +1075,7 @@ impl OrderRow {
             "updated_at": format_timestamp(self.updated_at),
         });
         view["priced_from"] = json!(self.priced_from);
+        view["paykit_delivery_state"] = json!(self.paykit_delivery_state);
         view["payment_reversed_at"] = self.payment_reversed_at.map(format_timestamp).into();
         view["payment_reversal_cancelled_at"] = self
             .payment_reversal_cancelled_at

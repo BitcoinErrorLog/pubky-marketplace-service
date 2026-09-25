@@ -63,6 +63,7 @@ pub const ORDER_COLUMNS: &str =
      EXISTS (SELECT 1 FROM gateway_refund_inbox AS refund_inbox \
        WHERE refund_inbox.order_id = orders.id AND refund_inbox.resolved_at IS NULL) \
        AS gateway_refund_unmatched, shipping_label, paykit_request_reference, paykit_request_state, \
+     paykit_delivery_state, \
      paykit_last_checked_at, paykit_invoice_id, paykit_stack_id, paykit_stack_endpoint, \
      paykit_total_sats, paykit_expires_at, paykit_prepare_expires_at, paykit_allocation_mode, \
      bitcoin_quote_rate, bitcoin_quote_source, bitcoin_quote_fetched_at, bitcoin_quoted_sats, \
