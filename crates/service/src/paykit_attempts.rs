@@ -396,7 +396,8 @@ async fn route_released_settlement(
          bitcoin_quoted_sats = $14, bitcoin_quote_expires_at = $15, \
          bitcoin_quote_currency = $16, bitcoin_quote_exponent = $17, \
          bitcoin_quote_spread_bps = $18, paykit_activation_state = 'active', \
-         paykit_request_state = 'confirmed', paykit_observation = $19, \
+         paykit_request_state = 'confirmed', paykit_delivery_state = NULL, \
+         paykit_observation = $19, \
          paykit_observed_sats = $20, paykit_seller_confirmation_entered_at = NULL, \
          paykit_seller_confirmation_deadline = NULL, updated_at = $21 WHERE id = $1",
     )

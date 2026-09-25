@@ -810,6 +810,7 @@ pub async fn bind_payment_method(
         "UPDATE orders SET revision = revision + 1, payment_method = $2, \
          fiat_checkout_url = $3, paykit_request_reference = $4, \
          paykit_request_state = CASE WHEN $4::text IS NULL THEN NULL ELSE 'preparing' END, \
+         paykit_delivery_state = NULL, \
          updated_at = $5 WHERE id = $1 RETURNING {}",
         crate::queries::ORDER_COLUMNS
     ))

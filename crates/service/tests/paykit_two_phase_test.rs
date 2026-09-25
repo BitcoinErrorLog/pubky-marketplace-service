@@ -1130,6 +1130,12 @@ async fn a_voided_bind_retries_with_a_fresh_reference(pool: PgPool) {
         .expect("drain runs");
     let (_request_state, activation_state, ..) = order_paykit_row(&pool, &order_id).await;
     assert_eq!(activation_state.as_deref(), Some("voided"));
+    // The released attempt's delivery never reached the wallet.
+    sqlx::query("UPDATE orders SET paykit_delivery_state = 'failed' WHERE id = $1")
+        .bind(order_uuid(&order_id))
+        .execute(&pool)
+        .await
+        .expect("released attempt's delivery state");
 
     let (rebind_status, rebind_body) = bind_bitcoin(&app, &buyer.token, &order_id).await;
     assert_eq!(
@@ -1143,6 +1149,16 @@ async fn a_voided_bind_retries_with_a_fresh_reference(pool: PgPool) {
         .await
         .expect("order row exists");
     assert_eq!(attempt, 2, "the retry incremented the counter");
+    let delivery: Option<String> =
+        sqlx::query_scalar("SELECT paykit_delivery_state FROM orders WHERE id = $1")
+            .bind(order_uuid(&order_id))
+            .fetch_one(&pool)
+            .await
+            .expect("order row exists");
+    assert_eq!(
+        delivery, None,
+        "a new attempt starts with no delivery state"
+    );
     let requests = paykit.requests();
     assert_eq!(requests.len(), 2, "two phase-1 calls");
     let first = attempt_reference(order_uuid(&order_id), 1);

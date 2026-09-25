@@ -2216,10 +2216,13 @@ async fn apply_paykit_status_outcome(
     row: &ClaimedPaykitOrder,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    match source
-        .status(&row.seller_pubky, &row.paykit_request_reference)
-        .await
-    {
+    let (outcome, delivery) = source
+        .status_with_delivery(&row.seller_pubky, &row.paykit_request_reference)
+        .await;
+    if let Some(delivery) = delivery {
+        record_paykit_delivery(&state.pool, row, delivery).await?;
+    }
+    match outcome {
         PaykitStatusOutcome::Confirmed {
             amount_matched,
             facts,
@@ -2324,6 +2327,28 @@ async fn apply_paykit_status_outcome(
         // only commits after a successful create).
         PaykitStatusOutcome::NotFound | PaykitStatusOutcome::Unavailable => Ok(false),
     }
+}
+
+/// Records whether the polled request reached the buyer's wallet, for the
+/// attempt the claim polled (a re-bind since then is left alone). A final
+/// state (`delivered`, `failed`) is never moved back to `pending`.
+async fn record_paykit_delivery(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    delivery: crate::payments::PaykitDeliveryState,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE orders SET paykit_delivery_state = $3 \
+         WHERE id = $1 AND paykit_request_reference = $2 \
+         AND paykit_delivery_state IS DISTINCT FROM $3 \
+         AND (paykit_delivery_state IS NULL OR paykit_delivery_state = 'pending')",
+    )
+    .bind(row.id)
+    .bind(&row.paykit_request_reference)
+    .bind(delivery.as_str())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// One paykit verification pass: claims due bitcoin orders, polls the
