@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
-    CheckoutLine, Command, CreateCheckoutPayload, FulfillmentMethod,
+    CheckoutLine, Command, CreateCheckoutPayload, DigitalDeliveryKind, FulfillmentMethod,
 };
 use marketplace_domain::state_machines::{can_transition, listing_machine};
 use marketplace_domain::{ids, ErrorCode};
@@ -15,8 +15,11 @@ use crate::locks::LocksKeys;
 use crate::model::{money_json, ListingRow, OrderRow, PaymentRow, ProjectionContext};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
-pub struct CheckoutWindows {
+pub struct CheckoutContext<'a> {
     pub drop_claim_seconds: i64,
+    /// The digital delivery sealing keys; `None` when digital delivery is
+    /// off on this deployment.
+    pub digital: Option<&'a crate::digital::DigitalKeys>,
 }
 
 pub async fn handle(
@@ -25,10 +28,10 @@ pub async fn handle(
     command: &Command,
     payload: &CreateCheckoutPayload,
     locks_keys: Option<&LocksKeys>,
-    windows: CheckoutWindows,
+    context: CheckoutContext<'_>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let drop_claim_window_seconds = windows.drop_claim_seconds;
+    let drop_claim_window_seconds = context.drop_claim_seconds;
     if command.aggregate_id != ids::checkout_aggregate_id(command.command_id)
         || command.expected_revision != 0
     {
@@ -186,10 +189,24 @@ pub async fn handle(
                 "fulfillment_not_published",
             )));
         }
-        // Digital orders need the confirm-time pin and the buyer read before
-        // they can be sold; until then a digital line is refused.
         if method == FulfillmentMethod::Digital {
-            return Ok(Err(crate::handlers::digital::unavailable()));
+            if context.digital.is_none() {
+                return Ok(Err(crate::handlers::digital::unavailable()));
+            }
+            // The seller must have a current deliverable (§6 B4).
+            if listing
+                .digital_delivery_kind
+                .as_deref()
+                .and_then(DigitalDeliveryKind::parse)
+                .is_none()
+            {
+                return Ok(Err(CommandFailure::refused_with_reason(
+                    crate::refusal_audit::RefusalKind::InvalidState,
+                    ErrorCode::InvalidState,
+                    "The seller has not finished setting up delivery for this item.",
+                    crate::handlers::digital::REASON_NOT_READY,
+                )));
+            }
         }
         match groups.iter_mut().find(|(seller, group_method, _)| {
             *seller == listing.seller_pubky && *group_method == method
@@ -222,6 +239,39 @@ pub async fn handle(
         _ => {}
     }
 
+    // The delivery email is required exactly when a line is email-kind, and
+    // refused otherwise, so no client can store an address the order does
+    // not need (§4.3, §6 F1–F3). Issues and messages never echo it.
+    let is_email_line = |index: &usize| {
+        let (_, listing) = &resolved[*index];
+        listing.digital_delivery_kind.as_deref() == Some("email")
+    };
+    let any_email_line = groups.iter().any(|(_, method, indices)| {
+        *method == FulfillmentMethod::Digital && indices.iter().any(is_email_line)
+    });
+    match (&payload.delivery_email, any_email_line) {
+        (None, true) => {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                "An email for delivery is required for this checkout.",
+                crate::handlers::digital_manual::REASON_EMAIL_REQUIRED,
+            )));
+        }
+        (Some(_), false) => {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                "No item in this checkout is delivered by email.",
+                crate::handlers::digital_manual::REASON_EMAIL_NOT_NEEDED,
+            )));
+        }
+        (Some(email), true) if !email.is_well_formed() => {
+            return Ok(Err(crate::handlers::digital_manual::invalid_email()));
+        }
+        _ => {}
+    }
+
     let delivery_address = payload
         .delivery_address
         .as_ref()
@@ -230,7 +280,8 @@ pub async fn handle(
     let mut payments: Vec<Value> = Vec::with_capacity(groups.len());
     let mut event_ids: Vec<Uuid> = Vec::with_capacity(groups.len());
     for (seller_pubky, group_method, indices) in &groups {
-        let pickup = *group_method == FulfillmentMethod::Pickup;
+        // Pickup and digital orders carry no address and no shipping charge.
+        let unshipped = *group_method != FulfillmentMethod::Shipping;
         let lines: Vec<Value> = indices
             .iter()
             .map(|&index| {
@@ -249,6 +300,11 @@ pub async fn handle(
                     ),
                     "fulfillment": group_method.as_str(),
                 });
+                // The delivery kind the buyer pays for rides the line: the
+                // confirm-time pin and the order page read it (§2).
+                if *group_method == FulfillmentMethod::Digital {
+                    line_json["digital_kind"] = json!(listing.digital_delivery_kind);
+                }
                 // The seller-authored Locks metadata is deliberately NOT
                 // snapshotted onto the order line: `lines` is projected to
                 // participants and persisted in durable command results, and
@@ -285,7 +341,7 @@ pub async fn handle(
         // pickup order's shipping is zero, never charged and refunded later
         // (§A2). The price the buyer pays is exactly the seller's listed
         // price plus that shipping — nothing else is added.
-        let shipping_minor: i64 = if pickup {
+        let shipping_minor: i64 = if unshipped {
             0
         } else {
             indices
@@ -313,7 +369,7 @@ pub async fn handle(
             seller_pubky.clone(),
             seller_has_rail,
             Value::Array(lines),
-            if pickup {
+            if unshipped {
                 None
             } else {
                 delivery_address.clone()
@@ -351,7 +407,7 @@ pub async fn handle(
         .bind(order.revision)
         .bind(&order.state)
         .bind(&order.lines)
-        .bind(if pickup {
+        .bind(if unshipped {
             None
         } else {
             delivery_address.clone()
@@ -370,6 +426,21 @@ pub async fn handle(
         .bind(now)
         .execute(&mut **tx)
         .await?;
+        // One sealed address per email-kind order, in the order-create
+        // transaction; two email-kind sellers each get their own row.
+        if *group_method == FulfillmentMethod::Digital && indices.iter().any(is_email_line) {
+            let (Some(email), Some(keys)) = (&payload.delivery_email, context.digital) else {
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvariantViolation,
+                    ErrorCode::InvariantViolation,
+                    "An email-kind order reached storage without its address or key.",
+                )));
+            };
+            crate::handlers::digital_manual::store_delivery_email(
+                tx, keys, order.id, actor, email, now,
+            )
+            .await?;
+        }
 
         let payment = PaymentRow {
             id: payment_id,

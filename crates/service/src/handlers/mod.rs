@@ -3,6 +3,8 @@ pub mod auction;
 pub mod cancellation;
 pub mod checkout;
 pub mod digital;
+pub mod digital_manual;
+pub mod digital_orders;
 pub mod drops;
 pub mod fulfillment;
 pub mod holds;

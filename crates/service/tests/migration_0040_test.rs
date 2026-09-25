@@ -50,7 +50,7 @@ async fn migration_0040_adds_digital_delivery_and_is_rerunnable(pool: PgPool) {
         );
     }
     let kinds: Vec<(i16, String)> = sqlx::query_as(
-        "SELECT id, name FROM command_refusal_command_kinds WHERE id >= 35 ORDER BY id",
+        "SELECT id, name FROM command_refusal_command_kinds WHERE id IN (35, 36) ORDER BY id",
     )
     .fetch_all(&pool)
     .await

@@ -361,6 +361,8 @@ fn command_kind(payload: &CommandPayload) -> CommandKind {
         CommandPayload::ClearPickupDetails(_) => CommandKind::ClearPickupDetails,
         CommandPayload::SetDigitalDelivery(_) => CommandKind::SetDigitalDelivery,
         CommandPayload::ClearDigitalDelivery(_) => CommandKind::ClearDigitalDelivery,
+        CommandPayload::SetDeliveryEmail(_) => CommandKind::SetDeliveryEmail,
+        CommandPayload::DeliverDigital(_) => CommandKind::DeliverDigital,
         CommandPayload::MarkReadyForPickup(_) => CommandKind::MarkReadyForPickup,
         CommandPayload::ConfirmPickup(_) => CommandKind::ConfirmPickup,
         CommandPayload::RequestReturn(_) => CommandKind::RequestReturn,
@@ -430,8 +432,9 @@ async fn dispatch(
                 command,
                 payload,
                 state.locks.as_deref().map(|runtime| &runtime.keys),
-                crate::handlers::checkout::CheckoutWindows {
+                crate::handlers::checkout::CheckoutContext {
                     drop_claim_seconds: state.config.drop_claim_window_seconds,
+                    digital: state.digital.as_deref(),
                 },
                 now,
             )
@@ -515,7 +518,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.config.sandbox_payment_window_seconds,
-                state.pickup.as_deref(),
+                state.confirm_keys(),
                 now,
             )
             .await
@@ -603,6 +606,20 @@ async fn dispatch(
                 now,
             )
             .await
+        }
+        CommandPayload::SetDeliveryEmail(payload) => {
+            crate::handlers::digital_manual::set_delivery_email(
+                tx,
+                actor,
+                command,
+                payload,
+                state.digital.as_deref(),
+                now,
+            )
+            .await
+        }
+        CommandPayload::DeliverDigital(payload) => {
+            crate::handlers::digital_manual::deliver_digital(tx, actor, command, payload, now).await
         }
         CommandPayload::MarkReadyForPickup(payload) => {
             crate::handlers::fulfillment::mark_ready(tx, actor, command, payload, now).await

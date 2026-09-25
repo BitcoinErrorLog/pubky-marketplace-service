@@ -43,6 +43,7 @@ pub const REASON_UNAVAILABLE: &str = "digital_delivery_unavailable";
 pub const REASON_IN_USE: &str = "digital_delivery_in_use";
 pub const REASON_UNVERIFIABLE: &str = "deliverable_unverifiable";
 pub const REASON_TOO_LARGE: &str = "deliverable_too_large";
+pub const REASON_NOT_READY: &str = "digital_delivery_not_ready";
 
 pub(crate) fn unavailable() -> CommandFailure {
     CommandFailure::refused_with_reason(

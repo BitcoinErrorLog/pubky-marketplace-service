@@ -422,6 +422,14 @@
             {
               "trigger": "command",
               "name": "fulfillment.confirm_pickup"
+            },
+            {
+              "trigger": "command",
+              "name": "fulfillment.deliver_digital"
+            },
+            {
+              "trigger": "server",
+              "name": "digital_delivery"
             }
           ]
         },
@@ -636,6 +644,10 @@
           "to": "refunded_external",
           "via": [
             {
+              "trigger": "command",
+              "name": "refund.record_external"
+            },
+            {
               "trigger": "server",
               "name": "paypal_refund"
             }
@@ -645,6 +657,10 @@
           "from": "completed",
           "to": "refunded_external",
           "via": [
+            {
+              "trigger": "command",
+              "name": "refund.record_external"
+            },
             {
               "trigger": "server",
               "name": "paypal_refund"
@@ -805,6 +821,8 @@
         "fulfillment.confirm_delivery",
         "fulfillment.mark_ready",
         "fulfillment.confirm_pickup",
+        "fulfillment.deliver_digital",
+        "order.set_delivery_email",
         "return.request",
         "return.approve",
         "return.receive",

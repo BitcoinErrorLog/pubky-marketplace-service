@@ -111,6 +111,14 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::handlers::pickup::get_listing_pickup_details),
         )
         .route(
+            "/v1/orders/{id}/delivery-email",
+            get(crate::handlers::digital_manual::get_order_delivery_email),
+        )
+        .route(
+            "/v1/orders/{id}/digital-delivery",
+            get(crate::handlers::digital_orders::get_order_digital_delivery),
+        )
+        .route(
             "/v1/listings/{aggregate_id}/digital-delivery",
             get(crate::handlers::digital::get_listing_digital_delivery),
         )
@@ -265,6 +273,36 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 async fn ready(State(state): State<AppState>) -> Response {
     if let Some(audit) = &state.refusal_audit {
         if !audit.is_ready() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "status": "unavailable" })),
+            )
+                .into_response();
+        }
+    }
+    // A purge that stopped running leaves buyer addresses past their
+    // retention; readiness reports it rather than keeping them silently.
+    match crate::handlers::digital_manual::overdue_delivery_emails(
+        &state.pool,
+        state.clock.now(),
+        state.config.buyer_email_retention_days,
+        state.config.buyer_email_unpaid_retention_days,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(_) => {
+            tracing::error!(
+                "buyer delivery emails are past their retention; the purge is not running"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "status": "unavailable", "reason": "delivery_email_purge_overdue" })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "readiness probe failed");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "status": "unavailable" })),

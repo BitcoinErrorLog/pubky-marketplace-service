@@ -252,10 +252,18 @@ pub fn order_machine() -> AggregateMachine {
                 "ready_for_pickup",
                 vec![Command("fulfillment.mark_ready")],
             ),
+            // `digital_delivery` is the confirmation of an order whose every
+            // line is released on the order page (file, link, text): it
+            // leaves `paid` for `delivered` in the receipt transaction
+            // (digital delivery design §3.6).
             t(
                 "paid",
                 "delivered",
-                vec![Command("fulfillment.confirm_pickup")],
+                vec![
+                    Command("fulfillment.confirm_pickup"),
+                    Command("fulfillment.deliver_digital"),
+                    Server("digital_delivery"),
+                ],
             ),
             t(
                 "ready_for_pickup",
@@ -363,15 +371,18 @@ pub fn order_machine() -> AggregateMachine {
                 "refunded_external",
                 vec![Server("paypal_refund")],
             ),
+            // The seller's refund after a digital delivery (digital orders
+            // never enter the return states); the handler admits the
+            // command only for `fulfillment = digital`.
             t(
                 "delivered",
                 "refunded_external",
-                vec![Server("paypal_refund")],
+                vec![Command("refund.record_external"), Server("paypal_refund")],
             ),
             t(
                 "completed",
                 "refunded_external",
-                vec![Server("paypal_refund")],
+                vec![Command("refund.record_external"), Server("paypal_refund")],
             ),
             t(
                 "cancel_requested",
@@ -462,6 +473,8 @@ pub fn order_machine() -> AggregateMachine {
             "fulfillment.confirm_delivery",
             "fulfillment.mark_ready",
             "fulfillment.confirm_pickup",
+            "fulfillment.deliver_digital",
+            "order.set_delivery_email",
             "return.request",
             "return.approve",
             "return.receive",
@@ -914,7 +927,15 @@ mod tests {
         for transition in orders.transitions.iter().filter(|t| {
             t.to == "refunded_external" && !matches!(t.from, "cancelled" | "return_received")
         }) {
-            assert_eq!(transition.via, vec![Server("paypal_refund")]);
+            // A delivered or completed digital order also takes the
+            // seller's recorded refund; the handler admits it for
+            // `fulfillment = digital` only.
+            let expected = if matches!(transition.from, "delivered" | "completed") {
+                vec![Command("refund.record_external"), Server("paypal_refund")]
+            } else {
+                vec![Server("paypal_refund")]
+            };
+            assert_eq!(transition.via, expected, "{}", transition.from);
         }
         assert!(!orders.states.contains(&"refunded_partial"));
         assert!(!can_transition(
@@ -1012,6 +1033,60 @@ mod tests {
 
     /// Fails when `contracts/state-machines.json` is stale. Regenerate with:
     /// `cargo run -p marketplace-domain --bin emit-contracts`
+    #[test]
+    fn order_machine_declares_the_digital_edges() {
+        let machine = order_machine();
+        let delivered = machine
+            .transitions
+            .iter()
+            .find(|t| t.from == "paid" && t.to == "delivered")
+            .expect("paid -> delivered");
+        assert!(delivered.via.contains(&Server("digital_delivery")));
+        assert!(delivered
+            .via
+            .contains(&Command("fulfillment.deliver_digital")));
+        assert!(delivered
+            .via
+            .contains(&Command("fulfillment.confirm_pickup")));
+        for from in ["delivered", "completed"] {
+            let refund = machine
+                .transitions
+                .iter()
+                .find(|t| t.from == from && t.to == "refunded_external")
+                .expect("refund edge");
+            assert!(
+                refund.via.contains(&Command("refund.record_external")),
+                "{from}"
+            );
+        }
+        // Digital orders never need a return edge of their own.
+        assert!(!can_transition(&machine, "paid", "return_requested"));
+        // Change email moves no state, so only the catalog names it.
+        for command in ["fulfillment.deliver_digital", "order.set_delivery_email"] {
+            assert!(machine.commands.contains(&command), "{command}");
+        }
+    }
+
+    // Other machines move on commands another aggregate accepts (a listing
+    // releases stock on `order.cancel_request`); every order edge is driven
+    // by an order command.
+    #[test]
+    fn every_order_transition_command_is_in_the_order_catalog() {
+        let machine = order_machine();
+        for transition in &machine.transitions {
+            for via in &transition.via {
+                if let Command(command) = via {
+                    assert!(
+                        machine.commands.contains(command),
+                        "{} -> {} via {command} is missing from the order command catalog",
+                        transition.from,
+                        transition.to,
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn contract_artifact_is_in_sync() {
         let path = concat!(

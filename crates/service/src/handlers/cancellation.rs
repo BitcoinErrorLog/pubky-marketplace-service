@@ -72,6 +72,14 @@ pub async fn request(
             "Only the buyer may request cancellation.",
         )));
     }
+    if order.fulfillment == "digital" && matches!(order.state.as_str(), "delivered" | "completed") {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "A delivered digital order cannot be cancelled.",
+            "digital_order_delivered",
+        )));
+    }
     if !matches!(
         order.state.as_str(),
         "pending_payment" | "paid" | "processing" | "ready_for_pickup"
@@ -409,10 +417,14 @@ pub async fn approve(
     // reversal returns them sold -> available (the listing machine declares
     // this transition for order.cancel_approve). The payment and receipt
     // stay untouched: the refund path is refund.record_external.
-    if let Err(failure) = credit_order_drop(tx, &order, now).await? {
+    // A digital order keeps an instant line the buyer already opened
+    // counted as sold: the file, link or text cannot be taken back. Email,
+    // message and unopened instant lines restock (§6 E8).
+    let releasable = releasable_lines(tx, &order).await?;
+    if let Err(failure) = credit_order_drop(tx, &releasable, now).await? {
         return Ok(Err(failure));
     }
-    if let Err(failure) = release_lines(tx, &order, HeldQuantity::Sold, now).await? {
+    if let Err(failure) = release_lines(tx, &releasable, HeldQuantity::Sold, now).await? {
         return Ok(Err(failure));
     }
 
@@ -437,6 +449,41 @@ pub async fn approve(
         now,
     )
     .await
+}
+
+/// The order with only the lines a cancel-approve returns to stock.
+async fn releasable_lines(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &OrderRow,
+) -> Result<OrderRow, sqlx::Error> {
+    if order.fulfillment != "digital" {
+        return Ok(order.clone());
+    }
+    let opened: Vec<i32> = sqlx::query_scalar(
+        "SELECT DISTINCT line_index FROM order_digital_access WHERE order_id = $1",
+    )
+    .bind(order.id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let lines = order
+        .lines
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(index, line)| {
+                    let instant = crate::handlers::digital_orders::line_kind(line)
+                        .is_some_and(marketplace_domain::commands::DigitalDeliveryKind::is_instant);
+                    !(instant && opened.contains(&(*index as i32)))
+                })
+                .map(|(_, line)| line.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut releasable = order.clone();
+    releasable.lines = serde_json::Value::Array(lines);
+    Ok(releasable)
 }
 
 /// Pre-#50 held rows can carry `stock_held` with a NULL window. Releasing

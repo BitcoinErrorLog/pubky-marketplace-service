@@ -1324,7 +1324,7 @@ async fn apply_fiat_paid(
         let command_id = Uuid::new_v4();
         match apply_late_money(
             &mut tx,
-            state.pickup.as_deref(),
+            state.confirm_keys(),
             &payment,
             &order,
             command_id,
@@ -1397,13 +1397,59 @@ async fn apply_fiat_paid(
         .await
         .map_err(|error| internal("verification provenance update", &error))?;
     let command_id = Uuid::new_v4();
+    // A digital order the seller can no longer deliver never takes a
+    // receipt: the payment routes to a seller refund (§6 D3).
+    let undeliverable = crate::handlers::digital_orders::unpinnable(&mut tx, &order)
+        .await
+        .map_err(|error| internal("digital pin check", &error))?;
+    if undeliverable {
+        if let Err(failure) = crate::bitcoin_review::refund_required(
+            &mut tx,
+            &payment,
+            &order,
+            "digital delivery unavailable at payment",
+            command_id,
+            actor,
+            now,
+        )
+        .await
+        {
+            let _ = tx.rollback().await;
+            return Err(internal(
+                "digital refund route",
+                &format!("{:?}", std::mem::discriminant(&failure)),
+            ));
+        }
+        settle_gateway(&mut tx, state, order_id, gateway, now).await?;
+        let Some(order) = fetch_order_for_update(&mut tx, order_id)
+            .await
+            .map_err(|error| internal("digital refund order re-read", &error))?
+        else {
+            return Err(method_error(
+                ErrorCode::NotFound,
+                "order_not_found",
+                "The order was not found.",
+            ));
+        };
+        let response = order_response(&mut tx, &order, json!({ "verified": true }))
+            .await
+            .map_err(|error| internal("order projection", &error))?;
+        tx.commit()
+            .await
+            .map_err(|error| internal("digital refund commit", &error))?;
+        tracing::warn!(
+            order_id = %order_id,
+            "fiat payment verified for a digital order with no deliverable; refund required"
+        );
+        return Ok(response);
+    }
     match crate::handlers::payment::confirm_order(
         &mut tx,
         actor,
         command_id,
         &payment,
         order,
-        state.pickup.as_deref(),
+        state.confirm_keys(),
         now,
     )
     .await

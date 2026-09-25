@@ -74,6 +74,7 @@ pub const TASK_STAT_ATTESTATIONS: &str = "stat_attestations";
 pub const TASK_DELIVERY_AUTOCOMPLETE: &str = "delivery_autocomplete";
 pub const TASK_PICKUP_RESEAL: &str = "pickup_reseal";
 pub const TASK_DIGITAL_RESEAL: &str = "digital_reseal";
+pub const TASK_DELIVERY_EMAIL_PURGE: &str = "delivery_email_purge";
 pub const TASK_PICKUP_RETENTION: &str = "pickup_retention";
 pub const TASK_SELLER_CONFIRMATION_WINDOW: &str = "seller_confirmation_window";
 pub const TASK_MANUAL_REVIEW_WATCH: &str = "manual_review_watch";
@@ -1360,7 +1361,7 @@ async fn apply_manual_review(
 async fn apply_completed_lifecycle(
     pool: &PgPool,
     row: &ClaimedCorrelation,
-    pickup: Option<&crate::pickup::PickupKeys>,
+    keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
@@ -1385,7 +1386,7 @@ async fn apply_completed_lifecycle(
                 row.id,
                 &payment,
                 order,
-                pickup,
+                keys,
                 now,
             )
             .await?
@@ -1451,7 +1452,7 @@ async fn apply_completed_lifecycle(
             };
             match apply_late_money(
                 &mut tx,
-                pickup,
+                keys,
                 &payment,
                 &order,
                 row.id,
@@ -1514,7 +1515,7 @@ async fn apply_locks_lookup_outcome(
     let outcome = locks.client.lookup(&row.creator_pubky, &bundle_id).await;
     match outcome {
         LocksLookupOutcome::Status(LocksTaskStatus::Completed) => {
-            apply_completed_lifecycle(&state.pool, row, state.pickup.as_deref(), now).await
+            apply_completed_lifecycle(&state.pool, row, state.confirm_keys(), now).await
         }
         LocksLookupOutcome::Status(LocksTaskStatus::Failed) => {
             record_upstream_terminal(&state.pool, row, "failed", "upstream_failed", now).await?;
@@ -1665,7 +1666,7 @@ async fn apply_confirmed_paykit_payment(
     row: &ClaimedPaykitOrder,
     amount_matched: bool,
     observation: &crate::payments::PaykitObservation,
-    pickup: Option<&crate::pickup::PickupKeys>,
+    keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
     late_settlement: bool,
 ) -> anyhow::Result<bool> {
@@ -1717,7 +1718,7 @@ async fn apply_confirmed_paykit_payment(
         };
         match apply_late_money(
             &mut tx,
-            pickup,
+            keys,
             &payment,
             &order,
             row.id,
@@ -1849,13 +1850,59 @@ async fn apply_confirmed_paykit_payment(
         );
         return Ok(true);
     }
+    // A digital order the seller can no longer deliver never takes a
+    // receipt: the money routes to a seller refund and the observation is
+    // consumed, so no retry sits on money already taken (§6 D3).
+    if crate::handlers::digital_orders::unpinnable(&mut tx, &order).await? {
+        crate::bitcoin_review::refund_required(
+            &mut tx,
+            &payment,
+            &order,
+            "digital delivery unavailable at payment",
+            row.id,
+            &row.buyer_pubky,
+            now,
+        )
+        .await
+        .map_err(|failure| {
+            anyhow::anyhow!(
+                "digital refund route for {} failed: {:?}",
+                row.id,
+                std::mem::discriminant(&failure)
+            )
+        })?;
+        sqlx::query(
+            "UPDATE orders SET paykit_request_state = 'confirmed', \
+             paykit_seller_confirmation_entered_at = NULL, \
+             paykit_seller_confirmation_deadline = NULL, paykit_observation = $3, updated_at = $2 \
+             WHERE id = $1",
+        )
+        .bind(row.id)
+        .bind(now)
+        .bind(crate::bitcoin_review::observation_json(
+            "confirmed",
+            amount_matched,
+            observation,
+            now,
+            false,
+        ))
+        .execute(&mut *tx)
+        .await?;
+        freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
+        tx.commit().await?;
+        tracing::warn!(
+            order_id = %row.id,
+            "paykit payment confirmed for a digital order with no deliverable; refund required"
+        );
+        return Ok(true);
+    }
     match confirm_order(
         &mut tx,
         &row.buyer_pubky,
         row.id,
         &payment,
         order,
-        pickup,
+        keys,
         now,
     )
     .await?
@@ -2002,7 +2049,7 @@ async fn apply_shared_manual_observation(
     observed_state: &str,
     amount_matched: bool,
     observation: &crate::payments::PaykitObservation,
-    pickup: Option<&crate::pickup::PickupKeys>,
+    keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     if row.paykit_stack_id.is_none() || row.paykit_stack_endpoint.is_none() {
@@ -2036,7 +2083,7 @@ async fn apply_shared_manual_observation(
                 row,
                 amount_matched,
                 observation,
-                pickup,
+                keys,
                 now,
                 false,
             )
@@ -2189,7 +2236,7 @@ async fn apply_paykit_status_outcome(
                     row,
                     amount_matched,
                     &facts.observation,
-                    state.pickup.as_deref(),
+                    state.confirm_keys(),
                     now,
                     true,
                 )
@@ -2207,7 +2254,7 @@ async fn apply_paykit_status_outcome(
                         "confirmed",
                         amount_matched,
                         &facts.observation,
-                        state.pickup.as_deref(),
+                        state.confirm_keys(),
                         now,
                     )
                     .await
@@ -2218,7 +2265,7 @@ async fn apply_paykit_status_outcome(
                         row,
                         amount_matched,
                         &facts.observation,
-                        state.pickup.as_deref(),
+                        state.confirm_keys(),
                         now,
                         false,
                     )
@@ -2249,7 +2296,7 @@ async fn apply_paykit_status_outcome(
                         "detected",
                         true,
                         &facts.observation,
-                        state.pickup.as_deref(),
+                        state.confirm_keys(),
                         now,
                     )
                     .await
@@ -3019,7 +3066,7 @@ async fn assume_due_deliveries_batch(
     let due: Vec<(Uuid, Value, String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, shipment, buyer_pubky, seller_pubky, shipment->>'shipped_at' \
          FROM orders \
-         WHERE state = 'shipped' \
+         WHERE state = 'shipped' AND fulfillment <> 'digital' \
          AND (shipment->>'shipped_at' IS NULL \
               OR shipment->>'shipped_at' !~ $2 \
               OR left(shipment->>'shipped_at', 19) <= left($1, 19)) \
@@ -3155,12 +3202,15 @@ async fn complete_due_delivered_orders_batch(
     let due: Vec<DeliveredOrderClaim> = sqlx::query_as(
         "SELECT o.id, o.buyer_pubky, o.seller_pubky, o.fulfillment, \
                     o.shipment->>'delivered_at' AS delivered_at, \
-                    h.confirmed_at AS handover_at \
+                    CASE WHEN o.fulfillment = 'digital' THEN o.digital_delivered_at \
+                         ELSE h.confirmed_at END AS handover_at \
              FROM orders o LEFT JOIN pickup_handovers h ON h.order_id = o.id \
              WHERE o.state = 'delivered' \
              AND ( \
                (o.fulfillment = 'pickup' AND (h.confirmed_at IS NULL OR h.confirmed_at <= $1)) \
-               OR (o.fulfillment <> 'pickup' AND ( \
+               OR (o.fulfillment = 'digital' \
+                   AND (o.digital_delivered_at IS NULL OR o.digital_delivered_at <= $1)) \
+               OR (o.fulfillment NOT IN ('pickup', 'digital') AND ( \
                     o.shipment->>'delivered_at' IS NULL \
                     OR o.shipment->>'delivered_at' !~ $3 \
                     OR left(o.shipment->>'delivered_at', 19) <= left($2, 19))) \
@@ -3185,8 +3235,9 @@ async fn complete_due_delivered_orders_batch(
             delivered_at: shipment_delivered_at,
             handover_at,
         } = claim;
-        if fulfillment == "pickup" {
-            // A delivered pickup order always carries its handover row
+        if fulfillment == "pickup" || fulfillment == "digital" {
+            // A delivered pickup order always carries its handover row, and a
+            // delivered digital order its `digital_delivered_at`
             // (written in the confirm transaction). A missing row is an
             // anomaly to skip — never the warn-and-skip-forever loop the
             // shipment-only sweep would have emitted for pickup rows (§A6).
@@ -3275,6 +3326,7 @@ pub struct WorkerSummary {
     pub pickup_snapshots_purged: u64,
     pub pickup_versions_purged: u64,
     pub digital_rows_resealed: u64,
+    pub delivery_emails_purged: u64,
     pub seller_windows_routed: u64,
     pub manual_review_sla_alerts: u64,
     pub manual_reviews_abandoned: u64,
@@ -3671,6 +3723,27 @@ pub async fn run_once(
     // While a previous digital delivery key is configured, one re-seal pass
     // per tick across all three sealed families (digital delivery design
     // §7). A failed pass is logged and retried next tick, as pickup's is.
+    // The buyer delivery email purge (§4.3 step 7). It runs whether or not
+    // the key is configured: deleting ciphertext needs no key.
+    if try_acquire_lease(
+        &state.pool,
+        TASK_DELIVERY_EMAIL_PURGE,
+        holder,
+        now,
+        lease_seconds,
+    )
+    .await?
+    {
+        let result = crate::handlers::digital_manual::purge_delivery_emails(
+            &state.pool,
+            now,
+            state.config.buyer_email_retention_days,
+            state.config.buyer_email_unpaid_retention_days,
+        )
+        .await;
+        release_lease(&state.pool, TASK_DELIVERY_EMAIL_PURGE, holder, now).await?;
+        summary.delivery_emails_purged = result?;
+    }
     if let Some(digital) = &state.digital {
         if digital.has_previous()
             && try_acquire_lease(&state.pool, TASK_DIGITAL_RESEAL, holder, now, lease_seconds)
