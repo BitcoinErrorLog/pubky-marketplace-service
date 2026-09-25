@@ -494,7 +494,7 @@ async fn offer_refused_on_digital_only_listing(pool: PgPool) {
         json!("offers_unavailable_for_digital")
     );
 
-    // A pickup-only listing keeps the existing refusal without a reason.
+    // A pickup-only listing takes offers; only digital items refuse them.
     let pickup_seller = new_actor(&app).await;
     register_digital_listing(&app, &pickup_seller, json!(["pickup"])).await;
     let (status, body) = execute(
@@ -503,8 +503,7 @@ async fn offer_refused_on_digital_only_listing(pool: PgPool) {
         &create_offer_command(&pickup_seller.pubky, 1),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].get("reason").is_none(), "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
