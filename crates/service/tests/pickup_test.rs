@@ -887,7 +887,8 @@ async fn mixed_cart_splits_per_seller_fulfillment(pool: PgPool) {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
 
-    // Offers on a non-shipping listing are refused with a typed error.
+    // A pickup-only listing takes offers; the award settles by pickup
+    // (`pickup_offers_test.rs`).
     let mut pickup_only = register_pickup_listing(&seller_a.pubky, "boots_04", 1, 0x156);
     pickup_only["payload"]["fulfillment_methods"] = json!(["pickup"]);
     let (status, body) = execute(&app, &seller_a.token, &pickup_only).await;
@@ -895,8 +896,8 @@ async fn mixed_cart_splits_per_seller_fulfillment(pool: PgPool) {
     let mut offer = common::create_offer_command(&seller_a.pubky, 1);
     offer["aggregate_id"] = json!(listing_agg(&seller_a.pubky, "boots_04"));
     let (status, body) = execute(&app, &buyer.token, &offer).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["offer"]["state"], json!("pending"));
 }
 
 // The address rule pair: a pickup-only checkout PRESENTING a

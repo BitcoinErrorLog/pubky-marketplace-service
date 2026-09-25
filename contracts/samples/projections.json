@@ -22,6 +22,9 @@
               "accepted_at": "<timestamp:1>",
               "convert_by": "<timestamp:6>",
               "converted_order_id": null,
+              "fulfillment_methods": [
+                "shipping"
+              ],
               "id": "<uuid:12>",
               "listing": {
                 "aggregate_id": "listing:<pubky:seller>_boots_01",
