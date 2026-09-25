@@ -18,8 +18,21 @@
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS digital_message_delivered_at TIMESTAMPTZ;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
 
+-- The backfill rewrites every ended order, and an UPDATE re-checks each
+-- CHECK constraint on the rows it touches, including NOT VALID ones.
+-- `orders_total_balance` is NOT VALID since 0018 because historical staging
+-- orders carry totals that include a since-dropped tax; those totals are
+-- what buyers paid, so they are not rewritten. As in 0018, the constraint
+-- is dropped for the backfill and re-added NOT VALID, which enforces it on
+-- every new insert and update and leaves existing rows as they are.
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_total_balance;
+
 UPDATE orders SET ended_at = updated_at
 WHERE ended_at IS NULL AND state IN ('completed', 'cancelled', 'refunded_external', 'closed');
+
+ALTER TABLE orders
+    ADD CONSTRAINT orders_total_balance
+    CHECK (total_minor = subtotal_minor + shipping_minor) NOT VALID;
 
 CREATE OR REPLACE FUNCTION stamp_order_ended_at() RETURNS trigger
 LANGUAGE plpgsql AS $$
