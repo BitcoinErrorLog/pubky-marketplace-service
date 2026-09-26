@@ -231,7 +231,7 @@ async fn read_delivery(app: &TestApp, token: &str, order_id: &str) -> (StatusCod
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/v1/orders/{order_id}/digital-delivery"))
+                .uri(format!("/v1/orders/{order_id}/digital-delivery/0"))
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .expect("request builds"),
@@ -1438,7 +1438,7 @@ async fn refund_racing_download_never_releases_key(pool: PgPool) {
                 .oneshot(
                     Request::builder()
                         .method("GET")
-                        .uri(format!("/v1/orders/{order_id}/digital-delivery"))
+                        .uri(format!("/v1/orders/{order_id}/digital-delivery/0"))
                         .header("authorization", format!("Bearer {token}"))
                         .body(Body::empty())
                         .expect("request builds"),
@@ -1613,7 +1613,7 @@ async fn concurrent_first_reads_share_the_buyer_bucket(pool: PgPool) {
                     .oneshot(
                         Request::builder()
                             .method("GET")
-                            .uri(format!("/v1/orders/{order_id}/digital-delivery"))
+                            .uri(format!("/v1/orders/{order_id}/digital-delivery/0"))
                             .header("authorization", format!("Bearer {token}"))
                             .body(Body::empty())
                             .expect("request builds"),

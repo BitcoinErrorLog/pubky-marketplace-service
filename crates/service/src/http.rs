@@ -119,7 +119,7 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::handlers::digital_orders::get_order_digital_evidence),
         )
         .route(
-            "/v1/orders/{id}/digital-delivery",
+            "/v1/orders/{id}/digital-delivery/{line_index}",
             get(crate::handlers::digital_orders::get_order_digital_delivery),
         )
         .route(
