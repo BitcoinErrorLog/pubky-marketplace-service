@@ -986,12 +986,31 @@ async fn bitcoin_seller(app: &TestApp, paykit: &FakePaykit) -> TestActor {
 }
 
 async fn read_download(app: &TestApp, token: &str, order_id: &str) -> (StatusCode, String, Value) {
+    read_download_line(app, token, order_id, 0).await
+}
+
+async fn read_download_line(
+    app: &TestApp,
+    token: &str,
+    order_id: &str,
+    line_index: i32,
+) -> (StatusCode, String, Value) {
     get_raw(
         app,
         token,
-        &format!("/v1/orders/{order_id}/digital-delivery"),
+        &format!("/v1/orders/{order_id}/digital-delivery/{line_index}"),
     )
     .await
+}
+
+async fn access_lines(app: &TestApp, order_id: &str) -> Vec<i32> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT line_index FROM order_digital_access WHERE order_id = $1::uuid ORDER BY line_index",
+    )
+    .bind(order_id)
+    .fetch_all(&app.pool)
+    .await
+    .expect("access lines")
 }
 
 async fn stock_of(app: &TestApp, seller: &TestActor, listing_id: &str) -> (i64, i64) {
@@ -1118,6 +1137,71 @@ async fn cancel_approve_keeps_opened_instant_line_sold(pool: PgPool) {
         stock_of(&app, &seller, "text_01").await,
         (4, 1),
         "the unopened text restocked"
+    );
+    assert_eq!(stock_of(&app, &seller, "email_01").await, (5, 0));
+}
+
+// Review P1 (Shop Wave 2): opening one instant line releases and logs only
+// that line, so an unopened instant line on the same order still restocks
+// when a cancel is approved (§3.6 E8).
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn opening_one_line_releases_and_logs_only_that_line(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool).await;
+    let seller = bitcoin_seller(&app, &paykit).await;
+    listing(&app, &seller, "text_01", text_kind()).await;
+    listing(&app, &seller, "text_02", text_kind()).await;
+    listing(&app, &seller, "email_01", email_kind()).await;
+    let lines: &[(&TestActor, &str)] = &[
+        (&seller, "text_01"),
+        (&seller, "text_02"),
+        (&seller, "email_01"),
+    ];
+    let buyer = new_actor(&app).await;
+    let order = one_order(&app, &buyer, lines, Some(EMAIL)).await;
+    paykit_pay(&app, &paykit, &buyer, &order).await;
+
+    let (status, cache, body) = read_download_line(&app, &buyer.token, &order.id, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(cache, "no-store");
+    let released = body["lines"].as_array().expect("lines");
+    assert_eq!(released.len(), 1, "{body}");
+    assert_eq!(released[0]["line_index"], json!(0));
+    assert_eq!(access_lines(&app, &order.id).await, vec![0]);
+
+    // A manual line and an index the order does not have release nothing.
+    for missing in [2, 7] {
+        let (status, _, body) = read_download_line(&app, &buyer.token, &order.id, missing).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+    assert_eq!(access_lines(&app, &order.id).await, vec![0]);
+
+    let (status, body) = act(
+        &app,
+        &buyer.token,
+        "order.cancel_request",
+        &order.id,
+        json!({ "reason": "Changed my mind" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = act(
+        &app,
+        &seller.token,
+        "order.cancel_approve",
+        &order.id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        stock_of(&app, &seller, "text_01").await,
+        (4, 1),
+        "the opened line stays sold"
+    );
+    assert_eq!(
+        stock_of(&app, &seller, "text_02").await,
+        (5, 0),
+        "the unopened instant line restocks"
     );
     assert_eq!(stock_of(&app, &seller, "email_01").await, (5, 0));
 }
