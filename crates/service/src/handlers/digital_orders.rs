@@ -281,8 +281,12 @@ fn rate_limited(retry_after: i64) -> Response {
     response
 }
 
-/// `GET /v1/orders/{id}/digital-delivery`: the paying buyer's download
-/// (§4.2).
+/// `GET /v1/orders/{id}/digital-delivery/{line_index}`: the paying buyer's
+/// download of ONE line (§4.2).
+///
+/// A read releases only the requested line and records access only for it.
+/// The access row is what keeps an opened instant line sold on cancel
+/// (§3.6 E8), so opening one line must never release or log another.
 ///
 /// The entitlement is checked and the payload released in ONE transaction
 /// that holds the order row `FOR SHARE`: a refund or cancel that commits
@@ -296,7 +300,7 @@ fn rate_limited(retry_after: i64) -> Response {
 pub async fn get_order_digital_delivery(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
-    Path(id): Path<Uuid>,
+    Path((id, line_index)): Path<(Uuid, i32)>,
 ) -> Response {
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
@@ -340,15 +344,21 @@ pub async fn get_order_digital_delivery(
     let pins: Vec<PinRow> = match sqlx::query_as(
         "SELECT line_index, listing_aggregate_id, deliverable_id, version, kind, \
          payload_ciphertext, confirming_adapter FROM order_digital_pins \
-         WHERE order_id = $1 ORDER BY line_index",
+         WHERE order_id = $1 AND line_index = $2",
     )
     .bind(order.id)
+    .bind(line_index)
     .fetch_all(&mut *tx)
     .await
     {
         Ok(pins) => pins,
         Err(_) => return internal_error("digital delivery pins"),
     };
+    // A manual (email or message) line, or an index the order does not
+    // have, has no pin to release.
+    if pins.is_empty() {
+        return read_error(ErrorCode::NotFound, "The order line has no download.", None);
+    }
     if pins.iter().any(|pin| pin.confirming_adapter == "sandbox") {
         return read_error(
             ErrorCode::InvalidState,
