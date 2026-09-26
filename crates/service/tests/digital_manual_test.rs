@@ -1141,6 +1141,67 @@ async fn cancel_approve_keeps_opened_instant_line_sold(pool: PgPool) {
     assert_eq!(stock_of(&app, &seller, "email_01").await, (5, 0));
 }
 
+// §3 "Seller's orders": every digital order shows its delivery evidence to
+// its seller: first opened and open count for instant lines, marked-emailed
+// and marked-delivered times, and when the order was delivered.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn seller_reads_delivery_evidence(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool).await;
+    let seller = bitcoin_seller(&app, &paykit).await;
+    listing(&app, &seller, "text_01", text_kind()).await;
+    listing(&app, &seller, "email_01", email_kind()).await;
+    let lines: &[(&TestActor, &str)] = &[(&seller, "text_01"), (&seller, "email_01")];
+    let buyer = new_actor(&app).await;
+    let order = one_order(&app, &buyer, lines, Some(EMAIL)).await;
+    paykit_pay(&app, &paykit, &buyer, &order).await;
+    let uri = format!("/v1/orders/{}/digital-evidence", order.id);
+
+    let (status, cache, body) = get_raw(&app, &seller.token, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(cache, "no-store");
+    assert_eq!(body["order_id"], json!(order.id));
+    assert_eq!(body["open_count"], json!(0));
+    for field in [
+        "delivered_at",
+        "first_opened_at",
+        "emailed_at",
+        "message_delivered_at",
+    ] {
+        assert!(body[field].is_null(), "{field}: {body}");
+    }
+
+    // Two opens in the same hour coalesce into one logged open.
+    for _ in 0..2 {
+        let (status, _, body) = read_download(&app, &buyer.token, &order.id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (_, _, body) = get_raw(&app, &seller.token, &uri).await;
+    assert_eq!(body["open_count"], json!(1));
+    assert!(body["first_opened_at"].is_string(), "{body}");
+    assert!(
+        body["delivered_at"].is_null(),
+        "an email line is still to send: {body}"
+    );
+
+    let (status, body) = mark(&app, &seller, &order.id, "email").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, _, body) = get_raw(&app, &seller.token, &uri).await;
+    assert!(body["emailed_at"].is_string(), "{body}");
+    assert!(body["delivered_at"].is_string(), "{body}");
+    assert!(body.get("delivery_email").is_none());
+    assert!(
+        !body.to_string().contains(EMAIL),
+        "no address in the evidence"
+    );
+
+    // The buyer and anyone else read nothing.
+    let outsider = new_actor(&app).await;
+    for token in [&buyer.token, &outsider.token] {
+        let (status, _, body) = get_raw(&app, token, &uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+}
+
 // Review P1 (Shop Wave 2): opening one instant line releases and logs only
 // that line, so an unopened instant line on the same order still restocks
 // when a cancel is approved (§3.6 E8).

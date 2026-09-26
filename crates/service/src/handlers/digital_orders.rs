@@ -22,6 +22,7 @@ use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::auth::Actor;
+use crate::clock::format_timestamp;
 use crate::digital::{pin_aad, version_aad, DigitalKeys};
 use crate::handlers::digital::{no_store, DIGITAL_ENDED_ORDER_STATES};
 use crate::model::OrderRow;
@@ -461,4 +462,58 @@ pub async fn get_order_digital_delivery(
         )
             .into_response(),
     )
+}
+
+/// `GET /v1/orders/{id}/digital-evidence`: the seller's delivery evidence on
+/// one of their digital orders (§3 "Seller's orders"): when the order was
+/// delivered, when an instant line was first opened and how many opens were
+/// logged (coalesced to at most one per line per hour), and when the seller
+/// marked the email and message lines. Timestamps and a count only: no
+/// address, key, link, text or IP. Seller only; anyone else, and a
+/// non-digital order, is NOT_FOUND.
+pub async fn get_order_digital_evidence(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let evidence: Result<Option<EvidenceRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT o.id AS order_id, o.digital_delivered_at AS delivered_at, \
+                o.digital_message_delivered_at AS message_delivered_at, \
+                (SELECT MIN(accessed_at) FROM order_digital_access a WHERE a.order_id = o.id) AS first_opened_at, \
+                (SELECT COUNT(*) FROM order_digital_access a WHERE a.order_id = o.id) AS open_count, \
+                (SELECT emailed_at FROM order_delivery_emails e WHERE e.order_id = o.id) AS emailed_at \
+         FROM orders o WHERE o.id = $1 AND o.seller_pubky = $2 AND o.fulfillment = 'digital'",
+    )
+    .bind(id)
+    .bind(&actor.0)
+    .fetch_optional(&state.pool)
+    .await;
+    match evidence {
+        Ok(Some(row)) => no_store(
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "order_id": row.order_id,
+                    "delivered_at": row.delivered_at.map(format_timestamp),
+                    "first_opened_at": row.first_opened_at.map(format_timestamp),
+                    "open_count": row.open_count,
+                    "emailed_at": row.emailed_at.map(format_timestamp),
+                    "message_delivered_at": row.message_delivered_at.map(format_timestamp),
+                })),
+            )
+                .into_response(),
+        ),
+        Ok(None) => read_error(ErrorCode::NotFound, "The order was not found.", None),
+        Err(_) => internal_error("digital evidence read"),
+    }
+}
+
+#[derive(FromRow)]
+struct EvidenceRow {
+    order_id: Uuid,
+    delivered_at: Option<DateTime<Utc>>,
+    message_delivered_at: Option<DateTime<Utc>>,
+    first_opened_at: Option<DateTime<Utc>>,
+    open_count: i64,
+    emailed_at: Option<DateTime<Utc>>,
 }
