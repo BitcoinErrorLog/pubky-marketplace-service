@@ -115,6 +115,10 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::handlers::digital_manual::get_order_delivery_email),
         )
         .route(
+            "/v1/orders/{id}/digital-evidence",
+            get(crate::handlers::digital_orders::get_order_digital_evidence),
+        )
+        .route(
             "/v1/orders/{id}/digital-delivery",
             get(crate::handlers::digital_orders::get_order_digital_delivery),
         )
