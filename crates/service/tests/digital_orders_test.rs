@@ -1261,13 +1261,21 @@ async fn notifications_name_the_order_fulfillment(pool: PgPool) {
     // A recipient outside the order, and an aggregate that only looks like
     // an order, read no fulfillment, and the list still answers.
     let outsider = new_actor(&app).await;
-    for (aggregate_id, offset) in [(aggregate.as_str(), 0), ("order:not-a-uuid", 1)] {
+    let event_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM events ORDER BY id LIMIT 2")
+        .fetch_all(&app.pool)
+        .await
+        .expect("events");
+    assert_eq!(event_ids.len(), 2);
+    for ((aggregate_id, offset), event_id) in [(aggregate.as_str(), 0), ("order:not-a-uuid", 1)]
+        .into_iter()
+        .zip(event_ids)
+    {
         sqlx::query(
             "INSERT INTO notifications (id, event_id, recipient_pubky, actor_pubky, type, \
              aggregate_id, amount, created_at) VALUES ($1, $2, $3, 'system', 'order_delivered', $4, NULL, $5)",
         )
         .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
+        .bind(event_id)
         .bind(&outsider.pubky)
         .bind(aggregate_id)
         .bind(app.clock.now() + chrono::Duration::seconds(offset))
