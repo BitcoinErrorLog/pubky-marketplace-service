@@ -42,7 +42,9 @@ const stagingEnv = {
   MARKETPLACE_GRANT_WORKER_BATCH_SIZE: preserve(),
   PAYKIT_REQUEST_SIGNING_KEY: preserve(),
   PAYKIT_SERVER_URL: preserve(),
-  PAYPAL_IPN_VERIFY_URL: preserve(),
+  // Staging must never take live PayPal money.
+  PAYPAL_CHECKOUT_URL: "https://www.sandbox.paypal.com/cgi-bin/webscr",
+  PAYPAL_IPN_VERIFY_URL: "https://ipnpb.sandbox.paypal.com/cgi-bin/webscr",
   PICKUP_DETAILS_ENCRYPTION_KEY: preserve(),
   PUBLIC_APP_ORIGIN: preserve(),
   PUBLIC_SERVICE_ORIGIN: preserve(),

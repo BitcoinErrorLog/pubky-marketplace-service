@@ -84,9 +84,16 @@ const grantAndGatewayEnv = {
   STRIPE_API_BASE: preserve(),
 };
 
+// Staging must never take live PayPal money.
+const stagingPaypalSandboxEnv = {
+  PAYPAL_CHECKOUT_URL: "https://www.sandbox.paypal.com/cgi-bin/webscr",
+  PAYPAL_IPN_VERIFY_URL: "https://ipnpb.sandbox.paypal.com/cgi-bin/webscr",
+};
+
 const stagingEnv = {
   ...sharedEnv,
   ...grantAndGatewayEnv,
+  ...stagingPaypalSandboxEnv,
   AUTH_SESSION_TTL_SECONDS: preserve(),
 };
 
