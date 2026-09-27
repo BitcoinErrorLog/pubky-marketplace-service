@@ -1,6 +1,7 @@
 mod common;
 
 use std::borrow::Cow;
+use std::ops::AsyncFnMut;
 
 use chrono::{Duration, Timelike, Utc};
 use marketplace_service::refusal_audit::{
@@ -27,6 +28,41 @@ use uuid::Uuid;
 
 static ADMIN_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
 static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
+
+/// Poll until `current` reaches `target`, or panic with the last value.
+/// The audit writer commits the bucket row and only then increments
+/// `delivered`, so a row check and a counter check are not one observation.
+async fn poll_metric(
+    bound: StdDuration,
+    mut current: impl FnMut() -> u64,
+    target: u64,
+    what: &str,
+) {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        let value = current();
+        if value >= target {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{what}: {value} of {target}");
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+}
+
+async fn poll_until(bound: StdDuration, mut ready: impl AsyncFnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        if ready().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+}
 
 fn migrator_through(version: i64) -> Migrator {
     Migrator {
@@ -300,7 +336,10 @@ async fn actual_writer_fixture(pool: &PgPool) -> ActualWriterFixture {
         writer_pool.clone(),
         keys.clone(),
     ));
-    for _ in 0..50 {
+    // The writer probes immediately, then every 5s. A loaded authority query
+    // can miss the 250ms probe deadline; the next tick is the one that passes.
+    let ready_deadline = tokio::time::Instant::now() + StdDuration::from_secs(15);
+    loop {
         if runtime.is_ready() {
             return ActualWriterFixture {
                 runtime,
@@ -309,9 +348,15 @@ async fn actual_writer_fixture(pool: &PgPool) -> ActualWriterFixture {
                 login: Some(login),
             };
         }
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        if tokio::time::Instant::now() >= ready_deadline {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
     }
-    panic!("online least-authority probe did not become ready");
+    panic!(
+        "online least-authority probe did not become ready: {:?}",
+        runtime.metrics()
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -1448,41 +1493,38 @@ async fn refusal_audit_uses_separate_least_privilege_pool(pool: PgPool) {
         )
         .expect("fixed descriptor");
     runtime.try_send(envelope);
-    for _ in 0..50 {
+    let recorded = poll_until(StdDuration::from_secs(5), async || {
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM command_refusal_audit_buckets")
             .fetch_one(&pool)
             .await
             .expect("bucket count");
-        if count == 1 {
-            assert_eq!(runtime.metrics().delivered, 1);
-            let catalog_mutation =
-                sqlx::query("UPDATE command_refusal_kinds SET name=name WHERE id=1")
-                    .execute(writer_pool)
-                    .await
-                    .expect_err("writer cannot mutate catalogs");
-            assert_eq!(
-                catalog_mutation
-                    .as_database_error()
-                    .and_then(|error| error.code()),
-                Some(std::borrow::Cow::Borrowed("42501"))
-            );
-            let bucket_delete = sqlx::query("DELETE FROM command_refusal_audit_buckets")
-                .execute(writer_pool)
-                .await
-                .expect_err("writer cannot delete buckets");
-            assert_eq!(
-                bucket_delete
-                    .as_database_error()
-                    .and_then(|error| error.code()),
-                Some(std::borrow::Cow::Borrowed("42501"))
-            );
-            return;
-        }
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
-    }
-    panic!(
+        count == 1 && runtime.metrics().delivered == 1
+    })
+    .await;
+    assert!(
+        recorded,
         "actual-login delivery did not insert: {:?}",
         runtime.metrics()
+    );
+    let catalog_mutation = sqlx::query("UPDATE command_refusal_kinds SET name=name WHERE id=1")
+        .execute(writer_pool)
+        .await
+        .expect_err("writer cannot mutate catalogs");
+    assert_eq!(
+        catalog_mutation
+            .as_database_error()
+            .and_then(|error| error.code()),
+        Some(std::borrow::Cow::Borrowed("42501"))
+    );
+    let bucket_delete = sqlx::query("DELETE FROM command_refusal_audit_buckets")
+        .execute(writer_pool)
+        .await
+        .expect_err("writer cannot delete buckets");
+    assert_eq!(
+        bucket_delete
+            .as_database_error()
+            .and_then(|error| error.code()),
+        Some(std::borrow::Cow::Borrowed("42501"))
     );
 }
 
@@ -1814,25 +1856,27 @@ async fn refusal_audit_concurrent_delivery_obeys_bounds(pool: PgPool) {
         assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["error"]["code"], "INVALID_COMMAND");
     }
-    for _ in 0..200 {
-        if runtime.metrics().delivered == 200 {
-            break;
+    let settled = poll_until(StdDuration::from_secs(60), async || {
+        if runtime.metrics().delivered != 200 {
+            return false;
         }
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
-    }
-    assert_eq!(runtime.metrics().delivered, 200);
-    let (rows, admitted, occurrences): (i64, i64, i64) = sqlx::query_as(
-        "SELECT count(*), COALESCE(max(l.admitted_rows),0)::bigint, \
-                COALESCE(sum(b.occurrence_count),0)::bigint \
-         FROM command_refusal_audit_buckets b \
-         LEFT JOIN command_refusal_audit_bucket_limits l USING (bucket_start)",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("concurrent delivery totals");
-    assert_eq!(rows, 20);
-    assert_eq!(admitted, 20);
-    assert_eq!(occurrences, 200);
+        let (rows, admitted, occurrences): (i64, i64, i64) = sqlx::query_as(
+            "SELECT count(*), COALESCE(max(l.admitted_rows),0)::bigint, \
+                    COALESCE(sum(b.occurrence_count),0)::bigint \
+             FROM command_refusal_audit_buckets b \
+             LEFT JOIN command_refusal_audit_bucket_limits l USING (bucket_start)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("concurrent delivery totals");
+        rows == 20 && admitted == 20 && occurrences == 200
+    })
+    .await;
+    assert!(
+        settled,
+        "concurrent delivery did not settle: {:?}",
+        runtime.metrics()
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -1932,7 +1976,7 @@ async fn refusal_audit_manual_resolve_missing_pin_is_recorded_after_domain_relea
     .await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["reason"], "missing_pin");
-    for _ in 0..50 {
+    let recorded = poll_until(StdDuration::from_secs(5), async || {
         let count: i64 = sqlx::query_scalar(
             "SELECT COALESCE(sum(occurrence_count), 0)::bigint \
              FROM command_refusal_audit_buckets \
@@ -1941,13 +1985,14 @@ async fn refusal_audit_manual_resolve_missing_pin_is_recorded_after_domain_relea
         .fetch_one(&pool)
         .await
         .expect("manual refusal count");
-        if count == 1 {
-            assert_eq!(runtime.metrics().delivered, 1);
-            return;
-        }
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
-    }
-    panic!("manual-resolution refusal was not recorded");
+        count == 1 && runtime.metrics().delivered == 1
+    })
+    .await;
+    assert!(
+        recorded,
+        "manual-resolution refusal was not recorded: {:?}",
+        runtime.metrics()
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -2624,13 +2669,13 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         before,
         "healthy writer changes no domain facts"
     );
-    tokio::time::timeout(StdDuration::from_secs(5), async {
-        while writer.runtime.metrics().delivered != cases.len() as u64 {
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("all healthy catalog fixtures delivered");
+    poll_metric(
+        StdDuration::from_secs(30),
+        || writer.runtime.metrics().delivered,
+        cases.len() as u64,
+        "all healthy catalog fixtures delivered",
+    )
+    .await;
     let produced = sqlx::query_scalar::<_, i16>(
         "SELECT DISTINCT refusal_kind FROM command_refusal_audit_buckets ORDER BY refusal_kind",
     )
@@ -2650,7 +2695,7 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     let timeout_drops_before = writer.runtime.metrics().dropped_after_retries;
     for (case, expected) in cases.iter().zip(&golden) {
         let actual = tokio::time::timeout(
-            StdDuration::from_millis(250),
+            StdDuration::from_secs(5),
             send_refusal_case(case, Arc::clone(&writer.runtime)),
         )
         .await
@@ -2666,15 +2711,22 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         before,
         "timed-out writer changes no domain facts"
     );
-    tokio::time::timeout(StdDuration::from_secs(45), async {
-        while writer.runtime.metrics().dropped_after_retries - timeout_drops_before
-            < cases.len() as u64
-        {
-            tokio::time::sleep(StdDuration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("every timed-out envelope exhausts three attempts");
+    // The fixture sleeps 1s in the insert. Cancelling that statement can still
+    // spend the rest of the sleep while the connection closes, three attempts
+    // per envelope. Stop as soon as every drop lands; the cap covers that cost.
+    poll_metric(
+        StdDuration::from_secs(180),
+        || {
+            writer
+                .runtime
+                .metrics()
+                .dropped_after_retries
+                .saturating_sub(timeout_drops_before)
+        },
+        cases.len() as u64,
+        "every timed-out envelope exhausts three attempts",
+    )
+    .await;
     sqlx::raw_sql("DROP TRIGGER refusal_audit_timeout_fixture ON command_refusal_audit_buckets; DROP FUNCTION refusal_audit_timeout_fixture();")
         .execute(&pool).await.expect("remove timeout fixture");
 
@@ -2685,8 +2737,12 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         .expect("only writer slot on a pool of 1");
     let exhausted_drops_before = writer.runtime.metrics().dropped_after_retries;
     for (case, expected) in cases.iter().zip(&golden) {
+        // Domain work under load exceeds 250ms. A handler that awaited the
+        // held writer would add three 100ms acquires per queued envelope and
+        // miss this cap on the later cases. The drop poll below is the
+        // completion condition.
         let actual = tokio::time::timeout(
-            StdDuration::from_millis(250),
+            StdDuration::from_secs(5),
             send_refusal_case(case, Arc::clone(&writer.runtime)),
         )
         .await
@@ -2702,15 +2758,21 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         before,
         "exhausted writer changes no domain facts"
     );
-    tokio::time::timeout(StdDuration::from_secs(20), async {
-        while writer.runtime.metrics().dropped_after_retries - exhausted_drops_before
-            < cases.len() as u64
-        {
-            tokio::time::sleep(StdDuration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("every exhausted envelope exhausts three attempts");
+    // Acquire timeout is 100ms, three attempts per envelope (~15s idle for the
+    // catalog). Main CI elapsed a 20s cap while the counter was still moving.
+    poll_metric(
+        StdDuration::from_secs(90),
+        || {
+            writer
+                .runtime
+                .metrics()
+                .dropped_after_retries
+                .saturating_sub(exhausted_drops_before)
+        },
+        cases.len() as u64,
+        "every exhausted envelope exhausts three attempts",
+    )
+    .await;
     drop(held_writer);
 
     let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8; 32]);
