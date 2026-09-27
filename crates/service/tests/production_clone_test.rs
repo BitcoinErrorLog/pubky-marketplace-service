@@ -27,4 +27,14 @@ async fn production_schema_clone_applies_pending_migrations() {
     .await
     .expect("0044 constraints");
     assert_eq!(constraints, 2, "0044 constraints exist and are validated");
+    let priv_key_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public' \
+         AND tablename = 'user_priv_keys' AND indexname IN \
+         ('user_priv_keys_pkey', 'user_priv_keys_owner_generation_key', \
+          'user_priv_keys_owner_key_id_key')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("0046 indexes");
+    assert_eq!(priv_key_indexes, 3, "0046 table and unique indexes exist");
 }
