@@ -241,29 +241,30 @@ pub const READ_RATE_LIMIT_PURGE_MAX_BATCHES: u32 = 10;
 /// A token bucket in `digital_read_rate_limits`, consumed in the caller's
 /// transaction. Returns the seconds to wait when the bucket is empty.
 ///
-/// The bucket row is seeded full with `ON CONFLICT DO NOTHING` and then
-/// locked before any arithmetic, so concurrent first reads (for example one
-/// buyer opening several orders at once) all consume from the same row
-/// rather than each computing from an absent one.
+/// The bucket row is seeded full or locked in one upsert before any
+/// arithmetic, so concurrent first reads (for example one buyer opening
+/// several orders at once) all consume from the same row rather than each
+/// computing from an absent one.
 async fn consume_read_token(
     tx: &mut Transaction<'_, Postgres>,
     bucket: &str,
     per_minute: f64,
     now: DateTime<Utc>,
 ) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query(
+    // One statement seeds or locks the row and reads it. A separate
+    // `DO NOTHING` insert and `SELECT … FOR UPDATE` would leave a gap in
+    // which `purge_idle_read_buckets` can delete an idle row, and the select
+    // would then find nothing. `DO UPDATE` locks the existing row (the
+    // assignment keeps its tokens), and Postgres retries the insert if the
+    // row is deleted concurrently.
+    let (stored, updated_at): (f64, DateTime<Utc>) = sqlx::query_as(
         "INSERT INTO digital_read_rate_limits (bucket, tokens, updated_at) VALUES ($1, $2, $3) \
-         ON CONFLICT (bucket) DO NOTHING",
+         ON CONFLICT (bucket) DO UPDATE SET tokens = digital_read_rate_limits.tokens \
+         RETURNING tokens, updated_at",
     )
     .bind(bucket)
     .bind(per_minute)
     .bind(now)
-    .execute(&mut **tx)
-    .await?;
-    let (stored, updated_at): (f64, DateTime<Utc>) = sqlx::query_as(
-        "SELECT tokens, updated_at FROM digital_read_rate_limits WHERE bucket = $1 FOR UPDATE",
-    )
-    .bind(bucket)
     .fetch_one(&mut **tx)
     .await?;
     let elapsed = (now - updated_at).num_milliseconds().max(0) as f64 / 1_000.0;
