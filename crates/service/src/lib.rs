@@ -34,6 +34,7 @@ pub mod payment_availability;
 pub mod payment_methods;
 pub mod payments;
 pub mod pickup;
+pub mod priv_keys;
 pub mod queries;
 pub mod refusal_audit;
 pub mod refusal_audit_admin;
@@ -58,6 +59,7 @@ use crate::locks::LocksRuntime;
 use crate::payment_availability::PaymentAvailabilityCache;
 use crate::payments::PaymentsRuntime;
 use crate::pickup::PickupKeys;
+use crate::priv_keys::PrivKeys;
 use crate::refusal_audit::RefusalAuditRuntime;
 
 /// The sealing keys a payment confirmation pins order terms under: the
@@ -105,6 +107,11 @@ pub struct AppState {
     /// delivery is off, `digital_delivery.set` and digital checkout lines
     /// are refused, and `digital_delivery_available` reports false.
     pub digital: Option<Arc<DigitalKeys>>,
+    /// The sealing keys for per-user `/priv` data keys. `None` when
+    /// `PRIV_DATA_KEY_ENCRYPTION_KEY` is unset: `GET /v1/me/priv-keys`
+    /// answers `priv_keys_unavailable` and `priv_keys_available` reports
+    /// false.
+    pub priv_keys: Option<Arc<PrivKeys>>,
     /// Per-endpoint cache of pinned-stack readiness identities for the
     /// resolve delivery arm (§B.8.8: 15 s TTL, per endpoint).
     pub resolve_pin_cache: resolve_delivery::ResolvePinCache,
@@ -156,6 +163,7 @@ impl AppState {
             payment_availability: PaymentAvailabilityCache::default(),
             pickup: None,
             digital: None,
+            priv_keys: None,
             resolve_pin_cache: resolve_delivery::ResolvePinCache::default(),
             refusal_audit: None,
             refusal_audit_retention_pool: None,
@@ -190,6 +198,11 @@ impl AppState {
 
     pub fn with_digital(mut self, digital: Option<Arc<DigitalKeys>>) -> Self {
         self.digital = digital;
+        self
+    }
+
+    pub fn with_priv_keys(mut self, priv_keys: Option<Arc<PrivKeys>>) -> Self {
+        self.priv_keys = priv_keys;
         self
     }
 
