@@ -86,6 +86,19 @@ async fn main() -> anyhow::Result<()> {
         },
         "digital delivery sealing mode resolved"
     );
+    let priv_keys = marketplace_service::priv_keys::priv_keys_from_env(
+        locks.as_deref(),
+        pickup.as_deref(),
+        digital.as_deref(),
+    )?;
+    tracing::info!(
+        priv_keys = if priv_keys.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        "priv data key sealing mode resolved"
+    );
     // HOMESERVER_URL is required: `listing.sync` fetches canonical
     // seller-signed records from it, and running without the sync path would
     // silently re-open the unregistered-listing dead-end it exists to fix.
@@ -135,6 +148,9 @@ async fn main() -> anyhow::Result<()> {
     marketplace_service::digital::assert_digital_sealing_coherent(&pool, digital.as_deref())
         .await?;
     tracing::info!("digital delivery sealing coherence probe passed");
+    marketplace_service::priv_keys::assert_priv_key_sealing_coherent(&pool, priv_keys.as_deref())
+        .await?;
+    tracing::info!("priv data key sealing coherence probe passed");
 
     let bind_addr = config.bind_addr;
     let state = AppState::new(pool, Arc::new(SystemClock), config)
@@ -144,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
         .with_payments(payments)
         .with_pickup(pickup)
         .with_digital(digital)
+        .with_priv_keys(priv_keys)
         .with_refusal_audit(refusal_audit)
         .with_refusal_audit_retention_pool(audit_retention_pool)
         .with_grant(grant);

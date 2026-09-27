@@ -145,6 +145,7 @@ pub fn build_router(state: AppState) -> Router {
             get(queries::get_edition_attestation),
         )
         .route("/v1/notifications", get(queries::list_notifications))
+        .route("/v1/me/priv-keys", get(crate::priv_keys::get_own_priv_keys))
         .route(
             "/v0/sellers/me/payment-config",
             put(crate::payment_methods::put_payment_config)
@@ -267,6 +268,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "pickup_available": state.pickup_available(),
         "digital_delivery_available": state.digital_delivery_available(),
         "digital_delivery_max_bytes": state.config.digital_delivery_max_bytes,
+        "priv_keys_available": state.priv_keys.is_some(),
         "paykit_rail": {
             "bitcoin_offer_available": bitcoin_offer_available,
             "age_seconds": age_seconds,

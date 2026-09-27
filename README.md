@@ -111,6 +111,8 @@ Railway IaC `preserve()`):
 | `SANDBOX_PAYMENTS_ENABLED` | `false` | accept `payment.sandbox_advance` at all; must stay `false` on any deployment handling real orders |
 | `PICKUP_DETAILS_ENCRYPTION_KEY` | unset | 32-byte hex key sealing local-pickup details and pinned payment snapshots at rest (XChaCha20-Poly1305); must differ from the Locks key material; pickup is OFF without it |
 | `PICKUP_DETAILS_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous pickup key for the dual-key read window during rotation; the re-seal worker migrates both sealed families to the current key |
+| `PRIV_DATA_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing per-user `/priv` data keys at rest (XChaCha20-Poly1305); must differ from the Locks, pickup and digital delivery keys; `GET /v1/me/priv-keys` answers `priv_keys_unavailable` without it, and the service refuses to boot while sealed rows exist without it |
+| `PRIV_DATA_KEY_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous priv data key sealing key for the dual-key read window during rotation; the re-seal worker moves every row to the current key. Keep it set until the pass reports zero rows under the previous key |
 | `PICKUP_DISPUTE_RETENTION_DAYS` | `30` | days a cancelled-after-payment order's pinned pickup snapshot is retained as the dispute exhibit when no refund evidence ever lands, before the ordinary terminal-order purge takes it (≥ 1) |
 
 ### Public payment configuration availability

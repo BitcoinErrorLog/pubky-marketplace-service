@@ -32,74 +32,23 @@ use uuid::Uuid;
 
 use crate::locks::{LocksRuntime, ENV_BUNDLE_ENCRYPTION_KEY, ENV_LOOKUP_HMAC_KEY};
 use crate::pickup::{PickupKeys, ENV_PICKUP_DETAILS_ENCRYPTION_KEY};
-use crate::seal::{self, KEY_LEN};
+use crate::rotating_keys::{KeyFamily, RotatingKeys};
 
 pub const ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY: &str = "DIGITAL_DELIVERY_ENCRYPTION_KEY";
 pub const ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY_PREVIOUS: &str =
     "DIGITAL_DELIVERY_ENCRYPTION_KEY_PREVIOUS";
 
+pub struct DigitalDeliveryFamily;
+
+impl KeyFamily for DigitalDeliveryFamily {
+    const CURRENT_ENV: &'static str = ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY;
+    const PREVIOUS_ENV: &'static str = ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY_PREVIOUS;
+    const DESCRIPTION: &'static str = "digital delivery";
+    const DEBUG_NAME: &'static str = "DigitalKeys";
+}
+
 /// The configured sealing keys. Seals always use the current key.
-pub struct DigitalKeys {
-    current: [u8; KEY_LEN],
-    previous: Option<[u8; KEY_LEN]>,
-}
-
-impl std::fmt::Debug for DigitalKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("DigitalKeys(<redacted>)")
-    }
-}
-
-impl DigitalKeys {
-    pub fn from_hex(current_hex: &str, previous_hex: Option<&str>) -> anyhow::Result<Self> {
-        let current = seal::parse_key(ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY, current_hex)?;
-        let previous = previous_hex
-            .map(|hex| seal::parse_key(ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY_PREVIOUS, hex))
-            .transpose()?;
-        if previous.as_ref() == Some(&current) {
-            anyhow::bail!(
-                "{ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY} and \
-                 {ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY_PREVIOUS} must be distinct keys"
-            );
-        }
-        Ok(Self { current, previous })
-    }
-
-    pub fn has_previous(&self) -> bool {
-        self.previous.is_some()
-    }
-
-    pub fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        seal::seal(&self.current, aad, plaintext)
-    }
-
-    pub fn open(&self, aad: &[u8], sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if let Ok(plaintext) = seal::open(&self.current, aad, sealed) {
-            return Ok(plaintext);
-        }
-        if let Some(previous) = &self.previous {
-            return seal::open(previous, aad, sealed);
-        }
-        Err(anyhow::anyhow!(
-            "ciphertext did not authenticate under the configured digital delivery key"
-        ))
-    }
-
-    fn opens_under_current(&self, aad: &[u8], sealed: &[u8]) -> bool {
-        seal::open(&self.current, aad, sealed).is_ok()
-    }
-
-    fn open_under_previous(&self, aad: &[u8], sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let Some(previous) = &self.previous else {
-            anyhow::bail!("no previous digital delivery key configured");
-        };
-        seal::open(previous, aad, sealed)
-    }
-
-    fn key_material(&self) -> impl Iterator<Item = &[u8; KEY_LEN]> {
-        std::iter::once(&self.current).chain(self.previous.iter())
-    }
-}
+pub type DigitalKeys = RotatingKeys<DigitalDeliveryFamily>;
 
 pub fn version_aad(
     listing_aggregate_id: &str,
@@ -139,18 +88,9 @@ pub fn digital_keys_from_env(
     locks: Option<&LocksRuntime>,
     pickup: Option<&PickupKeys>,
 ) -> anyhow::Result<Option<Arc<DigitalKeys>>> {
-    let current = std::env::var(ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY).ok();
-    let previous = std::env::var(ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY_PREVIOUS).ok();
-    let Some(current) = current else {
-        if previous.is_some() {
-            anyhow::bail!(
-                "{ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY_PREVIOUS} requires \
-                 {ENV_DIGITAL_DELIVERY_ENCRYPTION_KEY}"
-            );
-        }
+    let Some(keys) = DigitalKeys::from_env()? else {
         return Ok(None);
     };
-    let keys = DigitalKeys::from_hex(&current, previous.as_deref())?;
     ensure_distinct_keys(&keys, locks, pickup)?;
     Ok(Some(Arc::new(keys)))
 }
