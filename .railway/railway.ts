@@ -14,7 +14,7 @@ const PRODUCTION_ENVIRONMENT_ID = "404919ad-fb95-4621-9f45-b7f993dfa8ae";
 // of git, not of the operator's shell. The release train MUST bump each
 // constant in the same PR as the IMAGE connect for that seat.
 const LIVE_IMAGE =
-  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:b6b5ba935e63a0287815d65995dab71df41c2201119d708720460fe7432d05db";
+  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:f2284cc4dcfee4a36784997f756da31a5a9b0e3c43b57e0f61ecd22ee907daa0";
 const STAGING_IMAGE = LIVE_IMAGE;
 const PRODUCTION_IMAGE = LIVE_IMAGE;
 
@@ -84,9 +84,16 @@ const grantAndGatewayEnv = {
   STRIPE_API_BASE: preserve(),
 };
 
+// Staging must never take live PayPal money.
+const stagingPaypalSandboxEnv = {
+  PAYPAL_CHECKOUT_URL: "https://www.sandbox.paypal.com/cgi-bin/webscr",
+  PAYPAL_IPN_VERIFY_URL: "https://ipnpb.sandbox.paypal.com/cgi-bin/webscr",
+};
+
 const stagingEnv = {
   ...sharedEnv,
   ...grantAndGatewayEnv,
+  ...stagingPaypalSandboxEnv,
   AUTH_SESSION_TTL_SECONDS: preserve(),
 };
 
