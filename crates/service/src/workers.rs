@@ -75,6 +75,7 @@ pub const TASK_DELIVERY_AUTOCOMPLETE: &str = "delivery_autocomplete";
 pub const TASK_PICKUP_RESEAL: &str = "pickup_reseal";
 pub const TASK_DIGITAL_RESEAL: &str = "digital_reseal";
 pub const TASK_DELIVERY_EMAIL_PURGE: &str = "delivery_email_purge";
+pub const TASK_READ_RATE_PURGE: &str = "read_rate_purge";
 pub const TASK_PICKUP_RETENTION: &str = "pickup_retention";
 pub const TASK_SELLER_CONFIRMATION_WINDOW: &str = "seller_confirmation_window";
 pub const TASK_MANUAL_REVIEW_WATCH: &str = "manual_review_watch";
@@ -3352,6 +3353,7 @@ pub struct WorkerSummary {
     pub pickup_versions_purged: u64,
     pub digital_rows_resealed: u64,
     pub delivery_emails_purged: u64,
+    pub read_rate_buckets_purged: u64,
     pub seller_windows_routed: u64,
     pub manual_review_sla_alerts: u64,
     pub manual_reviews_abandoned: u64,
@@ -3769,6 +3771,28 @@ pub async fn run_once(
         release_lease(&state.pool, TASK_DELIVERY_EMAIL_PURGE, holder, now).await?;
         summary.delivery_emails_purged = result?;
     }
+    // Download-rate buckets idle past READ_RATE_LIMIT_IDLE. Deleting one
+    // changes no later read: it has refilled to a full bucket, which is
+    // what the next read seeds.
+    if try_acquire_lease(
+        &state.pool,
+        TASK_READ_RATE_PURGE,
+        holder,
+        now,
+        lease_seconds,
+    )
+    .await?
+    {
+        let result = crate::handlers::digital_orders::purge_idle_read_buckets(
+            &state.pool,
+            now,
+            crate::handlers::digital_orders::READ_RATE_LIMIT_PURGE_BATCH,
+            crate::handlers::digital_orders::READ_RATE_LIMIT_PURGE_MAX_BATCHES,
+        )
+        .await;
+        release_lease(&state.pool, TASK_READ_RATE_PURGE, holder, now).await?;
+        summary.read_rate_buckets_purged = result?;
+    }
     if let Some(digital) = &state.digital {
         if digital.has_previous()
             && try_acquire_lease(&state.pool, TASK_DIGITAL_RESEAL, holder, now, lease_seconds)
@@ -4038,6 +4062,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             resolve_rows_delivered = summary.resolve_rows_delivered,
                             fx_samples_accepted = summary.fx_samples_accepted,
                             refusal_audit_rows_purged = summary.refusal_audit_rows_purged,
+                            read_rate_buckets_purged = summary.read_rate_buckets_purged,
                             "worker pass completed"
                         );
                     }
