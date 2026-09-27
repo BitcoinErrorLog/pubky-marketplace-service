@@ -708,6 +708,50 @@ async fn pinned_a_then_repoint_b_delivers_only_to_a(pool: PgPool) {
     );
 }
 
+/// Upstream paykit-server (`pubky/paykit-server@722ef26` master and
+/// `@7f1fec9` `feat/lock-payment-draining`) publishes no stack identity on
+/// `/health/ready` and serves no resolve route. Every resolve row is issued
+/// by the fork, so a row whose pinned endpoint answers upstream's body is
+/// never sent there.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_fork_row_is_never_sent_to_an_endpoint_answering_upstream_readiness(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let upstream = spawn_fake_paykit().await;
+    upstream.set_rail_health(json!({
+        "status": "ready",
+        "postgres": "ready",
+        "electrum": "ready",
+        "paykit_delivery": "ready",
+        "outbox": "ready",
+    }));
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _invoice_id) =
+        confirmed_order_with_resolve_row(&app, &paykit, &seller, &buyer).await;
+    sqlx::query("UPDATE paykit_resolve_outbox SET stack_endpoint = $2 WHERE order_id = $1")
+        .bind(Uuid::parse_str(&order_id).unwrap())
+        .bind(&upstream.base_url)
+        .execute(&pool)
+        .await
+        .expect("point the row at the upstream-shaped endpoint");
+
+    let finished = deliver(&app, paykit_client(&app), app.clock.now()).await;
+    assert_eq!(finished, 1);
+    let row = row_state(&pool, &order_id).await;
+    assert_eq!(row.delivery_state, "terminal_unresolved");
+    assert_eq!(row.terminal_reason.as_deref(), Some("stack_pin_mismatch"));
+    assert_eq!(
+        upstream
+            .calls()
+            .iter()
+            .map(|call| call.path.as_str())
+            .collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "only the unrecorded readiness read reached the upstream-shaped endpoint"
+    );
+    assert_eq!(upstream.rail_health_requests(), 1);
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn redelivery_is_a_terminal_ok_noop(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
