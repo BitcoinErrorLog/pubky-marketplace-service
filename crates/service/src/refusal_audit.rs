@@ -1786,6 +1786,13 @@ mod tests {
         );
     }
 
+    fn is_lock_timeout(error: &sqlx::Error) -> bool {
+        error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .is_some_and(|code| code == "55P03")
+    }
+
     #[sqlx::test(migrator = "crate::TEST_MIGRATOR")]
     async fn refusal_audit_10000_row_concurrent_admission_bound(pool: PgPool) {
         let occurred_at = Utc::now();
@@ -1800,7 +1807,9 @@ mod tests {
         // production SET LOCAL lock_timeout = '50ms'. On a 2-core GitHub
         // runner that wait exceeds 50ms (55P03); production retries that
         // PreCommit up to DELIVERY_ATTEMPTS. This test keeps the 50ms timeout
-        // and the 10_000 cap, and races only the last three slots.
+        // and the 10_000 cap, and races only the last three slots. A loser of
+        // that race sees 55P03; delivery retries PreCommit, and so does this
+        // direct prepare_delivery call.
         sqlx::query(
             "INSERT INTO command_refusal_audit_buckets (
                 bucket_start, surface_kind, command_kind, refusal_kind,
@@ -1846,11 +1855,20 @@ mod tests {
                     sample_command_tag: None,
                     command_id_present: false,
                 };
-                let mut transaction = pool.begin().await.expect("stress transaction");
-                prepare_delivery(&mut transaction, &envelope)
-                    .await
-                    .expect("bounded admission");
-                transaction.commit().await.expect("stress commit");
+                for attempt in 0..8 {
+                    let mut transaction = pool.begin().await.expect("stress transaction");
+                    match prepare_delivery(&mut transaction, &envelope).await {
+                        Ok(()) => {
+                            transaction.commit().await.expect("stress commit");
+                            break;
+                        }
+                        Err(error) if is_lock_timeout(&error) && attempt + 1 < 8 => {
+                            drop(transaction);
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                        Err(error) => panic!("bounded admission: {error}"),
+                    }
+                }
             });
         }
         while let Some(result) = tasks.join_next().await {
