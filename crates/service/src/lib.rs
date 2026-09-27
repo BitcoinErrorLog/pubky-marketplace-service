@@ -40,6 +40,7 @@ pub mod refusal_audit_admin;
 pub mod reserve_secrecy;
 pub mod resolve_delivery;
 pub mod result;
+pub mod rotating_keys;
 pub mod seal;
 pub mod shipping;
 pub mod workers;
