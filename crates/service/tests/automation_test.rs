@@ -523,7 +523,7 @@ async fn endpoint_classes_use_service_clock_rate_limits(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = send(
+    let (status, headers, body) = send_with_headers(
         app.router.clone(),
         "GET",
         "/v1/auth/sessions",
@@ -533,6 +533,16 @@ async fn endpoint_classes_use_service_clock_rate_limits(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(body["error"]["code"], json!("rate_limited"));
+    // One token per minute, bucket empty on a frozen clock: ceil(60/1) = 60.
+    let retry_after = headers
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .expect("Retry-After header is missing");
+    let seconds: i64 = retry_after
+        .parse()
+        .unwrap_or_else(|_| panic!("Retry-After {retry_after:?} is not an integer"));
+    assert!(seconds > 0, "Retry-After must be a positive integer");
+    assert_eq!(seconds, 60);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

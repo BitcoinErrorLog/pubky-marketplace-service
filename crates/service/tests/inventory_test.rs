@@ -46,6 +46,18 @@ fn adjust_request(
     })
 }
 
+fn assert_retry_after_seconds(headers: &axum::http::HeaderMap, expected: i64) {
+    let raw = headers
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .expect("Retry-After header is missing");
+    let seconds: i64 = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("Retry-After {raw:?} is not an integer"));
+    assert!(seconds > 0, "Retry-After must be a positive integer");
+    assert_eq!(seconds, expected);
+}
+
 async fn adjust(app: &TestApp, token: &str, body: &Value) -> (StatusCode, Value) {
     send(
         app.router.clone(),
@@ -607,9 +619,18 @@ async fn unavailable_variant_lookups_consume_rate_before_remote_io_and_stop_at_4
 
     let mut next = adjust_request(&seller.pubky, 1, 1, Uuid::new_v4());
     next["variant"] = json!({"id": "v1"});
-    let (status, body) = adjust(&app, &seller.token, &next).await;
+    let (status, headers, body) = send_with_headers(
+        app.router.clone(),
+        "POST",
+        "/v1/inventory/adjust",
+        Some(&seller.token),
+        &next,
+    )
+    .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(body["error"]["code"], json!("rate_limited"));
+    // The inventory limiter reports a fixed one-second wait.
+    assert_retry_after_seconds(&headers, 1);
     assert_eq!(
         fetch_count.load(Ordering::SeqCst),
         240,
@@ -1011,5 +1032,6 @@ async fn named_rate_limit_defaults_and_replay_bypass_are_enforced(pool: PgPool) 
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(body["error"]["code"], json!("rate_limited"));
     assert_eq!(body["error"]["limit_class"], json!("inventory.adjust"));
-    assert!(headers.get("retry-after").is_some());
+    // The inventory limiter reports a fixed one-second wait.
+    assert_retry_after_seconds(&headers, 1);
 }
