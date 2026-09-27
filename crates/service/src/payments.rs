@@ -666,6 +666,39 @@ impl PaypalIpnVerifier {
     }
 }
 
+/// The rail-wide Bitcoin offer gate from a `/health/ready` body.
+///
+/// - The fork publishes `bitcoin_offer_available`; when present it is the
+///   answer.
+/// - Upstream paykit-server (and the fork before Hop 1) publishes
+///   `{status, postgres, electrum, paykit_delivery, outbox}` with string
+///   components. Only `status == "ready"` permits new Bitcoin offers there;
+///   upstream's `status` is `ready` only when every component is.
+/// - The fork's Hop 1 rollout body carries an `electrum` object and no
+///   aggregate gate; its `state` decides.
+///
+/// Anything else is `false`.
+pub fn rail_offer_available(body: &serde_json::Value) -> bool {
+    body.get("bitcoin_offer_available")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            let status = body.get("status")?.as_str()?;
+            let electrum = body.get("electrum")?.as_str()?;
+            Some(status == "ready" && electrum == "ready")
+        })
+        .or_else(|| {
+            body.get("electrum").and_then(|electrum| match electrum {
+                serde_json::Value::String(state) => Some(state == "ready"),
+                serde_json::Value::Object(object) => object
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|state| state == "ready"),
+                _ => None,
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// The strict transaction-status contract paykit-server emits
 /// (`paykit.bitcoin_status/v2`, W1.14). The consumer fails CLOSED: a
 /// missing/wrong `contract_version`, a missing/unknown `allocation_mode`,
@@ -753,6 +786,39 @@ pub enum PaykitStatusOutcome {
     },
     NotFound,
     Unavailable,
+}
+
+/// Reads upstream paykit-server's `/transactions/status` body, which is
+/// exactly `{status, confirmations, amount_matched}`. `None` means the bytes
+/// are not that shape, and the caller fails closed as before.
+///
+/// Upstream reports no late-settlement flag and no allocation mode, and every
+/// automatic transition on a detected or confirmed payment depends on both.
+/// Only `undetected` is therefore an outcome; `detected` and `confirmed` fail
+/// closed as `Unavailable` until upstream defines those facts.
+pub fn upstream_payment_status(bytes: &[u8]) -> Option<PaykitStatusOutcome> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UpstreamStatusBody {
+        status: String,
+        #[allow(dead_code)]
+        confirmations: u32,
+        #[allow(dead_code)]
+        amount_matched: bool,
+    }
+    let body = serde_json::from_slice::<UpstreamStatusBody>(bytes).ok()?;
+    match body.status.as_str() {
+        "undetected" => Some(PaykitStatusOutcome::Undetected),
+        "detected" | "confirmed" => {
+            tracing::warn!(
+                status = %body.status,
+                "upstream paykit payment status carries no late-settlement flag or \
+                 allocation mode; failing closed"
+            );
+            Some(PaykitStatusOutcome::Unavailable)
+        }
+        _ => None,
+    }
 }
 
 /// How a Paykit payment-request creation failed.
@@ -996,12 +1062,8 @@ impl PaykitClient {
             .map_err(|_| PaykitRequestError::Unavailable)
     }
 
-    /// Reads Paykit's rail-wide Bitcoin offer gate.
-    ///
-    /// During the Hop 1 rollout, older paykit-server responses omit
-    /// `bitcoin_offer_available`; in that case the `electrum` component is
-    /// the compatibility source of truth. It may be a `"ready"` string or
-    /// an object whose `state` is `"ready"`.
+    /// Reads Paykit's rail-wide Bitcoin offer gate (see
+    /// [`rail_offer_available`] for the accepted readiness shapes).
     pub async fn rail_health(&self) -> Result<bool, PaykitRequestError> {
         let response = self
             .http
@@ -1017,20 +1079,7 @@ impl PaykitClient {
             .json::<serde_json::Value>()
             .await
             .map_err(|_| PaykitRequestError::Unavailable)?;
-        Ok(body
-            .get("bitcoin_offer_available")
-            .and_then(serde_json::Value::as_bool)
-            .or_else(|| {
-                body.get("electrum").and_then(|electrum| match electrum {
-                    serde_json::Value::String(state) => Some(state == "ready"),
-                    serde_json::Value::Object(object) => object
-                        .get("state")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|state| state == "ready"),
-                    _ => None,
-                })
-            })
-            .unwrap_or(false))
+        Ok(rail_offer_available(&body))
     }
 
     fn signed_body(&self, value: &serde_json::Value) -> anyhow::Result<(String, String)> {
@@ -1377,9 +1426,16 @@ impl PaykitClient {
             #[serde(default)]
             paykit_delivery_state: Option<String>,
         }
-        let body = match response.json::<StatusBody>().await {
+        let Ok(bytes) = response.bytes().await else {
+            tracing::warn!("paykit payment status returned a malformed body; failing closed");
+            return (PaykitStatusOutcome::Unavailable, None);
+        };
+        let body = match serde_json::from_slice::<StatusBody>(&bytes) {
             Ok(body) => body,
             Err(_) => {
+                if let Some(outcome) = upstream_payment_status(&bytes) {
+                    return (outcome, None);
+                }
                 tracing::warn!("paykit payment status returned a malformed body; failing closed");
                 return (PaykitStatusOutcome::Unavailable, None);
             }

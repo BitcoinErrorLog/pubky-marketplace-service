@@ -296,12 +296,21 @@ async fn public_config_mirrors_and_caches_the_rail_gate(pool: PgPool) {
 
     paykit.set_rail_health(json!({
         "status": "degraded",
-        "electrum": "ready",
+        "electrum": { "state": "ready" },
     }));
     app.clock.advance_seconds(16);
     let (status, body) = get_public_config(&app, &seller.pubky).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["bitcoin_offer_available"], json!(true));
+
+    paykit.set_rail_health(json!({
+        "status": "degraded",
+        "electrum": "ready",
+    }));
+    app.clock.advance_seconds(16);
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["bitcoin_offer_available"], json!(false));
 
     paykit.set_rail_health(json!({ "status": "degraded" }));
     app.clock.advance_seconds(16);
@@ -332,9 +341,12 @@ async fn paykit_failure_uses_last_known_then_fails_closed_without_503(pool: PgPo
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn legacy_paykit_rail_fallback_uses_electrum_component(pool: PgPool) {
+async fn paykit_rail_fallbacks_without_bitcoin_offer_available(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
+    // Upstream paykit-server's (and the pre-Hop-1 fork's) string-component
+    // body answers from the aggregate `status`; the Hop 1 electrum object
+    // answers from its own `state`.
     let fixtures = [
         (
             json!({
@@ -344,8 +356,19 @@ async fn legacy_paykit_rail_fallback_uses_electrum_component(pool: PgPool) {
                 "paykit_delivery": "degraded",
                 "outbox": "ready",
             }),
+            false,
+        ),
+        (
+            json!({
+                "status": "ready",
+                "postgres": "ready",
+                "electrum": "ready",
+                "paykit_delivery": "ready",
+                "outbox": "ready",
+            }),
             true,
         ),
+        (json!({ "electrum": "ready" }), true),
         (
             json!({
                 "status": "degraded",
