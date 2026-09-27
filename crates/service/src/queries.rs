@@ -97,8 +97,19 @@ pub async fn seller_has_rail(
     .await
 }
 
-pub const NOTIFICATION_COLUMNS: &str =
-    "id, recipient_pubky, actor_pubky, type, aggregate_id, amount, created_at, read_at";
+/// The notification columns plus `order_fulfillment`: the fulfillment of the
+/// order the notification is about, read at query time so rows written
+/// before the field existed carry it too. It is read only when the recipient
+/// is a party to that order; other aggregates, and malformed order ids, read
+/// NULL (the guarded CASE never casts a non-UUID).
+pub const NOTIFICATION_COLUMNS: &str = "n.id, n.recipient_pubky, n.actor_pubky, n.type, \
+     n.aggregate_id, n.amount, n.created_at, n.read_at, \
+     (SELECT o.fulfillment FROM orders o \
+      WHERE o.id = CASE WHEN n.aggregate_id ~ \
+        '^order:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+        THEN substring(n.aggregate_id FROM 7)::uuid END \
+      AND (o.buyer_pubky = n.recipient_pubky OR o.seller_pubky = n.recipient_pubky)) \
+     AS order_fulfillment";
 
 pub const RECEIPT_COLUMNS: &str = "id, order_id, payment_id, issuer_pubky, recipient_pubky, \
      total_minor, currency, exponent, merchandise_total_minor, merchandise_currency, \
@@ -996,8 +1007,8 @@ pub async fn list_notifications(
         return invalid_limit();
     };
     let notifications: Result<Vec<NotificationRow>, sqlx::Error> = sqlx::query_as(&format!(
-        "SELECT {NOTIFICATION_COLUMNS} FROM notifications WHERE recipient_pubky = $1 \
-         ORDER BY created_at DESC, id DESC LIMIT $2"
+        "SELECT {NOTIFICATION_COLUMNS} FROM notifications n WHERE n.recipient_pubky = $1 \
+         ORDER BY n.created_at DESC, n.id DESC LIMIT $2"
     ))
     .bind(&actor.0)
     .bind(limit)

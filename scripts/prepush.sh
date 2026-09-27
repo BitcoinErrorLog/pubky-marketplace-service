@@ -9,12 +9,8 @@ cd "$ROOT"
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.89.0}"
 
 start=$(date +%s)
-LOCK="/Volumes/t7/vibes-dev/.locks/heavy.lock"
-
-run_heavy() {
-  mkdir -p "$(dirname "$LOCK")"
-  lockf "$LOCK" "$@"
-}
+# shellcheck source=heavy-lock.sh
+source "$ROOT/scripts/heavy-lock.sh"
 
 # Hook stdin lists the refs being pushed. A push whose every commit message
 # contains [skip ci] does not run the gate.
@@ -133,10 +129,10 @@ if [ "$encryption" != "scram-sha-256" ] || [ "$host_all" != "scram-sha-256" ]; t
 fi
 
 echo "prepush: cargo clippy"
-run_heavy cargo clippy --workspace --all-targets -- -D warnings
+run_heavy cargo cargo clippy --workspace --all-targets -- -D warnings
 
 echo "prepush: cargo test"
-run_heavy bash scripts/ci-test.sh
+run_heavy cargo bash scripts/ci-test.sh
 
 sha="$(git rev-parse HEAD)"
 seconds="$(( $(date +%s) - start ))"

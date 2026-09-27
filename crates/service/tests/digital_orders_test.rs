@@ -1271,6 +1271,85 @@ async fn sandbox_confirmed_never_delivers(pool: PgPool) {
     assert!(!body.to_string().contains(TEXT_V1));
 }
 
+// Shop words `order_delivered` for a download, not a parcel, from the
+// notification's `order_fulfillment`. Only a party to the order reads it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn notifications_name_the_order_fulfillment(pool: PgPool) {
+    let (app, _server) = keyed_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = delivered_text_order(&app, &seller, &buyer).await;
+    drain_outbox(&app.pool, None, app.clock.now(), 30)
+        .await
+        .expect("outbox drains");
+    let aggregate = format!("order:{}", order.order_id);
+
+    let list = |token: String| {
+        let router = app.router.clone();
+        async move {
+            let (status, body) = send(
+                router,
+                "GET",
+                "/v1/notifications",
+                Some(&token),
+                &Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["notifications"]
+                .as_array()
+                .expect("notifications is an array")
+                .clone()
+        }
+    };
+    let buyer_rows = list(buyer.token.clone()).await;
+    let delivered = buyer_rows
+        .iter()
+        .find(|row| row["type"] == json!("order_delivered"))
+        .expect("the buyer is told the order was delivered");
+    assert_eq!(delivered["aggregate_id"], json!(aggregate));
+    assert_eq!(delivered["order_fulfillment"], json!("digital"));
+    let seller_rows = list(seller.token.clone()).await;
+    assert!(!seller_rows.is_empty());
+    for row in seller_rows
+        .iter()
+        .filter(|row| row["aggregate_id"] == json!(aggregate))
+    {
+        assert_eq!(row["order_fulfillment"], json!("digital"), "{row}");
+    }
+
+    // A recipient outside the order, and an aggregate that only looks like
+    // an order, read no fulfillment, and the list still answers.
+    let outsider = new_actor(&app).await;
+    let event_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM events ORDER BY id LIMIT 2")
+        .fetch_all(&app.pool)
+        .await
+        .expect("events");
+    assert_eq!(event_ids.len(), 2);
+    for ((aggregate_id, offset), event_id) in [(aggregate.as_str(), 0), ("order:not-a-uuid", 1)]
+        .into_iter()
+        .zip(event_ids)
+    {
+        sqlx::query(
+            "INSERT INTO notifications (id, event_id, recipient_pubky, actor_pubky, type, \
+             aggregate_id, amount, created_at) VALUES ($1, $2, $3, 'system', 'order_delivered', $4, NULL, $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(event_id)
+        .bind(&outsider.pubky)
+        .bind(aggregate_id)
+        .bind(app.clock.now() + chrono::Duration::seconds(offset))
+        .execute(&app.pool)
+        .await
+        .expect("notification row");
+    }
+    let outsider_rows = list(outsider.token.clone()).await;
+    assert_eq!(outsider_rows.len(), 2);
+    for row in &outsider_rows {
+        assert_eq!(row["order_fulfillment"], Value::Null, "{row}");
+    }
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn ship_refused_for_digital(pool: PgPool) {
     let (app, _server) = keyed_app(pool).await;

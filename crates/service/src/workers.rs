@@ -74,6 +74,7 @@ pub const TASK_STAT_ATTESTATIONS: &str = "stat_attestations";
 pub const TASK_DELIVERY_AUTOCOMPLETE: &str = "delivery_autocomplete";
 pub const TASK_PICKUP_RESEAL: &str = "pickup_reseal";
 pub const TASK_DIGITAL_RESEAL: &str = "digital_reseal";
+pub const TASK_PRIV_KEY_RESEAL: &str = "priv_key_reseal";
 pub const TASK_DELIVERY_EMAIL_PURGE: &str = "delivery_email_purge";
 pub const TASK_READ_RATE_PURGE: &str = "read_rate_purge";
 pub const TASK_PICKUP_RETENTION: &str = "pickup_retention";
@@ -3352,6 +3353,7 @@ pub struct WorkerSummary {
     pub pickup_snapshots_purged: u64,
     pub pickup_versions_purged: u64,
     pub digital_rows_resealed: u64,
+    pub priv_keys_resealed: u64,
     pub delivery_emails_purged: u64,
     pub read_rate_buckets_purged: u64,
     pub seller_windows_routed: u64,
@@ -3817,6 +3819,44 @@ pub async fn run_once(
                     tracing::error!(
                         error = %error,
                         "digital delivery re-seal pass failed; continuing with the remaining \
+                         worker tasks"
+                    );
+                }
+            }
+        }
+    }
+    // While a previous priv data key sealing key is configured, one re-seal
+    // pass per tick over `user_priv_keys`. A failed pass is logged and
+    // retried next tick, as the digital delivery pass is.
+    if let Some(priv_keys) = &state.priv_keys {
+        if priv_keys.has_previous()
+            && try_acquire_lease(
+                &state.pool,
+                TASK_PRIV_KEY_RESEAL,
+                holder,
+                now,
+                lease_seconds,
+            )
+            .await?
+        {
+            let result =
+                crate::priv_keys::reseal_previous_key_batch(&state.pool, priv_keys, now).await;
+            release_lease(&state.pool, TASK_PRIV_KEY_RESEAL, holder, now).await?;
+            match result {
+                Ok(progress) => {
+                    summary.priv_keys_resealed = progress.resealed;
+                    if progress.remaining_under_previous == 0 && progress.resealed > 0 {
+                        tracing::info!(
+                            resealed = progress.resealed,
+                            "priv data key rotation complete: zero rows remain under the \
+                             previous key"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "priv data key re-seal pass failed; continuing with the remaining \
                          worker tasks"
                     );
                 }

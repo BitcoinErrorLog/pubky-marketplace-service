@@ -1701,6 +1701,10 @@ pub struct NotificationRow {
     pub amount: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub read_at: Option<DateTime<Utc>>,
+    /// `shipping`, `pickup` or `digital` for a notification about an order
+    /// the recipient is party to; NULL otherwise. Lets a client word
+    /// `order_delivered` for a download rather than a parcel.
+    pub order_fulfillment: Option<String>,
 }
 
 impl NotificationRow {
@@ -1714,6 +1718,7 @@ impl NotificationRow {
             "amount": self.amount,
             "created_at": format_timestamp(self.created_at),
             "read_at": self.read_at.map(format_timestamp),
+            "order_fulfillment": self.order_fulfillment,
         })
     }
 }

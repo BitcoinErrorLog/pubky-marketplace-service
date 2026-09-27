@@ -17,6 +17,7 @@ use common::{
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::workers::drain_outbox;
+use uuid::Uuid;
 
 async fn get(app: &TestApp, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
     send(app.router.clone(), "GET", uri, token, &json!(null)).await
@@ -406,6 +407,11 @@ async fn notifications_are_readable_only_by_their_recipient(pool: PgPool) {
     assert_eq!(notifications[0]["recipient_pubky"], json!(seller.pubky));
     assert_eq!(notifications[0]["actor_pubky"], json!(buyer.pubky));
     assert_eq!(notifications[0]["read_at"], Value::Null);
+    assert_eq!(
+        notifications[0]["order_fulfillment"],
+        Value::Null,
+        "an offer is not an order"
+    );
 
     let (status, body) = get(&app, "/v1/notifications", Some(&other_seller.token)).await;
     assert_eq!(status, StatusCode::OK, "notification list failed: {body}");
@@ -459,4 +465,35 @@ async fn list_limits_are_bounded_and_ordering_is_newest_first(pool: PgPool) {
     let (status, body) = get(&app, "/v1/orders", Some(&buyer.token)).await;
     assert_eq!(status, StatusCode::OK, "default list failed: {body}");
     assert_eq!(body["orders"].as_array().map(Vec::len), Some(2));
+
+    // An unpaid checkout notifies nobody, so a notification about the newest
+    // order is written directly: its fulfillment is read from the order.
+    let event_id: Uuid = sqlx::query_scalar("SELECT id FROM events ORDER BY id LIMIT 1")
+        .fetch_one(&app.pool)
+        .await
+        .expect("event");
+    let order_id = newest_order_id.as_str().expect("order id");
+    sqlx::query(
+        "INSERT INTO notifications (id, event_id, recipient_pubky, actor_pubky, type, \
+         aggregate_id, amount, created_at) VALUES ($1, $2, $3, $4, 'order_delivered', $5, NULL, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(event_id)
+    .bind(&seller.pubky)
+    .bind(&buyer.pubky)
+    .bind(format!("order:{order_id}"))
+    .bind(app.clock.now())
+    .execute(&app.pool)
+    .await
+    .expect("notification row");
+    let (status, body) = get(&app, "/v1/notifications", Some(&seller.token)).await;
+    assert_eq!(status, StatusCode::OK, "notification list failed: {body}");
+    assert_eq!(
+        body["notifications"][0]["aggregate_id"],
+        json!(format!("order:{order_id}"))
+    );
+    assert_eq!(
+        body["notifications"][0]["order_fulfillment"],
+        json!("shipping")
+    );
 }
