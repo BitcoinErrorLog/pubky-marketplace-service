@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use marketplace_domain::commands::DigitalDeliveryKind;
 use marketplace_domain::ErrorCode;
 use serde_json::{json, Value};
-use sqlx::{FromRow, Postgres, Transaction};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::auth::Actor;
@@ -219,32 +219,52 @@ pub const ORDER_READS_PER_MINUTE: f64 = 10.0;
 /// records the first open and at most one open per line per hour.
 pub const ACCESS_COALESCE_SECONDS: i64 = 3_600;
 
+/// How long a download-rate bucket may sit untouched before a worker deletes it.
+///
+/// A bucket refills at `per_minute / 60` tokens per second, capped at
+/// `per_minute`. Sixty seconds after its last write it holds exactly
+/// `per_minute`, the same value `INSERT … ON CONFLICT DO NOTHING` seeds.
+/// Deleting a row at least this old changes no later read: the next consume
+/// seeds a full bucket and takes one token, which is what refilling that
+/// idle row and taking one token would have done. One hour is comfortably
+/// past that sixty-second refill. A bucket touched more recently is kept,
+/// including one that has not yet refilled.
+pub const READ_RATE_LIMIT_IDLE: chrono::Duration = chrono::Duration::hours(1);
+
+/// Buckets locked and deleted in one statement.
+pub const READ_RATE_LIMIT_PURGE_BATCH: i64 = 200;
+
+/// Most batches one worker pass deletes. The next pass continues, so a
+/// backlog cannot hold the worker lease for an unbounded scan.
+pub const READ_RATE_LIMIT_PURGE_MAX_BATCHES: u32 = 10;
+
 /// A token bucket in `digital_read_rate_limits`, consumed in the caller's
 /// transaction. Returns the seconds to wait when the bucket is empty.
 ///
-/// The bucket row is seeded full with `ON CONFLICT DO NOTHING` and then
-/// locked before any arithmetic, so concurrent first reads (for example one
-/// buyer opening several orders at once) all consume from the same row
-/// rather than each computing from an absent one.
+/// The bucket row is seeded full or locked in one upsert before any
+/// arithmetic, so concurrent first reads (for example one buyer opening
+/// several orders at once) all consume from the same row rather than each
+/// computing from an absent one.
 async fn consume_read_token(
     tx: &mut Transaction<'_, Postgres>,
     bucket: &str,
     per_minute: f64,
     now: DateTime<Utc>,
 ) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query(
+    // One statement seeds or locks the row and reads it. A separate
+    // `DO NOTHING` insert and `SELECT … FOR UPDATE` would leave a gap in
+    // which `purge_idle_read_buckets` can delete an idle row, and the select
+    // would then find nothing. `DO UPDATE` locks the existing row (the
+    // assignment keeps its tokens), and Postgres retries the insert if the
+    // row is deleted concurrently.
+    let (stored, updated_at): (f64, DateTime<Utc>) = sqlx::query_as(
         "INSERT INTO digital_read_rate_limits (bucket, tokens, updated_at) VALUES ($1, $2, $3) \
-         ON CONFLICT (bucket) DO NOTHING",
+         ON CONFLICT (bucket) DO UPDATE SET tokens = digital_read_rate_limits.tokens \
+         RETURNING tokens, updated_at",
     )
     .bind(bucket)
     .bind(per_minute)
     .bind(now)
-    .execute(&mut **tx)
-    .await?;
-    let (stored, updated_at): (f64, DateTime<Utc>) = sqlx::query_as(
-        "SELECT tokens, updated_at FROM digital_read_rate_limits WHERE bucket = $1 FOR UPDATE",
-    )
-    .bind(bucket)
     .fetch_one(&mut **tx)
     .await?;
     let elapsed = (now - updated_at).num_milliseconds().max(0) as f64 / 1_000.0;
@@ -280,6 +300,45 @@ fn rate_limited(retry_after: i64) -> Response {
             .expect("retry-after is a safe integer"),
     );
     response
+}
+
+/// Deletes download-rate buckets whose `updated_at` is older than
+/// [`READ_RATE_LIMIT_IDLE`].
+///
+/// Each batch locks with `FOR UPDATE SKIP LOCKED`, so a bucket an in-flight
+/// read holds is left in place and the statement does not wait on it. Rows
+/// come out oldest first. The loop stops when a batch deletes fewer than
+/// `batch_size` rows, or after `max_batches`.
+pub async fn purge_idle_read_buckets(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    batch_size: i64,
+    max_batches: u32,
+) -> Result<u64, sqlx::Error> {
+    let cutoff = now - READ_RATE_LIMIT_IDLE;
+    let mut purged = 0_u64;
+    for _ in 0..max_batches {
+        let deleted = sqlx::query(
+            "WITH expired AS ( \
+                 SELECT bucket FROM digital_read_rate_limits \
+                 WHERE updated_at < $1 \
+                 ORDER BY updated_at \
+                 LIMIT $2 \
+                 FOR UPDATE SKIP LOCKED) \
+             DELETE FROM digital_read_rate_limits \
+             WHERE bucket IN (SELECT bucket FROM expired)",
+        )
+        .bind(cutoff)
+        .bind(batch_size)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        purged += deleted;
+        if deleted < batch_size as u64 {
+            break;
+        }
+    }
+    Ok(purged)
 }
 
 /// `GET /v1/orders/{id}/digital-delivery/{line_index}`: the paying buyer's

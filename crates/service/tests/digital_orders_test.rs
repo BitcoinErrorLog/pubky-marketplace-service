@@ -15,10 +15,14 @@ use marketplace_domain::commands::DigitalDeliveryKind;
 use marketplace_service::clock::Clock;
 use marketplace_service::config::Config;
 use marketplace_service::digital::{version_aad, DigitalKeys};
+use marketplace_service::handlers::digital_orders::{
+    purge_idle_read_buckets, READ_RATE_LIMIT_IDLE,
+};
 use marketplace_service::http::build_router;
 use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{
     assume_due_deliveries, complete_due_delivered_orders, drain_outbox, expire_due_payment_windows,
+    run_once,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -225,6 +229,20 @@ async fn order_facts(app: &TestApp, order_id: &str) -> (String, bool, String, Op
 }
 
 async fn read_delivery(app: &TestApp, token: &str, order_id: &str) -> (StatusCode, String, Value) {
+    let (status, headers, body) = read_delivery_response(app, token, order_id).await;
+    let cache = headers
+        .get("cache-control")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    (status, cache, body)
+}
+
+async fn read_delivery_response(
+    app: &TestApp,
+    token: &str,
+    order_id: &str,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
     let response = app
         .router
         .clone()
@@ -239,21 +257,63 @@ async fn read_delivery(app: &TestApp, token: &str, order_id: &str) -> (StatusCod
         .await
         .expect("request executes");
     let status = response.status();
-    let cache = response
-        .headers()
-        .get("cache-control")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
+    let headers = response.headers().clone();
     let bytes = http_body_util::BodyExt::collect(response.into_body())
         .await
         .expect("body")
         .to_bytes();
     (
         status,
-        cache,
+        headers,
         serde_json::from_slice(&bytes).expect("json body"),
     )
+}
+
+/// `Retry-After` is present, a positive integer, and the bucket's wait.
+fn assert_retry_after(headers: &axum::http::HeaderMap, expected: i64) {
+    assert_retry_after_value(
+        headers
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        expected,
+    );
+}
+
+fn assert_retry_after_value(raw: Option<&str>, expected: i64) {
+    let raw = raw.expect("Retry-After header is missing");
+    let seconds: i64 = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("Retry-After {raw:?} is not an integer"));
+    assert!(
+        seconds > 0,
+        "Retry-After must be a positive integer, got {seconds}"
+    );
+    assert_eq!(seconds, expected);
+}
+
+async fn insert_read_bucket(
+    pool: &PgPool,
+    bucket: &str,
+    tokens: f64,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) {
+    sqlx::query(
+        "INSERT INTO digital_read_rate_limits (bucket, tokens, updated_at) VALUES ($1, $2, $3)",
+    )
+    .bind(bucket)
+    .bind(tokens)
+    .bind(updated_at)
+    .execute(pool)
+    .await
+    .expect("insert read bucket");
+}
+
+async fn read_bucket_exists(pool: &PgPool, bucket: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM digital_read_rate_limits WHERE bucket = $1)")
+        .bind(bucket)
+        .fetch_one(pool)
+        .await
+        .expect("bucket lookup")
 }
 
 async fn access_rows(app: &TestApp, order_id: &str) -> i64 {
@@ -1550,9 +1610,11 @@ async fn download_rate_limited_per_order_and_buyer(pool: PgPool) {
         let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
         assert_eq!(status, StatusCode::OK, "read {read}: {body}");
     }
-    let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    let (status, headers, body) = read_delivery_response(&app, &buyer.token, &order.order_id).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(body["error"]["reason"], json!("rate_limited"));
+    // Frozen clock, order bucket at 0, 10 per minute: one token is 6 seconds.
+    assert_retry_after(&headers, 6);
     assert!(!body.to_string().contains(TEXT_V1));
     // The bucket refills over time.
     app.clock
@@ -1578,12 +1640,175 @@ async fn download_rate_limited_per_order_and_buyer(pool: PgPool) {
             assert_eq!(status, StatusCode::OK, "{body}");
         }
     }
-    let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    let (status, headers, body) = read_delivery_response(&app, &buyer.token, &order.order_id).await;
     assert_eq!(
         status,
         StatusCode::TOO_MANY_REQUESTS,
         "the buyer bucket is empty: {body}"
     );
+    assert_eq!(body["error"]["reason"], json!("rate_limited"));
+    // Frozen clock, buyer bucket at 0, 30 per minute: one token is 2 seconds.
+    assert_retry_after(&headers, 2);
+}
+
+// An idle bucket is full again. Deleting it and reading is the same as
+// refilling it and reading: the next `per_minute` reads succeed, and the
+// one after that waits 6 seconds, the order bucket's one-token cost.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn purged_empty_read_bucket_admits_a_full_allowance(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
+    for read in 0..10 {
+        let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+        assert_eq!(status, StatusCode::OK, "read {read}: {body}");
+    }
+    let (status, headers, body) = read_delivery_response(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_retry_after(&headers, 6);
+
+    let stale = app.clock.now() - READ_RATE_LIMIT_IDLE - chrono::Duration::seconds(1);
+    sqlx::query("UPDATE digital_read_rate_limits SET updated_at = $1")
+        .bind(stale)
+        .execute(&app.pool)
+        .await
+        .expect("age buckets");
+    let purged = purge_idle_read_buckets(&app.pool, app.clock.now(), 10, 4)
+        .await
+        .expect("purge");
+    assert_eq!(purged, 2, "the buyer bucket and the order bucket");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM digital_read_rate_limits")
+        .fetch_one(&app.pool)
+        .await
+        .expect("buckets left");
+    assert_eq!(left, 0);
+
+    for read in 0..10 {
+        let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+        assert_eq!(status, StatusCode::OK, "read {read} after purge: {body}");
+    }
+    let (status, headers, body) = read_delivery_response(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["reason"], json!("rate_limited"));
+    assert_retry_after(&headers, 6);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn purge_drops_idle_read_buckets_and_keeps_fresher_ones(pool: PgPool) {
+    let app = test_app(pool).await;
+    let now = app.clock.now();
+    let cutoff = now - READ_RATE_LIMIT_IDLE;
+    insert_read_bucket(
+        &app.pool,
+        "idle",
+        0.0,
+        cutoff - chrono::Duration::seconds(1),
+    )
+    .await;
+    insert_read_bucket(&app.pool, "boundary", 0.0, cutoff).await;
+    insert_read_bucket(&app.pool, "fresh", 0.0, now - chrono::Duration::seconds(30)).await;
+
+    let purged = purge_idle_read_buckets(&app.pool, now, 10, 4)
+        .await
+        .expect("purge");
+    assert_eq!(purged, 1);
+    assert!(!read_bucket_exists(&app.pool, "idle").await);
+    assert!(read_bucket_exists(&app.pool, "boundary").await);
+    assert!(read_bucket_exists(&app.pool, "fresh").await);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn purge_skips_a_read_bucket_locked_by_an_open_transaction(pool: PgPool) {
+    let app = test_app(pool).await;
+    let now = app.clock.now();
+    let stale = now - READ_RATE_LIMIT_IDLE - chrono::Duration::seconds(5);
+    insert_read_bucket(&app.pool, "locked", 0.0, stale).await;
+    insert_read_bucket(&app.pool, "free", 0.0, stale).await;
+    let mut hold = app.pool.begin().await.expect("hold transaction");
+    sqlx::query("SELECT bucket FROM digital_read_rate_limits WHERE bucket = $1 FOR UPDATE")
+        .bind("locked")
+        .fetch_one(&mut *hold)
+        .await
+        .expect("lock bucket");
+
+    let purged = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        purge_idle_read_buckets(&app.pool, now, 10, 4),
+    )
+    .await
+    .expect("purge waited on a bucket an open transaction holds")
+    .expect("purge");
+    assert_eq!(purged, 1, "the unlocked idle bucket is deleted");
+    assert!(read_bucket_exists(&app.pool, "locked").await);
+    assert!(!read_bucket_exists(&app.pool, "free").await);
+    hold.rollback().await.expect("release the locked bucket");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn purge_deletes_idle_read_buckets_across_batches(pool: PgPool) {
+    let app = test_app(pool).await;
+    let now = app.clock.now();
+    let stale = now - READ_RATE_LIMIT_IDLE - chrono::Duration::seconds(1);
+    for index in 0..5 {
+        insert_read_bucket(&app.pool, &format!("idle-{index}"), 0.0, stale).await;
+    }
+    insert_read_bucket(&app.pool, "fresh", 3.0, now).await;
+
+    let purged = purge_idle_read_buckets(&app.pool, now, 2, 10)
+        .await
+        .expect("purge");
+    assert_eq!(purged, 5, "five rows take three batches of two");
+    assert!(read_bucket_exists(&app.pool, "fresh").await);
+    let idle_left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM digital_read_rate_limits WHERE bucket LIKE 'idle-%'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("idle left");
+    assert_eq!(idle_left, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn purge_stops_after_the_per_run_batch_cap(pool: PgPool) {
+    let app = test_app(pool).await;
+    let now = app.clock.now();
+    let stale = now - READ_RATE_LIMIT_IDLE - chrono::Duration::seconds(1);
+    for index in 0..5 {
+        insert_read_bucket(&app.pool, &format!("idle-{index}"), 0.0, stale).await;
+    }
+
+    let purged = purge_idle_read_buckets(&app.pool, now, 2, 1)
+        .await
+        .expect("purge");
+    assert_eq!(purged, 2, "one batch, then the cap");
+    let idle_left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM digital_read_rate_limits WHERE bucket LIKE 'idle-%'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("idle left");
+    assert_eq!(idle_left, 3);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn worker_pass_purges_idle_read_buckets(pool: PgPool) {
+    let app = test_app(pool).await;
+    let now = app.clock.now();
+    let cutoff = now - READ_RATE_LIMIT_IDLE;
+    insert_read_bucket(
+        &app.pool,
+        "idle",
+        0.0,
+        cutoff - chrono::Duration::seconds(1),
+    )
+    .await;
+    insert_read_bucket(&app.pool, "fresh", 1.0, now).await;
+
+    let summary = run_once(&app.state, Uuid::new_v4(), now)
+        .await
+        .expect("worker pass");
+    assert_eq!(summary.read_rate_buckets_purged, 1);
+    assert!(!read_bucket_exists(&app.pool, "idle").await);
+    assert!(read_bucket_exists(&app.pool, "fresh").await);
 }
 
 // Kimi P2-2: repeat opens coalesce into at most one access row per line per
@@ -1688,7 +1913,7 @@ async fn concurrent_first_reads_share_the_buyer_bucket(pool: PgPool) {
             let token = buyer.token.clone();
             let order_id = order_id.clone();
             reads.push(tokio::spawn(async move {
-                router
+                let response = router
                     .oneshot(
                         Request::builder()
                             .method("GET")
@@ -1698,17 +1923,33 @@ async fn concurrent_first_reads_share_the_buyer_bucket(pool: PgPool) {
                             .expect("request builds"),
                     )
                     .await
-                    .expect("request executes")
-                    .status()
+                    .expect("request executes");
+                let status = response.status();
+                let retry_after = response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                (status, retry_after)
             }));
         }
     }
     let mut ok = 0;
     let mut limited = 0;
     for read in reads {
-        match read.await.expect("read task") {
-            StatusCode::OK => ok += 1,
-            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+        let (status, retry_after) = read.await.expect("read task");
+        match status {
+            StatusCode::OK => {
+                assert!(retry_after.is_none(), "a served read has no Retry-After");
+                ok += 1;
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                // Frozen clock, buyer bucket at 0, 30 per minute: one token
+                // is 2 seconds. The order buckets are not the refusal: each
+                // order is attempted exactly its allowance of 10.
+                assert_retry_after_value(retry_after.as_deref(), 2);
+                limited += 1;
+            }
             other => panic!("unexpected status {other}"),
         }
     }
