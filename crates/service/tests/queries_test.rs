@@ -406,6 +406,11 @@ async fn notifications_are_readable_only_by_their_recipient(pool: PgPool) {
     assert_eq!(notifications[0]["recipient_pubky"], json!(seller.pubky));
     assert_eq!(notifications[0]["actor_pubky"], json!(buyer.pubky));
     assert_eq!(notifications[0]["read_at"], Value::Null);
+    assert_eq!(
+        notifications[0]["order_fulfillment"],
+        Value::Null,
+        "an offer is not an order"
+    );
 
     let (status, body) = get(&app, "/v1/notifications", Some(&other_seller.token)).await;
     assert_eq!(status, StatusCode::OK, "notification list failed: {body}");
@@ -459,4 +464,27 @@ async fn list_limits_are_bounded_and_ordering_is_newest_first(pool: PgPool) {
     let (status, body) = get(&app, "/v1/orders", Some(&buyer.token)).await;
     assert_eq!(status, StatusCode::OK, "default list failed: {body}");
     assert_eq!(body["orders"].as_array().map(Vec::len), Some(2));
+
+    drain_outbox(&app.pool, None, app.clock.now(), 30)
+        .await
+        .expect("outbox drains");
+    let (status, body) = get(&app, "/v1/notifications", Some(&seller.token)).await;
+    assert_eq!(status, StatusCode::OK, "notification list failed: {body}");
+    let order_rows: Vec<&Value> = body["notifications"]
+        .as_array()
+        .expect("notifications is an array")
+        .iter()
+        .filter(|row| {
+            row["aggregate_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("order:"))
+        })
+        .collect();
+    assert!(
+        !order_rows.is_empty(),
+        "the seller hears about the orders: {body}"
+    );
+    for row in order_rows {
+        assert_eq!(row["order_fulfillment"], json!("shipping"), "{row}");
+    }
 }
