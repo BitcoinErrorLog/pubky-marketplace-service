@@ -2229,31 +2229,93 @@ async fn apply_shared_manual_observation(
         );
         return Ok(true);
     }
-    // Already inside: the status-only path refreshes the live facts
-    // (confirmations progress, a refreshed observation after a
-    // disappearance) without ever advancing the order and without touching
-    // the observation frozen at entry (A1).
+    refresh_seller_confirmation_facts(&mut tx, row, &observation_doc, observation, now).await?;
+    tx.commit().await?;
+    Ok(false)
+}
+
+/// The status-only path for an order already inside
+/// `awaiting_seller_confirmation`: refreshes the live facts (confirmations
+/// progress, a refreshed observation after a disappearance) without ever
+/// advancing the order and without touching the observation frozen at
+/// entry (A1). The caller holds the payment row lock. Returns whether the
+/// order was still inside.
+async fn refresh_seller_confirmation_facts(
+    tx: &mut Transaction<'_, Postgres>,
+    row: &ClaimedPaykitOrder,
+    observation_doc: &Value,
+    observation: &crate::payments::PaykitObservation,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
     let refreshed = sqlx::query(
         "UPDATE orders SET paykit_observation = $2, updated_at = $3 \
          WHERE id = $1 AND paykit_request_state = 'awaiting_seller_confirmation'",
     )
     .bind(row.id)
-    .bind(&observation_doc)
+    .bind(observation_doc)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    if refreshed.rows_affected() == 1 {
-        if let Some(confirmations) = observation.confirmations {
-            sqlx::query("UPDATE payments SET confirmations = $2, updated_at = $3 WHERE id = $1")
-                .bind(row.payment_id)
-                .bind(i32::try_from(confirmations).unwrap_or(i32::MAX))
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-        }
+    if refreshed.rows_affected() != 1 {
+        return Ok(false);
+    }
+    if let Some(confirmations) = observation.confirmations {
+        sqlx::query("UPDATE payments SET confirmations = $2, updated_at = $3 WHERE id = $1")
+            .bind(row.payment_id)
+            .bind(i32::try_from(confirmations).unwrap_or(i32::MAX))
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(true)
+}
+
+/// A late-flagged report for an order inside `awaiting_seller_confirmation`.
+/// Paykit judges `late_settlement` against the invoice's own expiry, which
+/// stays at the bind-time payment window, while entry to this state
+/// happened only on a NON-late first sighting and extended the hold to the
+/// 24-hour seller window. For this order lateness is judged by that first
+/// sighting: the report refreshes the facts on the status-only path and
+/// never takes the late-money fork, whatever mode Paykit now reports. The
+/// seller's attestation and the window reaper stay the only exits. Returns
+/// false, having changed nothing, when the payment or order is no longer
+/// waiting; the caller then applies the ordinary late handling.
+async fn refresh_late_report_inside_seller_window(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    observed_state: &str,
+    amount_matched: bool,
+    observation: &crate::payments::PaykitObservation,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let payment_state: Option<(String,)> =
+        sqlx::query_as("SELECT state FROM payments WHERE id = $1 FOR UPDATE")
+            .bind(row.payment_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if payment_state.as_ref().map(|(state,)| state.as_str()) != Some("awaiting_entitlement") {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let observation_doc = crate::bitcoin_review::observation_json(
+        observed_state,
+        amount_matched,
+        observation,
+        now,
+        false,
+    );
+    if !refresh_seller_confirmation_facts(&mut tx, row, &observation_doc, observation, now).await? {
+        tx.rollback().await?;
+        return Ok(false);
     }
     tx.commit().await?;
-    Ok(false)
+    tracing::info!(
+        order_id = %row.id,
+        observed_state,
+        "late-flagged paykit report inside the seller-confirmation window; refreshed facts only"
+    );
+    Ok(true)
 }
 
 /// A disappearance/reorg fact for an order awaiting seller confirmation:
@@ -2302,8 +2364,22 @@ async fn apply_paykit_status_outcome(
             // auto-pays (exclusive) and NEVER enters
             // awaiting_seller_confirmation (shared_manual) — it takes the
             // existing durable manual-review entry with the observation
-            // frozen.
+            // frozen. An order already waiting for its seller judges
+            // lateness by its on-time first sighting instead.
             if facts.late_settlement {
+                if row.paykit_request_state == "awaiting_seller_confirmation"
+                    && refresh_late_report_inside_seller_window(
+                        &state.pool,
+                        row,
+                        "confirmed",
+                        amount_matched,
+                        &facts.observation,
+                        now,
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
                 return apply_confirmed_paykit_payment(
                     &state.pool,
                     row,
@@ -2357,8 +2433,21 @@ async fn apply_paykit_status_outcome(
         PaykitStatusOutcome::Detected { facts } => {
             // A LATE detection is fail-safe: display-only at most, never
             // the seller-confirmation entry and never a payment authority
-            // transition.
+            // transition. An order already waiting for its seller still
+            // gets its facts refreshed.
             if facts.late_settlement {
+                if row.paykit_request_state == "awaiting_seller_confirmation" {
+                    refresh_late_report_inside_seller_window(
+                        &state.pool,
+                        row,
+                        "detected",
+                        true,
+                        &facts.observation,
+                        now,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 return mark_paykit_detected(&state.pool, row, now).await;
             }
             match facts.allocation_mode.as_str() {

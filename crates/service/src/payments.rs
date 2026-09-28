@@ -729,7 +729,9 @@ pub struct PaykitObservation {
 /// statement that the settlement landed outside the invoice's settlement
 /// window: a late observation NEVER auto-pays and NEVER enters
 /// `awaiting_seller_confirmation`; a confirmed one routes to durable
-/// `manual_review`.
+/// `manual_review`. The one exception is an order already inside
+/// `awaiting_seller_confirmation`: it entered on an on-time sighting, so a
+/// later late flag only refreshes its facts and the seller still decides.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PaykitStatusFacts {
     pub allocation_mode: String,
