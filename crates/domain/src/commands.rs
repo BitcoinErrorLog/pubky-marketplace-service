@@ -321,18 +321,19 @@ pub struct RegisterListingPayload {
 /// as a million physical units, so registration refuses it there.
 pub const UNLIMITED_STOCK_QUANTITY: i64 = 1_000_000;
 
-/// The refusal reason for [`RegisterListingPayload::carries_unlimited_cap_as_physical_stock`].
+/// The refusal reason for a listing that ships or offers pickup at the unlimited cap.
 pub const UNLIMITED_STOCK_ON_PHYSICAL_LISTING: &str = "unlimited_stock_on_physical_listing";
 
 impl RegisterListingPayload {
-    /// True when a listing that ships or offers pickup registers exactly the
-    /// unlimited cap. `quantity` is the sum of the record's variants and is
-    /// at most the cap, so any variant at the cap makes the sum the cap. A
-    /// Locks listing is exempt: it registers as shipping only because the
-    /// Locks derivation skips `digital`, and its units are paid reveals.
-    pub fn carries_unlimited_cap_as_physical_stock(&self) -> bool {
-        self.digital_lock.is_none()
-            && self.quantity == UNLIMITED_STOCK_QUANTITY
+    /// True when the registration carries exactly the unlimited cap with a
+    /// shipping or pickup method. `quantity` is the sum of the record's
+    /// variants and is at most the cap, so any variant at the cap makes the
+    /// sum the cap. For a listing without a Locks lock this is the refusal.
+    /// A Locks listing registers as shipping even when its record publishes
+    /// only `digital` (the Locks derivation skips `digital`), so for it the
+    /// seller's record decides: see `record_publishes_physical_fulfillment`.
+    pub fn registers_unlimited_cap_with_physical_methods(&self) -> bool {
+        self.quantity == UNLIMITED_STOCK_QUANTITY
             && self.fulfillment_methods.iter().any(|method| {
                 matches!(
                     method,
@@ -2305,21 +2306,16 @@ mod tests {
     }
 
     #[test]
-    fn the_unlimited_cap_is_physical_stock_only_on_a_listing_that_ships_or_offers_pickup() {
+    fn the_unlimited_cap_registers_with_physical_methods_only_on_shipping_or_pickup() {
         let command = parse_command(&register_command_json()).expect("valid command");
         let CommandPayload::RegisterListing(base) = command.payload else {
             panic!("expected register payload");
         };
-        let with =
-            |methods: &[FulfillmentMethod], quantity: i64, locks: bool| RegisterListingPayload {
-                fulfillment_methods: methods.to_vec(),
-                quantity,
-                digital_lock: locks.then(|| DigitalLockMetadata {
-                    policy_uri: "pubky://seller/pub/locks.app/policy.json".to_string(),
-                    criterion_id: "criterion-1".to_string(),
-                }),
-                ..base.clone()
-            };
+        let with = |methods: &[FulfillmentMethod], quantity: i64| RegisterListingPayload {
+            fulfillment_methods: methods.to_vec(),
+            quantity,
+            ..base.clone()
+        };
         use FulfillmentMethod::{Digital, Pickup, Shipping};
         for methods in [
             &[Shipping][..],
@@ -2329,21 +2325,18 @@ mod tests {
             &[Pickup, Digital],
         ] {
             assert!(
-                with(methods, UNLIMITED_STOCK_QUANTITY, false)
-                    .carries_unlimited_cap_as_physical_stock(),
+                with(methods, UNLIMITED_STOCK_QUANTITY)
+                    .registers_unlimited_cap_with_physical_methods(),
                 "{methods:?}"
             );
             assert!(
-                !with(methods, UNLIMITED_STOCK_QUANTITY - 1, false)
-                    .carries_unlimited_cap_as_physical_stock(),
+                !with(methods, UNLIMITED_STOCK_QUANTITY - 1)
+                    .registers_unlimited_cap_with_physical_methods(),
                 "{methods:?}"
             );
         }
-        assert!(!with(&[Digital], UNLIMITED_STOCK_QUANTITY, false)
-            .carries_unlimited_cap_as_physical_stock());
-        // A Locks listing registers as shipping from a digital record; its units are reveals.
-        assert!(!with(&[Shipping], UNLIMITED_STOCK_QUANTITY, true)
-            .carries_unlimited_cap_as_physical_stock());
+        assert!(!with(&[Digital], UNLIMITED_STOCK_QUANTITY)
+            .registers_unlimited_cap_with_physical_methods());
     }
 
     #[test]

@@ -15,23 +15,59 @@ use crate::handlers::{
     fetch_listing, fetch_listing_for_update,
 };
 use crate::homeserver::{
-    registration_payload_from_record, HomeserverFetchOutcome, HomeserverListingClient,
+    record_publishes_physical_fulfillment, registration_payload_from_record,
+    HomeserverFetchOutcome, HomeserverListingClient,
 };
 use crate::model::{money_json, AuctionReserveRow, AuctionState, ListingRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
-/// Refuses a registration that would sell the unlimited digital cap as
-/// physical stock (`listing.register` and `listing.sync`, and so
+/// The refusal for a listing that ships or offers pickup at the unlimited
+/// digital cap (`listing.register` and `listing.sync`, and so
 /// `listing.sync_many` and the connectors that sync).
-pub(crate) fn unlimited_cap_refusal(payload: &RegisterListingPayload) -> Option<CommandFailure> {
-    payload.carries_unlimited_cap_as_physical_stock().then(|| {
-        CommandFailure::refused_with_reason(
-            crate::refusal_audit::RefusalKind::InvalidState,
-            ErrorCode::InvalidState,
-            "1000000 is reserved for unlimited digital stock; a listing that ships or offers pickup cannot register it.",
-            UNLIMITED_STOCK_ON_PHYSICAL_LISTING,
-        )
-    })
+pub(crate) fn unlimited_cap_refusal() -> CommandFailure {
+    CommandFailure::refused_with_reason(
+        crate::refusal_audit::RefusalKind::InvalidState,
+        ErrorCode::InvalidState,
+        "1000000 is reserved for unlimited digital stock; a listing that ships or offers pickup cannot register it.",
+        UNLIMITED_STOCK_ON_PHYSICAL_LISTING,
+    )
+}
+
+/// `listing.register` at the cap with a physical method. Without a Locks
+/// lock that is the refusal. A Locks payload registers as shipping even for
+/// a digital-only record, so the seller's record decides; a record that
+/// cannot be read is refused rather than trusted.
+async fn refuse_unlimited_cap(
+    payload: &RegisterListingPayload,
+    homeserver: Option<&dyn HomeserverListingClient>,
+) -> Option<CommandFailure> {
+    if !payload.registers_unlimited_cap_with_physical_methods() {
+        return None;
+    }
+    if payload.digital_lock.is_none() {
+        return Some(unlimited_cap_refusal());
+    }
+    let Some(homeserver) = homeserver else {
+        return Some(unlimited_cap_refusal());
+    };
+    match homeserver
+        .fetch_listing(&payload.seller_pubky, &payload.listing_id)
+        .await
+    {
+        HomeserverFetchOutcome::Found(record) => {
+            record_publishes_physical_fulfillment(&record).then(unlimited_cap_refusal)
+        }
+        HomeserverFetchOutcome::NotFound => Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
+            ErrorCode::NotFound,
+            "The seller's homeserver has no such listing record.",
+        )),
+        HomeserverFetchOutcome::Unavailable => Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::UpstreamUnavailable,
+            ErrorCode::UpstreamUnavailable,
+            "The seller's homeserver could not be reached. Try again shortly.",
+        )),
+    }
 }
 
 pub async fn handle(
@@ -49,7 +85,7 @@ pub async fn handle(
             "Only the listing seller may register inventory.",
         )));
     }
-    if let Some(refusal) = unlimited_cap_refusal(payload) {
+    if let Some(refusal) = refuse_unlimited_cap(payload, homeserver).await {
         return Ok(Err(refusal));
     }
     let expected_aggregate_id =
