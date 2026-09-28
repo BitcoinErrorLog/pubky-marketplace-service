@@ -100,7 +100,7 @@
           "priced_from": "listing",
           "receipt_id": null,
           "return_request": null,
-          "revision": 3,
+          "revision": 4,
           "seller_pubky": "<pubky:seller>",
           "shipment": null,
           "shipping": {
@@ -460,7 +460,7 @@
           "priced_from": "listing",
           "receipt_id": "<uuid:9>",
           "return_request": null,
-          "revision": 3,
+          "revision": 4,
           "seller_pubky": "<pubky:seller>",
           "shipment": null,
           "shipping": {
@@ -624,7 +624,7 @@
           "priced_from": "listing",
           "receipt_id": null,
           "return_request": null,
-          "revision": 4,
+          "revision": 5,
           "seller_pubky": "<pubky:seller>",
           "shipment": null,
           "shipping": {
@@ -759,7 +759,7 @@
           "priced_from": "listing",
           "receipt_id": "<uuid:9>",
           "return_request": null,
-          "revision": 3,
+          "revision": 4,
           "seller_pubky": "<pubky:seller>",
           "shipment": null,
           "shipping": {
