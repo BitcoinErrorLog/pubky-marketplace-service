@@ -370,7 +370,6 @@ async fn insert_drop_listing_bindings(
         .await?;
         aggregate_ids.push(aggregate_id);
     }
-    // Sorted, so two syncs over the same listings lock them in one order.
     let live: Vec<(String,)> = sqlx::query_as(
         "SELECT l.listing_id FROM listings l \
          JOIN drop_listings dl ON dl.drop_aggregate_id = $1 \
