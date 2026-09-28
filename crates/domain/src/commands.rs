@@ -316,6 +316,33 @@ pub struct RegisterListingPayload {
     pub digital_lock: Option<DigitalLockMetadata>,
 }
 
+/// The quantity Shop stores Unlimited digital stock as (digital delivery
+/// design §2 "Stock"). On a listing that ships or offers pickup it would sell
+/// as a million physical units, so registration refuses it there.
+pub const UNLIMITED_STOCK_QUANTITY: i64 = 1_000_000;
+
+/// The refusal reason for a listing that ships or offers pickup at the unlimited cap.
+pub const UNLIMITED_STOCK_ON_PHYSICAL_LISTING: &str = "unlimited_stock_on_physical_listing";
+
+impl RegisterListingPayload {
+    /// True when the registration carries exactly the unlimited cap with a
+    /// shipping or pickup method. `quantity` is the sum of the record's
+    /// variants and is at most the cap, so any variant at the cap makes the
+    /// sum the cap. For a listing without a Locks lock this is the refusal.
+    /// A Locks listing registers as shipping even when its record publishes
+    /// only `digital` (the Locks derivation skips `digital`), so for it the
+    /// seller's record decides: see `record_publishes_physical_fulfillment`.
+    pub fn registers_unlimited_cap_with_physical_methods(&self) -> bool {
+        self.quantity == UNLIMITED_STOCK_QUANTITY
+            && self.fulfillment_methods.iter().any(|method| {
+                matches!(
+                    method,
+                    FulfillmentMethod::Shipping | FulfillmentMethod::Pickup
+                )
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DigitalLockMetadata {
@@ -2276,6 +2303,40 @@ mod tests {
                 "unit_price": { "amount_minor": 12_500, "currency": "USD", "exponent": 2 },
             },
         })
+    }
+
+    #[test]
+    fn the_unlimited_cap_registers_with_physical_methods_only_on_shipping_or_pickup() {
+        let command = parse_command(&register_command_json()).expect("valid command");
+        let CommandPayload::RegisterListing(base) = command.payload else {
+            panic!("expected register payload");
+        };
+        let with = |methods: &[FulfillmentMethod], quantity: i64| RegisterListingPayload {
+            fulfillment_methods: methods.to_vec(),
+            quantity,
+            ..base.clone()
+        };
+        use FulfillmentMethod::{Digital, Pickup, Shipping};
+        for methods in [
+            &[Shipping][..],
+            &[Pickup],
+            &[Shipping, Pickup],
+            &[Shipping, Digital],
+            &[Pickup, Digital],
+        ] {
+            assert!(
+                with(methods, UNLIMITED_STOCK_QUANTITY)
+                    .registers_unlimited_cap_with_physical_methods(),
+                "{methods:?}"
+            );
+            assert!(
+                !with(methods, UNLIMITED_STOCK_QUANTITY - 1)
+                    .registers_unlimited_cap_with_physical_methods(),
+                "{methods:?}"
+            );
+        }
+        assert!(!with(&[Digital], UNLIMITED_STOCK_QUANTITY)
+            .registers_unlimited_cap_with_physical_methods());
     }
 
     #[test]

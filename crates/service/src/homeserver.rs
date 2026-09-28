@@ -1042,6 +1042,23 @@ fn shipping_minor_from_options(options: &[RecordShippingOption], listing_currenc
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MalformedDigitalLock;
 
+/// Whether a seller's listing record publishes a physical fulfillment, as a
+/// buyer reads it: `shipping` or `pickup`, or none of the known methods (an
+/// older or `physical`-only record sells as shipping). A Locks record that
+/// publishes only `digital` does not, although it registers as shipping.
+/// This matches the Shop's reading of the same record.
+pub fn record_publishes_physical_fulfillment(record: &Value) -> bool {
+    let methods: Vec<&str> = record
+        .get("fulfillmentMethods")
+        .and_then(Value::as_array)
+        .map(|methods| methods.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    methods
+        .iter()
+        .any(|method| *method == "shipping" || *method == "pickup")
+        || !methods.contains(&"digital")
+}
+
 /// Derives the registration payload from a fetched record, mirroring the
 /// reference client's `registerListing` field mapping EXACTLY: the title,
 /// `listingRevision = record.revision`, `contentHash = media[0].contentHash`,

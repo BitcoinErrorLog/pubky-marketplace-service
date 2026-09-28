@@ -1454,6 +1454,15 @@ fn mirror_listing_registration(command: &Value) {
         .insert((seller_pubky.to_string(), listing_id.to_string()), record);
 }
 
+/// Puts a seller-authored listing record on the mirror homeserver as-is, for
+/// tests whose record differs from what a register command would mirror.
+pub fn put_command_mirror_record(seller_pubky: &str, listing_id: &str, record: Value) {
+    command_mirror_records()
+        .lock()
+        .expect("command mirror records lock")
+        .insert((seller_pubky.to_string(), listing_id.to_string()), record);
+}
+
 pub fn drop_command_mirror_record(seller_pubky: &str, listing_id: &str) {
     command_mirror_records()
         .lock()
