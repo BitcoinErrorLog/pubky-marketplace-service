@@ -103,6 +103,9 @@ pub async fn handle(
     // The derived payload must satisfy exactly the invariants
     // `listing.register` enforces; a record that fails them cannot back a
     // registered aggregate.
+    if let Some(refusal) = crate::handlers::register_listing::unlimited_cap_refusal(&registration) {
+        return Ok(Err(refusal));
+    }
     let registration = match validate_public_listing_payload(registration) {
         Ok(registration) => registration,
         Err(issues) => {

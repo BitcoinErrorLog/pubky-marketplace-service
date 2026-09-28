@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
     validate_public_listing_payload, AuctionReserve, Command, RegisterListingPayload, SaleFormat,
+    UNLIMITED_STOCK_ON_PHYSICAL_LISTING,
 };
 use marketplace_domain::{ids, ErrorCode};
 use serde_json::{json, Value};
@@ -19,6 +20,20 @@ use crate::homeserver::{
 use crate::model::{money_json, AuctionReserveRow, AuctionState, ListingRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
+/// Refuses a registration that would sell the unlimited digital cap as
+/// physical stock (`listing.register` and `listing.sync`, and so
+/// `listing.sync_many` and the connectors that sync).
+pub(crate) fn unlimited_cap_refusal(payload: &RegisterListingPayload) -> Option<CommandFailure> {
+    payload.carries_unlimited_cap_as_physical_stock().then(|| {
+        CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "1000000 is reserved for unlimited digital stock; a listing that ships or offers pickup cannot register it.",
+            UNLIMITED_STOCK_ON_PHYSICAL_LISTING,
+        )
+    })
+}
+
 pub async fn handle(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
@@ -33,6 +48,9 @@ pub async fn handle(
             ErrorCode::Unauthorized,
             "Only the listing seller may register inventory.",
         )));
+    }
+    if let Some(refusal) = unlimited_cap_refusal(payload) {
+        return Ok(Err(refusal));
     }
     let expected_aggregate_id =
         ids::listing_aggregate_id(&payload.seller_pubky, &payload.listing_id);
