@@ -51,6 +51,44 @@ pub async fn execute(
     };
     let request_hash = command.request_hash();
 
+    // A `listing.register` that needs the seller's public record reads it
+    // here, before the transaction and the command's advisory lock, so a slow
+    // homeserver never holds a domain connection or blocks a duplicate. It
+    // enters the command's flight first, so a concurrent duplicate waits for
+    // this submission instead of reading the record too, and a replay or a
+    // conflicting reuse of the command id is answered from its stored result
+    // without the homeserver. `command_results` rows are never updated or
+    // deleted, so that result is the one the locked lookup below would find.
+    let (prefetched, _flight) =
+        match crate::handlers::register_listing::public_record_request(actor, &command) {
+            Some(payload) => {
+                let flight = state.command_flights.enter(actor, command.command_id).await;
+                if let Some((stored_hash, stored_result)) =
+                    stored_command_result(&state.pool, actor, command.command_id).await?
+                {
+                    return Ok(stored_result_response(
+                        state,
+                        actor,
+                        &command,
+                        &request_hash,
+                        &stored_hash,
+                        stored_result,
+                        started,
+                    ));
+                }
+                let prefetched = crate::handlers::register_listing::prefetch_public_record(
+                    state.homeserver.as_deref(),
+                    payload,
+                )
+                .await;
+                (prefetched, Some(flight))
+            }
+            None => (
+                crate::handlers::register_listing::RegisterRecordPrefetch::NotNeeded,
+                None,
+            ),
+        };
+
     let mut tx = state.pool.begin().await?;
 
     // Serialize concurrent submissions of the same actor + command id so a
@@ -60,126 +98,23 @@ pub async fn execute(
         .execute(&mut *tx)
         .await?;
 
-    let stored: Option<(String, Value)> = sqlx::query_as(
-        "SELECT request_hash, result FROM command_results \
-         WHERE actor_pubky = $1 AND command_id = $2",
-    )
-    .bind(actor)
-    .bind(command.command_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some((stored_hash, stored_result)) = stored {
+    if let Some((stored_hash, stored_result)) =
+        stored_command_result(&mut *tx, actor, command.command_id).await?
+    {
         tx.commit().await?;
-        if stored_hash == request_hash {
-            log_command(
-                actor,
-                command.kind(),
-                &command.command_id.to_string(),
-                &command.aggregate_id,
-                "idempotent_replay",
-                None,
-                None,
-                stored_result["revision"].as_i64().unwrap_or_default(),
-                started.elapsed().as_millis() as u64,
-            );
-            if command.kind() == "checkout.create" {
-                let Some(stored_result) = redact_command_result(stored_result) else {
-                    let failure = CommandFailure::refused(
-                        crate::refusal_audit::RefusalKind::InvariantViolation,
-                        ErrorCode::InvariantViolation,
-                        "The stored command result could not be processed.",
-                    );
-                    let response = failure_response(&failure);
-                    enqueue_refusal(
-                        state,
-                        actor,
-                        state.clock.now(),
-                        SurfaceKind::V1Command,
-                        command_kind(&command.payload),
-                        failure.refusal_kind(),
-                        Some(command.command_id),
-                    );
-                    return Ok(response);
-                };
-                return Ok((StatusCode::OK, stored_result));
-            }
-            if command.kind() == "payment.prepare_locks" {
-                // The stored result is sealed to this payment and buyer; it
-                // is opened only for the same authenticated actor (the
-                // command_results lookup above is actor-scoped).
-                let Some(locks) = state.locks.as_deref() else {
-                    let failure = CommandFailure::refused(
-                        crate::refusal_audit::RefusalKind::InvariantViolation,
-                        ErrorCode::InvariantViolation,
-                        "The stored command result could not be processed.",
-                    );
-                    let response = failure_response(&failure);
-                    enqueue_refusal(
-                        state,
-                        actor,
-                        state.clock.now(),
-                        SurfaceKind::V1Command,
-                        command_kind(&command.payload),
-                        failure.refusal_kind(),
-                        Some(command.command_id),
-                    );
-                    return Ok(response);
-                };
-                let Some(stored_result) =
-                    unseal_prepare_locks_result(locks, &command, actor, &stored_result)
-                else {
-                    let failure = CommandFailure::refused(
-                        crate::refusal_audit::RefusalKind::InvariantViolation,
-                        ErrorCode::InvariantViolation,
-                        "The stored command result could not be processed.",
-                    );
-                    let response = failure_response(&failure);
-                    enqueue_refusal(
-                        state,
-                        actor,
-                        state.clock.now(),
-                        SurfaceKind::V1Command,
-                        command_kind(&command.payload),
-                        failure.refusal_kind(),
-                        Some(command.command_id),
-                    );
-                    return Ok(response);
-                };
-                return Ok((StatusCode::OK, stored_result));
-            }
-            return Ok((StatusCode::OK, stored_result));
-        }
-        let failure = CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::IdempotencyConflict,
-            ErrorCode::IdempotencyConflict,
-            "The command id was already used with different input.",
-        );
-        log_command(
-            actor,
-            command.kind(),
-            &command.command_id.to_string(),
-            &command.aggregate_id,
-            "conflict",
-            Some(failure.code()),
-            Some(failure.message()),
-            command.expected_revision,
-            started.elapsed().as_millis() as u64,
-        );
-        let response = failure_response(&failure);
-        enqueue_refusal(
+        return Ok(stored_result_response(
             state,
             actor,
-            state.clock.now(),
-            SurfaceKind::V1Command,
-            command_kind(&command.payload),
-            failure.refusal_kind(),
-            Some(command.command_id),
-        );
-        return Ok(response);
+            &command,
+            &request_hash,
+            &stored_hash,
+            stored_result,
+            started,
+        ));
     }
 
     let now = state.clock.now();
-    let outcome = dispatch(state, &mut tx, actor, &command, now).await;
+    let outcome = dispatch(state, &mut tx, actor, &command, &prefetched, now).await;
     match outcome {
         Ok(Ok(success)) => {
             let body = success_body(&command, &success);
@@ -315,6 +250,143 @@ pub async fn execute(
     }
 }
 
+async fn stored_command_result<'e, E>(
+    executor: E,
+    actor: &str,
+    command_id: Uuid,
+) -> Result<Option<(String, Value)>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "SELECT request_hash, result FROM command_results \
+         WHERE actor_pubky = $1 AND command_id = $2",
+    )
+    .bind(actor)
+    .bind(command_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// The response to a command whose actor + command id already has a stored
+/// result: an exact replay returns it, and different input is a conflict.
+fn stored_result_response(
+    state: &AppState,
+    actor: &str,
+    command: &Command,
+    request_hash: &str,
+    stored_hash: &str,
+    stored_result: Value,
+    started: Instant,
+) -> (StatusCode, Value) {
+    if stored_hash == request_hash {
+        log_command(
+            actor,
+            command.kind(),
+            &command.command_id.to_string(),
+            &command.aggregate_id,
+            "idempotent_replay",
+            None,
+            None,
+            stored_result["revision"].as_i64().unwrap_or_default(),
+            started.elapsed().as_millis() as u64,
+        );
+        if command.kind() == "checkout.create" {
+            let Some(stored_result) = redact_command_result(stored_result) else {
+                let failure = CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvariantViolation,
+                    ErrorCode::InvariantViolation,
+                    "The stored command result could not be processed.",
+                );
+                let response = failure_response(&failure);
+                enqueue_refusal(
+                    state,
+                    actor,
+                    state.clock.now(),
+                    SurfaceKind::V1Command,
+                    command_kind(&command.payload),
+                    failure.refusal_kind(),
+                    Some(command.command_id),
+                );
+                return response;
+            };
+            return (StatusCode::OK, stored_result);
+        }
+        if command.kind() == "payment.prepare_locks" {
+            // The stored result is sealed to this payment and buyer; it
+            // is opened only for the same authenticated actor (the
+            // command_results lookup is actor-scoped).
+            let Some(locks) = state.locks.as_deref() else {
+                let failure = CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvariantViolation,
+                    ErrorCode::InvariantViolation,
+                    "The stored command result could not be processed.",
+                );
+                let response = failure_response(&failure);
+                enqueue_refusal(
+                    state,
+                    actor,
+                    state.clock.now(),
+                    SurfaceKind::V1Command,
+                    command_kind(&command.payload),
+                    failure.refusal_kind(),
+                    Some(command.command_id),
+                );
+                return response;
+            };
+            let Some(stored_result) =
+                unseal_prepare_locks_result(locks, command, actor, &stored_result)
+            else {
+                let failure = CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvariantViolation,
+                    ErrorCode::InvariantViolation,
+                    "The stored command result could not be processed.",
+                );
+                let response = failure_response(&failure);
+                enqueue_refusal(
+                    state,
+                    actor,
+                    state.clock.now(),
+                    SurfaceKind::V1Command,
+                    command_kind(&command.payload),
+                    failure.refusal_kind(),
+                    Some(command.command_id),
+                );
+                return response;
+            };
+            return (StatusCode::OK, stored_result);
+        }
+        return (StatusCode::OK, stored_result);
+    }
+    let failure = CommandFailure::refused(
+        crate::refusal_audit::RefusalKind::IdempotencyConflict,
+        ErrorCode::IdempotencyConflict,
+        "The command id was already used with different input.",
+    );
+    log_command(
+        actor,
+        command.kind(),
+        &command.command_id.to_string(),
+        &command.aggregate_id,
+        "conflict",
+        Some(failure.code()),
+        Some(failure.message()),
+        command.expected_revision,
+        started.elapsed().as_millis() as u64,
+    );
+    let response = failure_response(&failure);
+    enqueue_refusal(
+        state,
+        actor,
+        state.clock.now(),
+        SurfaceKind::V1Command,
+        command_kind(&command.payload),
+        failure.refusal_kind(),
+        Some(command.command_id),
+    );
+    response
+}
+
 fn enqueue_refusal(
     state: &AppState,
     actor: &str,
@@ -380,19 +452,13 @@ async fn dispatch(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
+    prefetched: &crate::handlers::register_listing::RegisterRecordPrefetch,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     match &command.payload {
         CommandPayload::RegisterListing(payload) => {
-            crate::handlers::register_listing::handle(
-                tx,
-                actor,
-                command,
-                payload,
-                state.homeserver.as_deref(),
-                now,
-            )
-            .await
+            crate::handlers::register_listing::handle(tx, actor, command, payload, prefetched, now)
+                .await
         }
         CommandPayload::SyncListing(payload) => {
             crate::handlers::sync_listing::handle(

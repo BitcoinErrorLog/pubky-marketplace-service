@@ -100,6 +100,15 @@ pub async fn handle(
                 )))
             }
         };
+    // A Locks registration reads as shipping even for a digital-only record,
+    // so the record, not the registration, says whether it ships.
+    if registration.registers_unlimited_cap_with_physical_methods()
+        && crate::homeserver::record_publishes_physical_fulfillment(&record)
+    {
+        return Ok(Err(
+            crate::handlers::register_listing::unlimited_cap_refusal(),
+        ));
+    }
     // The derived payload must satisfy exactly the invariants
     // `listing.register` enforces; a record that fails them cannot back a
     // registered aggregate.
