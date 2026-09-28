@@ -552,25 +552,40 @@ async fn grant_settled_under_the_previous_request_still_needs_reauth_for_priv_ke
     assert_eq!(body["error"]["code"], json!("needs_reauth"));
 }
 
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn grant_settle_with_priv_outside_the_app_tree_mints_nothing(pool: sqlx::PgPool) {
+async fn assert_settle_mints_nothing(pool: sqlx::PgPool, requested: &str, verified: &str) {
     let (app, authority) = test_app_with_grant(pool).await;
     let pubky = "r".repeat(52);
-    for (requested, verified) in [
-        ("/priv/:rw", "/priv/:rw"),
-        (grant::GRANT_REQUEST_CAPABILITIES, "/priv/:rw"),
-        (
-            grant::GRANT_REQUEST_CAPABILITIES,
-            "/pub/pubky.app/marketplace-service/v1/:rw,/priv/other.app/:rw",
-        ),
-    ] {
-        let (_flow_id, applied, bearer, stored) = authority
-            .settle_grant_caps(&app.state, &pubky, requested, verified)
-            .await;
-        assert!(applied, "{requested} / {verified}");
-        assert!(bearer.is_none(), "{requested} / {verified}");
-        assert!(stored.is_none(), "{requested} / {verified}");
-    }
+    let (_flow_id, applied, bearer, stored) = authority
+        .settle_grant_caps(&app.state, &pubky, requested, verified)
+        .await;
+    assert!(applied, "{requested} / {verified}");
+    assert!(bearer.is_none(), "{requested} / {verified}");
+    assert!(stored.is_none(), "{requested} / {verified}");
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0, "{requested} / {verified}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn grant_settle_with_whole_priv_tree_mints_nothing(pool: sqlx::PgPool) {
+    assert_settle_mints_nothing(pool, "/priv/:rw", "/priv/:rw").await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn grant_settle_verified_wider_than_priv_app_mints_nothing(pool: sqlx::PgPool) {
+    assert_settle_mints_nothing(pool, grant::GRANT_REQUEST_CAPABILITIES, "/priv/:rw").await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn grant_settle_with_another_apps_priv_tree_mints_nothing(pool: sqlx::PgPool) {
+    assert_settle_mints_nothing(
+        pool,
+        grant::GRANT_REQUEST_CAPABILITIES,
+        "/pub/pubky.app/marketplace-service/v1/:rw,/priv/other.app/:rw",
+    )
+    .await;
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
