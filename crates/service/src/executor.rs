@@ -51,6 +51,16 @@ pub async fn execute(
     };
     let request_hash = command.request_hash();
 
+    // `listing.register` reads the seller's public record here, before the
+    // transaction and the command's advisory lock, so a slow homeserver
+    // never holds a domain connection or blocks a duplicate submission.
+    let prefetched = crate::handlers::register_listing::prefetch_public_record(
+        state.homeserver.as_deref(),
+        actor,
+        &command,
+    )
+    .await;
+
     let mut tx = state.pool.begin().await?;
 
     // Serialize concurrent submissions of the same actor + command id so a
@@ -179,7 +189,7 @@ pub async fn execute(
     }
 
     let now = state.clock.now();
-    let outcome = dispatch(state, &mut tx, actor, &command, now).await;
+    let outcome = dispatch(state, &mut tx, actor, &command, &prefetched, now).await;
     match outcome {
         Ok(Ok(success)) => {
             let body = success_body(&command, &success);
@@ -380,19 +390,13 @@ async fn dispatch(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
+    prefetched: &crate::handlers::register_listing::RegisterRecordPrefetch,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     match &command.payload {
         CommandPayload::RegisterListing(payload) => {
-            crate::handlers::register_listing::handle(
-                tx,
-                actor,
-                command,
-                payload,
-                state.homeserver.as_deref(),
-                now,
-            )
-            .await
+            crate::handlers::register_listing::handle(tx, actor, command, payload, prefetched, now)
+                .await
         }
         CommandPayload::SyncListing(payload) => {
             crate::handlers::sync_listing::handle(

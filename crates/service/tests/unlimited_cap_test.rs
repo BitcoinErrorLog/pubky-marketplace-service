@@ -4,10 +4,16 @@
 
 mod common;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
 use axum::http::StatusCode;
 use common::*;
 use marketplace_domain::commands::{UNLIMITED_STOCK_ON_PHYSICAL_LISTING, UNLIMITED_STOCK_QUANTITY};
 use marketplace_service::config::Config;
+use marketplace_service::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
@@ -306,5 +312,269 @@ async fn sync_decides_a_locks_listing_at_the_cap_from_the_seller_record(pool: Pg
         body["results"][0]["result"]["error"]["reason"],
         json!(UNLIMITED_STOCK_ON_PHYSICAL_LISTING),
         "{body}"
+    );
+}
+
+fn locks_register(
+    seller: &str,
+    listing_id: &str,
+    methods: Value,
+    lock: &Value,
+    index: u64,
+) -> Value {
+    let mut command = register(seller, listing_id, methods, UNLIMITED_STOCK_QUANTITY, index);
+    command["payload"]["digital_lock"] = lock.clone();
+    command
+}
+
+async fn send_command(app: &TestApp, token: &str, command: &Value) -> (StatusCode, Value) {
+    send(
+        app.router.clone(),
+        "POST",
+        "/v1/commands",
+        Some(token),
+        command,
+    )
+    .await
+}
+
+// Sol round 4 P1: a digital-only Locks record exempts only the exact
+// registration its derivation produces (shipping, its lock, its quantity and
+// version). Any other command at the cap is refused.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn register_binds_a_locks_exemption_to_the_registration_its_record_derives(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let lock = locks_lock(&seller.pubky);
+    let other_lock = json!({"policyUri": lock_resource_for(&seller.pubky), "criterionId": "other"});
+    let digital_only =
+        |listing_id: &str| locks_record(&seller.pubky, listing_id, json!(["digital"]), &lock);
+
+    let mut refused: Vec<(&str, Value, Value)> = Vec::new();
+    // Service methods the derivation never produces for a digital-only Locks record.
+    refused.push((
+        "m_pickup",
+        digital_only("m_pickup"),
+        locks_register(&seller.pubky, "m_pickup", json!(["pickup"]), &lock, 500),
+    ));
+    refused.push((
+        "m_ship_pickup",
+        digital_only("m_ship_pickup"),
+        locks_register(
+            &seller.pubky,
+            "m_ship_pickup",
+            json!(["shipping", "pickup"]),
+            &lock,
+            501,
+        ),
+    ));
+    // A lock the record does not carry.
+    refused.push((
+        "m_lock",
+        digital_only("m_lock"),
+        locks_register(
+            &seller.pubky,
+            "m_lock",
+            json!(["shipping"]),
+            &other_lock,
+            502,
+        ),
+    ));
+    // A quantity the record's variants do not sum to.
+    let mut small = digital_only("m_quantity");
+    small["variants"][0]["quantity"] = json!(5);
+    refused.push((
+        "m_quantity",
+        small,
+        locks_register(&seller.pubky, "m_quantity", json!(["shipping"]), &lock, 503),
+    ));
+    // A record version the command does not register.
+    let mut newer = locks_register(&seller.pubky, "m_revision", json!(["shipping"]), &lock, 504);
+    newer["payload"]["listing_revision"] = json!(2);
+    refused.push(("m_revision", digital_only("m_revision"), newer));
+    // A digital-only record with no lock at all.
+    let mut unlocked = digital_only("m_unlocked");
+    unlocked
+        .as_object_mut()
+        .expect("record object")
+        .remove("digitalLock");
+    refused.push((
+        "m_unlocked",
+        unlocked,
+        locks_register(&seller.pubky, "m_unlocked", json!(["shipping"]), &lock, 505),
+    ));
+    // A malformed record that merely names digital.
+    refused.push((
+        "m_malformed",
+        json!({"fulfillmentMethods": ["digital"]}),
+        locks_register(
+            &seller.pubky,
+            "m_malformed",
+            json!(["shipping"]),
+            &lock,
+            506,
+        ),
+    ));
+
+    for (listing_id, record, command) in refused {
+        put_command_mirror_record(&seller.pubky, listing_id, record);
+        let (status, body) = send_command(&app, &seller.token, &command).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{listing_id}: {body}");
+        assert_eq!(
+            body["error"]["reason"],
+            json!(UNLIMITED_STOCK_ON_PHYSICAL_LISTING),
+            "{listing_id}: {body}"
+        );
+    }
+
+    // The exact derivation registers.
+    put_command_mirror_record(&seller.pubky, "m_exact", digital_only("m_exact"));
+    let exact = locks_register(&seller.pubky, "m_exact", json!(["shipping"]), &lock, 507);
+    let (status, body) = send_command(&app, &seller.token, &exact).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A homeserver double that counts listing fetches and, during each one,
+/// tries the executor's advisory lock for the command under test from a
+/// separate connection.
+struct ProbeHomeserver {
+    pool: PgPool,
+    record: Mutex<Option<Value>>,
+    lock_key: Mutex<Option<String>>,
+    fetches: AtomicUsize,
+    lock_free_during_fetch: Mutex<Vec<bool>>,
+}
+
+impl HomeserverListingClient for ProbeHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            let key = self.lock_key.lock().expect("probe key").clone();
+            if let Some(key) = key {
+                let mut connection = self.pool.acquire().await.expect("probe connection");
+                let free: bool =
+                    sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 42))")
+                        .bind(&key)
+                        .fetch_one(&mut *connection)
+                        .await
+                        .expect("probe try lock");
+                if free {
+                    sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 42))")
+                        .bind(&key)
+                        .execute(&mut *connection)
+                        .await
+                        .expect("probe unlock");
+                }
+                self.lock_free_during_fetch
+                    .lock()
+                    .expect("probe results")
+                    .push(free);
+            }
+            match self.record.lock().expect("probe record").clone() {
+                Some(record) => HomeserverFetchOutcome::Found(record),
+                None => HomeserverFetchOutcome::NotFound,
+            }
+        })
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async { HomeserverFetchOutcome::NotFound })
+    }
+}
+
+// Sol round 4 P2: the record is read once per command, after the cheap
+// checks, and outside the command's transaction and advisory lock.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn register_reads_the_record_once_after_cheap_checks_and_outside_the_command_lock(
+    pool: PgPool,
+) {
+    let probe = Arc::new(ProbeHomeserver {
+        pool: pool.clone(),
+        record: Mutex::new(None),
+        lock_key: Mutex::new(None),
+        fetches: AtomicUsize::new(0),
+        lock_free_during_fetch: Mutex::new(Vec::new()),
+    });
+    let app = test_app_with_homeserver_client(pool, probe.clone()).await;
+    let seller = new_actor(&app).await;
+    let outsider = new_actor(&app).await;
+    let lock = locks_lock(&seller.pubky);
+    *probe.record.lock().expect("probe record") = Some(locks_record(
+        &seller.pubky,
+        "probe_01",
+        json!(["digital"]),
+        &lock,
+    ));
+
+    let command = locks_register(&seller.pubky, "probe_01", json!(["shipping"]), &lock, 600);
+    *probe.lock_key.lock().expect("probe key") = Some(format!(
+        "{}:{}",
+        seller.pubky,
+        command["command_id"].as_str().expect("command id")
+    ));
+    let (status, body) = send_command(&app, &seller.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        probe.fetches.load(Ordering::SeqCst),
+        1,
+        "one fetch per command"
+    );
+    assert_eq!(
+        *probe.lock_free_during_fetch.lock().expect("probe results"),
+        vec![true],
+        "the command's advisory lock is not held during the fetch"
+    );
+
+    // Refused on cheap checks without reading the record.
+    let mut wrong_aggregate =
+        locks_register(&seller.pubky, "probe_02", json!(["shipping"]), &lock, 601);
+    wrong_aggregate["aggregate_id"] = json!(format!("listing:{}_probe_other", seller.pubky));
+    let (status, body) = send_command(&app, &seller.token, &wrong_aggregate).await;
+    assert_eq!(
+        body["error"]["code"],
+        json!("INVALID_COMMAND"),
+        "{status}: {body}"
+    );
+    let not_seller = locks_register(&seller.pubky, "probe_03", json!(["shipping"]), &lock, 602);
+    let (status, body) = send_command(&app, &outsider.token, &not_seller).await;
+    assert_eq!(
+        body["error"]["code"],
+        json!("UNAUTHORIZED"),
+        "{status}: {body}"
+    );
+    assert_eq!(
+        probe.fetches.load(Ordering::SeqCst),
+        1,
+        "no fetch before cheap checks"
+    );
+
+    // A Locks auction at the cap reads the record once for both its cap
+    // decision and its auction authority.
+    let mut auction = register_auction_command(&seller.pubky);
+    auction["command_id"] = json!(indexed_command_id(0xca93, 1));
+    auction["aggregate_id"] = json!(format!("listing:{}_probe_04", seller.pubky));
+    auction["payload"]["listing_id"] = json!("probe_04");
+    auction["payload"]["quantity"] = json!(UNLIMITED_STOCK_QUANTITY);
+    auction["payload"]["digital_lock"] = lock.clone();
+    *probe.record.lock().expect("probe record") = Some(locks_record(
+        &seller.pubky,
+        "probe_04",
+        json!(["digital"]),
+        &lock,
+    ));
+    *probe.lock_key.lock().expect("probe key") = None;
+    let _ = send_command(&app, &seller.token, &auction).await;
+    assert_eq!(
+        probe.fetches.load(Ordering::SeqCst),
+        2,
+        "one fetch for the auction command"
     );
 }

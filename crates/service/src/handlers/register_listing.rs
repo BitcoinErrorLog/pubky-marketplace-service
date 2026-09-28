@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
-    validate_public_listing_payload, AuctionReserve, Command, RegisterListingPayload, SaleFormat,
-    UNLIMITED_STOCK_ON_PHYSICAL_LISTING,
+    validate_public_listing_payload, AuctionReserve, Command, CommandPayload,
+    RegisterListingPayload, SaleFormat, UNLIMITED_STOCK_ON_PHYSICAL_LISTING,
 };
 use marketplace_domain::{ids, ErrorCode};
 use serde_json::{json, Value};
@@ -33,13 +33,114 @@ pub(crate) fn unlimited_cap_refusal() -> CommandFailure {
     )
 }
 
-/// `listing.register` at the cap with a physical method. Without a Locks
-/// lock that is the refusal. A Locks payload registers as shipping even for
-/// a digital-only record, so the seller's record decides; a record that
-/// cannot be read is refused rather than trusted.
-async fn refuse_unlimited_cap(
+/// The seller's public listing record for one `listing.register`, fetched
+/// once before the executor opens its transaction or takes the command's
+/// advisory lock, so a slow homeserver never holds a domain connection. It
+/// is fetched only for a command that needs it (see `needs_public_record`)
+/// and passes the cheap actor and aggregate checks; the handler decides the
+/// auction authority and the Locks cap exemption from this one record.
+pub enum RegisterRecordPrefetch {
+    NotNeeded,
+    Found(Value),
+    NotFound,
+    Unavailable,
+    NoHomeserver,
+}
+
+/// An auction registers against its public authority, and a Locks payload at
+/// the unlimited cap with a physical method is exempt only by its record.
+fn needs_public_record(payload: &RegisterListingPayload) -> bool {
+    payload.sale_format == SaleFormat::Auction
+        || (payload.digital_lock.is_some()
+            && payload.registers_unlimited_cap_with_physical_methods())
+}
+
+/// The seller-signed actor and the aggregate the command names; the handler
+/// refuses anything else before it would read a record.
+fn register_addresses_its_own_listing(
+    actor: &str,
+    command: &Command,
     payload: &RegisterListingPayload,
+) -> bool {
+    actor == payload.seller_pubky
+        && command.aggregate_id
+            == ids::listing_aggregate_id(&payload.seller_pubky, &payload.listing_id)
+}
+
+pub async fn prefetch_public_record(
     homeserver: Option<&dyn HomeserverListingClient>,
+    actor: &str,
+    command: &Command,
+) -> RegisterRecordPrefetch {
+    let CommandPayload::RegisterListing(payload) = &command.payload else {
+        return RegisterRecordPrefetch::NotNeeded;
+    };
+    if !register_addresses_its_own_listing(actor, command, payload) || !needs_public_record(payload)
+    {
+        return RegisterRecordPrefetch::NotNeeded;
+    }
+    let Some(homeserver) = homeserver else {
+        return RegisterRecordPrefetch::NoHomeserver;
+    };
+    match homeserver
+        .fetch_listing(&payload.seller_pubky, &payload.listing_id)
+        .await
+    {
+        HomeserverFetchOutcome::Found(record) => RegisterRecordPrefetch::Found(record),
+        HomeserverFetchOutcome::NotFound => RegisterRecordPrefetch::NotFound,
+        HomeserverFetchOutcome::Unavailable => RegisterRecordPrefetch::Unavailable,
+    }
+}
+
+fn record_not_found() -> CommandFailure {
+    CommandFailure::refused(
+        crate::refusal_audit::RefusalKind::NotFound,
+        ErrorCode::NotFound,
+        "The seller's homeserver has no such listing record.",
+    )
+}
+
+fn record_unavailable() -> CommandFailure {
+    CommandFailure::refused(
+        crate::refusal_audit::RefusalKind::UpstreamUnavailable,
+        ErrorCode::UpstreamUnavailable,
+        "The seller's homeserver could not be reached. Try again shortly.",
+    )
+}
+
+/// The registration the seller's record derives, validated as `listing.sync`
+/// validates it.
+fn public_candidate(
+    payload: &RegisterListingPayload,
+    record: &Value,
+) -> Result<RegisterListingPayload, CommandFailure> {
+    match registration_payload_from_record(&payload.seller_pubky, &payload.listing_id, record) {
+        Ok(Some(candidate)) => validate_public_listing_payload(candidate).map_err(|issues| {
+            CommandFailure::refused_with_issues(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "The seller's listing record does not satisfy registration invariants.",
+                issues,
+            )
+        }),
+        _ => Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The seller's listing record could not be interpreted for registration.",
+        )),
+    }
+}
+
+/// `listing.register` at the cap with a physical method. Without a Locks
+/// lock that is the refusal. The Locks derivation registers a digital-only
+/// record as shipping, so a Locks payload is exempt only when the seller's
+/// record publishes digital alone and the command is exactly the
+/// registration that record derives: the same service methods, lock,
+/// quantity and record version. Anything else, including a record that
+/// cannot be read or derived, is refused rather than trusted.
+fn refuse_unlimited_cap(
+    payload: &RegisterListingPayload,
+    prefetched: &RegisterRecordPrefetch,
 ) -> Option<CommandFailure> {
     if !payload.registers_unlimited_cap_with_physical_methods() {
         return None;
@@ -47,26 +148,28 @@ async fn refuse_unlimited_cap(
     if payload.digital_lock.is_none() {
         return Some(unlimited_cap_refusal());
     }
-    let Some(homeserver) = homeserver else {
-        return Some(unlimited_cap_refusal());
-    };
-    match homeserver
-        .fetch_listing(&payload.seller_pubky, &payload.listing_id)
-        .await
-    {
-        HomeserverFetchOutcome::Found(record) => {
-            record_publishes_physical_fulfillment(&record).then(unlimited_cap_refusal)
+    let record = match prefetched {
+        RegisterRecordPrefetch::Found(record) => record,
+        RegisterRecordPrefetch::NotFound => return Some(record_not_found()),
+        RegisterRecordPrefetch::Unavailable => return Some(record_unavailable()),
+        RegisterRecordPrefetch::NotNeeded | RegisterRecordPrefetch::NoHomeserver => {
+            return Some(unlimited_cap_refusal())
         }
-        HomeserverFetchOutcome::NotFound => Some(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::NotFound,
-            ErrorCode::NotFound,
-            "The seller's homeserver has no such listing record.",
-        )),
-        HomeserverFetchOutcome::Unavailable => Some(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::UpstreamUnavailable,
-            ErrorCode::UpstreamUnavailable,
-            "The seller's homeserver could not be reached. Try again shortly.",
-        )),
+    };
+    if record_publishes_physical_fulfillment(record) {
+        return Some(unlimited_cap_refusal());
+    }
+    match public_candidate(payload, record) {
+        Ok(candidate)
+            if candidate.fulfillment_methods == payload.fulfillment_methods
+                && candidate.digital_lock == payload.digital_lock
+                && candidate.quantity == payload.quantity
+                && candidate.listing_revision == payload.listing_revision
+                && candidate.content_hash == payload.content_hash =>
+        {
+            None
+        }
+        _ => Some(unlimited_cap_refusal()),
     }
 }
 
@@ -75,7 +178,7 @@ pub async fn handle(
     actor: &str,
     command: &Command,
     payload: &RegisterListingPayload,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    prefetched: &RegisterRecordPrefetch,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     if actor != payload.seller_pubky {
@@ -85,73 +188,35 @@ pub async fn handle(
             "Only the listing seller may register inventory.",
         )));
     }
-    if let Some(refusal) = refuse_unlimited_cap(payload, homeserver).await {
-        return Ok(Err(refusal));
-    }
-    let expected_aggregate_id =
-        ids::listing_aggregate_id(&payload.seller_pubky, &payload.listing_id);
-    if command.aggregate_id != expected_aggregate_id {
+    if !register_addresses_its_own_listing(actor, command, payload) {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The listing aggregate id does not match its seller and listing.",
         )));
     }
+    if let Some(refusal) = refuse_unlimited_cap(payload, prefetched) {
+        return Ok(Err(refusal));
+    }
 
-    // Resolve and validate public auction authority before taking either
-    // aggregate lock. A slow public homeserver must not stall bids or close
-    // while the seller registration command is waiting on the network.
+    // The auction's public authority is the same prefetched record the cap
+    // decision read, so the two cannot observe different record versions.
     if payload.sale_format == SaleFormat::Auction {
-        let Some(homeserver) = homeserver else {
-            return Ok(Err(CommandFailure::refused(
-                crate::refusal_audit::RefusalKind::InvalidCommand,
-                ErrorCode::InvalidCommand,
-                "Listing registration is not enabled on this deployment.",
-            )));
-        };
-        let public_record = match homeserver
-            .fetch_listing(&payload.seller_pubky, &payload.listing_id)
-            .await
-        {
-            HomeserverFetchOutcome::Found(record) => record,
-            HomeserverFetchOutcome::NotFound => {
+        let public_record = match prefetched {
+            RegisterRecordPrefetch::Found(record) => record,
+            RegisterRecordPrefetch::NotFound => return Ok(Err(record_not_found())),
+            RegisterRecordPrefetch::Unavailable => return Ok(Err(record_unavailable())),
+            RegisterRecordPrefetch::NotNeeded | RegisterRecordPrefetch::NoHomeserver => {
                 return Ok(Err(CommandFailure::refused(
-                    crate::refusal_audit::RefusalKind::NotFound,
-                    ErrorCode::NotFound,
-                    "The seller's homeserver has no such listing record.",
-                )))
-            }
-            HomeserverFetchOutcome::Unavailable => {
-                return Ok(Err(CommandFailure::refused(
-                    crate::refusal_audit::RefusalKind::UpstreamUnavailable,
-                    ErrorCode::UpstreamUnavailable,
-                    "The seller's homeserver could not be reached. Try again shortly.",
-                )))
+                    crate::refusal_audit::RefusalKind::InvalidCommand,
+                    ErrorCode::InvalidCommand,
+                    "Listing registration is not enabled on this deployment.",
+                )));
             }
         };
-        let public_candidate = match registration_payload_from_record(
-            &payload.seller_pubky,
-            &payload.listing_id,
-            &public_record,
-        ) {
-            Ok(Some(candidate)) => match validate_public_listing_payload(candidate) {
-                Ok(candidate) => candidate,
-                Err(issues) => {
-                    return Ok(Err(CommandFailure::refused_with_issues(
-                        crate::refusal_audit::RefusalKind::InvalidState,
-                        ErrorCode::InvalidState,
-                        "The seller's listing record does not satisfy registration invariants.",
-                        issues,
-                    )))
-                }
-            },
-            _ => {
-                return Ok(Err(CommandFailure::refused(
-                    crate::refusal_audit::RefusalKind::InvalidState,
-                    ErrorCode::InvalidState,
-                    "The seller's listing record could not be interpreted for registration.",
-                )))
-            }
+        let public_candidate = match public_candidate(payload, public_record) {
+            Ok(candidate) => candidate,
+            Err(refusal) => return Ok(Err(refusal)),
         };
         let mut public_command = payload.clone();
         public_command.auction_reserve = None;
