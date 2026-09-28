@@ -507,7 +507,8 @@ pub async fn claim_outbox_batch(
     sqlx::query_as(
         "UPDATE outbox SET lease_until = $2 WHERE id IN (\
              SELECT id FROM outbox \
-             WHERE delivered_at IS NULL AND (lease_until IS NULL OR lease_until <= $1) \
+             WHERE delivered_at IS NULL AND quarantined_at IS NULL \
+             AND (lease_until IS NULL OR lease_until <= $1) \
              ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED\
          ) RETURNING id, event_id, kind, payload, created_at",
     )
@@ -524,7 +525,10 @@ pub async fn claim_outbox_batch(
 /// apply its effect twice. `paykit.activate` / `paykit.void` rows drive the
 /// two-phase protocol against the order's persisted stack endpoint
 /// (§B.11.8); a paykit row on a deployment without the signed client is
-/// skipped (logged), never head-of-line for the rest of the batch.
+/// skipped (logged), never head-of-line for the rest of the batch. A
+/// notification row that can never deliver (an unroutable kind, a payload
+/// missing a required field) is quarantined on its own and the batch
+/// continues.
 pub async fn deliver_claimed(
     pool: &PgPool,
     paykit: Option<&PaykitClient>,
@@ -559,36 +563,13 @@ pub async fn deliver_claimed(
             }
             continue;
         }
-        let Some(notification_type) = row.kind.strip_prefix("notification.") else {
-            anyhow::bail!("outbox row {} has unroutable kind {}", row.id, row.kind);
-        };
-        let recipient = payload_str(&row.payload, "recipient_pubky", row.id)?;
-        let actor = payload_str(&row.payload, "actor_pubky", row.id)?;
-        let aggregate_id = payload_str(&row.payload, "aggregate_id", row.id)?;
-        // Optional monetary context; intents written before amounts existed
-        // have no key and deliver as NULL.
-        let amount = match &row.payload["amount"] {
-            Value::Null => None,
-            value => Some(value.clone()),
-        };
-        // The 0048 CHECK refuses an unknown reason. An intent carrying one
-        // still delivers, without it, so it never stalls the rows behind it.
-        let review_reason = match &row.payload["review_reason"] {
-            Value::Null => None,
-            value => {
-                let known = value
-                    .as_str()
-                    .and_then(crate::handlers::BitcoinReviewNotice::parse);
-                if known.is_none() {
-                    tracing::warn!(
-                        row_id = row.id,
-                        "outbox notification carries an unknown review_reason; delivering without it"
-                    );
-                }
-                known.map(crate::handlers::BitcoinReviewNotice::as_str)
+        let intent = match notification_intent(row) {
+            Ok(intent) => intent,
+            Err(reason) => {
+                quarantine_outbox_row(pool, row.id, reason, now).await?;
+                continue;
             }
         };
-
         let mut tx = pool.begin().await?;
         sqlx::query(
             "INSERT INTO notifications (id, event_id, recipient_pubky, actor_pubky, type, \
@@ -598,12 +579,12 @@ pub async fn deliver_claimed(
         )
         .bind(Uuid::new_v4())
         .bind(row.event_id)
-        .bind(recipient)
-        .bind(actor)
-        .bind(notification_type)
-        .bind(aggregate_id)
-        .bind(amount)
-        .bind(review_reason)
+        .bind(intent.recipient)
+        .bind(intent.actor)
+        .bind(intent.notification_type)
+        .bind(intent.aggregate_id)
+        .bind(intent.amount)
+        .bind(intent.review_reason)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -616,6 +597,117 @@ pub async fn deliver_claimed(
         delivered += 1;
     }
     Ok(delivered)
+}
+
+/// Why a notification outbox row can never deliver (the 0049
+/// `outbox_quarantine_check` vocabulary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxQuarantine {
+    UnroutableKind,
+    MissingRecipientPubky,
+    MissingActorPubky,
+    MissingAggregateId,
+}
+
+impl OutboxQuarantine {
+    pub const ALL: [Self; 4] = [
+        Self::UnroutableKind,
+        Self::MissingRecipientPubky,
+        Self::MissingActorPubky,
+        Self::MissingAggregateId,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnroutableKind => "unroutable_kind",
+            Self::MissingRecipientPubky => "missing_recipient_pubky",
+            Self::MissingActorPubky => "missing_actor_pubky",
+            Self::MissingAggregateId => "missing_aggregate_id",
+        }
+    }
+}
+
+/// A notification outbox row, validated before anything is written.
+struct NotificationIntent<'a> {
+    notification_type: &'a str,
+    recipient: &'a str,
+    actor: &'a str,
+    aggregate_id: &'a str,
+    amount: Option<Value>,
+    review_reason: Option<&'static str>,
+}
+
+fn notification_intent(row: &ClaimedOutboxRow) -> Result<NotificationIntent<'_>, OutboxQuarantine> {
+    let notification_type = row
+        .kind
+        .strip_prefix("notification.")
+        .filter(|kind| !kind.is_empty())
+        .ok_or(OutboxQuarantine::UnroutableKind)?;
+    let field = |name: &str, missing: OutboxQuarantine| {
+        row.payload[name]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or(missing)
+    };
+    let recipient = field("recipient_pubky", OutboxQuarantine::MissingRecipientPubky)?;
+    let actor = field("actor_pubky", OutboxQuarantine::MissingActorPubky)?;
+    let aggregate_id = field("aggregate_id", OutboxQuarantine::MissingAggregateId)?;
+    // Optional monetary context; intents written before amounts existed
+    // have no key and deliver as NULL.
+    let amount = match &row.payload["amount"] {
+        Value::Null => None,
+        value => Some(value.clone()),
+    };
+    // The 0048 CHECK refuses an unknown reason. An intent carrying one
+    // still delivers, without it, so it never stalls the rows behind it.
+    let review_reason = match &row.payload["review_reason"] {
+        Value::Null => None,
+        value => {
+            let known = value
+                .as_str()
+                .and_then(crate::handlers::BitcoinReviewNotice::parse);
+            if known.is_none() {
+                tracing::warn!(
+                    row_id = row.id,
+                    "outbox notification carries an unknown review_reason; delivering without it"
+                );
+            }
+            known.map(crate::handlers::BitcoinReviewNotice::as_str)
+        }
+    };
+    Ok(NotificationIntent {
+        notification_type,
+        recipient,
+        actor,
+        aggregate_id,
+        amount,
+        review_reason,
+    })
+}
+
+/// Sets one undeliverable row aside: it is never claimed again, and the
+/// rest of the batch continues.
+async fn quarantine_outbox_row(
+    pool: &PgPool,
+    row_id: i64,
+    reason: OutboxQuarantine,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE outbox SET quarantined_at = $2, quarantine_reason = $3, lease_until = NULL \
+         WHERE id = $1 AND delivered_at IS NULL",
+    )
+    .bind(row_id)
+    .bind(now)
+    .bind(reason.as_str())
+    .execute(pool)
+    .await?;
+    tracing::error!(
+        row_id,
+        reason = reason.as_str(),
+        "ALERT quarantined an undeliverable outbox row; continuing the batch"
+    );
+    Ok(())
 }
 
 fn payload_str<'a>(payload: &'a Value, field: &str, row_id: i64) -> anyhow::Result<&'a str> {
