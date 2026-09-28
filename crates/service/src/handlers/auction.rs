@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::executor::insert_event;
 use crate::handlers::{
-    fetch_auction_reserve_for_update, fetch_listing_for_update, insert_notification_intent,
-    LISTING_COLUMNS,
+    fetch_auction_reserve_for_update, fetch_listing_for_update, fetch_live_listing_for_update,
+    insert_notification_intent, LISTING_COLUMNS,
 };
 use crate::model::{
     money_json, AuctionReserveRow, AuctionState, BidRow, ListingRow, OrderRow, PaymentRow,
@@ -57,7 +57,7 @@ pub async fn place_bid(
     payload: &PlaceBidPayload,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let Some(listing) = fetch_listing_for_update(tx, &command.aggregate_id).await? else {
+    let Some(listing) = fetch_live_listing_for_update(tx, &command.aggregate_id).await? else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::BidListingNotFound,
             ErrorCode::NotFound,
@@ -367,7 +367,12 @@ pub async fn close_locked_auction(
         .await?
         .ok_or_else(|| sqlx::Error::Protocol("auction reserve authority is missing".to_string()))?;
     let reserve_satisfied = reserve_satisfied(listing, &auction, &reserve)?;
-    let winner = auction.leader_pubky.clone().filter(|_| reserve_satisfied);
+    // A deleted auction closes unsold: its leader never becomes a buyer of a
+    // listing the seller withdrew.
+    let winner = auction
+        .leader_pubky
+        .clone()
+        .filter(|_| reserve_satisfied && !listing.is_deleted());
     let sold = winner.is_some();
     let auction_status = if sold { "sold" } else { "unsold" };
     debug_assert!(can_transition(&auction_machine(), "active", auction_status));

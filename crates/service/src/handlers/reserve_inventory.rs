@@ -7,7 +7,7 @@ use sqlx::{Postgres, Transaction};
 
 use crate::executor::insert_event;
 use crate::handlers::{
-    current_listing_revision, fetch_auction_reserve, fetch_listing, LISTING_COLUMNS,
+    current_listing_revision, fetch_auction_reserve, fetch_live_listing, LISTING_COLUMNS,
 };
 use crate::model::{ListingRow, ReservationRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
@@ -19,7 +19,7 @@ pub async fn handle(
     payload: &ReserveInventoryPayload,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let Some(listing) = fetch_listing(tx, &command.aggregate_id).await? else {
+    let Some(listing) = fetch_live_listing(tx, &command.aggregate_id).await? else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,

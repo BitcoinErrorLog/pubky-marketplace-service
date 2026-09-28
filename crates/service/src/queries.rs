@@ -227,14 +227,15 @@ pub async fn get_band_consent(
 /// buyer identity beyond the auction's current leader, which the auction
 /// state already makes visible to every bidder. An auction bidder additionally
 /// receives only their own proxy maximum and the minimum next maximum accepted
-/// for that bidder; this field is absent for other viewers.
+/// for that bidder; this field is absent for other viewers. A tombstoned
+/// listing is not found.
 pub async fn get_listing(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Path(aggregate_id): Path<String>,
 ) -> Response {
     let listing: Result<Option<ListingRow>, sqlx::Error> = sqlx::query_as(&format!(
-        "SELECT {LISTING_COLUMNS} FROM listings WHERE aggregate_id = $1"
+        "SELECT {LISTING_COLUMNS} FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL"
     ))
     .bind(&aggregate_id)
     .fetch_optional(&state.pool)
@@ -312,6 +313,7 @@ pub async fn get_listing(
 /// price existed show `visible_amount: null` rather than an invented figure.
 pub async fn list_listing_bids(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(aggregate_id): Path<String>,
 ) -> Response {
     let listing: Result<Option<ListingRow>, sqlx::Error> = sqlx::query_as(&format!(
@@ -325,6 +327,22 @@ pub async fn list_listing_bids(
         Ok(None) => return query_error(ErrorCode::NotFound, "The listing was not found."),
         Err(error) => return internal_error("listing", &error),
     };
+    // A deleted auction's history stays auditable by the parties to it — the
+    // seller and its bidders — and is gone for everyone else.
+    if listing.is_deleted() && actor.0 != listing.seller_pubky {
+        let bidder: Result<bool, sqlx::Error> = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM bids WHERE listing_aggregate_id = $1 AND bidder_pubky = $2)",
+        )
+        .bind(&aggregate_id)
+        .bind(&actor.0)
+        .fetch_one(&state.pool)
+        .await;
+        match bidder {
+            Ok(true) => {}
+            Ok(false) => return query_error(ErrorCode::NotFound, "The listing was not found."),
+            Err(error) => return internal_error("listing bidder", &error),
+        }
+    }
     type BidHistoryRow = (i64, String, Option<i64>, String, i32, DateTime<Utc>);
     let rows: Result<Vec<BidHistoryRow>, sqlx::Error> = sqlx::query_as(
         "SELECT sequence, bidder_pubky, visible_amount_minor, currency, exponent, created_at \

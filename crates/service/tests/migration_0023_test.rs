@@ -541,14 +541,15 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 /// checkout-hold 0038, PayPal gateway refunds 0039, digital delivery 0040,
 /// digital orders 0041, released Paykit attempts 0042, manual digital
 /// delivery 0043, accepted offer fulfillment methods 0044, Paykit
-/// delivery state 0045, and per-user priv data keys 0046.
+/// delivery state 0045, per-user priv data keys 0046, and listing
+/// tombstones 0047.
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0046() {
+fn migration_catalog_is_gapless_through_0047() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -558,18 +559,18 @@ fn migration_catalog_is_gapless_through_0046() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    let expected = (1..=46).collect::<Vec<_>>();
+    let expected = (1..=47).collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
         expected,
-        "the raw catalog is 0001..=0046, gapless"
+        "the raw catalog is 0001..=0047, gapless"
     );
 }
 
 #[test]
-fn migration_catalog_rejects_a_duplicate_0046_number() {
-    let numbers = (1..=45).chain([46, 46]).collect::<Vec<_>>();
-    let expected = (1..=45).chain([46]).collect::<Vec<_>>();
+fn migration_catalog_rejects_a_duplicate_0047_number() {
+    let numbers = (1..=46).chain([47, 47]).collect::<Vec<_>>();
+    let expected = (1..=46).chain([47]).collect::<Vec<_>>();
     assert_ne!(
         sorted_migration_catalog(numbers),
         expected,

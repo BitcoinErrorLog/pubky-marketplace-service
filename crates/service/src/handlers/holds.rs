@@ -42,6 +42,11 @@ pub const SOLD_OUT_BEFORE_PAYMENT: &str = "The listing sold out before this paym
 /// `INVALID_STATE` 409.
 pub const HOLDING_COPY: &str = "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.";
 
+/// Refusal copy when the seller deleted the listing (or re-created it) after
+/// this order was placed: the unpaid order can no longer take stock.
+pub const LISTING_REMOVED_COPY: &str =
+    "The seller removed this listing before this payment started.";
+
 /// Historical `hold_source` written by #50 at `checkout.create`. Ordinary
 /// create no longer writes it; in-flight rows may still carry it until TTL.
 #[allow(dead_code)]
@@ -180,6 +185,13 @@ pub async fn acquire_payment_hold(
                 "An order line's listing is missing.",
             )));
         };
+        if !listing.accepts_commitment_created_at(order.created_at) {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::NotFound,
+                ErrorCode::NotFound,
+                LISTING_REMOVED_COPY,
+            )));
+        }
         if listing.available_quantity < quantity {
             if listing.state == "reserved" || listing.reserved_quantity > 0 {
                 return Ok(Err(CommandFailure::refused(
