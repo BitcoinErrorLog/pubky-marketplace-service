@@ -36,9 +36,10 @@ pub(crate) fn unlimited_cap_refusal() -> CommandFailure {
 /// The seller's public listing record for one `listing.register`, fetched
 /// once before the executor opens its transaction or takes the command's
 /// advisory lock, so a slow homeserver never holds a domain connection. It
-/// is fetched only for a command that needs it (see `needs_public_record`)
-/// and passes the cheap actor and aggregate checks; the handler decides the
-/// auction authority and the Locks cap exemption from this one record.
+/// is fetched only for a command that needs it (see `needs_public_record`),
+/// passes the cheap actor and aggregate checks, and has no stored result;
+/// the handler decides the auction authority and the Locks cap exemption
+/// from this one record.
 pub enum RegisterRecordPrefetch {
     NotNeeded,
     Found(Value),
@@ -67,18 +68,26 @@ fn register_addresses_its_own_listing(
             == ids::listing_aggregate_id(&payload.seller_pubky, &payload.listing_id)
 }
 
-pub async fn prefetch_public_record(
-    homeserver: Option<&dyn HomeserverListingClient>,
+/// The `listing.register` payload whose public record the executor must read
+/// before its transaction, or `None` for every other command.
+pub fn public_record_request<'c>(
     actor: &str,
-    command: &Command,
-) -> RegisterRecordPrefetch {
+    command: &'c Command,
+) -> Option<&'c RegisterListingPayload> {
     let CommandPayload::RegisterListing(payload) = &command.payload else {
-        return RegisterRecordPrefetch::NotNeeded;
+        return None;
     };
     if !register_addresses_its_own_listing(actor, command, payload) || !needs_public_record(payload)
     {
-        return RegisterRecordPrefetch::NotNeeded;
+        return None;
     }
+    Some(payload)
+}
+
+pub async fn prefetch_public_record(
+    homeserver: Option<&dyn HomeserverListingClient>,
+    payload: &RegisterListingPayload,
+) -> RegisterRecordPrefetch {
     let Some(homeserver) = homeserver else {
         return RegisterRecordPrefetch::NoHomeserver;
     };

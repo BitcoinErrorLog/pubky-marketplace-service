@@ -6,8 +6,9 @@ mod common;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::*;
@@ -436,13 +437,29 @@ async fn register_binds_a_locks_exemption_to_the_registration_its_record_derives
 
 /// A homeserver double that counts listing fetches and, during each one,
 /// tries the executor's advisory lock for the command under test from a
-/// separate connection.
+/// separate connection. With `wait_for_peer` set, a fetch stays open for up
+/// to a second or until another fetch starts, so a concurrent duplicate that
+/// reads the record too is seen while the first read is still in flight.
 struct ProbeHomeserver {
     pool: PgPool,
     record: Mutex<Option<Value>>,
     lock_key: Mutex<Option<String>>,
     fetches: AtomicUsize,
     lock_free_during_fetch: Mutex<Vec<bool>>,
+    wait_for_peer: AtomicBool,
+}
+
+impl ProbeHomeserver {
+    fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            record: Mutex::new(None),
+            lock_key: Mutex::new(None),
+            fetches: AtomicUsize::new(0),
+            lock_free_during_fetch: Mutex::new(Vec::new()),
+            wait_for_peer: AtomicBool::new(false),
+        }
+    }
 }
 
 impl HomeserverListingClient for ProbeHomeserver {
@@ -452,7 +469,15 @@ impl HomeserverListingClient for ProbeHomeserver {
         _listing_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
         Box::pin(async move {
-            self.fetches.fetch_add(1, Ordering::SeqCst);
+            let started = self.fetches.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.wait_for_peer.load(Ordering::SeqCst) {
+                for _ in 0..100 {
+                    if self.fetches.load(Ordering::SeqCst) > started {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
             let key = self.lock_key.lock().expect("probe key").clone();
             if let Some(key) = key {
                 let mut connection = self.pool.acquire().await.expect("probe connection");
@@ -496,13 +521,7 @@ impl HomeserverListingClient for ProbeHomeserver {
 async fn register_reads_the_record_once_after_cheap_checks_and_outside_the_command_lock(
     pool: PgPool,
 ) {
-    let probe = Arc::new(ProbeHomeserver {
-        pool: pool.clone(),
-        record: Mutex::new(None),
-        lock_key: Mutex::new(None),
-        fetches: AtomicUsize::new(0),
-        lock_free_during_fetch: Mutex::new(Vec::new()),
-    });
+    let probe = Arc::new(ProbeHomeserver::new(pool.clone()));
     let app = test_app_with_homeserver_client(pool, probe.clone()).await;
     let seller = new_actor(&app).await;
     let outsider = new_actor(&app).await;
@@ -577,4 +596,72 @@ async fn register_reads_the_record_once_after_cheap_checks_and_outside_the_comma
         2,
         "one fetch for the auction command"
     );
+}
+
+// Sol round 5 P2: a replay, a conflicting reuse of the command id, and a
+// concurrent duplicate are answered without another record read, and
+// commands that need no record never read one.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn register_answers_replays_conflicts_and_duplicates_without_another_record_read(
+    pool: PgPool,
+) {
+    let probe = Arc::new(ProbeHomeserver::new(pool.clone()));
+    let app = test_app_with_homeserver_client(pool, probe.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let lock = locks_lock(&seller.pubky);
+    let fetches = || probe.fetches.load(Ordering::SeqCst);
+
+    // A fixed-price registration and a non-register command read nothing.
+    let (status, body) =
+        send_command(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) =
+        send_command(&app, &buyer.token, &reserve_command(&seller.pubky, 1, 1, 1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fetches(), 0, "no record read without a record decision");
+
+    *probe.record.lock().expect("probe record") = Some(locks_record(
+        &seller.pubky,
+        "replay_01",
+        json!(["digital"]),
+        &lock,
+    ));
+    let command = locks_register(&seller.pubky, "replay_01", json!(["shipping"]), &lock, 700);
+    let (status, first) = send_command(&app, &seller.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(fetches(), 1, "the first submission reads the record");
+
+    let (status, replay) = send_command(&app, &seller.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, first, "the replay returns the stored result");
+    assert_eq!(fetches(), 1, "an exact replay reads nothing");
+
+    let mut conflicting = command.clone();
+    conflicting["payload"]["listing_revision"] = json!(2);
+    let (status, body) = send_command(&app, &seller.token, &conflicting).await;
+    assert_eq!(
+        body["error"]["code"],
+        json!("IDEMPOTENCY_CONFLICT"),
+        "{status}: {body}"
+    );
+    assert_eq!(fetches(), 1, "a conflicting reuse reads nothing");
+
+    // Two identical first submissions in flight together read once.
+    *probe.record.lock().expect("probe record") = Some(locks_record(
+        &seller.pubky,
+        "twice_01",
+        json!(["digital"]),
+        &lock,
+    ));
+    probe.wait_for_peer.store(true, Ordering::SeqCst);
+    let duplicate = locks_register(&seller.pubky, "twice_01", json!(["shipping"]), &lock, 701);
+    let ((status_a, body_a), (status_b, body_b)) = tokio::join!(
+        send_command(&app, &seller.token, &duplicate),
+        send_command(&app, &seller.token, &duplicate),
+    );
+    assert_eq!(status_a, StatusCode::OK, "{body_a}");
+    assert_eq!(status_b, StatusCode::OK, "{body_b}");
+    assert_eq!(body_a, body_b, "the duplicate returns the first result");
+    assert_eq!(fetches(), 2, "concurrent duplicates read the record once");
 }

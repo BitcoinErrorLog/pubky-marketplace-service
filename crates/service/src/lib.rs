@@ -14,6 +14,7 @@ pub mod auth;
 pub mod automation;
 pub mod bitcoin_review;
 pub mod clock;
+pub mod command_flight;
 pub mod config;
 pub mod content_lock;
 pub mod contracts;
@@ -89,6 +90,9 @@ pub struct AppState {
     /// in production (`HOMESERVER_URL`); `None` only in tests that do not
     /// exercise sync, where the command is refused (fail closed).
     pub homeserver: Option<Arc<dyn HomeserverListingClient>>,
+    /// Single flight for commands that read the homeserver before their
+    /// executor transaction (`listing.register` with a public record).
+    pub command_flights: command_flight::CommandFlights,
     /// Seller payment-method rails: Stripe key sealing/verification and the
     /// signed Paykit client. `None` when `STRIPE_KEY_ENCRYPTION_KEY` is
     /// unset: the whole `/v0` payment-methods surface is refused (fail
@@ -159,6 +163,7 @@ impl AppState {
             locks: None,
             attestor: None,
             homeserver: None,
+            command_flights: command_flight::CommandFlights::default(),
             payments: None,
             payment_availability: PaymentAvailabilityCache::default(),
             pickup: None,
