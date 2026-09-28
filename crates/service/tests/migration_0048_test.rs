@@ -1,3 +1,4 @@
+use marketplace_service::handlers::BitcoinReviewNotice;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -29,16 +30,33 @@ async fn insert(pool: &PgPool, review_reason: Option<&str>) -> Result<(), sqlx::
     .map(|_| ())
 }
 
+const REVIEW_REASONS: [&str; 5] = [
+    "late_settlement",
+    "amount_mismatch",
+    "confirmation_failed",
+    "seller_confirmation_window_elapsed",
+    "seller_response_overdue",
+];
+
+#[test]
+fn the_notice_vocabulary_is_the_0048_check() {
+    let notices: Vec<&str> = BitcoinReviewNotice::ALL
+        .into_iter()
+        .map(BitcoinReviewNotice::as_str)
+        .collect();
+    assert_eq!(notices, REVIEW_REASONS);
+    for reason in REVIEW_REASONS {
+        assert_eq!(
+            BitcoinReviewNotice::parse(reason).map(BitcoinReviewNotice::as_str),
+            Some(reason)
+        );
+    }
+    assert_eq!(BitcoinReviewNotice::parse("refund_required"), None);
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0048_bounds_notification_review_reasons_and_is_rerunnable(pool: PgPool) {
-    for reason in [
-        None,
-        Some("late_settlement"),
-        Some("amount_mismatch"),
-        Some("confirmation_failed"),
-        Some("seller_confirmation_window_elapsed"),
-        Some("seller_response_overdue"),
-    ] {
+    for reason in std::iter::once(None).chain(REVIEW_REASONS.map(Some)) {
         insert(&pool, reason)
             .await
             .unwrap_or_else(|error| panic!("{reason:?} must insert: {error}"));

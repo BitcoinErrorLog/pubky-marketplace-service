@@ -438,3 +438,72 @@ async fn an_overdue_review_reminds_the_seller_once(pool: PgPool) {
             .is_empty()
     );
 }
+
+/// An outbox intent whose `review_reason` the 0047 CHECK would refuse
+/// (not a string, or outside the vocabulary) still delivers, without the
+/// reason, and never stalls the intents queued behind it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_unknown_review_reason_never_stalls_the_outbox(pool: PgPool) {
+    let app = test_app(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let order_id = Uuid::new_v4();
+    let mut event_ids = Vec::new();
+    for (revision, reason) in [
+        (1, json!(7)),
+        (2, json!("refund_later")),
+        (3, json!("amount_mismatch")),
+    ] {
+        let event_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO events (id, command_id, aggregate_id, revision, actor_pubky, kind, \
+             occurred_at) VALUES ($1, $2, $3, $4, 'system', 'payment.manual_review', now())",
+        )
+        .bind(event_id)
+        .bind(Uuid::new_v4())
+        .bind(format!("payment:{order_id}"))
+        .bind(revision)
+        .execute(&pool)
+        .await
+        .expect("event row");
+        sqlx::query(
+            "INSERT INTO outbox (event_id, kind, payload, created_at) \
+             VALUES ($1, 'notification.bitcoin_manual_review', $2, now())",
+        )
+        .bind(event_id)
+        .bind(json!({
+            "event_id": event_id,
+            "recipient_pubky": seller.pubky,
+            "actor_pubky": "system",
+            "aggregate_id": format!("order:{order_id}"),
+            "review_reason": reason,
+        }))
+        .execute(&pool)
+        .await
+        .expect("outbox row");
+        event_ids.push(event_id);
+    }
+
+    let delivered = marketplace_service::workers::drain_outbox(&pool, None, app.clock.now(), 30)
+        .await
+        .expect("the drain completes");
+    assert_eq!(delivered, 3);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM outbox WHERE delivered_at IS NULL"
+        )
+        .await,
+        0
+    );
+    let mut reasons = Vec::new();
+    for event_id in event_ids {
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT review_reason FROM notifications WHERE event_id = $1")
+                .bind(event_id)
+                .fetch_one(&pool)
+                .await
+                .expect("delivered notification");
+        reasons.push(reason);
+    }
+    assert_eq!(reasons, [None, None, Some("amount_mismatch".to_string())]);
+}

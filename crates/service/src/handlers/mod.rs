@@ -316,6 +316,20 @@ pub enum BitcoinReviewNotice {
 }
 
 impl BitcoinReviewNotice {
+    pub const ALL: [Self; 5] = [
+        Self::LateSettlement,
+        Self::AmountMismatch,
+        Self::ConfirmationFailed,
+        Self::SellerConfirmationWindowElapsed,
+        Self::SellerResponseOverdue,
+    ];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|notice| notice.as_str() == value)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::LateSettlement => "late_settlement",

@@ -571,10 +571,22 @@ pub async fn deliver_claimed(
             Value::Null => None,
             value => Some(value.clone()),
         };
+        // The 0048 CHECK refuses an unknown reason. An intent carrying one
+        // still delivers, without it, so it never stalls the rows behind it.
         let review_reason = match &row.payload["review_reason"] {
             Value::Null => None,
-            Value::String(reason) => Some(reason.as_str()),
-            _ => anyhow::bail!("outbox row {} review_reason is not a string", row.id),
+            value => {
+                let known = value
+                    .as_str()
+                    .and_then(crate::handlers::BitcoinReviewNotice::parse);
+                if known.is_none() {
+                    tracing::warn!(
+                        row_id = row.id,
+                        "outbox notification carries an unknown review_reason; delivering without it"
+                    );
+                }
+                known.map(crate::handlers::BitcoinReviewNotice::as_str)
+            }
         };
 
         let mut tx = pool.begin().await?;
