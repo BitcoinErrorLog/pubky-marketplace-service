@@ -382,7 +382,21 @@ async fn a_deleted_auction_takes_no_bids_and_closes_unsold(pool: PgPool) {
         &place_bid_command(&seller.pubky, 40, 10_000, 1),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "bid above reserve: {body}");
+    assert_eq!(status, StatusCode::OK, "leading bid: {body}");
+    // A competing bid lifts the visible price past the 60.00 reserve, so a
+    // live listing would close sold.
+    let rival = new_actor(&app).await;
+    let (status, body) = execute(
+        &app,
+        &rival.token,
+        &place_bid_command(&seller.pubky, 43, 8_000, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rival bid: {body}");
+    assert_eq!(
+        body["result"]["listing"]["auction"]["current_price"]["amount_minor"],
+        json!(8_500)
+    );
 
     let aggregate_id = listing_aggregate(&seller.pubky);
     let mut tx = app.pool.begin().await.expect("tx");

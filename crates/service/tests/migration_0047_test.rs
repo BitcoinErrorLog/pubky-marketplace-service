@@ -63,7 +63,10 @@ async fn migration_0047_keeps_existing_listings_live_and_is_rerunnable(pool: PgP
     .fetch_one(&pool)
     .await
     .expect("constraint catalog");
-    assert!(valid, "the evidence constraint is validated over existing rows");
+    assert!(
+        valid,
+        "the evidence constraint is validated over existing rows"
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -80,7 +83,11 @@ async fn a_tombstone_always_carries_its_homeserver_evidence(pool: PgPool) {
     assert!(mark(&pool, "boots_01", true, Some("7")).await);
     assert!(mark(&pool, "boots_01", false, None).await);
 
-    for (label, cursor, ok) in [("numeric", Some("42"), true), ("null", None, true), ("text", Some("x"), false)] {
+    for (label, cursor, ok) in [
+        ("numeric", Some("42"), true),
+        ("null", None, true),
+        ("text", Some("x"), false),
+    ] {
         let inserted = sqlx::query(
             "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
              VALUES ($1, $2, now())",
