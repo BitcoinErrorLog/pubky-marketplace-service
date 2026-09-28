@@ -227,7 +227,8 @@ pub async fn handle(
 /// paths — quantity can never fall below committed (reserved + sold) stock.
 ///
 /// A tombstoned `current` is revived: the tombstone clears, `recreated_at`
-/// is stamped, and available stock is the new record's quantity minus the
+/// is stamped, the generation advances (drop bindings made against the
+/// deleted generation stop gating), and available stock is the new record's quantity minus the
 /// holds and sales the deleted listing still owes. Its earlier available
 /// count (seller adjustments, restocks while deleted) is discarded.
 // Eight positional facts of one write; both callers must supply all of them.
@@ -327,6 +328,7 @@ pub(crate) async fn apply_registration(
              shipping_minor = $13, sale_format = $14, auction = $15, fulfillment_methods = $16, \
              digital_lock_policy_uri = $17, digital_lock_criterion_id = $18, updated_at = $19, \
              recreated_at = CASE WHEN deleted_at IS NULL THEN recreated_at ELSE $19 END, \
+             generation = CASE WHEN deleted_at IS NULL THEN generation ELSE generation + 1 END, \
              deleted_at = NULL, deleted_event_cursor = NULL \
              WHERE aggregate_id = $1 AND server_revision = $2",
         )

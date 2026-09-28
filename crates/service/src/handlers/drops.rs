@@ -13,8 +13,8 @@
 //! [`lock_bound_drop`] + [`enforce_drop_gate`] when a target listing is
 //! bound to a drop. The drop row lock, and any `drop_listings` row lock, is
 //! taken BEFORE any listing row lock in every transaction that touches both
-//! (gating, releases, sell-out confirmation, late reacquire, tombstone), so
-//! the two never deadlock. All cap accounting lives in the same transaction
+//! (gating, releases, sell-out confirmation, late reacquire, tombstone,
+//! `drop.sync`), so the two never deadlock. All cap accounting lives in the same transaction
 //! as the hold, with database CHECK constraints backing every handler guard.
 //!
 //! Releases: every path that returns held units to a listing credits the
@@ -174,22 +174,7 @@ pub async fn sync(
         }
     }
     if !missing.is_empty() {
-        tracing::warn!(
-            missing_count = missing.len(),
-            "drop.sync refused: unregistered listings"
-        );
-        return Ok(Err(CommandFailure::refused_with_issues(
-            crate::refusal_audit::RefusalKind::InvalidCommand,
-            ErrorCode::InvalidCommand,
-            "The drop references unregistered listings.",
-            missing
-                .iter()
-                .map(|listing_id| marketplace_domain::ValidationIssue {
-                    path: "payload.listing_ids".to_string(),
-                    message: format!("Unregistered listing: {listing_id}"),
-                })
-                .collect(),
-        )));
+        return Ok(Err(unregistered_listings(&missing)));
     }
 
     let current = fetch_drop_for_update(tx, &command.aggregate_id).await?;
@@ -246,7 +231,11 @@ async fn apply_registration(
     .fetch_one(&mut **tx)
     .await?;
 
-    insert_drop_listing_bindings(tx, &drop, &record.listing_ids, is_active_state(state)).await?;
+    if let Err(failure) =
+        insert_drop_listing_bindings(tx, &drop, &record.listing_ids, is_active_state(state)).await?
+    {
+        return Ok(Err(failure));
+    }
 
     let event_id = insert_event(
         tx,
@@ -319,7 +308,11 @@ async fn apply_resync(
         .bind(&command.aggregate_id)
         .execute(&mut **tx)
         .await?;
-    insert_drop_listing_bindings(tx, &drop, &record.listing_ids, is_active_state(state)).await?;
+    if let Err(failure) =
+        insert_drop_listing_bindings(tx, &drop, &record.listing_ids, is_active_state(state)).await?
+    {
+        return Ok(Err(failure));
+    }
 
     let event_id = insert_event(
         tx,
@@ -339,28 +332,86 @@ async fn apply_resync(
     }))
 }
 
+/// Binds the drop to its listings, each at the listing's current
+/// generation, then re-reads every listing under a share lock and refuses
+/// (rolling the bindings back) unless each is still live at that
+/// generation.
+///
+/// The live check at the top of [`sync`] is an unlocked read, so a
+/// tombstone can commit after it. The re-read runs under the listing row
+/// lock the tombstone takes, after the binding writes (bindings before
+/// listings, the shared lock order): a tombstone that committed first is
+/// seen here, and one still waiting cannot release bindings until this
+/// commits. A binding that commits while a tombstone waits keeps the
+/// deleted generation, which gating ignores once the listing is re-created.
 async fn insert_drop_listing_bindings(
     tx: &mut Transaction<'_, Postgres>,
     drop: &DropRow,
     listing_ids: &[String],
     active: bool,
-) -> Result<(), sqlx::Error> {
+) -> Result<Result<(), CommandFailure>, sqlx::Error> {
+    let mut aggregate_ids = Vec::with_capacity(listing_ids.len());
     for listing_id in listing_ids {
-        // The partial unique index (one announced/live drop per listing)
-        // rejects a second active binding; the executor maps that unique
-        // violation to INVARIANT_VIOLATION.
+        let aggregate_id = ids::listing_aggregate_id(&drop.seller_pubky, listing_id);
+        // The partial unique index (one announced/live drop per listing
+        // generation) rejects a second active binding; the executor maps
+        // that unique violation to INVARIANT_VIOLATION.
         sqlx::query(
-            "INSERT INTO drop_listings (drop_aggregate_id, seller_pubky, listing_id, active) \
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO drop_listings (drop_aggregate_id, seller_pubky, listing_id, active, \
+             listing_generation) \
+             SELECT $1, $2, $3, $4, generation FROM listings WHERE aggregate_id = $5",
         )
         .bind(&drop.aggregate_id)
         .bind(&drop.seller_pubky)
         .bind(listing_id)
         .bind(active)
+        .bind(&aggregate_id)
         .execute(&mut **tx)
         .await?;
+        aggregate_ids.push(aggregate_id);
     }
-    Ok(())
+    // Sorted, so two syncs over the same listings lock them in one order.
+    let live: Vec<(String,)> = sqlx::query_as(
+        "SELECT l.listing_id FROM listings l \
+         JOIN drop_listings dl ON dl.drop_aggregate_id = $1 \
+             AND dl.seller_pubky = l.seller_pubky AND dl.listing_id = l.listing_id \
+         WHERE l.aggregate_id = ANY($2) AND l.deleted_at IS NULL \
+             AND l.generation = dl.listing_generation \
+         ORDER BY l.aggregate_id FOR SHARE OF l",
+    )
+    .bind(&drop.aggregate_id)
+    .bind(&aggregate_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    let missing: Vec<&str> = listing_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|listing_id| !live.iter().any(|(live_id,)| live_id == listing_id))
+        .collect();
+    if missing.is_empty() {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(unregistered_listings(&missing)))
+    }
+}
+
+fn unregistered_listings(missing: &[&str]) -> CommandFailure {
+    tracing::warn!(
+        missing_count = missing.len(),
+        "drop.sync refused: unregistered listings"
+    );
+    CommandFailure::refused_with_issues(
+        crate::refusal_audit::RefusalKind::InvalidCommand,
+        ErrorCode::InvalidCommand,
+        "The drop references unregistered listings.",
+        missing
+            .iter()
+            .map(|listing_id| marketplace_domain::ValidationIssue {
+                path: "payload.listing_ids".to_string(),
+                message: format!("Unregistered listing: {listing_id}"),
+            })
+            .collect(),
+    )
 }
 
 /// `drop.cancel`: seller only, from announced or live, terminal. Outstanding
@@ -561,7 +612,8 @@ pub async fn release_listings(
 /// cancelled — until the seller binds it to a new drop or releases the
 /// ended binding (`drop.release_listings`), the listing does not quietly
 /// fall back to open sale. Released bindings are out of gating
-/// consideration entirely.
+/// consideration entirely, and so are bindings made against an earlier
+/// generation of the listing (before a delete and re-create).
 pub async fn lock_bound_drop(
     tx: &mut Transaction<'_, Postgres>,
     seller_pubky: &str,
@@ -570,7 +622,9 @@ pub async fn lock_bound_drop(
     sqlx::query_as(&format!(
         "SELECT {columns} FROM drops d \
          JOIN drop_listings dl ON dl.drop_aggregate_id = d.aggregate_id \
+         JOIN listings l ON l.seller_pubky = dl.seller_pubky AND l.listing_id = dl.listing_id \
          WHERE dl.seller_pubky = $1 AND dl.listing_id = $2 AND NOT dl.released \
+           AND dl.listing_generation = l.generation \
          ORDER BY dl.active DESC, d.updated_at DESC, d.aggregate_id \
          LIMIT 1 FOR UPDATE OF d",
         columns = DROP_COLUMNS

@@ -1230,3 +1230,354 @@ async fn a_tombstone_takes_drop_and_listing_locks_in_the_sell_out_confirm_order(
     .expect("binding released");
     assert!(released, "tombstone releases the binding it locked");
 }
+
+/// Waits until another backend is blocked on a lock while running a
+/// statement that contains `fragment`.
+async fn wait_for_lock_wait(pool: &PgPool, fragment: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+             AND wait_event_type = 'Lock' AND strpos(query, $1) > 0",
+        )
+        .bind(fragment)
+        .fetch_one(pool)
+        .await
+        .expect("lock wait poll");
+        if waiting >= 1 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let activity: Vec<(Option<String>, Option<String>, String)> = sqlx::query_as(
+                "SELECT wait_event_type, wait_event, left(query, 160) \
+                 FROM pg_stat_activity WHERE datname = current_database() \
+                 AND pid <> pg_backend_pid()",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("activity");
+            panic!("nothing waited on {fragment:?}: {activity:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+fn spawn_command(
+    app: &TestApp,
+    actor: &TestActor,
+    body: Value,
+) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    let router = app.router.clone();
+    let token = actor.token.clone();
+    tokio::spawn(async move { send(router, "POST", "/v1/commands", Some(&token), &body).await })
+}
+
+async fn tombstone_now(pool: &PgPool, aggregate_id: &str, now: chrono::DateTime<chrono::Utc>) {
+    let mut tx = pool.begin().await.expect("tombstone tx");
+    marketplace_service::listing_deletion::tombstone(
+        &mut tx,
+        aggregate_id,
+        "9",
+        "system",
+        Uuid::new_v4(),
+        now,
+    )
+    .await
+    .expect("tombstone")
+    .expect("live listing");
+    tx.commit().await.expect("tombstone commits");
+}
+
+/// Re-creates `boots_01` from a new record with five units.
+async fn revive(app: &TestApp, homeserver: &FakeHomeserver, seller: &TestActor, number: u64) {
+    app.clock.advance_seconds(60);
+    homeserver.put_record(&seller.pubky, LISTING_ID, record(2, 5));
+    let (status, body) = sync_as(app, seller, &seller.pubky, number).await;
+    assert_eq!(status, StatusCode::OK, "revival: {body}");
+    assert_eq!(body["result"]["listing"]["available_quantity"], json!(5));
+}
+
+/// A two-unit checkout line, which a drop-bound listing refuses.
+async fn two_unit_checkout(
+    app: &TestApp,
+    buyer: &TestActor,
+    seller: &TestActor,
+) -> (StatusCode, Value) {
+    let revision = body_revision(app, &listing_aggregate(&seller.pubky)).await;
+    let mut checkout = common::checkout_command_with_id(&seller.pubky, &Uuid::new_v4().to_string());
+    checkout["payload"]["lines"][0]["expected_revision"] = revision;
+    checkout["payload"]["lines"][0]["quantity"] = json!(2);
+    execute(app, &buyer.token, &checkout).await
+}
+
+async fn unreleased_bindings(pool: &PgPool, drop_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM drop_listings \
+         WHERE drop_aggregate_id = $1 AND NOT released",
+    )
+    .bind(drop_id)
+    .fetch_one(pool)
+    .await
+    .expect("bindings")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_drop_sync_that_read_its_listing_live_cannot_bind_it_after_the_tombstone(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 3).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    let drop_record = |revision: i64, starts_in: i64| {
+        common::drop_record_json(
+            &seller.pubky,
+            "race_drop",
+            revision,
+            &[LISTING_ID],
+            &common::ts_after(starts_in),
+            None,
+            1,
+            1,
+        )
+    };
+    homeserver.put_drop_record(&seller.pubky, "race_drop", drop_record(1, 3600));
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &common::sync_drop_command(&seller.pubky, "race_drop", 100),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "announced drop: {body}");
+    let drop_id = common::drop_aggregate(&seller.pubky, "race_drop");
+
+    // The re-sync reads the listing live, then waits on the drop row.
+    homeserver.put_drop_record(&seller.pubky, "race_drop", drop_record(2, -60));
+    let mut hold = app.pool.begin().await.expect("hold tx");
+    sqlx::query("SELECT 1 FROM drops WHERE aggregate_id = $1 FOR UPDATE")
+        .bind(&drop_id)
+        .execute(&mut *hold)
+        .await
+        .expect("drop row held");
+    let resync = spawn_command(
+        &app,
+        &seller,
+        common::sync_drop_command(&seller.pubky, "race_drop", 101),
+    );
+    wait_for_lock_wait(&app.pool, "FROM drops WHERE aggregate_id").await;
+
+    tombstone_now(&app.pool, &aggregate_id, app.clock.now()).await;
+    hold.rollback().await.expect("release the drop row");
+    let (status, body) = resync.await.expect("resync task");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "resync: {body}");
+    assert_eq!(
+        body["error"]["message"],
+        json!("The drop references unregistered listings.")
+    );
+    assert_eq!(unreleased_bindings(&app.pool, &drop_id).await, 0);
+    let (record_revision,): (i64,) =
+        sqlx::query_as("SELECT record_revision FROM drops WHERE aggregate_id = $1")
+            .bind(&drop_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("drop row");
+    assert_eq!(record_revision, 1, "the refused re-sync rolled back");
+
+    revive(&app, &homeserver, &seller, 102).await;
+    let (status, body) = two_unit_checkout(&app, &buyer, &seller).await;
+    assert_eq!(status, StatusCode::OK, "checkout after revival: {body}");
+    let current = body_revision(&app, &aggregate_id).await;
+    let reserve = reserve_command(&seller.pubky, 103, 2, current.as_i64().expect("revision"));
+    let (status, body) = execute(&app, &buyer.token, &reserve).await;
+    assert_eq!(status, StatusCode::OK, "reserve after revival: {body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_binding_committed_while_the_tombstone_waits_does_not_gate_the_revived_listing(
+    pool: PgPool,
+) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 3).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    let live_drop = |drop_id: &str| {
+        common::drop_record_json(
+            &seller.pubky,
+            drop_id,
+            1,
+            &[LISTING_ID],
+            &common::ts_after(-60),
+            None,
+            1,
+            1,
+        )
+    };
+    homeserver.put_drop_record(&seller.pubky, "early_drop", live_drop("early_drop"));
+    let early = common::drop_aggregate(&seller.pubky, "early_drop");
+
+    // The sync passes its locked live check and then waits on its event
+    // insert, still holding the listing share lock.
+    let mut hold = app.pool.begin().await.expect("hold tx");
+    sqlx::query(
+        "INSERT INTO events (id, command_id, aggregate_id, revision, actor_pubky, kind, \
+         occurred_at) VALUES ($1, $1, $2, 1, 'test', 'test.hold', now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&early)
+    .execute(&mut *hold)
+    .await
+    .expect("event revision held");
+    let sync = spawn_command(
+        &app,
+        &seller,
+        common::sync_drop_command(&seller.pubky, "early_drop", 110),
+    );
+    wait_for_lock_wait(&app.pool, "INSERT INTO events").await;
+
+    // The tombstone releases the bindings it can see, then waits on the
+    // listing row the sync holds.
+    let pool = app.pool.clone();
+    let tombstone_id = aggregate_id.clone();
+    let now = app.clock.now();
+    let deletion = tokio::spawn(async move { tombstone_now(&pool, &tombstone_id, now).await });
+    wait_for_lock_wait(&app.pool, "UPDATE listings SET deleted_at").await;
+    hold.rollback().await.expect("release the event revision");
+    let (status, body) = sync.await.expect("sync task");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sync ahead of the tombstone: {body}"
+    );
+    deletion.await.expect("tombstone task");
+    assert_eq!(
+        unreleased_bindings(&app.pool, &early).await,
+        1,
+        "the binding committed after the tombstone's release"
+    );
+
+    revive(&app, &homeserver, &seller, 111).await;
+    let (status, body) = two_unit_checkout(&app, &buyer, &seller).await;
+    assert_eq!(status, StatusCode::OK, "checkout after revival: {body}");
+    let current = body_revision(&app, &aggregate_id).await;
+    let reserve = reserve_command(&seller.pubky, 112, 2, current.as_i64().expect("revision"));
+    let (status, body) = execute(&app, &buyer.token, &reserve).await;
+    assert_eq!(status, StatusCode::OK, "reserve after revival: {body}");
+    let (remaining,): (i64,) =
+        sqlx::query_as("SELECT remaining_quantity FROM drops WHERE aggregate_id = $1")
+            .bind(&early)
+            .fetch_one(&app.pool)
+            .await
+            .expect("early drop");
+    assert_eq!(
+        remaining, 1,
+        "the deleted generation's drop is not drawn on"
+    );
+
+    // The revived generation binds to a new drop, and that binding gates.
+    homeserver.put_drop_record(&seller.pubky, "late_drop", live_drop("late_drop"));
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &common::sync_drop_command(&seller.pubky, "late_drop", 113),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "new drop on the revived listing: {body}"
+    );
+    let (status, body) = two_unit_checkout(&app, &buyer, &seller).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        json!(marketplace_service::handlers::drops::DROP_SINGLE_LINE)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_drop_sync_refuses_a_listing_re_created_while_it_was_binding(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 3).await;
+    register_as(&app, &seller, "boots_02", 1).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    homeserver.put_drop_record(
+        &seller.pubky,
+        "pair_drop",
+        common::drop_record_json(
+            &seller.pubky,
+            "pair_drop",
+            1,
+            &[LISTING_ID, "boots_02"],
+            &common::ts_after(-60),
+            None,
+            1,
+            1,
+        ),
+    );
+    let pair = common::drop_aggregate(&seller.pubky, "pair_drop");
+
+    // An uncommitted active binding on `boots_02` stops the sync between
+    // its `boots_01` binding and its locked re-read.
+    let mut hold = app.pool.begin().await.expect("hold tx");
+    sqlx::query(
+        "INSERT INTO drops (aggregate_id, seller_pubky, drop_id, record_revision, revision, \
+         state, format, starts_at, ends_at, total_quantity, per_buyer_limit, \
+         remaining_quantity, paid_quantity, stock_display, listing_ids, created_at, updated_at) \
+         VALUES ($1, $2, 'hold_drop', 1, 1, 'live', 'fcfs', now(), NULL, 1, 1, 1, 0, 'exact', \
+         '[\"boots_02\"]', now(), now())",
+    )
+    .bind(common::drop_aggregate(&seller.pubky, "hold_drop"))
+    .bind(&seller.pubky)
+    .execute(&mut *hold)
+    .await
+    .expect("holding drop");
+    sqlx::query(
+        "INSERT INTO drop_listings (drop_aggregate_id, seller_pubky, listing_id, active) \
+         VALUES ($1, $2, 'boots_02', TRUE)",
+    )
+    .bind(common::drop_aggregate(&seller.pubky, "hold_drop"))
+    .bind(&seller.pubky)
+    .execute(&mut *hold)
+    .await
+    .expect("holding binding");
+    let sync = spawn_command(
+        &app,
+        &seller,
+        common::sync_drop_command(&seller.pubky, "pair_drop", 120),
+    );
+    wait_for_lock_wait(&app.pool, "INSERT INTO drop_listings").await;
+
+    // `boots_01` is deleted and re-created before the sync re-reads it.
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    let (status, body) = sync_as(&app, &seller, &seller.pubky, 121).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["kind"], json!("listing_deleted"));
+    revive(&app, &homeserver, &seller, 122).await;
+    hold.rollback().await.expect("release boots_02");
+
+    let (status, body) = sync.await.expect("sync task");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "sync: {body}");
+    assert_eq!(
+        body["error"]["issues"],
+        json!([{
+            "path": "payload.listing_ids",
+            "message": format!("Unregistered listing: {LISTING_ID}"),
+        }])
+    );
+    let drops: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM drops WHERE aggregate_id = $1")
+            .bind(&pair)
+            .fetch_one(&app.pool)
+            .await
+            .expect("drop count");
+    assert_eq!(drops, 0, "the refused registration rolled back");
+    let (generation,): (i64,) =
+        sqlx::query_as("SELECT generation FROM listings WHERE aggregate_id = $1")
+            .bind(&aggregate_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing");
+    assert_eq!(generation, 1);
+}

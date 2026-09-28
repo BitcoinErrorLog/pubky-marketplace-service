@@ -17,6 +17,14 @@
 -- offers, awards, and unpaid orders created before it cannot commit stock
 -- against the new listing.
 --
+-- `generation` counts revivals. Each drop binding carries the generation it
+-- was made against (`drop_listings.listing_generation`), and gating reads
+-- only bindings of the listing's current generation. A binding committed
+-- by a `drop.sync` that overlapped the tombstone therefore never gates, or
+-- draws on, the re-created listing, and the one-active-drop rule is per
+-- generation. Existing rows are generation 0 on both sides, so every
+-- binding that gates today keeps gating.
+--
 -- `listing_deletion_cursors` is the per-seller position in the homeserver
 -- event stream for the deletion follower.
 --
@@ -25,6 +33,14 @@
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS deleted_event_cursor TEXT;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS recreated_at TIMESTAMPTZ;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE drop_listings
+    ADD COLUMN IF NOT EXISTS listing_generation BIGINT NOT NULL DEFAULT 0;
+
+DROP INDEX IF EXISTS drop_listings_one_active_per_listing;
+CREATE UNIQUE INDEX drop_listings_one_active_per_listing
+    ON drop_listings (seller_pubky, listing_id, listing_generation)
+    WHERE active;
 
 ALTER TABLE listings DROP CONSTRAINT IF EXISTS listings_deletion_evidence_check;
 ALTER TABLE listings
