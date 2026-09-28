@@ -12,8 +12,12 @@
 //!
 //! `GET /v1/me/priv-keys` releases the owner's keys only to a session whose
 //! verified grant covers `/priv/pubky.app/` with read and write, the scope
-//! that can already read and write the plaintext the key protects. Narrower,
-//! grant-bridged and legacy sessions get `needs_reauth`.
+//! that can already read and write the plaintext the key protects. The
+//! grant flow requests that scope (`grant::GRANT_REQUEST_CAPABILITIES`), so a
+//! Bitkit or Ring grant session qualifies once approved. Narrower sessions —
+//! empty-grant bridged sessions, AuthToken sessions without the scope, and
+//! grant sessions settled before the scope was requested — get
+//! `needs_reauth`.
 //!
 //! Rotation and the boot probe follow digital delivery: opens try the
 //! current key, then `PRIV_DATA_KEY_ENCRYPTION_KEY_PREVIOUS`; the re-seal

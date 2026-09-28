@@ -439,6 +439,155 @@ async fn grant_settle_with_shop_caps_opens_inventory(pool: sqlx::PgPool) {
     assert_eq!(status, StatusCode::OK, "inventory projection: {body}");
 }
 
+/// Live staging capture (2026-09-28): a homegate `ip_verification` account
+/// approved both grant shapes through Paykit rc55's Bitkit approval path.
+fn priv_parity_capture() -> Value {
+    let fixture =
+        std::fs::read_to_string("tests/fixtures/grant/bitkit-rc55-priv-parity-staging.json")
+            .expect("priv parity capture");
+    serde_json::from_str(&fixture).expect("priv parity capture json")
+}
+
+fn capture_caps<'a>(capture: &'a Value, request: &str, field: &str) -> &'a str {
+    capture[request][field]
+        .as_str()
+        .unwrap_or_else(|| panic!("capture {request}.{field}"))
+}
+
+fn with_priv_keys(mut app: common::TestApp) -> common::TestApp {
+    let keys = marketplace_service::priv_keys::PrivKeys::from_hex(&"b".repeat(64), None)
+        .expect("priv keys");
+    app.state = app
+        .state
+        .clone()
+        .with_priv_keys(Some(std::sync::Arc::new(keys)));
+    app.router = marketplace_service::http::build_router(app.state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(
+            "127.0.0.1:41000"
+                .parse::<std::net::SocketAddr>()
+                .expect("test peer address"),
+        ),
+    );
+    app
+}
+
+#[test]
+fn service_requests_the_captured_bitkit_parity_grant() {
+    let capture = priv_parity_capture();
+    assert_eq!(capture["intent"], "signin_grant");
+    assert_eq!(capture["sensitive_payload_recorded"], false);
+    assert_eq!(
+        capture_caps(&capture, "parity_request", "requested"),
+        grant::GRANT_REQUEST_CAPABILITIES
+    );
+    assert_eq!(
+        capture_caps(&capture, "parity_request", "bitkit_shown"),
+        grant::GRANT_REQUEST_CAPABILITIES
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn bitkit_parity_grant_releases_priv_keys_and_opens_inventory(pool: sqlx::PgPool) {
+    let capture = priv_parity_capture();
+    let (app, authority) = test_app_with_grant(pool).await;
+    let app = with_priv_keys(app);
+    let pubky = "p".repeat(52);
+    let requested = capture_caps(&capture, "parity_request", "requested");
+    let verified = capture_caps(&capture, "parity_request", "homeserver_verified");
+    let (_flow_id, bearer, stored) = authority
+        .settle_matching_grant(&app.state, &pubky, requested, verified)
+        .await;
+    assert_eq!(stored, verified);
+    let token = URL_SAFE_NO_PAD.encode(bearer);
+
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/me/priv-keys",
+        Some(&token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "priv keys: {body}");
+    assert_eq!(body["owner"], json!(pubky));
+    assert_eq!(body["keys"].as_array().map(Vec::len), Some(1));
+
+    let (status, body) = execute(&app, &token, &register_command(&pubky, 3)).await;
+    assert_eq!(status, StatusCode::OK, "listing registration: {body}");
+    let (status, body) = send(
+        app.router,
+        "GET",
+        &format!("/v1/inventory/listings/{}", listing_aggregate(&pubky)),
+        Some(&token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "inventory projection: {body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn grant_settled_under_the_previous_request_still_needs_reauth_for_priv_keys(
+    pool: sqlx::PgPool,
+) {
+    let capture = priv_parity_capture();
+    let (app, authority) = test_app_with_grant(pool).await;
+    let app = with_priv_keys(app);
+    let pubky = "q".repeat(52);
+    let requested = capture_caps(&capture, "previous_request", "requested");
+    let verified = capture_caps(&capture, "previous_request", "homeserver_verified");
+    let (_flow_id, bearer, stored) = authority
+        .settle_matching_grant(&app.state, &pubky, requested, verified)
+        .await;
+    assert_eq!(stored, verified);
+    let token = URL_SAFE_NO_PAD.encode(bearer);
+    let (status, body) = send(
+        app.router,
+        "GET",
+        "/v1/me/priv-keys",
+        Some(&token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], json!("needs_reauth"));
+}
+
+async fn assert_settle_mints_nothing(pool: sqlx::PgPool, requested: &str, verified: &str) {
+    let (app, authority) = test_app_with_grant(pool).await;
+    let pubky = "r".repeat(52);
+    let (_flow_id, applied, bearer, stored) = authority
+        .settle_grant_caps(&app.state, &pubky, requested, verified)
+        .await;
+    assert!(applied, "{requested} / {verified}");
+    assert!(bearer.is_none(), "{requested} / {verified}");
+    assert!(stored.is_none(), "{requested} / {verified}");
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0, "{requested} / {verified}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn grant_settle_with_whole_priv_tree_mints_nothing(pool: sqlx::PgPool) {
+    assert_settle_mints_nothing(pool, "/priv/:rw", "/priv/:rw").await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn grant_settle_verified_wider_than_priv_app_mints_nothing(pool: sqlx::PgPool) {
+    assert_settle_mints_nothing(pool, grant::GRANT_REQUEST_CAPABILITIES, "/priv/:rw").await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn grant_settle_with_another_apps_priv_tree_mints_nothing(pool: sqlx::PgPool) {
+    assert_settle_mints_nothing(
+        pool,
+        grant::GRANT_REQUEST_CAPABILITIES,
+        "/pub/pubky.app/marketplace-service/v1/:rw,/priv/other.app/:rw",
+    )
+    .await;
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn grant_settle_with_insufficient_caps_is_not_widened(pool: sqlx::PgPool) {
     let (app, authority) = test_app_with_grant(pool).await;
