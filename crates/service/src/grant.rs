@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use crate::auth;
 use crate::clock::format_timestamp;
+use crate::priv_keys;
 use crate::seal;
 use crate::AppState;
 
@@ -55,9 +56,11 @@ const RESULT_AAD_DOMAIN: &[u8] = b"marketplace/grant-flow-result/v1";
 const POP_DOMAIN: &str = "marketplace/grant-result-pop/v1";
 const RESULT_DENIED: &str = "result_denied";
 const GRANT_STATE_VERSION: u8 = 1;
-/// Design §26.2 marketplace grant. Never `/:rw` — Ring/Bitkit must not see
+/// Design §26.2 marketplace grant plus the Shop's private tree, the scope
+/// `GET /v1/me/priv-keys` requires. Never `/:rw` — Ring/Bitkit must not see
 /// a homeserver root-write request.
-const GRANT_REQUEST_CAPABILITIES: &str = "/pub/pubky.app/marketplace-service/v1/:rw";
+pub const GRANT_REQUEST_CAPABILITIES: &str =
+    "/pub/pubky.app/marketplace-service/v1/:rw,/priv/pubky.app/:rw";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -68,10 +71,8 @@ pub(crate) enum GrantCapabilityError {
 }
 
 fn allowlisted_capability(capability: &Capability) -> bool {
-    capability
-        .scope()
-        .as_str()
-        .starts_with(auth::INVENTORY_SERVICE_SCOPE)
+    let scope = capability.scope().as_str();
+    scope.starts_with(auth::INVENTORY_SERVICE_SCOPE) || scope.starts_with(priv_keys::PRIV_APP_SCOPE)
 }
 
 fn allowlisted(capabilities: &Capabilities) -> bool {
@@ -95,7 +96,8 @@ fn granted_subseteq_requested(granted: &Capabilities, requested: &Capabilities) 
 }
 
 /// Empty is identity-only (§3). Anything else must sit under
-/// `/pub/pubky.app/marketplace-service/v1/`. Root `/:rw` is rejected.
+/// `/pub/pubky.app/marketplace-service/v1/` or `/priv/pubky.app/`. Root
+/// `/:rw`, `/priv/:rw` and every other tree are rejected.
 pub(crate) fn capabilities_for_grant_url(raw: &str) -> Result<Capabilities, GrantCapabilityError> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -120,7 +122,7 @@ fn grant_url_capabilities() -> Capabilities {
 /// `session.info().capabilities()`), never the unsigned GrantClaims
 /// payload. Requested caps only bound the set: granted ⊆ requested.
 /// Empty verified stays empty (§3). Root or any scope outside the
-/// inventory prefix is rejected.
+/// inventory and `/priv/pubky.app/` prefixes is rejected.
 pub(crate) fn session_capabilities_for_grant(
     verified: &str,
     requested: &str,
@@ -3146,16 +3148,25 @@ mod capability_persist_tests {
         GrantCapabilityError, GRANT_REQUEST_CAPABILITIES,
     };
 
+    const INVENTORY_RW: &str = "/pub/pubky.app/marketplace-service/v1/:rw";
+    const PRIV_APP_RW: &str = "/priv/pubky.app/:rw";
+
     #[test]
-    fn grant_url_requests_inventory_rw() {
+    fn grant_url_requests_inventory_and_priv_app_rw() {
         assert_eq!(
             grant_url_capabilities().to_string(),
             GRANT_REQUEST_CAPABILITIES
         );
         assert_eq!(
             GRANT_REQUEST_CAPABILITIES,
-            "/pub/pubky.app/marketplace-service/v1/:rw"
+            "/pub/pubky.app/marketplace-service/v1/:rw,/priv/pubky.app/:rw"
         );
+        assert!(crate::priv_keys::capability_covers_priv_app(
+            GRANT_REQUEST_CAPABILITIES
+        ));
+        assert!(crate::auth::capability_covers_inventory_service(
+            GRANT_REQUEST_CAPABILITIES
+        ));
     }
 
     #[test]
@@ -3163,6 +3174,58 @@ mod capability_persist_tests {
         assert_eq!(
             capabilities_for_grant_url("/:rw"),
             Err(GrantCapabilityError::Disallowed)
+        );
+    }
+
+    #[test]
+    fn scopes_outside_inventory_and_priv_app_are_rejected() {
+        for disallowed in [
+            "/priv/:rw",
+            "/priv/other.app/:rw",
+            "/priv/pubky.appx/:rw",
+            "/pub/pubky.app/:rw",
+            "/pub/paykit/:rw",
+            "/pub/pubky.app/marketplace-service/:rw",
+            "/priv/pubky.app/:rw,/pub/paykit/:rw",
+        ] {
+            assert_eq!(
+                capabilities_for_grant_url(disallowed),
+                Err(GrantCapabilityError::Disallowed),
+                "{disallowed}"
+            );
+            assert_eq!(
+                session_capabilities_for_grant(disallowed, disallowed),
+                Err(GrantCapabilityError::Disallowed),
+                "{disallowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn grants_settled_under_the_inventory_only_request_still_persist() {
+        assert_eq!(
+            session_capabilities_for_grant(INVENTORY_RW, INVENTORY_RW),
+            Ok(INVENTORY_RW.to_string())
+        );
+        assert_eq!(
+            session_capabilities_for_grant(INVENTORY_RW, GRANT_REQUEST_CAPABILITIES),
+            Ok(INVENTORY_RW.to_string())
+        );
+    }
+
+    #[test]
+    fn priv_app_alone_is_not_widened_to_inventory() {
+        assert_eq!(
+            session_capabilities_for_grant(PRIV_APP_RW, GRANT_REQUEST_CAPABILITIES),
+            Ok(PRIV_APP_RW.to_string())
+        );
+    }
+
+    #[test]
+    fn priv_app_verified_without_being_requested_fails_closed() {
+        assert_eq!(
+            session_capabilities_for_grant(GRANT_REQUEST_CAPABILITIES, INVENTORY_RW),
+            Err(GrantCapabilityError::WiderThanRequested)
         );
     }
 

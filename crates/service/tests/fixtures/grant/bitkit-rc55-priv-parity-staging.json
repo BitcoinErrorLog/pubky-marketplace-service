@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "intent": "signin_grant",
+  "approval_path": "paykit-sdk 0.1.0-rc55 PubkySessionBootstrap::approve_auth with the request cid and request caps (Bitkit master bde47ec0 approvalBootstrap)",
+  "account": {
+    "signup": "homegate.staging.pubky.app/ip_verification",
+    "pubky_prefix": "o44ardzt",
+    "homeserver_prefix": "ufibwbme"
+  },
+  "captured_at_utc": "2026-09-28T06:25:27Z",
+  "client_id": "marketplace.staging.shop.pubky.app",
+  "relay": "https://httprelay.pubky.app/inbox",
+  "previous_request": {
+    "requested": "/pub/pubky.app/marketplace-service/v1/:rw",
+    "bitkit_shown": "/pub/pubky.app/marketplace-service/v1/:rw",
+    "homeserver_verified": "/pub/pubky.app/marketplace-service/v1/:rw",
+    "priv_write": "403 Session does not have write access to path"
+  },
+  "parity_request": {
+    "requested": "/pub/pubky.app/marketplace-service/v1/:rw,/priv/pubky.app/:rw",
+    "bitkit_shown": "/pub/pubky.app/marketplace-service/v1/:rw,/priv/pubky.app/:rw",
+    "homeserver_verified": "/pub/pubky.app/marketplace-service/v1/:rw,/priv/pubky.app/:rw",
+    "priv_write": "200",
+    "approved_while_previous_grant_live": true,
+    "previous_grant_live_after": true
+  },
+  "sensitive_payload_recorded": false
+}
