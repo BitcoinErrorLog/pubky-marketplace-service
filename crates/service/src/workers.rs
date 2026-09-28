@@ -83,6 +83,7 @@ pub const TASK_MANUAL_REVIEW_WATCH: &str = "manual_review_watch";
 pub const TASK_PAYKIT_RESOLVE_DELIVERY: &str = "paykit_resolve_delivery";
 pub const TASK_FX_SAMPLER: &str = "fx_sampler";
 pub const TASK_REFUSAL_AUDIT_RETENTION: &str = "refusal_audit_retention";
+pub const TASK_LISTING_DELETIONS: &str = "listing_deletions";
 
 static AWARD_EXPIRY_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -3362,6 +3363,7 @@ pub struct WorkerSummary {
     pub resolve_rows_delivered: u64,
     pub fx_samples_accepted: u64,
     pub refusal_audit_rows_purged: u64,
+    pub listings_tombstoned: u64,
 }
 
 /// Samples the bounded sole source once per server-time bucket. The unique
@@ -3880,6 +3882,52 @@ pub async fn run_once(
             summary.stat_attestations_signed = result?;
         }
     }
+    // Follows sellers' homeserver deletes into listing tombstones. Last in
+    // the pass because it waits on the network; a failed pass is logged and
+    // retried next tick.
+    if let Some(homeserver) = state.homeserver.as_deref() {
+        // The lease is taken at the current time, not the pass start: the
+        // tasks above may have run for a while, and the follower's writes
+        // check the lease against the clock.
+        let lease_now = state.clock.now();
+        if try_acquire_lease(
+            &state.pool,
+            TASK_LISTING_DELETIONS,
+            holder,
+            lease_now,
+            lease_seconds,
+        )
+        .await?
+        {
+            let pass = crate::listing_deletion::FollowerPass {
+                pool: &state.pool,
+                homeserver,
+                clock: state.clock.as_ref(),
+                holder,
+                deadline: tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(
+                        state.config.listing_deletion_pass_budget_ms,
+                    ),
+            };
+            let result = crate::listing_deletion::follow_homeserver_deletions(&pass).await;
+            release_lease(
+                &state.pool,
+                TASK_LISTING_DELETIONS,
+                holder,
+                state.clock.now(),
+            )
+            .await?;
+            match result {
+                Ok(tombstoned) => summary.listings_tombstoned = tombstoned,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "listing deletion follower pass failed; retrying next tick"
+                    );
+                }
+            }
+        }
+    }
     Ok(summary)
 }
 
@@ -4103,6 +4151,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             fx_samples_accepted = summary.fx_samples_accepted,
                             refusal_audit_rows_purged = summary.refusal_audit_rows_purged,
                             read_rate_buckets_purged = summary.read_rate_buckets_purged,
+                            listings_tombstoned = summary.listings_tombstoned,
                             "worker pass completed"
                         );
                     }

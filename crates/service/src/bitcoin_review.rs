@@ -1244,7 +1244,8 @@ async fn hold_present(
 /// Atomically reacquires the order's inventory in the normal lock order
 /// (drop row, then listing rows), for the late-settlement `paid` branch.
 /// Failure is always `stock_unavailable`: sold-out, drop-exhausted, and
-/// auction-lapsed cases all land on the same named error.
+/// auction-lapsed cases all land on the same named error, as does a listing
+/// the seller deleted, or re-created after this order was placed.
 pub(crate) async fn reacquire_hold(
     tx: &mut Transaction<'_, Postgres>,
     order: &OrderRow,
@@ -1266,6 +1267,12 @@ pub(crate) async fn reacquire_hold(
         else {
             return Err(ResolutionFailure::StockUnavailable);
         };
+        // Before the listing rows below. This transaction later confirms the
+        // payment, and a sell-out confirmation deactivates these bindings;
+        // a tombstone releases them before it updates the listing.
+        crate::handlers::drops::lock_listing_bindings(tx, drop_aggregate_id)
+            .await
+            .map_err(|e| ResolutionFailure::Internal("drop binding lock".into(), e.to_string()))?;
         crate::handlers::drops::apply_time_transitions(tx, drop, inputless_command_id(), now)
             .await
             .map_err(|e| ResolutionFailure::Internal("drop transition".into(), e.to_string()))?;
@@ -1328,11 +1335,13 @@ pub(crate) async fn reacquire_hold(
              state = CASE WHEN available_quantity = $2 THEN 'reserved' ELSE 'available' END, \
              available_quantity = available_quantity - $2, \
              reserved_quantity = reserved_quantity + $2, updated_at = $3 \
-             WHERE aggregate_id = $1 AND available_quantity >= $2",
+             WHERE aggregate_id = $1 AND available_quantity >= $2 \
+             AND deleted_at IS NULL AND (recreated_at IS NULL OR recreated_at <= $4)",
         )
         .bind(aggregate_id)
         .bind(quantity)
         .bind(now)
+        .bind(order.created_at)
         .execute(&mut **tx)
         .await
         .map_err(|e| ResolutionFailure::Internal("listing reacquire".into(), e.to_string()))?;

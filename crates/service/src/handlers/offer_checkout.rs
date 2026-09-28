@@ -150,6 +150,13 @@ pub async fn handle(
             "The inventory reserved for this accepted offer is no longer held.",
         )));
     };
+    if !listing.accepts_commitment_created_at(offer.created_at) {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
+            ErrorCode::NotFound,
+            "The offer listing is unavailable.",
+        )));
+    }
     if reservation.buyer_pubky != offer.buyer_pubky
         || reservation.listing_aggregate_id != payload.listing_aggregate_id
         || reservation.quantity != payload.quantity

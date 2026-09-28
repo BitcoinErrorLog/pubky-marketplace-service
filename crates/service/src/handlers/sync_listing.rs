@@ -23,11 +23,12 @@ use serde_json::json;
 use sqlx::{Postgres, Transaction};
 
 use crate::handlers::register_listing::apply_registration;
-use crate::handlers::{fetch_auction_reserve_for_update, fetch_listing_for_update};
+use crate::handlers::{fetch_auction_reserve_for_update, fetch_listing, fetch_listing_for_update};
 use crate::homeserver::{
     registration_payload_from_record, HomeserverFetchOutcome, HomeserverListingClient,
     MalformedDigitalLock,
 };
+use crate::listing_deletion::{latest_event_is_delete, tombstone, DeletionCheck};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 pub async fn handle(
@@ -64,11 +65,7 @@ pub async fn handle(
     {
         HomeserverFetchOutcome::Found(record) => record,
         HomeserverFetchOutcome::NotFound => {
-            return Ok(Err(CommandFailure::refused(
-                crate::refusal_audit::RefusalKind::NotFound,
-                ErrorCode::NotFound,
-                "The seller's homeserver has no such listing record.",
-            )));
+            return settle_missing_record(tx, actor, command, payload, homeserver, now).await;
         }
         HomeserverFetchOutcome::Unavailable => {
             return Ok(Err(CommandFailure::refused(
@@ -100,6 +97,15 @@ pub async fn handle(
                 )))
             }
         };
+    // A Locks registration reads as shipping even for a digital-only record,
+    // so the record, not the registration, says whether it ships.
+    if registration.registers_unlimited_cap_with_physical_methods()
+        && crate::homeserver::record_publishes_physical_fulfillment(&record)
+    {
+        return Ok(Err(
+            crate::handlers::register_listing::unlimited_cap_refusal(),
+        ));
+    }
     // The derived payload must satisfy exactly the invariants
     // `listing.register` enforces; a record that fails them cannot back a
     // registered aggregate.
@@ -116,6 +122,28 @@ pub async fn handle(
     };
 
     let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
+    if let Some(deleted) = current.as_ref().filter(|listing| listing.is_deleted()) {
+        // The record was re-created at a deleted id. It revives the
+        // aggregate with stock derived from this record alone; the
+        // tombstoned row's revision chain does not apply to it.
+        if deleted.sale_format != "fixed_price"
+            || registration.sale_format != SaleFormat::FixedPrice
+        {
+            return Ok(Err(recreated_auction_refused()));
+        }
+        return apply_registration(
+            tx,
+            actor,
+            command.command_id,
+            &command.aggregate_id,
+            &registration,
+            Some(deleted),
+            None,
+            "listing.synced",
+            now,
+        )
+        .await;
+    }
     if let Some(current_auction) = current
         .as_ref()
         .filter(|listing| listing.sale_format == "auction")
@@ -251,6 +279,72 @@ pub async fn handle(
         now,
     )
     .await
+}
+
+/// The fetch found no record. A registered listing whose deletion the
+/// seller's event stream confirms is tombstoned; an already tombstoned one
+/// is a convergent no-op. Anything else keeps the definitive 404.
+async fn settle_missing_record(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    command: &Command,
+    payload: &SyncListingPayload,
+    homeserver: &dyn HomeserverListingClient,
+    now: DateTime<Utc>,
+) -> Result<HandlerResult, sqlx::Error> {
+    let not_found = || {
+        CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
+            ErrorCode::NotFound,
+            "The seller's homeserver has no such listing record.",
+        )
+    };
+    let Some(current) = fetch_listing(tx, &command.aggregate_id).await? else {
+        return Ok(Err(not_found()));
+    };
+    if current.is_deleted() {
+        return Ok(Ok(deleted_success(&current, vec![])));
+    }
+    let DeletionCheck::Deleted { cursor } =
+        latest_event_is_delete(homeserver, &payload.seller_pubky, &payload.listing_id).await
+    else {
+        return Ok(Err(not_found()));
+    };
+    match tombstone(
+        tx,
+        &command.aggregate_id,
+        &cursor,
+        actor,
+        command.command_id,
+        now,
+    )
+    .await?
+    {
+        Some((deleted, event_id)) => Ok(Ok(deleted_success(&deleted, vec![event_id]))),
+        None => match fetch_listing(tx, &command.aggregate_id).await? {
+            Some(deleted) if deleted.is_deleted() => Ok(Ok(deleted_success(&deleted, vec![]))),
+            _ => Ok(Err(not_found())),
+        },
+    }
+}
+
+fn deleted_success(
+    listing: &crate::model::ListingRow,
+    event_ids: Vec<uuid::Uuid>,
+) -> HandlerSuccess {
+    HandlerSuccess {
+        revision: listing.server_revision,
+        event_ids,
+        result: json!({ "kind": "listing_deleted", "listing": listing.deleted_projection() }),
+    }
+}
+
+pub(crate) fn recreated_auction_refused() -> CommandFailure {
+    CommandFailure::refused(
+        crate::refusal_audit::RefusalKind::InvalidState,
+        ErrorCode::InvalidState,
+        "This listing id was deleted. Publish the auction under a new id.",
+    )
 }
 
 fn seller_registration_required() -> CommandFailure {

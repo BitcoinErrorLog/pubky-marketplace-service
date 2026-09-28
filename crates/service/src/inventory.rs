@@ -672,7 +672,7 @@ pub async fn adjust_inventory(
         "SELECT seller_pubky, listing_id, listing_revision, server_revision, \
                     total_quantity AS total, available_quantity AS available, \
                     reserved_quantity AS reserved, sold_quantity AS sold \
-             FROM listings WHERE aggregate_id = $1 FOR UPDATE",
+             FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(&request.wire.aggregate_id)
     .fetch_optional(&mut *tx)
@@ -1100,7 +1100,7 @@ pub async fn get_inventory_projection(
     let row: Option<(String, String, i64, i64, i64, i64, i64)> = match sqlx::query_as(
         "SELECT seller_pubky, listing_id, server_revision, total_quantity, \
                 available_quantity, reserved_quantity, sold_quantity \
-         FROM listings WHERE aggregate_id = $1",
+         FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL",
     )
     .bind(&aggregate_id)
     .fetch_optional(&mut *tx)
