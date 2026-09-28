@@ -1385,6 +1385,14 @@ pub(crate) async fn apply_late_money(
     event_actor: &str,
     now: DateTime<Utc>,
 ) -> Result<LateMoneyOutcome, ResolutionFailure> {
+    // Only the seller or the seller-window reaper moves an order waiting
+    // for its seller; every caller rolls back on this error.
+    if order.paykit_request_state.as_deref() == Some("awaiting_seller_confirmation") {
+        return Err(ResolutionFailure::Internal(
+            "late money".into(),
+            "the order is awaiting seller confirmation".into(),
+        ));
+    }
     // A digital order the seller can no longer deliver takes the stock-gone
     // shape (digital delivery design §6 D3) before any other late-money
     // branch: a still-held order releases its hold, a lapsed one never

@@ -14,10 +14,11 @@
 //!   (pins and quote) restored as the order's attempt of record, so a later
 //!   resolution names the invoice that was paid, and the order's other
 //!   attempt released in its place, still watched;
-//! - money the order can no longer take (its payment settled or under
-//!   review, or the order on another rail: a fiat method, or a payment
-//!   managed by Locks or any adapter but paykit or sandbox) goes to
-//!   `needs_review`, alerted, with the order and payment untouched;
+//! - money the order can no longer take (its payment settled, under
+//!   review, or awaiting seller confirmation, or the order on another rail:
+//!   a fiat method, or a payment managed by Locks or any adapter but paykit
+//!   or sandbox) goes to `needs_review`, alerted, with the order and
+//!   payment untouched;
 //! - a detection keeps the attempt watched past its tail, up to
 //!   [`DETECTION_WINDOW_DAYS`] by our clock, after which every poll pass
 //!   moves it to `needs_review` whether or not paykit answers;
@@ -354,7 +355,11 @@ async fn route_released_settlement(
         .as_deref()
         .is_some_and(|method| method != "bitcoin")
         || !matches!(payment.adapter.as_str(), "paykit" | "sandbox");
-    let settled = !matches!(payment.state.as_str(), "awaiting_entitlement" | "expired");
+    // An order waiting for its seller is settling on its current attempt:
+    // only the seller or the seller-window reaper may move it, so money on
+    // a released attempt waits for an operator like money on a settled one.
+    let settled = !matches!(payment.state.as_str(), "awaiting_entitlement" | "expired")
+        || order.paykit_request_state.as_deref() == Some("awaiting_seller_confirmation");
     if other_rail || settled {
         let reason = if settled {
             "payment_settled"
@@ -372,7 +377,7 @@ async fn route_released_settlement(
             review_reason = reason,
             code = "paykit_released_attempt_paid_after_settlement",
             "ALERT money confirmed on a released paykit attempt of an order that is settled, \
-             under review, or on another payment rail; held for review"
+             under review, awaiting seller confirmation, or on another payment rail; held for review"
         );
         return Ok(true);
     }

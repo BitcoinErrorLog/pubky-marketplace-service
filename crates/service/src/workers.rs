@@ -1704,6 +1704,25 @@ async fn apply_confirmed_paykit_payment(
     let Some(payment) = payment else {
         anyhow::bail!("paykit order {} references a missing payment", row.id);
     };
+    // The seller gate, rechecked under the order lock: the caller routed on
+    // the claim-time state, and a waiting order leaves only through its
+    // seller or the seller-window reaper.
+    let request_state: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT paykit_request_state FROM orders WHERE id = $1 FOR UPDATE")
+            .bind(row.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if matches!(
+        request_state,
+        Some((Some(ref state),)) if state == "awaiting_seller_confirmation"
+    ) {
+        tx.rollback().await?;
+        tracing::warn!(
+            order_id = %row.id,
+            "refused an automatic paykit settlement for an order awaiting seller confirmation"
+        );
+        return Ok(false);
+    }
     if payment.state == "expired" || (late_settlement && payment.state == "awaiting_entitlement") {
         if !resolution_pins_present {
             tx.rollback().await?;
@@ -2282,17 +2301,60 @@ async fn refresh_seller_confirmation_facts(
     Ok(true)
 }
 
-/// A late-flagged report for an order inside `awaiting_seller_confirmation`.
-/// Paykit judges `late_settlement` against the invoice's own expiry, which
-/// stays at the bind-time payment window, while entry to this state
-/// happened only on a NON-late first sighting and extended the hold to the
-/// 24-hour seller window. For this order lateness is judged by that first
-/// sighting: the report refreshes the facts on the status-only path and
-/// never takes the late-money fork, whatever mode Paykit now reports. The
-/// seller's attestation and the window reaper stay the only exits. Returns
-/// false, having changed nothing, when the payment or order is no longer
-/// waiting; the caller then applies the ordinary late handling.
-async fn refresh_late_report_inside_seller_window(
+/// Applies one Paykit report to an order inside
+/// `awaiting_seller_confirmation`. Once the seller gate is armed no report
+/// pays the order or routes it to review: not an `exclusive` mode Paykit
+/// now reports, not a late flag (Paykit judges lateness against the
+/// invoice's own expiry, which the 24-hour window outlives; entry happened
+/// on an on-time sighting), not an amount mismatch. Detected and confirmed
+/// reports refresh the facts; a disappearance is marked. The seller's
+/// attestation and the seller-window reaper stay the only exits. A report
+/// that finds the order already gone from the state changes nothing, and
+/// the next poll reads the order afresh.
+async fn apply_report_inside_seller_window(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    outcome: &PaykitStatusOutcome,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let (observed_state, amount_matched, facts) = match outcome {
+        PaykitStatusOutcome::Confirmed {
+            amount_matched,
+            facts,
+        } => ("confirmed", *amount_matched, facts),
+        PaykitStatusOutcome::Detected { facts } => ("detected", true, facts),
+        PaykitStatusOutcome::Undetected => {
+            return mark_shared_manual_disappeared(pool, row, now).await
+        }
+        PaykitStatusOutcome::NotFound | PaykitStatusOutcome::Unavailable => return Ok(false),
+    };
+    if !matches!(
+        facts.allocation_mode.as_str(),
+        "shared_manual" | "exclusive"
+    ) {
+        tracing::warn!(
+            order_id = %row.id,
+            allocation_mode = %facts.allocation_mode,
+            "paykit status reported an unknown allocation_mode; failing closed"
+        );
+        return Ok(false);
+    }
+    refresh_inside_seller_window(
+        pool,
+        row,
+        observed_state,
+        amount_matched,
+        &facts.observation,
+        now,
+    )
+    .await?;
+    Ok(false)
+}
+
+/// Refreshes an order waiting for its seller from one report, under the
+/// canonical payment-then-order lock. Returns false, having changed
+/// nothing, when the payment or the order is no longer waiting.
+async fn refresh_inside_seller_window(
     pool: &PgPool,
     row: &ClaimedPaykitOrder,
     observed_state: &str,
@@ -2325,7 +2387,7 @@ async fn refresh_late_report_inside_seller_window(
     tracing::info!(
         order_id = %row.id,
         observed_state,
-        "late-flagged paykit report inside the seller-confirmation window; refreshed facts only"
+        "paykit report inside the seller-confirmation window; refreshed facts only"
     );
     Ok(true)
 }
@@ -2366,6 +2428,9 @@ async fn apply_paykit_status_outcome(
     if let Some(delivery) = delivery {
         record_paykit_delivery(&state.pool, row, delivery).await?;
     }
+    if row.paykit_request_state == "awaiting_seller_confirmation" {
+        return apply_report_inside_seller_window(&state.pool, row, &outcome, now).await;
+    }
     match outcome {
         PaykitStatusOutcome::Confirmed {
             amount_matched,
@@ -2376,22 +2441,8 @@ async fn apply_paykit_status_outcome(
             // auto-pays (exclusive) and NEVER enters
             // awaiting_seller_confirmation (shared_manual) — it takes the
             // existing durable manual-review entry with the observation
-            // frozen. An order already waiting for its seller judges
-            // lateness by its on-time first sighting instead.
+            // frozen.
             if facts.late_settlement {
-                if row.paykit_request_state == "awaiting_seller_confirmation"
-                    && refresh_late_report_inside_seller_window(
-                        &state.pool,
-                        row,
-                        "confirmed",
-                        amount_matched,
-                        &facts.observation,
-                        now,
-                    )
-                    .await?
-                {
-                    return Ok(false);
-                }
                 return apply_confirmed_paykit_payment(
                     &state.pool,
                     row,
@@ -2445,21 +2496,8 @@ async fn apply_paykit_status_outcome(
         PaykitStatusOutcome::Detected { facts } => {
             // A LATE detection is fail-safe: display-only at most, never
             // the seller-confirmation entry and never a payment authority
-            // transition. An order already waiting for its seller still
-            // gets its facts refreshed.
+            // transition.
             if facts.late_settlement {
-                if row.paykit_request_state == "awaiting_seller_confirmation" {
-                    refresh_late_report_inside_seller_window(
-                        &state.pool,
-                        row,
-                        "detected",
-                        true,
-                        &facts.observation,
-                        now,
-                    )
-                    .await?;
-                    return Ok(false);
-                }
                 return mark_paykit_detected(&state.pool, row, now).await;
             }
             match facts.allocation_mode.as_str() {

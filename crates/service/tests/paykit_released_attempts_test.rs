@@ -961,3 +961,70 @@ async fn a_preparing_current_attempt_is_released_and_never_activated(pool: PgPoo
         )
     );
 }
+
+// Money on a released attempt of an order waiting for its seller on its
+// current attempt goes to an operator. The order keeps waiting: only the
+// seller or the seller-window reaper moves it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn money_on_a_released_attempt_never_moves_an_order_waiting_for_its_seller(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
+    paykit.set_allocation_mode("shared_manual");
+    bind_bitcoin(&app, &buyer.token, &order_id.to_string()).await;
+    drain(&app).await;
+    let now = app.clock.now();
+    paykit.set_status(
+        &attempt_reference(order_id, 2),
+        status_detected("shared_manual", 0),
+    );
+    poll_now(&app, now).await;
+    let request_state: Option<String> =
+        sqlx::query_scalar("SELECT paykit_request_state FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .expect("order row");
+    assert_eq!(
+        request_state.as_deref(),
+        Some("awaiting_seller_confirmation")
+    );
+
+    paykit.set_allocation_mode("exclusive");
+    paykit.set_status(
+        &attempt_reference(order_id, 1),
+        status_confirmed("exclusive", true, 2),
+    );
+    poll_now(&app, now + chrono::Duration::hours(2)).await;
+    assert_eq!(
+        attempt_state(&pool, order_id, first).await,
+        (
+            "needs_review".to_string(),
+            Some("payment_settled".to_string())
+        )
+    );
+    let (request_state, invoice, entered): (Option<String>, Uuid, Option<DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT paykit_request_state, paykit_invoice_id, \
+             paykit_seller_confirmation_entered_at FROM orders WHERE id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("order row");
+    assert_eq!(
+        request_state.as_deref(),
+        Some("awaiting_seller_confirmation")
+    );
+    assert_ne!(
+        invoice, first,
+        "the waiting attempt stays the attempt of record"
+    );
+    assert_eq!(entered, Some(now));
+    assert_eq!(
+        payment_facts(&pool, order_id).await,
+        ("awaiting_entitlement".to_string(), None)
+    );
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 0);
+}
