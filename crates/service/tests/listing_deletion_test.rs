@@ -1103,3 +1103,130 @@ async fn the_follower_lease_is_taken_at_the_current_time(pool: PgPool) {
         Some("2")
     );
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_tombstone_takes_drop_and_listing_locks_in_the_sell_out_confirm_order(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 3).await;
+    homeserver.put_drop_record(
+        &seller.pubky,
+        "lock_drop",
+        common::drop_record_json(
+            &seller.pubky,
+            "lock_drop",
+            1,
+            &[LISTING_ID],
+            &common::ts_after(-60),
+            None,
+            1,
+            1,
+        ),
+    );
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &common::sync_drop_command(&seller.pubky, "lock_drop", 95),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "drop sync: {body}");
+    let drop_id = common::drop_aggregate(&seller.pubky, "lock_drop");
+    let aggregate_id = listing_aggregate(&seller.pubky);
+
+    // Open the tombstone's transaction first so it already holds a pool
+    // connection, then hold the drop's bindings the way `record_paid_unit`
+    // does before `payment.rs` locks the listing.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    let pool = app.pool.clone();
+    let tombstone_id = aggregate_id.clone();
+    let now = app.clock.now();
+    let deletion = tokio::spawn(async move {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET deadlock_timeout = '200ms'")
+            .execute(&mut *tx)
+            .await?;
+        let _ = ready_tx.send(());
+        let _ = go_rx.await;
+        let deleted = marketplace_service::listing_deletion::tombstone(
+            &mut tx,
+            &tombstone_id,
+            "9",
+            "system",
+            Uuid::new_v4(),
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok::<bool, sqlx::Error>(deleted.is_some())
+    });
+    ready_rx.await.expect("tombstone transaction");
+
+    let mut confirm = app.pool.begin().await.expect("confirm tx");
+    sqlx::query("SET deadlock_timeout = '200ms'")
+        .execute(&mut *confirm)
+        .await
+        .expect("confirm deadlock timeout");
+    sqlx::query("UPDATE drop_listings SET active = FALSE WHERE drop_aggregate_id = $1")
+        .bind(&drop_id)
+        .execute(&mut *confirm)
+        .await
+        .expect("bindings locked");
+    let _ = go_tx.send(());
+
+    // Wait until the tombstone is blocked on the binding row. In the old
+    // order it already holds the listing row by then, and the confirmation's
+    // listing lock deadlocks. Bindings-first leaves the listing free.
+    let poll = app.pool.clone();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if deletion.is_finished() {
+            let deleted = deletion.await.expect("tombstone task");
+            panic!("tombstone finished before waiting on the bindings: {deleted:?}");
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+             AND wait_event_type = 'Lock' AND query LIKE '%drop_listings%'",
+        )
+        .fetch_one(&poll)
+        .await
+        .expect("lock wait poll");
+        if waiting >= 1 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let activity: Vec<(Option<String>, Option<String>, String)> = sqlx::query_as(
+                "SELECT wait_event_type, wait_event, left(query, 160) \
+                 FROM pg_stat_activity WHERE datname = current_database() \
+                 AND pid <> pg_backend_pid()",
+            )
+            .fetch_all(&poll)
+            .await
+            .expect("activity");
+            panic!("tombstone never waited on drop_listings: {activity:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let locked: Result<(i64,), sqlx::Error> =
+        sqlx::query_as("SELECT server_revision FROM listings WHERE aggregate_id = $1 FOR UPDATE")
+            .bind(&aggregate_id)
+            .fetch_one(&mut *confirm)
+            .await;
+    assert!(locked.is_ok(), "confirmation lock: {locked:?}");
+    confirm.commit().await.expect("confirmation commits");
+    let deleted = deletion.await.expect("tombstone task");
+    assert!(
+        matches!(deleted, Ok(true)),
+        "tombstone after the confirmation: {deleted:?}"
+    );
+    let released: bool = sqlx::query_scalar(
+        "SELECT bool_and(released) FROM drop_listings WHERE drop_aggregate_id = $1",
+    )
+    .bind(&drop_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("binding released");
+    assert!(released, "tombstone releases the binding it locked");
+}

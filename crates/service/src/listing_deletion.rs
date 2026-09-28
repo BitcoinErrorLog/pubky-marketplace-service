@@ -119,6 +119,30 @@ pub async fn tombstone(
     command_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<Option<(ListingRow, Uuid)>, sqlx::Error> {
+    let live: Option<(String, String)> = sqlx::query_as(
+        "SELECT seller_pubky, listing_id FROM listings \
+         WHERE aggregate_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(aggregate_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((seller_pubky, listing_id)) = live else {
+        return Ok(None);
+    };
+    // A drop bound to the deleted listing must not gate, or draw on, a
+    // record later re-created at the same id. Releasing the binding takes it
+    // out of gating the way `drop.release_listings` does; only an advanced
+    // record of a still-announced drop can bind the re-created listing.
+    // The bindings are locked before the listing row: a drop sell-out
+    // payment confirmation takes them in that order too.
+    sqlx::query(
+        "UPDATE drop_listings SET active = FALSE, released = TRUE \
+         WHERE seller_pubky = $1 AND listing_id = $2 AND NOT released",
+    )
+    .bind(&seller_pubky)
+    .bind(&listing_id)
+    .execute(&mut **tx)
+    .await?;
     let deleted: Option<ListingRow> = sqlx::query_as(&format!(
         "UPDATE listings SET deleted_at = $2, deleted_event_cursor = $3, \
          server_revision = server_revision + 1, updated_at = $2 \
@@ -133,18 +157,6 @@ pub async fn tombstone(
     let Some(deleted) = deleted else {
         return Ok(None);
     };
-    // A drop bound to the deleted listing must not gate, or draw on, a
-    // record later re-created at the same id. Releasing the binding takes it
-    // out of gating the way `drop.release_listings` does; only an advanced
-    // record of a still-announced drop can bind the re-created listing.
-    sqlx::query(
-        "UPDATE drop_listings SET active = FALSE, released = TRUE \
-         WHERE seller_pubky = $1 AND listing_id = $2 AND NOT released",
-    )
-    .bind(&deleted.seller_pubky)
-    .bind(&deleted.listing_id)
-    .execute(&mut **tx)
-    .await?;
     let event_id = insert_event(
         tx,
         command_id,

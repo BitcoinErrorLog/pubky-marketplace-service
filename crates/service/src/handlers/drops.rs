@@ -11,10 +11,11 @@
 //!
 //! Gating: `inventory.reserve` and `checkout.create` call
 //! [`lock_bound_drop`] + [`enforce_drop_gate`] when a target listing is
-//! bound to a drop. The drop row lock is taken BEFORE any listing row lock
-//! in every transaction that touches both (gating, releases), so the two
-//! never deadlock. All cap accounting lives in the same transaction as the
-//! hold, with database CHECK constraints backing every handler guard.
+//! bound to a drop. The drop row lock, and any `drop_listings` row lock, is
+//! taken BEFORE any listing row lock in every transaction that touches both
+//! (gating, releases, sell-out confirmation, late reacquire, tombstone), so
+//! the two never deadlock. All cap accounting lives in the same transaction
+//! as the hold, with database CHECK constraints backing every handler guard.
 //!
 //! Releases: every path that returns held units to a listing credits the
 //! stamped drop through [`credit_drop_release`] — reservation expiry, the
@@ -456,6 +457,24 @@ async fn deactivate_drop_listing_bindings(
     Ok(())
 }
 
+/// Row-locks every binding of a drop. A transaction that also updates a
+/// listing takes this before the listing row: a tombstone releases the
+/// listing's bindings before it updates the listing, and a sell-out
+/// confirmation deactivates them before it does. Taking the locks in
+/// opposite orders deadlocks.
+pub async fn lock_listing_bindings(
+    tx: &mut Transaction<'_, Postgres>,
+    drop_aggregate_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query_as::<_, (i32,)>(
+        "SELECT 1 FROM drop_listings WHERE drop_aggregate_id = $1 FOR UPDATE",
+    )
+    .bind(drop_aggregate_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// `drop.release_listings`: seller only, `expected_revision` CAS, allowed
 /// only once the drop has ended (any of the three terminal states — a due
 /// server-time end is persisted first, so the seller never has to wait for
@@ -727,6 +746,9 @@ pub async fn record_paid_unit(
             "The order's drop is missing.",
         )));
     };
+    // Bindings before the listing rows `confirm_order` locks after this
+    // returns. A tombstone takes the same rows first.
+    lock_listing_bindings(tx, drop_aggregate_id).await?;
     // Persist any due server-time transition first (the UPDATE below
     // re-reads the row, so the returned state is post-transition).
     apply_time_transitions(tx, drop, command_id, now).await?;

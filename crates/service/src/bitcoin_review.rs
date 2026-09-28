@@ -1267,6 +1267,12 @@ pub(crate) async fn reacquire_hold(
         else {
             return Err(ResolutionFailure::StockUnavailable);
         };
+        // Before the listing rows below. This transaction later confirms the
+        // payment, and a sell-out confirmation deactivates these bindings;
+        // a tombstone releases them before it updates the listing.
+        crate::handlers::drops::lock_listing_bindings(tx, drop_aggregate_id)
+            .await
+            .map_err(|e| ResolutionFailure::Internal("drop binding lock".into(), e.to_string()))?;
         crate::handlers::drops::apply_time_transitions(tx, drop, inputless_command_id(), now)
             .await
             .map_err(|e| ResolutionFailure::Internal("drop transition".into(), e.to_string()))?;
