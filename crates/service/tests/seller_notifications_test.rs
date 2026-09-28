@@ -439,7 +439,7 @@ async fn an_overdue_review_reminds_the_seller_once(pool: PgPool) {
     );
 }
 
-/// An outbox intent whose `review_reason` the 0047 CHECK would refuse
+/// An outbox intent whose `review_reason` the 0048 CHECK would refuse
 /// (not a string, or outside the vocabulary) still delivers, without the
 /// reason, and never stalls the intents queued behind it.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
