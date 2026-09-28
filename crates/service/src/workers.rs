@@ -571,11 +571,17 @@ pub async fn deliver_claimed(
             Value::Null => None,
             value => Some(value.clone()),
         };
+        let review_reason = match &row.payload["review_reason"] {
+            Value::Null => None,
+            Value::String(reason) => Some(reason.as_str()),
+            _ => anyhow::bail!("outbox row {} review_reason is not a string", row.id),
+        };
 
         let mut tx = pool.begin().await?;
         sqlx::query(
             "INSERT INTO notifications (id, event_id, recipient_pubky, actor_pubky, type, \
-             aggregate_id, amount, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             aggregate_id, amount, review_reason, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT (event_id, recipient_pubky) DO NOTHING",
         )
         .bind(Uuid::new_v4())
@@ -585,6 +591,7 @@ pub async fn deliver_claimed(
         .bind(notification_type)
         .bind(aggregate_id)
         .bind(amount)
+        .bind(review_reason)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -1766,7 +1773,7 @@ async fn apply_confirmed_paykit_payment(
         .bind(now)
         .fetch_one(&mut *tx)
         .await?;
-        crate::executor::insert_event(
+        let event_id = crate::executor::insert_event(
             &mut tx,
             row.id,
             &ids::payment_aggregate_id(payment.id),
@@ -1776,6 +1783,18 @@ async fn apply_confirmed_paykit_payment(
             now,
         )
         .await?;
+        // An unpinned legacy order cannot take a seller resolution.
+        if resolution_pins_present {
+            crate::handlers::insert_bitcoin_manual_review_intent(
+                &mut tx,
+                event_id,
+                &row.seller_pubky,
+                row.id,
+                crate::handlers::BitcoinReviewNotice::AmountMismatch,
+                now,
+            )
+            .await?;
+        }
         sqlx::query(
             "UPDATE orders SET paykit_request_state = 'confirmed', \
              paykit_seller_confirmation_entered_at = NULL, \
@@ -1818,7 +1837,7 @@ async fn apply_confirmed_paykit_payment(
         .bind(now)
         .fetch_one(&mut *tx)
         .await?;
-        crate::executor::insert_event(
+        let event_id = crate::executor::insert_event(
             &mut tx,
             row.id,
             &ids::payment_aggregate_id(payment.id),
@@ -1828,6 +1847,18 @@ async fn apply_confirmed_paykit_payment(
             now,
         )
         .await?;
+        // An unpinned legacy order cannot take a seller resolution.
+        if resolution_pins_present {
+            crate::handlers::insert_bitcoin_manual_review_intent(
+                &mut tx,
+                event_id,
+                &row.seller_pubky,
+                row.id,
+                crate::handlers::BitcoinReviewNotice::AmountMismatch,
+                now,
+            )
+            .await?;
+        }
         sqlx::query(
             "UPDATE orders SET paykit_request_state = 'confirmed', \
              paykit_seller_confirmation_entered_at = NULL, \
@@ -1984,7 +2015,7 @@ async fn apply_confirmed_paykit_payment(
             .fetch_optional(&mut *tx)
             .await?;
             if let Some((revision,)) = updated {
-                crate::executor::insert_event(
+                let event_id = crate::executor::insert_event(
                     &mut tx,
                     row.id,
                     &ids::payment_aggregate_id(payment.id),
@@ -1994,6 +2025,18 @@ async fn apply_confirmed_paykit_payment(
                     now,
                 )
                 .await?;
+                // An unpinned legacy order cannot take a seller resolution.
+                if resolution_pins_present {
+                    crate::handlers::insert_bitcoin_manual_review_intent(
+                        &mut tx,
+                        event_id,
+                        &row.seller_pubky,
+                        row.id,
+                        crate::handlers::BitcoinReviewNotice::ConfirmationFailed,
+                        now,
+                    )
+                    .await?;
+                }
             }
             sqlx::query(
                 "UPDATE orders SET paykit_request_state = 'confirmed', \
@@ -2120,21 +2163,45 @@ async fn apply_shared_manual_observation(
     // observation. The hold is EXTENDED to the 24-hour window, not expired
     // (a buyer who demonstrably paid must not lose stock to a 3600 s
     // timeout while waiting for a human).
-    let entered = sqlx::query(
+    let entered: Option<(i64,)> = sqlx::query_as(
         "UPDATE orders SET paykit_request_state = 'awaiting_seller_confirmation', \
          paykit_observation = $2, paykit_seller_confirmation_entered_at = $3, \
          paykit_seller_confirmation_deadline = $4, \
          hold_expires_at = CASE WHEN auction_aggregate_id IS NULL THEN $4 ELSE hold_expires_at END, \
-         updated_at = $3 \
-         WHERE id = $1 AND paykit_request_state IN ('pending', 'detected')",
+         revision = revision + 1, updated_at = $3 \
+         WHERE id = $1 AND paykit_request_state IN ('pending', 'detected') \
+         RETURNING revision",
     )
     .bind(row.id)
     .bind(&observation_doc)
     .bind(now)
     .bind(deadline)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if entered.rows_affected() == 1 {
+    if let Some((revision,)) = entered {
+        // The seller is the only exit to `paid`: tell them the payment was
+        // seen and that it waits for their confirmation.
+        let event_id = crate::executor::insert_event(
+            &mut tx,
+            Uuid::new_v4(),
+            &ids::order_aggregate_id(row.id),
+            revision,
+            SYSTEM_ACTOR,
+            "payment.awaiting_seller_confirmation",
+            now,
+        )
+        .await?;
+        insert_notification_intent(
+            &mut tx,
+            event_id,
+            "bitcoin_payment_seen",
+            &order.seller_pubky,
+            SYSTEM_ACTOR,
+            &ids::order_aggregate_id(row.id),
+            None,
+            now,
+        )
+        .await?;
         // A1: the FIRST authority-establishing observation is frozen onto
         // the order in the same transaction as the state change. Later
         // status refreshes update the JSON facts only; the seller-window

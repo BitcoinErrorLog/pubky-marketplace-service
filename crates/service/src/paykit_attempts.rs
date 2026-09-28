@@ -454,13 +454,22 @@ async fn route_released_settlement(
         .bind(now)
         .fetch_one(&mut *tx)
         .await?;
-        crate::executor::insert_event(
+        let event_id = crate::executor::insert_event(
             &mut tx,
             Uuid::new_v4(),
             &ids::payment_aggregate_id(payment.id),
             revision,
             &order.buyer_pubky,
             "payment.manual_review",
+            now,
+        )
+        .await?;
+        crate::handlers::insert_bitcoin_manual_review_intent(
+            &mut tx,
+            event_id,
+            &order.seller_pubky,
+            order.id,
+            crate::handlers::BitcoinReviewNotice::AmountMismatch,
             now,
         )
         .await?;

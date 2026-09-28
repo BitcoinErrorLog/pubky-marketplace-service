@@ -103,7 +103,7 @@ pub async fn seller_has_rail(
 /// is a party to that order; other aggregates, and malformed order ids, read
 /// NULL (the guarded CASE never casts a non-UUID).
 pub const NOTIFICATION_COLUMNS: &str = "n.id, n.recipient_pubky, n.actor_pubky, n.type, \
-     n.aggregate_id, n.amount, n.created_at, n.read_at, \
+     n.aggregate_id, n.amount, n.created_at, n.read_at, n.review_reason, \
      (SELECT o.fulfillment FROM orders o \
       WHERE o.id = CASE WHEN n.aggregate_id ~ \
         '^order:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \

@@ -7,7 +7,8 @@ mod common;
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use common::paykit_review::{
-    create_sat_order, enable_bitcoin, poll_now, status_confirmed, status_detected,
+    create_sat_order, delivered_notifications, enable_bitcoin, poll_now, status_confirmed,
+    status_detected,
 };
 use common::*;
 use marketplace_service::clock::Clock;
@@ -62,6 +63,27 @@ async fn released(pool: &PgPool, order_id: Uuid) -> Vec<(Uuid, Option<String>, S
     .fetch_all(pool)
     .await
     .expect("released attempts")
+}
+
+/// The review reasons of every `bitcoin_manual_review` notice the seller
+/// holds about this order; the buyer holds none.
+async fn review_notices(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+    order_id: Uuid,
+) -> Vec<Value> {
+    assert!(
+        delivered_notifications(app, &buyer.token, "bitcoin_manual_review")
+            .await
+            .is_empty()
+    );
+    delivered_notifications(app, &seller.token, "bitcoin_manual_review")
+        .await
+        .into_iter()
+        .filter(|notice| notice["aggregate_id"] == json!(format!("order:{order_id}")))
+        .map(|notice| notice["review_reason"].clone())
+        .collect()
 }
 
 async fn payment_facts(pool: &PgPool, order_id: Uuid) -> (String, Option<String>) {
@@ -146,6 +168,10 @@ async fn money_on_a_released_attempt_after_a_rebind_reaches_late_money(pool: PgP
             "manual_review".to_string(),
             Some("late_settlement".to_string())
         )
+    );
+    assert_eq!(
+        review_notices(&app, &seller, &buyer, order_id).await,
+        vec![json!("late_settlement")]
     );
     let (invoice, reference, request_state, method): (
         Uuid,
@@ -874,6 +900,10 @@ async fn a_mismatched_amount_on_a_released_attempt_goes_to_manual_review(pool: P
             "manual_review".to_string(),
             Some("amount_mismatch".to_string())
         )
+    );
+    assert_eq!(
+        review_notices(&app, &seller, &buyer, order_id).await,
+        vec![json!("amount_mismatch")]
     );
     assert_eq!(current_invoice(&pool, order_id).await, first);
     assert_eq!(

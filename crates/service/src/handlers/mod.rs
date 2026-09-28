@@ -301,6 +301,60 @@ pub async fn insert_notification_intent(
     if let Some(amount) = amount {
         payload["amount"] = amount.clone();
     }
+    enqueue_notification(tx, event_id, notification_type, payload, now).await
+}
+
+/// Why a Bitcoin payment waits for the seller's decision (the
+/// `notifications_review_reason_check` vocabulary, migration 0048).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitcoinReviewNotice {
+    LateSettlement,
+    AmountMismatch,
+    ConfirmationFailed,
+    SellerConfirmationWindowElapsed,
+    SellerResponseOverdue,
+}
+
+impl BitcoinReviewNotice {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LateSettlement => "late_settlement",
+            Self::AmountMismatch => "amount_mismatch",
+            Self::ConfirmationFailed => "confirmation_failed",
+            Self::SellerConfirmationWindowElapsed => "seller_confirmation_window_elapsed",
+            Self::SellerResponseOverdue => "seller_response_overdue",
+        }
+    }
+}
+
+/// Tells the order's seller that a Paykit Bitcoin payment is in
+/// `manual_review` and needs their resolution, with the reason. The seller
+/// already sees the payment state and its review reason on the order.
+pub async fn insert_bitcoin_manual_review_intent(
+    tx: &mut Transaction<'_, Postgres>,
+    event_id: Uuid,
+    seller_pubky: &str,
+    order_id: Uuid,
+    reason: BitcoinReviewNotice,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let payload = json!({
+        "event_id": event_id,
+        "recipient_pubky": seller_pubky,
+        "actor_pubky": crate::workers::SYSTEM_ACTOR,
+        "aggregate_id": ids::order_aggregate_id(order_id),
+        "review_reason": reason.as_str(),
+    });
+    enqueue_notification(tx, event_id, "bitcoin_manual_review", payload, now).await
+}
+
+async fn enqueue_notification(
+    tx: &mut Transaction<'_, Postgres>,
+    event_id: Uuid,
+    notification_type: &str,
+    payload: Value,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
     crate::reserve_secrecy::ensure_reserve_free(&payload)
         .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     sqlx::query("INSERT INTO outbox (event_id, kind, payload, created_at) VALUES ($1, $2, $3, $4)")

@@ -55,6 +55,35 @@ pub async fn poll_now(app: &TestApp, now: DateTime<Utc>) -> u64 {
         .expect("poll runs")
 }
 
+/// Delivers every pending outbox intent, then reads the caller's
+/// notifications through `GET /v1/notifications`, filtered to `kind`.
+pub async fn delivered_notifications(app: &TestApp, token: &str, kind: &str) -> Vec<Value> {
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    drain_outbox(&app.pool, client, app.clock.now(), 30)
+        .await
+        .expect("outbox drains");
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/notifications",
+        Some(token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "notifications read failed: {body}");
+    body["notifications"]
+        .as_array()
+        .expect("notifications array")
+        .iter()
+        .filter(|notification| notification["type"] == json!(kind))
+        .cloned()
+        .collect()
+}
+
 pub async fn enable_bitcoin(app: &TestApp, paykit: &FakePaykit, seller: &TestActor) {
     let (status, body) = send(
         app.router.clone(),
