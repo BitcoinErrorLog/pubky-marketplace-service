@@ -746,7 +746,13 @@ async fn a_slow_homeserver_cannot_hold_the_follower_past_its_deadline(pool: PgPo
         ids[..settled as usize].to_vec()
     );
 
+    // Without the delay, one pass confirms at most 20 deletions.
     homeserver.set_delay(std::time::Duration::ZERO);
+    app.clock.advance_seconds(61);
+    let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("capped pass");
+    assert_eq!(summary.listings_tombstoned, 20);
     for _ in 0..10 {
         app.clock.advance_seconds(61);
         marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
@@ -1076,4 +1082,24 @@ async fn a_deleted_auctions_bid_history_is_kept_for_its_parties_only(pool: PgPoo
         let (status, body) = get(&app, &actor.token, &path).await;
         assert_eq!(status, expected, "{label}: {body}");
     }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_follower_lease_is_taken_at_the_current_time(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 1).await;
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+
+    // The pass started 40 s ago (the tasks before the follower ran long);
+    // a lease dated then would already have lapsed.
+    let stale = app.clock.now() - chrono::Duration::seconds(40);
+    let summary = marketplace_service::workers::run_once(&app.state, Uuid::new_v4(), stale)
+        .await
+        .expect("worker pass");
+    assert_eq!(summary.listings_tombstoned, 1);
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("2")
+    );
 }

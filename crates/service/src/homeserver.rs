@@ -1672,6 +1672,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_crlf_framed_event_streams_like_lf_ones() {
+        let crlf = STAGING_SELLER_EVENTS.replace('\n', "\r\n");
+        assert_eq!(
+            parse_event_stream(&crlf),
+            parse_event_stream(STAGING_SELLER_EVENTS)
+        );
+        assert_eq!(
+            parse_event_stream(&crlf).map(|events| events.len()),
+            Some(10)
+        );
+    }
+
+    #[test]
     fn rejects_event_stream_batches_it_cannot_read_exactly() {
         assert_eq!(parse_event_stream(""), Some(vec![]));
         for body in [
