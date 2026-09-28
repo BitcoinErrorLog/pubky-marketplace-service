@@ -1741,6 +1741,9 @@ pub struct NotificationRow {
     /// the recipient is party to; NULL otherwise. Lets a client word
     /// `order_delivered` for a download rather than a parcel.
     pub order_fulfillment: Option<String>,
+    /// Why a `bitcoin_manual_review` notification was sent (migration
+    /// 0048); NULL on every other type.
+    pub review_reason: Option<String>,
 }
 
 impl NotificationRow {
@@ -1755,6 +1758,7 @@ impl NotificationRow {
             "created_at": format_timestamp(self.created_at),
             "read_at": self.read_at.map(format_timestamp),
             "order_fulfillment": self.order_fulfillment,
+            "review_reason": self.review_reason,
         })
     }
 }

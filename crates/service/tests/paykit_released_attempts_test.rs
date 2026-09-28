@@ -7,7 +7,8 @@ mod common;
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use common::paykit_review::{
-    create_sat_order, enable_bitcoin, poll_now, status_confirmed, status_detected,
+    create_sat_order, delivered_notifications, enable_bitcoin, poll_now, status_confirmed,
+    status_detected,
 };
 use common::*;
 use marketplace_service::clock::Clock;
@@ -62,6 +63,27 @@ async fn released(pool: &PgPool, order_id: Uuid) -> Vec<(Uuid, Option<String>, S
     .fetch_all(pool)
     .await
     .expect("released attempts")
+}
+
+/// The review reasons of every `bitcoin_manual_review` notice the seller
+/// holds about this order; the buyer holds none.
+async fn review_notices(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+    order_id: Uuid,
+) -> Vec<Value> {
+    assert!(
+        delivered_notifications(app, &buyer.token, "bitcoin_manual_review")
+            .await
+            .is_empty()
+    );
+    delivered_notifications(app, &seller.token, "bitcoin_manual_review")
+        .await
+        .into_iter()
+        .filter(|notice| notice["aggregate_id"] == json!(format!("order:{order_id}")))
+        .map(|notice| notice["review_reason"].clone())
+        .collect()
 }
 
 async fn payment_facts(pool: &PgPool, order_id: Uuid) -> (String, Option<String>) {
@@ -146,6 +168,10 @@ async fn money_on_a_released_attempt_after_a_rebind_reaches_late_money(pool: PgP
             "manual_review".to_string(),
             Some("late_settlement".to_string())
         )
+    );
+    assert_eq!(
+        review_notices(&app, &seller, &buyer, order_id).await,
+        vec![json!("late_settlement")]
     );
     let (invoice, reference, request_state, method): (
         Uuid,
@@ -875,6 +901,10 @@ async fn a_mismatched_amount_on_a_released_attempt_goes_to_manual_review(pool: P
             Some("amount_mismatch".to_string())
         )
     );
+    assert_eq!(
+        review_notices(&app, &seller, &buyer, order_id).await,
+        vec![json!("amount_mismatch")]
+    );
     assert_eq!(current_invoice(&pool, order_id).await, first);
     assert_eq!(
         attempt_state(&pool, order_id, first).await,
@@ -930,4 +960,71 @@ async fn a_preparing_current_attempt_is_released_and_never_activated(pool: PgPoo
             Some("late_settlement".to_string())
         )
     );
+}
+
+// Money on a released attempt of an order waiting for its seller on its
+// current attempt goes to an operator. The order keeps waiting: only the
+// seller or the seller-window reaper moves it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn money_on_a_released_attempt_never_moves_an_order_waiting_for_its_seller(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
+    paykit.set_allocation_mode("shared_manual");
+    bind_bitcoin(&app, &buyer.token, &order_id.to_string()).await;
+    drain(&app).await;
+    let now = app.clock.now();
+    paykit.set_status(
+        &attempt_reference(order_id, 2),
+        status_detected("shared_manual", 0),
+    );
+    poll_now(&app, now).await;
+    let request_state: Option<String> =
+        sqlx::query_scalar("SELECT paykit_request_state FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .expect("order row");
+    assert_eq!(
+        request_state.as_deref(),
+        Some("awaiting_seller_confirmation")
+    );
+
+    paykit.set_allocation_mode("exclusive");
+    paykit.set_status(
+        &attempt_reference(order_id, 1),
+        status_confirmed("exclusive", true, 2),
+    );
+    poll_now(&app, now + chrono::Duration::hours(2)).await;
+    assert_eq!(
+        attempt_state(&pool, order_id, first).await,
+        (
+            "needs_review".to_string(),
+            Some("payment_settled".to_string())
+        )
+    );
+    let (request_state, invoice, entered): (Option<String>, Uuid, Option<DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT paykit_request_state, paykit_invoice_id, \
+             paykit_seller_confirmation_entered_at FROM orders WHERE id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("order row");
+    assert_eq!(
+        request_state.as_deref(),
+        Some("awaiting_seller_confirmation")
+    );
+    assert_ne!(
+        invoice, first,
+        "the waiting attempt stays the attempt of record"
+    );
+    assert_eq!(entered, Some(now));
+    assert_eq!(
+        payment_facts(&pool, order_id).await,
+        ("awaiting_entitlement".to_string(), None)
+    );
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 0);
 }

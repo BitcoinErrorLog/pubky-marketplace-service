@@ -48,8 +48,8 @@ use crate::contracts::ReviewReason;
 use crate::executor::insert_event;
 use crate::handlers::holds::{release_lines, HeldQuantity};
 use crate::handlers::{
-    fetch_listing, fetch_order_for_update, insert_notification_intent,
-    seller_order_json_with_reviews,
+    fetch_listing, fetch_order_for_update, insert_bitcoin_manual_review_intent,
+    insert_notification_intent, seller_order_json_with_reviews, BitcoinReviewNotice,
 };
 use crate::model::{seller_observation, OrderRow, PaymentRow};
 use crate::payments::PaykitObservation;
@@ -1385,6 +1385,14 @@ pub(crate) async fn apply_late_money(
     event_actor: &str,
     now: DateTime<Utc>,
 ) -> Result<LateMoneyOutcome, ResolutionFailure> {
+    // Only the seller or the seller-window reaper moves an order waiting
+    // for its seller; every caller rolls back on this error.
+    if order.paykit_request_state.as_deref() == Some("awaiting_seller_confirmation") {
+        return Err(ResolutionFailure::Internal(
+            "late money".into(),
+            "the order is awaiting seller confirmation".into(),
+        ));
+    }
     // A digital order the seller can no longer deliver takes the stock-gone
     // shape (digital delivery design §6 D3) before any other late-money
     // branch: a still-held order releases its hold, a lapsed one never
@@ -1407,7 +1415,7 @@ pub(crate) async fn apply_late_money(
     }
     let still_held = order.state == "pending_payment" && order.stock_held;
     if still_held {
-        stamp_review_reason(
+        let event_id = stamp_review_reason(
             tx,
             payment,
             "late_settlement",
@@ -1417,6 +1425,20 @@ pub(crate) async fn apply_late_money(
             now,
         )
         .await?;
+        if payment.adapter == "paykit" {
+            insert_bitcoin_manual_review_intent(
+                tx,
+                event_id,
+                &order.seller_pubky,
+                order.id,
+                BitcoinReviewNotice::LateSettlement,
+                now,
+            )
+            .await
+            .map_err(|e| {
+                ResolutionFailure::Internal("review notification".into(), e.to_string())
+            })?;
+        }
         return Ok(LateMoneyOutcome::HeldLateSettlement);
     }
 
@@ -1939,14 +1961,12 @@ async fn route_one_seller_confirmation_window(
         .bind(order_id)
         .fetch_one(&mut *tx)
         .await?;
-    insert_notification_intent(
+    insert_bitcoin_manual_review_intent(
         &mut tx,
         event_id,
-        "bitcoin_manual_review",
         &seller_pubky.0,
-        SYSTEM_ACTOR,
-        &ids::order_aggregate_id(order_id),
-        None,
+        order_id,
+        BitcoinReviewNotice::SellerConfirmationWindowElapsed,
         now,
     )
     .await?;
@@ -1987,20 +2007,44 @@ pub async fn watch_manual_reviews(
     let mut alerts = 0u64;
     let mut abandoned = 0u64;
     for (order_id, entered_at, sla_alerted_at) in rows {
-        // The SLA: alert on breach, once. It never transitions authority.
+        // The SLA: alert on breach, once, and remind the seller that the
+        // decision is still theirs. It never transitions authority.
         if sla_alerted_at.is_none()
             && now >= add_business_days(entered_at, SELLER_RESPONSE_SLA_BUSINESS_DAYS)
         {
-            let stamped = sqlx::query(
-                "UPDATE payments SET manual_review_sla_alerted_at = $2 \
+            let mut tx = pool.begin().await?;
+            let stamped: Option<(Uuid, i64, String)> = sqlx::query_as(
+                "UPDATE payments SET manual_review_sla_alerted_at = $2, \
+                 revision = revision + 1, updated_at = $2 \
                  WHERE order_id = $1 AND state = 'manual_review' \
-                 AND manual_review_sla_alerted_at IS NULL",
+                 AND manual_review_sla_alerted_at IS NULL \
+                 RETURNING id, revision, seller_pubky",
             )
             .bind(order_id)
             .bind(now)
-            .execute(pool)
+            .fetch_optional(&mut *tx)
             .await?;
-            if stamped.rows_affected() == 1 {
+            if let Some((payment_id, revision, seller_pubky)) = stamped {
+                let event_id = insert_event(
+                    &mut tx,
+                    Uuid::new_v4(),
+                    &ids::payment_aggregate_id(payment_id),
+                    revision,
+                    SYSTEM_ACTOR,
+                    "payment.manual_review_overdue",
+                    now,
+                )
+                .await?;
+                insert_bitcoin_manual_review_intent(
+                    &mut tx,
+                    event_id,
+                    &seller_pubky,
+                    order_id,
+                    BitcoinReviewNotice::SellerResponseOverdue,
+                    now,
+                )
+                .await?;
+                tx.commit().await?;
                 tracing::error!(
                     order_id = %order_id,
                     "ALERT seller-response SLA breached: a bitcoin payment has waited in \

@@ -576,8 +576,12 @@ async fn a_late_observation_goes_straight_to_manual_review(pool: PgPool) {
     let _ = request_state;
 }
 
+/// Paykit flags a settlement late against the invoice's own expiry, which
+/// the 24-hour seller window outlives. An order that entered the window on
+/// an on-time sighting judges lateness by that sighting: a late-flagged
+/// confirmation refreshes the facts and keeps the window open.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_late_confirmation_clears_an_active_seller_window(pool: PgPool) {
+async fn a_late_confirmation_keeps_an_active_seller_window(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -591,11 +595,12 @@ async fn a_late_confirmation_clears_an_active_seller_window(pool: PgPool) {
         &reference,
         captured_late_status(LIVE_SHARED_MANUAL_LATE_STATUS),
     );
-    assert_eq!(poll_now(&app, now + chrono::Duration::seconds(60)).await, 1);
+    assert_eq!(poll_now(&app, now + chrono::Duration::seconds(60)).await, 0);
 
-    let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
-    assert_eq!(request_state, "confirmed");
-    assert_eq!(payment_state, "manual_review");
+    let (request_state, payment_state, stock_held, _) = order_facts(&pool, &order_id).await;
+    assert_eq!(request_state, "awaiting_seller_confirmation");
+    assert_eq!(payment_state, "awaiting_entitlement");
+    assert!(stock_held);
     let (entered, deadline): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
         "SELECT paykit_seller_confirmation_entered_at, \
              paykit_seller_confirmation_deadline FROM orders WHERE id = $1",
@@ -604,13 +609,80 @@ async fn a_late_confirmation_clears_an_active_seller_window(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("seller window columns");
-    assert_eq!(entered, None);
-    assert_eq!(deadline, None);
+    assert_eq!(entered, Some(now));
+    assert_eq!(
+        deadline,
+        Some(now + chrono::Duration::seconds(SELLER_CONFIRMATION_WINDOW_SECONDS))
+    );
+    let observation_doc: Value =
+        sqlx::query_scalar("SELECT paykit_observation FROM orders WHERE id = $1")
+            .bind(Uuid::parse_str(&order_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("observation refreshed");
+    assert_eq!(observation_doc["state"], json!("confirmed"));
+    assert_eq!(observation_doc["confirmations"], json!(6));
+    assert_eq!(
+        payment_event_count(&pool, &order_id, "payment.manual_review").await,
+        0
+    );
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 0);
+
+    // The seller's attestation stays the exit.
+    let (status, body) = confirm_call(&app, &seller.token, &order_id, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "confirm failed: {body}");
+    assert_eq!(body["order"]["state"], json!("paid"));
 }
 
+/// The seller gate once armed, for a report that would otherwise move
+/// the order: the order keeps waiting, the payment stays unpaid, no receipt,
+/// paid event, or review exists, and the refreshed facts reach the seller.
+async fn assert_still_waiting(pool: &PgPool, order_id: &str, state: &str, confirmations: i32) {
+    let (request_state, payment_state, stock_held, _) = order_facts(pool, order_id).await;
+    assert_eq!(request_state, "awaiting_seller_confirmation");
+    assert_eq!(
+        payment_state, "awaiting_entitlement",
+        "never paid automatically"
+    );
+    assert!(stock_held, "the hold stays with the waiting payment");
+    assert_eq!(count(pool, "SELECT COUNT(*) FROM receipts").await, 0);
+    assert_eq!(
+        payment_event_count(pool, order_id, "payment.confirmed").await,
+        0
+    );
+    assert_eq!(
+        payment_event_count(pool, order_id, "payment.manual_review").await,
+        0
+    );
+    let (entered, deadline): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT paykit_seller_confirmation_entered_at, \
+             paykit_seller_confirmation_deadline FROM orders WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(order_id).unwrap())
+    .fetch_one(pool)
+    .await
+    .expect("seller window columns");
+    assert!(
+        entered.is_some() && deadline.is_some(),
+        "the window stays armed"
+    );
+    let (observation_doc, paid_confirmations): (Value, i32) = sqlx::query_as(
+        "SELECT o.paykit_observation, p.confirmations \
+         FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
+    )
+    .bind(Uuid::parse_str(order_id).unwrap())
+    .fetch_one(pool)
+    .await
+    .expect("refreshed facts");
+    assert_eq!(observation_doc["state"], json!(state));
+    assert_eq!(paid_confirmations, confirmations);
+}
+
+/// Review P1 (Sol round 1): the seller moves to `exclusive` after the order
+/// entered the window; Paykit then reports a non-late exact confirmation.
+/// Only the seller's attestation may pay it.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn an_exclusive_confirmation_clears_an_active_seller_window(pool: PgPool) {
+async fn an_exclusive_confirmation_keeps_an_active_seller_window(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -622,26 +694,48 @@ async fn an_exclusive_confirmation_clears_an_active_seller_window(pool: PgPool) 
     assert_eq!(poll_now(&app, now).await, 1);
     paykit.set_allocation_mode("exclusive");
     paykit.set_status(&reference, status_confirmed("exclusive", true, 6));
-    assert_eq!(poll_now(&app, now + chrono::Duration::seconds(60)).await, 1);
+    assert_eq!(poll_now(&app, now + chrono::Duration::seconds(60)).await, 0);
+    assert_still_waiting(&pool, &order_id, "confirmed", 6).await;
 
-    let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
-    assert_eq!(request_state, "confirmed");
-    assert_eq!(payment_state, "confirmed");
-    let (entered, deadline): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT paykit_seller_confirmation_entered_at, \
-             paykit_seller_confirmation_deadline FROM orders WHERE id = $1",
-    )
-    .bind(Uuid::parse_str(&order_id).unwrap())
-    .fetch_one(&pool)
-    .await
-    .expect("seller window columns");
-    assert_eq!(entered, None);
-    assert_eq!(deadline, None);
+    let (status, body) = confirm_call(&app, &seller.token, &order_id, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "confirm failed: {body}");
+    assert_eq!(body["order"]["state"], json!("paid"));
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 1);
 }
 
+/// The same mode change with no seller answer: the reaper is the other exit.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn an_amount_mismatch_clears_an_active_seller_window(pool: PgPool) {
+async fn an_exclusive_confirmation_leaves_the_window_to_the_reaper(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _payment_id, reference) =
+        bound_shared_manual_order(&app, &paykit, &seller, &buyer).await;
+
+    let now = app.clock.now();
+    paykit.set_status(&reference, status_detected("shared_manual", 0));
+    assert_eq!(poll_now(&app, now).await, 1);
+    paykit.set_allocation_mode("exclusive");
+    paykit.set_status(&reference, status_confirmed("exclusive", true, 6));
+    assert_eq!(poll_now(&app, now + chrono::Duration::seconds(60)).await, 0);
+    assert_still_waiting(&pool, &order_id, "confirmed", 6).await;
+
+    let at_deadline = now + chrono::Duration::seconds(SELLER_CONFIRMATION_WINDOW_SECONDS);
+    assert_eq!(
+        route_due_seller_confirmation_windows(&app.state, at_deadline)
+            .await
+            .expect("reaper runs"),
+        1
+    );
+    let (request_state, payment_state, stock_held, _) = order_facts(&pool, &order_id).await;
+    assert_eq!(request_state, "confirmed");
+    assert_eq!(payment_state, "manual_review");
+    assert!(stock_held);
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_amount_mismatch_keeps_an_active_seller_window(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -653,26 +747,26 @@ async fn an_amount_mismatch_clears_an_active_seller_window(pool: PgPool) {
     assert_eq!(poll_now(&app, now).await, 1);
     paykit.set_allocation_mode("exclusive");
     paykit.set_status(&reference, status_confirmed("exclusive", false, 6));
-    assert_eq!(poll_now(&app, now + chrono::Duration::seconds(60)).await, 1);
-
-    let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
-    assert_eq!(request_state, "confirmed");
-    assert_eq!(payment_state, "manual_review");
-    let (entered, deadline): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT paykit_seller_confirmation_entered_at, \
-             paykit_seller_confirmation_deadline FROM orders WHERE id = $1",
-    )
-    .bind(Uuid::parse_str(&order_id).unwrap())
-    .fetch_one(&pool)
-    .await
-    .expect("seller window columns");
-    assert_eq!(entered, None);
-    assert_eq!(deadline, None);
-    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 0);
+    assert_eq!(poll_now(&app, now + chrono::Duration::seconds(60)).await, 0);
+    assert_still_waiting(&pool, &order_id, "confirmed", 6).await;
+    let observation_doc: Value =
+        sqlx::query_scalar("SELECT paykit_observation FROM orders WHERE id = $1")
+            .bind(Uuid::parse_str(&order_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("observation");
+    assert_eq!(
+        observation_doc["amount_matched"],
+        json!(false),
+        "the seller sees the mismatch before deciding"
+    );
 }
 
+/// An order that can no longer be confirmed (cancelled under the window by
+/// direct SQL: no command cancels a waiting order) still takes no automatic
+/// exit; the reaper routes it to review.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_confirm_failure_clears_an_active_seller_window(pool: PgPool) {
+async fn a_confirmation_the_order_cannot_take_keeps_the_seller_window(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -683,7 +777,7 @@ async fn a_confirm_failure_clears_an_active_seller_window(pool: PgPool) {
     paykit.set_status(&reference, status_detected("shared_manual", 0));
     assert_eq!(poll_now(&app, now).await, 1);
     sqlx::query(
-        "UPDATE orders SET state = 'cancelled', stock_held = FALSE, \
+        "UPDATE orders SET state = 'cancelled', \
          cancellation_reason = 'cancelled during seller confirmation window' \
          WHERE id = $1",
     )
@@ -693,21 +787,101 @@ async fn a_confirm_failure_clears_an_active_seller_window(pool: PgPool) {
     .expect("cancel order during seller window");
     paykit.set_allocation_mode("exclusive");
     paykit.set_status(&reference, status_confirmed("exclusive", true, 6));
-    assert_eq!(poll_now(&app, now + chrono::Duration::seconds(60)).await, 1);
+    assert_eq!(poll_now(&app, now + chrono::Duration::seconds(60)).await, 0);
+    assert_still_waiting(&pool, &order_id, "confirmed", 6).await;
 
+    let at_deadline = now + chrono::Duration::seconds(SELLER_CONFIRMATION_WINDOW_SECONDS);
+    assert_eq!(
+        route_due_seller_confirmation_windows(&app.state, at_deadline)
+            .await
+            .expect("reaper runs"),
+        1
+    );
     let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
     assert_eq!(request_state, "confirmed");
     assert_eq!(payment_state, "manual_review");
-    let (entered, deadline): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT paykit_seller_confirmation_entered_at, \
-             paykit_seller_confirmation_deadline FROM orders WHERE id = $1",
-    )
-    .bind(Uuid::parse_str(&order_id).unwrap())
-    .fetch_one(&pool)
-    .await
-    .expect("seller window columns");
-    assert_eq!(entered, None);
-    assert_eq!(deadline, None);
+}
+
+/// The whole class: every Paykit status, every allocation mode (known or
+/// not), late or on time, matched or not, polled against one waiting order.
+/// None pays it, reviews it, or disarms the window.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn no_paykit_report_moves_an_order_out_of_the_seller_window(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _payment_id, reference) =
+        bound_shared_manual_order(&app, &paykit, &seller, &buyer).await;
+    let mut now = app.clock.now();
+    paykit.set_status(&reference, status_detected("shared_manual", 0));
+    assert_eq!(poll_now(&app, now).await, 1);
+
+    let mut reports = Vec::new();
+    for mode in ["shared_manual", "exclusive", "pasted_auto"] {
+        for late in [false, true] {
+            for (status, amount_matched) in [
+                ("detected", true),
+                ("confirmed", true),
+                ("confirmed", false),
+            ] {
+                let mut body = bitcoin_status_v2(
+                    status,
+                    amount_matched,
+                    mode,
+                    Some(OBSERVED_TXID),
+                    Some(TOTAL_SATS as u64),
+                    Some(3),
+                );
+                body["late_settlement"] = json!(late);
+                reports.push((
+                    format!("{status} {mode} late={late} matched={amount_matched}"),
+                    body,
+                ));
+            }
+        }
+        reports.push((
+            format!("undetected {mode}"),
+            bitcoin_status_v2("undetected", false, mode, None, None, None),
+        ));
+    }
+    for (label, body) in reports {
+        paykit.set_allocation_mode(if body["allocation_mode"] == json!("exclusive") {
+            "exclusive"
+        } else {
+            "shared_manual"
+        });
+        paykit.set_status(&reference, body);
+        now += chrono::Duration::seconds(60);
+        assert_eq!(poll_now(&app, now).await, 0, "{label}: nothing applies");
+        let (request_state, payment_state, stock_held, _) = order_facts(&pool, &order_id).await;
+        assert_eq!(request_state, "awaiting_seller_confirmation", "{label}");
+        assert_eq!(payment_state, "awaiting_entitlement", "{label}");
+        assert!(stock_held, "{label}");
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM receipts").await,
+            0,
+            "{label}"
+        );
+        assert_eq!(
+            payment_event_count(&pool, &order_id, "payment.confirmed").await,
+            0,
+            "{label}"
+        );
+        assert_eq!(
+            payment_event_count(&pool, &order_id, "payment.manual_review").await,
+            0,
+            "{label}"
+        );
+    }
+    for (label, http_status) in [("not found", 404), ("unavailable", 503)] {
+        paykit.fail_status_with(http_status);
+        now += chrono::Duration::seconds(60);
+        assert_eq!(poll_now(&app, now).await, 0, "{label}");
+        let (request_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
+        assert_eq!(request_state, "awaiting_seller_confirmation", "{label}");
+        assert_eq!(payment_state, "awaiting_entitlement", "{label}");
+    }
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 0);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -771,9 +945,7 @@ async fn an_unpinned_legacy_amount_mismatch_enters_manual_review(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn exclusive_confirmation_races_in_window_cancellation_with_one_terminal_outcome(
-    pool: PgPool,
-) {
+async fn an_exclusive_poll_racing_the_seller_confirm_pays_once_by_attestation(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -784,47 +956,41 @@ async fn exclusive_confirmation_races_in_window_cancellation_with_one_terminal_o
     assert_eq!(poll_now(&app, app.clock.now()).await, 1);
     paykit.set_allocation_mode("exclusive");
     paykit.set_status(&reference, status_confirmed("exclusive", true, 6));
-    let cancellation = async {
-        sqlx::query(
-            "UPDATE orders SET state = 'cancelled', stock_held = FALSE, \
-             cancellation_reason = 'cancelled during seller confirmation window' \
-             WHERE id = $1 AND state = 'pending'",
-        )
-        .bind(Uuid::parse_str(&order_id).unwrap())
-        .execute(&pool)
-        .await
-        .expect("cancel during confirmation race");
-    };
-    let (applied, _) = tokio::join!(
+    let empty = json!({});
+    let (applied, (status, body)) = tokio::join!(
         poll_now(&app, app.clock.now() + chrono::Duration::seconds(60)),
-        cancellation
+        confirm_call(&app, &seller.token, &order_id, &empty)
     );
-    assert!(applied <= 1);
+    assert_eq!(applied, 0, "the poll never pays a waiting order");
+    assert_eq!(status, StatusCode::OK, "confirm failed: {body}");
 
-    let (order_state, payment_state, _, _) = order_facts(&pool, &order_id).await;
-    assert!(
-        ((order_state == "paid" || order_state == "confirmed") && payment_state == "confirmed")
-            || (order_state == "cancelled" && payment_state == "manual_review"),
-        "unexpected terminal pair: {order_state}/{payment_state}"
-    );
-    let receipts = count(&pool, "SELECT COUNT(*) FROM receipts").await;
-    let terminal_events = count(
-        &pool,
-        "SELECT COUNT(*) FROM events WHERE kind IN ('payment.confirmed', 'payment.manual_review')",
-    )
-    .await;
-    assert_eq!(terminal_events, 1);
-    assert_eq!(receipts, if payment_state == "confirmed" { 1 } else { 0 });
-    let (entered, deadline): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT paykit_seller_confirmation_entered_at, \
-             paykit_seller_confirmation_deadline FROM orders WHERE id = $1",
+    let (order_state, payment_state): (String, String) = sqlx::query_as(
+        "SELECT o.state, p.state FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE o.id = $1",
     )
     .bind(Uuid::parse_str(&order_id).unwrap())
     .fetch_one(&pool)
     .await
-    .expect("seller window columns");
-    assert_eq!(entered, None);
-    assert_eq!(deadline, None);
+    .expect("order and payment");
+    assert_eq!(
+        (order_state.as_str(), payment_state.as_str()),
+        ("paid", "confirmed")
+    );
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 1);
+    assert_eq!(
+        payment_event_count(&pool, &order_id, "payment.confirmed").await,
+        1
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM paykit_seller_confirmations \
+             WHERE confirmation_basis = 'seller_attestation'"
+        )
+        .await,
+        1,
+        "the one payment is the seller's attestation"
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

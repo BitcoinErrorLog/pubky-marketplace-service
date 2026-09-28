@@ -507,7 +507,8 @@ pub async fn claim_outbox_batch(
     sqlx::query_as(
         "UPDATE outbox SET lease_until = $2 WHERE id IN (\
              SELECT id FROM outbox \
-             WHERE delivered_at IS NULL AND (lease_until IS NULL OR lease_until <= $1) \
+             WHERE delivered_at IS NULL AND quarantined_at IS NULL \
+             AND (lease_until IS NULL OR lease_until <= $1) \
              ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED\
          ) RETURNING id, event_id, kind, payload, created_at",
     )
@@ -524,7 +525,10 @@ pub async fn claim_outbox_batch(
 /// apply its effect twice. `paykit.activate` / `paykit.void` rows drive the
 /// two-phase protocol against the order's persisted stack endpoint
 /// (§B.11.8); a paykit row on a deployment without the signed client is
-/// skipped (logged), never head-of-line for the rest of the batch.
+/// skipped (logged), never head-of-line for the rest of the batch. A
+/// notification row that can never deliver (an unroutable kind, a payload
+/// missing a required field) is quarantined on its own and the batch
+/// continues.
 pub async fn deliver_claimed(
     pool: &PgPool,
     paykit: Option<&PaykitClient>,
@@ -559,32 +563,28 @@ pub async fn deliver_claimed(
             }
             continue;
         }
-        let Some(notification_type) = row.kind.strip_prefix("notification.") else {
-            anyhow::bail!("outbox row {} has unroutable kind {}", row.id, row.kind);
+        let intent = match notification_intent(row) {
+            Ok(intent) => intent,
+            Err(reason) => {
+                quarantine_outbox_row(pool, row.id, reason, now).await?;
+                continue;
+            }
         };
-        let recipient = payload_str(&row.payload, "recipient_pubky", row.id)?;
-        let actor = payload_str(&row.payload, "actor_pubky", row.id)?;
-        let aggregate_id = payload_str(&row.payload, "aggregate_id", row.id)?;
-        // Optional monetary context; intents written before amounts existed
-        // have no key and deliver as NULL.
-        let amount = match &row.payload["amount"] {
-            Value::Null => None,
-            value => Some(value.clone()),
-        };
-
         let mut tx = pool.begin().await?;
         sqlx::query(
             "INSERT INTO notifications (id, event_id, recipient_pubky, actor_pubky, type, \
-             aggregate_id, amount, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             aggregate_id, amount, review_reason, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT (event_id, recipient_pubky) DO NOTHING",
         )
         .bind(Uuid::new_v4())
         .bind(row.event_id)
-        .bind(recipient)
-        .bind(actor)
-        .bind(notification_type)
-        .bind(aggregate_id)
-        .bind(amount)
+        .bind(intent.recipient)
+        .bind(intent.actor)
+        .bind(intent.notification_type)
+        .bind(intent.aggregate_id)
+        .bind(intent.amount)
+        .bind(intent.review_reason)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -597,6 +597,117 @@ pub async fn deliver_claimed(
         delivered += 1;
     }
     Ok(delivered)
+}
+
+/// Why a notification outbox row can never deliver (the 0049
+/// `outbox_quarantine_check` vocabulary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxQuarantine {
+    UnroutableKind,
+    MissingRecipientPubky,
+    MissingActorPubky,
+    MissingAggregateId,
+}
+
+impl OutboxQuarantine {
+    pub const ALL: [Self; 4] = [
+        Self::UnroutableKind,
+        Self::MissingRecipientPubky,
+        Self::MissingActorPubky,
+        Self::MissingAggregateId,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnroutableKind => "unroutable_kind",
+            Self::MissingRecipientPubky => "missing_recipient_pubky",
+            Self::MissingActorPubky => "missing_actor_pubky",
+            Self::MissingAggregateId => "missing_aggregate_id",
+        }
+    }
+}
+
+/// A notification outbox row, validated before anything is written.
+struct NotificationIntent<'a> {
+    notification_type: &'a str,
+    recipient: &'a str,
+    actor: &'a str,
+    aggregate_id: &'a str,
+    amount: Option<Value>,
+    review_reason: Option<&'static str>,
+}
+
+fn notification_intent(row: &ClaimedOutboxRow) -> Result<NotificationIntent<'_>, OutboxQuarantine> {
+    let notification_type = row
+        .kind
+        .strip_prefix("notification.")
+        .filter(|kind| !kind.is_empty())
+        .ok_or(OutboxQuarantine::UnroutableKind)?;
+    let field = |name: &str, missing: OutboxQuarantine| {
+        row.payload[name]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or(missing)
+    };
+    let recipient = field("recipient_pubky", OutboxQuarantine::MissingRecipientPubky)?;
+    let actor = field("actor_pubky", OutboxQuarantine::MissingActorPubky)?;
+    let aggregate_id = field("aggregate_id", OutboxQuarantine::MissingAggregateId)?;
+    // Optional monetary context; intents written before amounts existed
+    // have no key and deliver as NULL.
+    let amount = match &row.payload["amount"] {
+        Value::Null => None,
+        value => Some(value.clone()),
+    };
+    // The 0048 CHECK refuses an unknown reason. An intent carrying one
+    // still delivers, without it, so it never stalls the rows behind it.
+    let review_reason = match &row.payload["review_reason"] {
+        Value::Null => None,
+        value => {
+            let known = value
+                .as_str()
+                .and_then(crate::handlers::BitcoinReviewNotice::parse);
+            if known.is_none() {
+                tracing::warn!(
+                    row_id = row.id,
+                    "outbox notification carries an unknown review_reason; delivering without it"
+                );
+            }
+            known.map(crate::handlers::BitcoinReviewNotice::as_str)
+        }
+    };
+    Ok(NotificationIntent {
+        notification_type,
+        recipient,
+        actor,
+        aggregate_id,
+        amount,
+        review_reason,
+    })
+}
+
+/// Sets one undeliverable row aside: it is never claimed again, and the
+/// rest of the batch continues.
+async fn quarantine_outbox_row(
+    pool: &PgPool,
+    row_id: i64,
+    reason: OutboxQuarantine,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE outbox SET quarantined_at = $2, quarantine_reason = $3, lease_until = NULL \
+         WHERE id = $1 AND delivered_at IS NULL",
+    )
+    .bind(row_id)
+    .bind(now)
+    .bind(reason.as_str())
+    .execute(pool)
+    .await?;
+    tracing::error!(
+        row_id,
+        reason = reason.as_str(),
+        "ALERT quarantined an undeliverable outbox row; continuing the batch"
+    );
+    Ok(())
 }
 
 fn payload_str<'a>(payload: &'a Value, field: &str, row_id: i64) -> anyhow::Result<&'a str> {
@@ -1685,6 +1796,25 @@ async fn apply_confirmed_paykit_payment(
     let Some(payment) = payment else {
         anyhow::bail!("paykit order {} references a missing payment", row.id);
     };
+    // The seller gate, rechecked under the order lock: the caller routed on
+    // the claim-time state, and a waiting order leaves only through its
+    // seller or the seller-window reaper.
+    let request_state: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT paykit_request_state FROM orders WHERE id = $1 FOR UPDATE")
+            .bind(row.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if matches!(
+        request_state,
+        Some((Some(ref state),)) if state == "awaiting_seller_confirmation"
+    ) {
+        tx.rollback().await?;
+        tracing::warn!(
+            order_id = %row.id,
+            "refused an automatic paykit settlement for an order awaiting seller confirmation"
+        );
+        return Ok(false);
+    }
     if payment.state == "expired" || (late_settlement && payment.state == "awaiting_entitlement") {
         if !resolution_pins_present {
             tx.rollback().await?;
@@ -1766,7 +1896,7 @@ async fn apply_confirmed_paykit_payment(
         .bind(now)
         .fetch_one(&mut *tx)
         .await?;
-        crate::executor::insert_event(
+        let event_id = crate::executor::insert_event(
             &mut tx,
             row.id,
             &ids::payment_aggregate_id(payment.id),
@@ -1776,6 +1906,18 @@ async fn apply_confirmed_paykit_payment(
             now,
         )
         .await?;
+        // An unpinned legacy order cannot take a seller resolution.
+        if resolution_pins_present {
+            crate::handlers::insert_bitcoin_manual_review_intent(
+                &mut tx,
+                event_id,
+                &row.seller_pubky,
+                row.id,
+                crate::handlers::BitcoinReviewNotice::AmountMismatch,
+                now,
+            )
+            .await?;
+        }
         sqlx::query(
             "UPDATE orders SET paykit_request_state = 'confirmed', \
              paykit_seller_confirmation_entered_at = NULL, \
@@ -1818,7 +1960,7 @@ async fn apply_confirmed_paykit_payment(
         .bind(now)
         .fetch_one(&mut *tx)
         .await?;
-        crate::executor::insert_event(
+        let event_id = crate::executor::insert_event(
             &mut tx,
             row.id,
             &ids::payment_aggregate_id(payment.id),
@@ -1828,6 +1970,18 @@ async fn apply_confirmed_paykit_payment(
             now,
         )
         .await?;
+        // An unpinned legacy order cannot take a seller resolution.
+        if resolution_pins_present {
+            crate::handlers::insert_bitcoin_manual_review_intent(
+                &mut tx,
+                event_id,
+                &row.seller_pubky,
+                row.id,
+                crate::handlers::BitcoinReviewNotice::AmountMismatch,
+                now,
+            )
+            .await?;
+        }
         sqlx::query(
             "UPDATE orders SET paykit_request_state = 'confirmed', \
              paykit_seller_confirmation_entered_at = NULL, \
@@ -1984,7 +2138,7 @@ async fn apply_confirmed_paykit_payment(
             .fetch_optional(&mut *tx)
             .await?;
             if let Some((revision,)) = updated {
-                crate::executor::insert_event(
+                let event_id = crate::executor::insert_event(
                     &mut tx,
                     row.id,
                     &ids::payment_aggregate_id(payment.id),
@@ -1994,6 +2148,18 @@ async fn apply_confirmed_paykit_payment(
                     now,
                 )
                 .await?;
+                // An unpinned legacy order cannot take a seller resolution.
+                if resolution_pins_present {
+                    crate::handlers::insert_bitcoin_manual_review_intent(
+                        &mut tx,
+                        event_id,
+                        &row.seller_pubky,
+                        row.id,
+                        crate::handlers::BitcoinReviewNotice::ConfirmationFailed,
+                        now,
+                    )
+                    .await?;
+                }
             }
             sqlx::query(
                 "UPDATE orders SET paykit_request_state = 'confirmed', \
@@ -2120,21 +2286,45 @@ async fn apply_shared_manual_observation(
     // observation. The hold is EXTENDED to the 24-hour window, not expired
     // (a buyer who demonstrably paid must not lose stock to a 3600 s
     // timeout while waiting for a human).
-    let entered = sqlx::query(
+    let entered: Option<(i64,)> = sqlx::query_as(
         "UPDATE orders SET paykit_request_state = 'awaiting_seller_confirmation', \
          paykit_observation = $2, paykit_seller_confirmation_entered_at = $3, \
          paykit_seller_confirmation_deadline = $4, \
          hold_expires_at = CASE WHEN auction_aggregate_id IS NULL THEN $4 ELSE hold_expires_at END, \
-         updated_at = $3 \
-         WHERE id = $1 AND paykit_request_state IN ('pending', 'detected')",
+         revision = revision + 1, updated_at = $3 \
+         WHERE id = $1 AND paykit_request_state IN ('pending', 'detected') \
+         RETURNING revision",
     )
     .bind(row.id)
     .bind(&observation_doc)
     .bind(now)
     .bind(deadline)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if entered.rows_affected() == 1 {
+    if let Some((revision,)) = entered {
+        // The seller is the only exit to `paid`: tell them the payment was
+        // seen and that it waits for their confirmation.
+        let event_id = crate::executor::insert_event(
+            &mut tx,
+            Uuid::new_v4(),
+            &ids::order_aggregate_id(row.id),
+            revision,
+            SYSTEM_ACTOR,
+            "payment.awaiting_seller_confirmation",
+            now,
+        )
+        .await?;
+        insert_notification_intent(
+            &mut tx,
+            event_id,
+            "bitcoin_payment_seen",
+            &order.seller_pubky,
+            SYSTEM_ACTOR,
+            &ids::order_aggregate_id(row.id),
+            None,
+            now,
+        )
+        .await?;
         // A1: the FIRST authority-establishing observation is frozen onto
         // the order in the same transaction as the state change. Later
         // status refreshes update the JSON facts only; the seller-window
@@ -2162,31 +2352,136 @@ async fn apply_shared_manual_observation(
         );
         return Ok(true);
     }
-    // Already inside: the status-only path refreshes the live facts
-    // (confirmations progress, a refreshed observation after a
-    // disappearance) without ever advancing the order and without touching
-    // the observation frozen at entry (A1).
+    refresh_seller_confirmation_facts(&mut tx, row, &observation_doc, observation, now).await?;
+    tx.commit().await?;
+    Ok(false)
+}
+
+/// The status-only path for an order already inside
+/// `awaiting_seller_confirmation`: refreshes the live facts (confirmations
+/// progress, a refreshed observation after a disappearance) without ever
+/// advancing the order and without touching the observation frozen at
+/// entry (A1). The caller holds the payment row lock. Returns whether the
+/// order was still inside.
+async fn refresh_seller_confirmation_facts(
+    tx: &mut Transaction<'_, Postgres>,
+    row: &ClaimedPaykitOrder,
+    observation_doc: &Value,
+    observation: &crate::payments::PaykitObservation,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
     let refreshed = sqlx::query(
         "UPDATE orders SET paykit_observation = $2, updated_at = $3 \
          WHERE id = $1 AND paykit_request_state = 'awaiting_seller_confirmation'",
     )
     .bind(row.id)
-    .bind(&observation_doc)
+    .bind(observation_doc)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    if refreshed.rows_affected() == 1 {
-        if let Some(confirmations) = observation.confirmations {
-            sqlx::query("UPDATE payments SET confirmations = $2, updated_at = $3 WHERE id = $1")
-                .bind(row.payment_id)
-                .bind(i32::try_from(confirmations).unwrap_or(i32::MAX))
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
+    if refreshed.rows_affected() != 1 {
+        return Ok(false);
+    }
+    if let Some(confirmations) = observation.confirmations {
+        sqlx::query("UPDATE payments SET confirmations = $2, updated_at = $3 WHERE id = $1")
+            .bind(row.payment_id)
+            .bind(i32::try_from(confirmations).unwrap_or(i32::MAX))
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(true)
+}
+
+/// Applies one Paykit report to an order inside
+/// `awaiting_seller_confirmation`. Once the seller gate is armed no report
+/// pays the order or routes it to review: not an `exclusive` mode Paykit
+/// now reports, not a late flag (Paykit judges lateness against the
+/// invoice's own expiry, which the 24-hour window outlives; entry happened
+/// on an on-time sighting), not an amount mismatch. Detected and confirmed
+/// reports refresh the facts; a disappearance is marked. The seller's
+/// attestation and the seller-window reaper stay the only exits. A report
+/// that finds the order already gone from the state changes nothing, and
+/// the next poll reads the order afresh.
+async fn apply_report_inside_seller_window(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    outcome: &PaykitStatusOutcome,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let (observed_state, amount_matched, facts) = match outcome {
+        PaykitStatusOutcome::Confirmed {
+            amount_matched,
+            facts,
+        } => ("confirmed", *amount_matched, facts),
+        PaykitStatusOutcome::Detected { facts } => ("detected", true, facts),
+        PaykitStatusOutcome::Undetected => {
+            return mark_shared_manual_disappeared(pool, row, now).await
         }
+        PaykitStatusOutcome::NotFound | PaykitStatusOutcome::Unavailable => return Ok(false),
+    };
+    if !matches!(
+        facts.allocation_mode.as_str(),
+        "shared_manual" | "exclusive"
+    ) {
+        tracing::warn!(
+            order_id = %row.id,
+            allocation_mode = %facts.allocation_mode,
+            "paykit status reported an unknown allocation_mode; failing closed"
+        );
+        return Ok(false);
+    }
+    refresh_inside_seller_window(
+        pool,
+        row,
+        observed_state,
+        amount_matched,
+        &facts.observation,
+        now,
+    )
+    .await?;
+    Ok(false)
+}
+
+/// Refreshes an order waiting for its seller from one report, under the
+/// canonical payment-then-order lock. Returns false, having changed
+/// nothing, when the payment or the order is no longer waiting.
+async fn refresh_inside_seller_window(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    observed_state: &str,
+    amount_matched: bool,
+    observation: &crate::payments::PaykitObservation,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let payment_state: Option<(String,)> =
+        sqlx::query_as("SELECT state FROM payments WHERE id = $1 FOR UPDATE")
+            .bind(row.payment_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if payment_state.as_ref().map(|(state,)| state.as_str()) != Some("awaiting_entitlement") {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let observation_doc = crate::bitcoin_review::observation_json(
+        observed_state,
+        amount_matched,
+        observation,
+        now,
+        false,
+    );
+    if !refresh_seller_confirmation_facts(&mut tx, row, &observation_doc, observation, now).await? {
+        tx.rollback().await?;
+        return Ok(false);
     }
     tx.commit().await?;
-    Ok(false)
+    tracing::info!(
+        order_id = %row.id,
+        observed_state,
+        "paykit report inside the seller-confirmation window; refreshed facts only"
+    );
+    Ok(true)
 }
 
 /// A disappearance/reorg fact for an order awaiting seller confirmation:
@@ -2224,6 +2519,9 @@ async fn apply_paykit_status_outcome(
         .await;
     if let Some(delivery) = delivery {
         record_paykit_delivery(&state.pool, row, delivery).await?;
+    }
+    if row.paykit_request_state == "awaiting_seller_confirmation" {
+        return apply_report_inside_seller_window(&state.pool, row, &outcome, now).await;
     }
     match outcome {
         PaykitStatusOutcome::Confirmed {

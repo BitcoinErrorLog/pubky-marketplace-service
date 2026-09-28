@@ -656,7 +656,7 @@ async fn shared_manual_extension_and_late_settlement_retain_the_quote(pool: PgPo
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn quote_divergent_observation_clears_an_active_seller_window(pool: PgPool) {
+async fn quote_divergent_observation_keeps_an_active_seller_window(pool: PgPool) {
     let fixture = fx_fixture(pool.clone()).await;
     let now = fixture.app.clock.now();
     seed_fx_samples(&pool, RATE, now, 3).await;
@@ -694,21 +694,42 @@ async fn quote_divergent_observation_clears_an_active_seller_window(pool: PgPool
             Some(3),
         ),
     );
-    assert_eq!(poll_now(&fixture.app, now + Duration::seconds(60)).await, 1);
+    assert_eq!(poll_now(&fixture.app, now + Duration::seconds(60)).await, 0);
 
+    // A later exclusive report off the bind quote never moves a waiting
+    // order: the seller sees the new amount and decides.
     let facts = order_facts(&pool, &order.order_id).await;
-    assert_eq!(facts.paykit_request_state.as_deref(), Some("confirmed"));
-    assert_eq!(payment_state(&pool, &order.order_id).await, "manual_review");
-    let (entered, deadline): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+    assert_eq!(
+        facts.paykit_request_state.as_deref(),
+        Some("awaiting_seller_confirmation")
+    );
+    assert_eq!(
+        payment_state(&pool, &order.order_id).await,
+        "awaiting_entitlement"
+    );
+    let (entered, deadline, observation): (
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        serde_json::Value,
+    ) = sqlx::query_as(
         "SELECT paykit_seller_confirmation_entered_at, \
-         paykit_seller_confirmation_deadline FROM orders WHERE id = $1",
+         paykit_seller_confirmation_deadline, paykit_observation FROM orders WHERE id = $1",
     )
     .bind(Uuid::parse_str(&order.order_id).unwrap())
     .fetch_one(&pool)
     .await
     .expect("seller window columns");
-    assert_eq!(entered, None);
-    assert_eq!(deadline, None);
+    assert_eq!(entered, Some(now));
+    assert!(deadline.is_some());
+    assert_eq!(
+        observation["observed_sats"],
+        serde_json::json!(total_sats + 1)
+    );
+    assert_eq!(
+        facts.paykit_observed_sats,
+        Some(total_sats),
+        "the entry observation stays frozen"
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

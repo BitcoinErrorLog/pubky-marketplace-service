@@ -268,7 +268,7 @@
           "receipt_id": "<uuid:5>",
           "return_request": null,
           "reviews": [],
-          "revision": 3,
+          "revision": 4,
           "seller_pubky": "<pubky:seller>",
           "shipment": null,
           "shipping": {
