@@ -663,3 +663,417 @@ async fn the_worker_follows_homeserver_deletes_without_a_sync(pool: PgPool) {
         Some("6".to_string())
     );
 }
+
+async fn register_as(app: &TestApp, seller: &TestActor, listing_id: &str, quantity: i64) {
+    let mut register = register_command(&seller.pubky, quantity);
+    register["command_id"] = json!(Uuid::new_v4());
+    register["aggregate_id"] = json!(format!("listing:{}_{listing_id}", seller.pubky));
+    register["payload"]["listing_id"] = json!(listing_id);
+    let (status, body) = execute(app, &seller.token, &register).await;
+    assert_eq!(status, StatusCode::OK, "register {listing_id}: {body}");
+}
+
+async fn seller_cursor(pool: &PgPool, seller: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT event_cursor FROM listing_deletion_cursors WHERE seller_pubky = $1")
+        .bind(seller)
+        .fetch_optional(pool)
+        .await
+        .expect("cursor row")
+        .flatten()
+}
+
+async fn tombstoned_ids(pool: &PgPool, seller: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT listing_id FROM listings WHERE seller_pubky = $1 AND deleted_at IS NOT NULL \
+         ORDER BY listing_id",
+    )
+    .bind(seller)
+    .fetch_all(pool)
+    .await
+    .expect("tombstoned ids")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_slow_homeserver_cannot_hold_the_follower_past_its_deadline(pool: PgPool) {
+    let mut config = marketplace_service::config::Config::for_tests();
+    config.listing_deletion_pass_budget_ms = 1_500;
+    let (app, homeserver) = common::test_app_with_homeserver_config(pool, config).await;
+    let seller = new_actor(&app).await;
+    let ids: Vec<String> = (0..100).map(|index| format!("bulk_{index:03}")).collect();
+    for id in &ids {
+        homeserver.put_record(&seller.pubky, id, record(1, 1));
+        register_as(&app, &seller, id, 1).await;
+    }
+    for id in &ids {
+        homeserver.delete_record(&seller.pubky, id);
+    }
+    let holder = Uuid::new_v4();
+
+    // The first page is the 100 PUTs: nothing to settle, due again at once.
+    let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("first pass");
+    assert_eq!(summary.listings_tombstoned, 0);
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("100")
+    );
+
+    // A full page of 100 DELs behind 300 ms per homeserver request: each
+    // confirmation costs two requests, so the 1.5 s budget ends the pass
+    // after one or two of them.
+    homeserver.set_delay(std::time::Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("slow pass");
+    let elapsed = started.elapsed();
+    // The whole worker pass, including the tasks before the follower; an
+    // unbounded follower would spend 600 ms on each of the page's DELs.
+    assert!(
+        elapsed < std::time::Duration::from_millis(4_000),
+        "the pass outlived its budget: {elapsed:?}"
+    );
+    let settled = summary.listings_tombstoned;
+    assert!((1..20).contains(&settled), "settled {settled}");
+    // The cursor stops at the last settled DEL; nothing after it is skipped.
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await,
+        Some((100 + settled).to_string())
+    );
+    assert_eq!(
+        tombstoned_ids(&app.pool, &seller.pubky).await,
+        ids[..settled as usize].to_vec()
+    );
+
+    homeserver.set_delay(std::time::Duration::ZERO);
+    for _ in 0..10 {
+        app.clock.advance_seconds(61);
+        marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+            .await
+            .expect("catch-up pass");
+    }
+    assert_eq!(tombstoned_ids(&app.pool, &seller.pubky).await, ids);
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("200")
+    );
+    let deletions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE kind = 'listing.deleted' AND actor_pubky = 'system'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("deletion events");
+    assert_eq!(deletions, 100);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_expired_holder_cannot_rewind_the_follower_cursor(pool: PgPool) {
+    use marketplace_service::listing_deletion::{follow_homeserver_deletions, FollowerPass};
+    use marketplace_service::workers::{release_lease, try_acquire_lease, TASK_LISTING_DELETIONS};
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let ids = ["race_0", "race_1", "race_2"];
+    for id in ids {
+        homeserver.put_record(&seller.pubky, id, record(1, 1));
+        register_as(&app, &seller, id, 1).await;
+    }
+
+    // Holder A reads the page of three PUTs; the answer is slow.
+    homeserver.set_delay(std::time::Duration::from_millis(1_500));
+    let holder_a = Uuid::new_v4();
+    assert!(try_acquire_lease(
+        &app.pool,
+        TASK_LISTING_DELETIONS,
+        holder_a,
+        app.clock.now(),
+        30
+    )
+    .await
+    .expect("lease A"));
+    let state = app.state.clone();
+    let pass_a = tokio::spawn(async move {
+        let pass = FollowerPass {
+            pool: &state.pool,
+            homeserver: state.homeserver.as_deref().expect("homeserver"),
+            clock: state.clock.as_ref(),
+            holder: holder_a,
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        };
+        follow_homeserver_deletions(&pass).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Meanwhile the seller deletes all three, A's lease lapses, and holder
+    // B follows them through to cursor 6.
+    for id in ids {
+        homeserver.delete_record(&seller.pubky, id);
+    }
+    homeserver.set_delay(std::time::Duration::ZERO);
+    app.clock.advance_seconds(31);
+    let holder_b = Uuid::new_v4();
+    assert!(try_acquire_lease(
+        &app.pool,
+        TASK_LISTING_DELETIONS,
+        holder_b,
+        app.clock.now(),
+        30
+    )
+    .await
+    .expect("lease B"));
+    let pass = FollowerPass {
+        pool: &app.pool,
+        homeserver: app.state.homeserver.as_deref().expect("homeserver"),
+        clock: app.clock.as_ref(),
+        holder: holder_b,
+        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+    };
+    assert_eq!(follow_homeserver_deletions(&pass).await.expect("pass B"), 3);
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("6")
+    );
+    release_lease(&app.pool, TASK_LISTING_DELETIONS, holder_b, app.clock.now())
+        .await
+        .expect("release B");
+
+    // A's stale page (through cursor 3) arrives after B finished: its write
+    // is refused, and the cursor stays where B left it.
+    assert_eq!(pass_a.await.expect("pass A joins").expect("pass A"), 0);
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("6")
+    );
+    assert_eq!(tombstoned_ids(&app.pool, &seller.pubky).await, ids);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_revived_listing_is_not_gated_by_the_deleted_listings_drop(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 3).await;
+    homeserver.put_drop_record(
+        &seller.pubky,
+        "winter_drop",
+        common::drop_record_json(
+            &seller.pubky,
+            "winter_drop",
+            1,
+            &[LISTING_ID],
+            &common::ts_after(-60),
+            None,
+            1,
+            1,
+        ),
+    );
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &common::sync_drop_command(&seller.pubky, "winter_drop", 90),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "drop sync: {body}");
+    let drop_id = common::drop_aggregate(&seller.pubky, "winter_drop");
+
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    let (status, body) = sync_as(&app, &buyer, &seller.pubky, 91).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    app.clock.advance_seconds(60);
+    homeserver.put_record(&seller.pubky, LISTING_ID, record(2, 5));
+    let (status, body) = sync_as(&app, &buyer, &seller.pubky, 92).await;
+    assert_eq!(status, StatusCode::OK, "revival: {body}");
+    assert_eq!(body["result"]["listing"]["available_quantity"], json!(5));
+
+    // Open sale again: two units in one line, which a drop-bound listing
+    // refuses, and the old drop's single unit is not drawn on.
+    let revision = body["revision"].clone();
+    let mut checkout = checkout_command(&seller.pubky);
+    checkout["payload"]["lines"][0]["expected_revision"] = revision.clone();
+    checkout["payload"]["lines"][0]["quantity"] = json!(2);
+    let (status, body) = execute(&app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "checkout: {body}");
+    let current = body_revision(&app, &listing_aggregate(&seller.pubky)).await;
+    let reserve = reserve_command(&seller.pubky, 93, 2, current.as_i64().expect("revision"));
+    let (status, body) = execute(&app, &buyer.token, &reserve).await;
+    assert_eq!(status, StatusCode::OK, "reserve: {body}");
+    let (remaining, bindings): (i64, i64) = sqlx::query_as(
+        "SELECT d.remaining_quantity, \
+         (SELECT COUNT(*) FROM drop_listings WHERE drop_aggregate_id = d.aggregate_id AND NOT released) \
+         FROM drops d WHERE d.aggregate_id = $1",
+    )
+    .bind(&drop_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("drop row");
+    assert_eq!((remaining, bindings), (1, 0));
+}
+
+/// Takes a shared-manual bitcoin order through its payment window so its
+/// hold lapses, applies `between`, then lets the late settlement arrive.
+/// Returns the order and whether the late money took stock.
+async fn late_settlement(
+    app: &TestApp,
+    paykit: &common::FakePaykit,
+    between: &str,
+) -> (String, String, Option<String>, i64) {
+    use common::paykit_review::{bound_shared_manual_order, poll_now, status_confirmed};
+    let seller = new_actor(app).await;
+    let buyer = new_actor(app).await;
+    let (order_id, _payment_id, reference) =
+        bound_shared_manual_order(app, paykit, &seller, &buyer).await;
+    let after_window = app.clock.now() + chrono::Duration::seconds(7300);
+    assert!(
+        marketplace_service::workers::expire_due_payment_windows(&app.state, after_window)
+            .await
+            .expect("payment-window reaper")
+            >= 1
+    );
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    match between {
+        "deleted" => {
+            let mut tx = app.pool.begin().await.expect("tx");
+            marketplace_service::listing_deletion::tombstone(
+                &mut tx,
+                &aggregate_id,
+                "9",
+                "system",
+                Uuid::new_v4(),
+                after_window,
+            )
+            .await
+            .expect("tombstone")
+            .expect("live listing");
+            tx.commit().await.expect("commit");
+        }
+        "revived" => {
+            sqlx::query("UPDATE listings SET recreated_at = $2 WHERE aggregate_id = $1")
+                .bind(&aggregate_id)
+                .bind(after_window)
+                .execute(&app.pool)
+                .await
+                .expect("revival marker");
+        }
+        _ => {}
+    }
+    let mut late = status_confirmed("shared_manual", true, 2);
+    late["late_settlement"] = json!(true);
+    paykit.set_status(&reference, late);
+    assert!(poll_now(app, after_window + chrono::Duration::seconds(60)).await >= 1);
+    let (order_state, review_reason, reserved): (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT o.state, p.review_reason, l.reserved_quantity + l.sold_quantity \
+         FROM orders o JOIN payments p ON p.order_id = o.id \
+         JOIN listings l ON l.aggregate_id = $2 WHERE o.id = $1",
+    )
+    .bind(Uuid::parse_str(&order_id).expect("order uuid"))
+    .bind(&aggregate_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("late facts");
+    (order_id, order_state, review_reason, reserved)
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn late_bitcoin_money_takes_no_stock_from_a_deleted_or_revived_listing(pool: PgPool) {
+    let (app, _stripe, paykit) = common::test_app_with_payments(pool).await;
+
+    // Control: with the listing live, the late money takes its unit back.
+    let (_, _, reason, committed) = late_settlement(&app, &paykit, "live").await;
+    assert_ne!(reason.as_deref(), Some("refund_required"));
+    assert_eq!(committed, 1, "the live listing re-holds the unit");
+
+    for between in ["deleted", "revived"] {
+        let (_, order_state, reason, committed) = late_settlement(&app, &paykit, between).await;
+        assert_eq!(order_state, "cancelled", "{between}");
+        assert_eq!(reason.as_deref(), Some("refund_required"), "{between}");
+        assert_eq!(committed, 0, "{between}: no unit was taken");
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_held_manual_review_on_a_deleted_listing_still_resolves_paid(pool: PgPool) {
+    use common::paykit_review::{into_manual_review_held, resolve_call};
+    let (app, _stripe, paykit) = common::test_app_with_payments(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _reference) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;
+    let mut tx = app.pool.begin().await.expect("tx");
+    marketplace_service::listing_deletion::tombstone(
+        &mut tx,
+        &listing_aggregate(&seller.pubky),
+        "9",
+        "system",
+        Uuid::new_v4(),
+        app.clock.now(),
+    )
+    .await
+    .expect("tombstone")
+    .expect("live listing");
+    tx.commit().await.expect("commit");
+
+    let (status, body) = resolve_call(
+        &app,
+        &seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "paid", "reason": "checked my wallet" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let state: String = sqlx::query_scalar("SELECT state FROM orders WHERE id = $1")
+        .bind(Uuid::parse_str(&order_id).expect("order uuid"))
+        .fetch_one(&app.pool)
+        .await
+        .expect("order");
+    assert_eq!(state, "paid");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_deleted_auctions_bid_history_is_kept_for_its_parties_only(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let bidder = new_actor(&app).await;
+    let stranger = new_actor(&app).await;
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &register_auction_command(&seller.pubky),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = execute(
+        &app,
+        &bidder.token,
+        &place_bid_command(&seller.pubky, 60, 10_000, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    let path = format!("/v1/listings/{aggregate_id}/bids");
+    let (status, _) = get(&app, &stranger.token, &path).await;
+    assert_eq!(status, StatusCode::OK, "live history is public");
+
+    let mut tx = app.pool.begin().await.expect("tx");
+    marketplace_service::listing_deletion::tombstone(
+        &mut tx,
+        &aggregate_id,
+        "9",
+        "system",
+        Uuid::new_v4(),
+        app.clock.now(),
+    )
+    .await
+    .expect("tombstone")
+    .expect("live auction");
+    tx.commit().await.expect("commit");
+
+    for (label, actor, expected) in [
+        ("seller", &seller, StatusCode::OK),
+        ("bidder", &bidder, StatusCode::OK),
+        ("stranger", &stranger, StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = get(&app, &actor.token, &path).await;
+        assert_eq!(status, expected, "{label}: {body}");
+    }
+}

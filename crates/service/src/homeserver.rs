@@ -121,6 +121,7 @@ pub fn parse_event_stream(body: &str) -> Option<Vec<HomeserverEvent>> {
     let mut events = Vec::new();
     let (mut kind, mut uri, mut cursor) = (None, None, None);
     for line in body.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
             finish(&mut kind, &mut uri, &mut cursor, &mut events)?;
         } else if line.starts_with(':') {

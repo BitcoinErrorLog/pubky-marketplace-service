@@ -70,6 +70,10 @@ pub struct Config {
     pub webhook_retry_max_seconds: i64,
     pub worker_interval_seconds: u64,
     pub worker_lease_seconds: i64,
+    /// Wall-clock bound on one listing-deletion follower pass. Worker tasks
+    /// run in sequence, so it caps how long a slow homeserver can delay the
+    /// rest of the pass; it must leave the task lease half its length.
+    pub listing_deletion_pass_budget_ms: u64,
     /// Marketplace payment window armed by `payment.register_locks`: the
     /// lock point acquires the order's inventory hold and this window bounds
     /// it — the correlation window IS the hold window. A payment still
@@ -266,6 +270,14 @@ impl Config {
         }
         let worker_interval_seconds = env_i64("WORKER_INTERVAL_SECONDS", 10)?.try_into()?;
         let worker_lease_seconds = env_i64("WORKER_LEASE_SECONDS", 30)?;
+        let listing_deletion_pass_budget_ms =
+            positive_i64("LISTING_DELETION_PASS_BUDGET_MS", 10_000)?;
+        if listing_deletion_pass_budget_ms.saturating_mul(2) > worker_lease_seconds * 1_000 {
+            anyhow::bail!(
+                "LISTING_DELETION_PASS_BUDGET_MS must be at most half of WORKER_LEASE_SECONDS"
+            );
+        }
+        let listing_deletion_pass_budget_ms: u64 = listing_deletion_pass_budget_ms.try_into()?;
         let locks_payment_window_seconds = env_i64("LOCKS_PAYMENT_WINDOW_SECONDS", 3_600)?;
         if locks_payment_window_seconds < 60 {
             anyhow::bail!("LOCKS_PAYMENT_WINDOW_SECONDS must be at least 60");
@@ -352,6 +364,7 @@ impl Config {
             webhook_retry_max_seconds,
             worker_interval_seconds,
             worker_lease_seconds,
+            listing_deletion_pass_budget_ms,
             locks_payment_window_seconds,
             checkout_hold_window_seconds,
             fiat_payment_window_seconds,
@@ -409,6 +422,7 @@ impl Config {
             webhook_retry_max_seconds: 3_600,
             worker_interval_seconds: 3_600,
             worker_lease_seconds: 30,
+            listing_deletion_pass_budget_ms: 10_000,
             locks_payment_window_seconds: 3_600,
             checkout_hold_window_seconds: 900,
             // Integration clocks keep the prior 1 h / 2 h rails so bind and

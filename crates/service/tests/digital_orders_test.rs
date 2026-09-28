@@ -1966,3 +1966,48 @@ async fn concurrent_first_reads_share_the_buyer_bucket(pool: PgPool) {
             .expect("buyer bucket");
     assert!(tokens < 1.0, "the buyer bucket is spent: {tokens}");
 }
+
+// A seller deleting the listing on the homeserver does not take a paid
+// buyer's delivery away: the tombstoned row keeps the order's pins readable.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_deleted_listing_still_delivers_its_paid_digital_order(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool).await;
+    let (seller, buyer, order) = paykit_delivered_order(&app, &paykit).await;
+
+    let listing = aggregate(&seller.pubky, "guide_01");
+    let mut tx = app.pool.begin().await.expect("tx");
+    marketplace_service::listing_deletion::tombstone(
+        &mut tx,
+        &listing,
+        "9",
+        "system",
+        Uuid::new_v4(),
+        app.clock.now(),
+    )
+    .await
+    .expect("tombstone")
+    .expect("live listing");
+    tx.commit().await.expect("commit");
+    let (status, _) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/listings/{listing}"),
+        Some(&buyer.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lines"][0]["text"], json!(TEXT_V1));
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/orders/{}/digital-evidence", order.order_id),
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seller evidence: {body}");
+}

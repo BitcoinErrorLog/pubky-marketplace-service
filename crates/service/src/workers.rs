@@ -3886,19 +3886,37 @@ pub async fn run_once(
     // the pass because it waits on the network; a failed pass is logged and
     // retried next tick.
     if let Some(homeserver) = state.homeserver.as_deref() {
+        // The lease is taken at the current time, not the pass start: the
+        // tasks above may have run for a while, and the follower's writes
+        // check the lease against the clock.
+        let lease_now = state.clock.now();
         if try_acquire_lease(
             &state.pool,
             TASK_LISTING_DELETIONS,
             holder,
-            now,
+            lease_now,
             lease_seconds,
         )
         .await?
         {
-            let result =
-                crate::listing_deletion::follow_homeserver_deletions(&state.pool, homeserver, now)
-                    .await;
-            release_lease(&state.pool, TASK_LISTING_DELETIONS, holder, now).await?;
+            let pass = crate::listing_deletion::FollowerPass {
+                pool: &state.pool,
+                homeserver,
+                clock: state.clock.as_ref(),
+                holder,
+                deadline: tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(
+                        state.config.listing_deletion_pass_budget_ms,
+                    ),
+            };
+            let result = crate::listing_deletion::follow_homeserver_deletions(&pass).await;
+            release_lease(
+                &state.pool,
+                TASK_LISTING_DELETIONS,
+                holder,
+                state.clock.now(),
+            )
+            .await?;
             match result {
                 Ok(tombstoned) => summary.listings_tombstoned = tombstoned,
                 Err(error) => {

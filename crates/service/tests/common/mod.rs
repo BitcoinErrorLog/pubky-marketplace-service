@@ -679,6 +679,7 @@ pub struct FakeHomeserver {
     records: HomeserverRecordMap,
     drop_records: HomeserverRecordMap,
     events: HomeserverEventLog,
+    delay_ms: Arc<std::sync::atomic::AtomicU64>,
     pub base_url: String,
 }
 
@@ -755,6 +756,14 @@ impl FakeHomeserver {
             .remove(&(seller_pubky.to_string(), listing_id.to_string()));
     }
 
+    /// Delays every response, as a slow homeserver would.
+    pub fn set_delay(&self, delay: std::time::Duration) {
+        self.delay_ms.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
     /// Writes an unrelated file so the user is hosted with some history.
     pub fn put_other_file(&self, user: &str, path: &str) {
         self.events
@@ -775,12 +784,21 @@ impl FakeHomeserver {
     }
 }
 
+async fn homeserver_delay(delay_ms: &std::sync::atomic::AtomicU64) {
+    let delay = delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+}
+
 async fn serve_homeserver_record(
     axum::extract::State(records): axum::extract::State<HomeserverRecordMap>,
+    axum::Extension(delay_ms): axum::Extension<Arc<std::sync::atomic::AtomicU64>>,
     axum::extract::Path(listing_id): axum::extract::Path<String>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    homeserver_delay(&delay_ms).await;
     let seller = headers
         .get("pubky-host")
         .and_then(|value| value.to_str().ok())
@@ -802,6 +820,7 @@ async fn serve_homeserver_record(
 /// a missing user is 400, as on the real homeserver.
 async fn serve_event_stream(
     axum::extract::State(log): axum::extract::State<HomeserverEventLog>,
+    axum::Extension(delay_ms): axum::Extension<Arc<std::sync::atomic::AtomicU64>>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -825,25 +844,31 @@ async fn serve_event_stream(
         ),
         None => (user, None),
     };
-    let log = log.lock().expect("fake event log lock");
-    if !log.hosted.contains(&user) {
+    // The snapshot is taken on arrival and delivered after the delay, like
+    // a response slowed on the way back.
+    let snapshot = {
+        let log = log.lock().expect("fake event log lock");
+        log.hosted.contains(&user).then(|| {
+            log.entries
+                .iter()
+                .filter(|event| event.user == user)
+                .filter(|event| {
+                    path.as_ref()
+                        .is_none_or(|path| event.path.starts_with(path))
+                })
+                .filter(|event| match cursor {
+                    Some(cursor) if reverse => event.cursor < cursor,
+                    Some(cursor) => event.cursor > cursor,
+                    None => true,
+                })
+                .cloned()
+                .collect::<Vec<FakeEvent>>()
+        })
+    };
+    homeserver_delay(&delay_ms).await;
+    let Some(mut matching) = snapshot else {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
-    }
-    let mut matching: Vec<FakeEvent> = log
-        .entries
-        .iter()
-        .filter(|event| event.user == user)
-        .filter(|event| {
-            path.as_ref()
-                .is_none_or(|path| event.path.starts_with(path))
-        })
-        .filter(|event| match cursor {
-            Some(cursor) if reverse => event.cursor < cursor,
-            Some(cursor) => event.cursor > cursor,
-            None => true,
-        })
-        .cloned()
-        .collect();
+    };
     if reverse {
         matching.reverse();
     }
@@ -874,6 +899,7 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
     let records: HomeserverRecordMap = Arc::default();
     let drop_records: HomeserverRecordMap = Arc::default();
     let events: HomeserverEventLog = Arc::default();
+    let delay_ms: Arc<std::sync::atomic::AtomicU64> = Arc::default();
     let router = Router::new()
         .route(
             "/pub/pubky.app/marketplace/v1/listings/{listing_id}",
@@ -892,7 +918,8 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
             Router::new()
                 .route("/events-stream", axum::routing::get(serve_event_stream))
                 .with_state(events.clone()),
-        );
+        )
+        .layer(axum::Extension(delay_ms.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fake homeserver binds");
@@ -906,6 +933,7 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
         records,
         drop_records,
         events,
+        delay_ms,
         base_url: format!("http://{addr}"),
     }
 }
@@ -925,6 +953,27 @@ pub async fn test_app_with_homeserver_client(
         clock,
         state,
     }
+}
+
+/// A test app with the given config, wired to a fresh fake homeserver.
+pub async fn test_app_with_homeserver_config(
+    pool: PgPool,
+    config: Config,
+) -> (TestApp, FakeHomeserver) {
+    let homeserver = spawn_fake_homeserver().await;
+    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let clock = Arc::new(AdjustableClock::new(now));
+    let state = AppState::new(pool.clone(), clock.clone(), config)
+        .with_homeserver(Some(homeserver.client()));
+    (
+        TestApp {
+            router: build_router(state.clone()),
+            pool,
+            clock,
+            state,
+        },
+        homeserver,
+    )
 }
 
 /// A test app wired to a freshly spawned fake homeserver.

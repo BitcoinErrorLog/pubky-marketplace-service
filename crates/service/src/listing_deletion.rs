@@ -43,11 +43,9 @@ const CONFIRM_WINDOW: u16 = 20;
 /// Forward entries read per seller per worker pass.
 const FOLLOW_PAGE: u16 = 100;
 const FOLLOW_SELLERS_PER_PASS: i64 = 10;
+/// Deletions confirmed per pass; each costs two homeserver requests.
+const FOLLOW_SETTLES_PER_PASS: usize = 20;
 const FOLLOW_POLL_SECONDS: i64 = 60;
-/// Wall-clock budget for one follower pass. Worker tasks run in sequence,
-/// so a slow homeserver must not delay payment windows or auction closes
-/// past the lease.
-const FOLLOW_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub fn listing_record_path(listing_id: &str) -> String {
     format!("{LISTINGS_PATH}{listing_id}")
@@ -135,6 +133,18 @@ pub async fn tombstone(
     let Some(deleted) = deleted else {
         return Ok(None);
     };
+    // A drop bound to the deleted listing must not gate, or draw on, a
+    // record later re-created at the same id. Releasing the binding takes it
+    // out of gating the way `drop.release_listings` does; only an advanced
+    // record of a still-announced drop can bind the re-created listing.
+    sqlx::query(
+        "UPDATE drop_listings SET active = FALSE, released = TRUE \
+         WHERE seller_pubky = $1 AND listing_id = $2 AND NOT released",
+    )
+    .bind(&deleted.seller_pubky)
+    .bind(&deleted.listing_id)
+    .execute(&mut **tx)
+    .await?;
     let event_id = insert_event(
         tx,
         command_id,
@@ -156,47 +166,100 @@ pub async fn tombstone(
 enum SettleOutcome {
     Tombstoned,
     NotDeleted,
-    Unavailable,
+    /// The homeserver could not answer, or the pass ran out of time.
+    Unsettled,
 }
 
-async fn settle_deletion(
-    pool: &PgPool,
-    homeserver: &dyn HomeserverListingClient,
-    seller_pubky: &str,
-    listing_id: &str,
-    now: DateTime<Utc>,
-) -> anyhow::Result<SettleOutcome> {
-    let aggregate_id = marketplace_domain::ids::listing_aggregate_id(seller_pubky, listing_id);
-    let live: Option<(String,)> = sqlx::query_as(
-        "SELECT aggregate_id FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL",
-    )
-    .bind(&aggregate_id)
-    .fetch_optional(pool)
-    .await?;
-    if live.is_none() {
-        return Ok(SettleOutcome::NotDeleted);
+/// One follower pass: its lease identity and its wall-clock deadline.
+pub struct FollowerPass<'a> {
+    pub pool: &'a PgPool,
+    pub homeserver: &'a dyn HomeserverListingClient,
+    pub clock: &'a dyn crate::clock::Clock,
+    pub holder: Uuid,
+    pub deadline: tokio::time::Instant,
+}
+
+impl FollowerPass<'_> {
+    /// Runs one homeserver call within what is left of the pass. `None`
+    /// means the deadline passed first.
+    async fn bounded<T>(&self, call: impl std::future::Future<Output = T>) -> Option<T> {
+        tokio::time::timeout_at(self.deadline, call).await.ok()
     }
-    let cursor = match confirm_deleted(homeserver, seller_pubky, listing_id).await {
-        DeletionCheck::Deleted { cursor } => cursor,
-        DeletionCheck::NotDeleted => return Ok(SettleOutcome::NotDeleted),
-        DeletionCheck::Unavailable => return Ok(SettleOutcome::Unavailable),
-    };
-    let mut tx = pool.begin().await?;
-    let tombstoned = tombstone(
-        &mut tx,
-        &aggregate_id,
-        &cursor,
-        crate::workers::SYSTEM_ACTOR,
-        Uuid::new_v4(),
-        now,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(if tombstoned.is_some() {
-        SettleOutcome::Tombstoned
-    } else {
-        SettleOutcome::NotDeleted
-    })
+
+    fn expired(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline
+    }
+
+    async fn settle_deletion(
+        &self,
+        seller_pubky: &str,
+        listing_id: &str,
+    ) -> anyhow::Result<SettleOutcome> {
+        let aggregate_id = marketplace_domain::ids::listing_aggregate_id(seller_pubky, listing_id);
+        let live: Option<(String,)> = sqlx::query_as(
+            "SELECT aggregate_id FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(&aggregate_id)
+        .fetch_optional(self.pool)
+        .await?;
+        if live.is_none() {
+            return Ok(SettleOutcome::NotDeleted);
+        }
+        let cursor = match self
+            .bounded(confirm_deleted(self.homeserver, seller_pubky, listing_id))
+            .await
+        {
+            Some(DeletionCheck::Deleted { cursor }) => cursor,
+            Some(DeletionCheck::NotDeleted) => return Ok(SettleOutcome::NotDeleted),
+            Some(DeletionCheck::Unavailable) | None => return Ok(SettleOutcome::Unsettled),
+        };
+        let mut tx = self.pool.begin().await?;
+        let tombstoned = tombstone(
+            &mut tx,
+            &aggregate_id,
+            &cursor,
+            crate::workers::SYSTEM_ACTOR,
+            Uuid::new_v4(),
+            self.clock.now(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(if tombstoned.is_some() {
+            SettleOutcome::Tombstoned
+        } else {
+            SettleOutcome::NotDeleted
+        })
+    }
+
+    /// Records a poll only while this pass still holds the task lease, so a
+    /// holder whose lease expired mid-pass cannot rewind the cursor a later
+    /// holder advanced. Returns false when the lease is gone and nothing was
+    /// written.
+    async fn record_poll(
+        &self,
+        seller_pubky: &str,
+        cursor: Option<&str>,
+        polled_at: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let written = sqlx::query(
+            "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
+             SELECT $1, $2, $3 WHERE EXISTS ( \
+                 SELECT 1 FROM worker_leases \
+                 WHERE task = $4 AND holder = $5 AND lease_until > $6) \
+             ON CONFLICT (seller_pubky) DO UPDATE SET \
+                 event_cursor = COALESCE(EXCLUDED.event_cursor, listing_deletion_cursors.event_cursor), \
+                 polled_at = EXCLUDED.polled_at",
+        )
+        .bind(seller_pubky)
+        .bind(cursor)
+        .bind(polled_at)
+        .bind(crate::workers::TASK_LISTING_DELETIONS)
+        .bind(self.holder)
+        .bind(self.clock.now())
+        .execute(self.pool)
+        .await?;
+        Ok(written.rows_affected() == 1)
+    }
 }
 
 /// The listing id named by an event URI for this seller's listings, if any.
@@ -208,40 +271,18 @@ fn event_listing_id<'a>(seller_pubky: &str, uri: &'a str) -> Option<&'a str> {
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
-async fn record_poll(
-    pool: &PgPool,
-    seller_pubky: &str,
-    cursor: Option<&str>,
-    polled_at: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
-         VALUES ($1, $2, $3) ON CONFLICT (seller_pubky) DO UPDATE \
-         SET event_cursor = COALESCE(EXCLUDED.event_cursor, listing_deletion_cursors.event_cursor), \
-             polled_at = EXCLUDED.polled_at",
-    )
-    .bind(seller_pubky)
-    .bind(cursor)
-    .bind(polled_at)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// One worker pass of the deletion follower. For up to
-/// [`FOLLOW_SELLERS_PER_PASS`] sellers with live listings whose last poll is
-/// older than [`FOLLOW_POLL_SECONDS`], reads the next batch of their listing
-/// events and tombstones every live listing whose latest event in the batch
-/// is a `DEL` that [`confirm_deleted`] still confirms. The seller's cursor
-/// advances only when every deletion in the batch settled; a transient
-/// homeserver failure leaves it for the next poll. Returns the number of
+/// One worker pass of the deletion follower, bounded by `pass.deadline`.
+/// For up to [`FOLLOW_SELLERS_PER_PASS`] sellers with live listings whose
+/// last poll is older than [`FOLLOW_POLL_SECONDS`], reads the next batch of
+/// their listing events in order. A `DEL` that is the batch's latest event
+/// for its listing is settled through [`confirm_deleted`], at most
+/// [`FOLLOW_SETTLES_PER_PASS`] per pass. The seller's cursor advances to the
+/// last event before the first one that could not be settled (homeserver
+/// unavailable, deadline, or settle cap), so nothing is skipped. The pass
+/// stops at the deadline or when its lease is gone. Returns the number of
 /// listings tombstoned.
-pub async fn follow_homeserver_deletions(
-    pool: &PgPool,
-    homeserver: &dyn HomeserverListingClient,
-    now: DateTime<Utc>,
-) -> anyhow::Result<u64> {
-    let started = std::time::Instant::now();
+pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Result<u64> {
+    let now = pass.clock.now();
     let due: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT s.seller_pubky, c.event_cursor \
          FROM (SELECT DISTINCT seller_pubky FROM listings WHERE deleted_at IS NULL) s \
@@ -252,66 +293,91 @@ pub async fn follow_homeserver_deletions(
     )
     .bind(now - chrono::Duration::seconds(FOLLOW_POLL_SECONDS))
     .bind(FOLLOW_SELLERS_PER_PASS)
-    .fetch_all(pool)
+    .fetch_all(pass.pool)
     .await?;
 
     let mut tombstoned = 0u64;
+    let mut settles = 0usize;
+    let mut unhosted = 0usize;
     for (seller_pubky, cursor) in due {
-        if started.elapsed() >= FOLLOW_PASS_BUDGET {
+        if pass.expired() || settles >= FOLLOW_SETTLES_PER_PASS {
             break;
         }
-        let events = match homeserver
-            .listing_events(
+        let events = match pass
+            .bounded(pass.homeserver.listing_events(
                 &seller_pubky,
                 LISTINGS_PATH,
                 cursor.as_deref(),
                 false,
                 FOLLOW_PAGE,
-            )
+            ))
             .await
         {
-            HomeserverEventsOutcome::Events(events) => events,
-            HomeserverEventsOutcome::UnknownUser | HomeserverEventsOutcome::Unavailable => {
-                record_poll(pool, &seller_pubky, None, now).await?;
+            Some(HomeserverEventsOutcome::Events(events)) => events,
+            Some(outcome) => {
+                if outcome == HomeserverEventsOutcome::UnknownUser {
+                    unhosted += 1;
+                }
+                if !pass
+                    .record_poll(&seller_pubky, None, pass.clock.now())
+                    .await?
+                {
+                    break;
+                }
                 continue;
             }
+            None => break,
         };
 
-        let mut latest: Vec<(&str, HomeserverEventKind)> = Vec::new();
-        for event in &events {
-            let Some(listing_id) = event_listing_id(&seller_pubky, &event.uri) else {
-                continue;
-            };
-            match latest.iter_mut().find(|(id, _)| *id == listing_id) {
-                Some(entry) => entry.1 = event.kind,
-                None => latest.push((listing_id, event.kind)),
+        let mut settled_through: Option<&str> = None;
+        let mut complete = true;
+        for (index, event) in events.iter().enumerate() {
+            let listing_id = event_listing_id(&seller_pubky, &event.uri);
+            let superseded = listing_id.is_some_and(|id| {
+                events[index + 1..]
+                    .iter()
+                    .any(|later| event_listing_id(&seller_pubky, &later.uri) == Some(id))
+            });
+            if let (Some(listing_id), HomeserverEventKind::Del, false) =
+                (listing_id, event.kind, superseded)
+            {
+                if settles >= FOLLOW_SETTLES_PER_PASS {
+                    complete = false;
+                    break;
+                }
+                settles += 1;
+                match pass.settle_deletion(&seller_pubky, listing_id).await? {
+                    SettleOutcome::Tombstoned => tombstoned += 1,
+                    SettleOutcome::NotDeleted => {}
+                    SettleOutcome::Unsettled => {
+                        complete = false;
+                        break;
+                    }
+                }
             }
+            settled_through = Some(event.cursor.as_str());
         }
 
-        let mut settled = true;
-        for (listing_id, kind) in latest {
-            if kind != HomeserverEventKind::Del {
-                continue;
-            }
-            match settle_deletion(pool, homeserver, &seller_pubky, listing_id, now).await? {
-                SettleOutcome::Tombstoned => tombstoned += 1,
-                SettleOutcome::NotDeleted => {}
-                SettleOutcome::Unavailable => settled = false,
-            }
-        }
-
-        let next_cursor = events
-            .last()
-            .filter(|_| settled)
-            .map(|event| event.cursor.as_str());
-        // A full page means more history is waiting: leave the seller due
-        // for the next pass instead of the next poll interval.
-        let polled_at = if settled && events.len() == usize::from(FOLLOW_PAGE) {
+        // A full page read to its end means more history is waiting: leave
+        // the seller due for the next pass instead of the next interval.
+        let polled_at = if complete && events.len() == usize::from(FOLLOW_PAGE) {
             now - chrono::Duration::seconds(FOLLOW_POLL_SECONDS)
         } else {
-            now
+            pass.clock.now()
         };
-        record_poll(pool, &seller_pubky, next_cursor, polled_at).await?;
+        if !pass
+            .record_poll(&seller_pubky, settled_through, polled_at)
+            .await?
+        {
+            tracing::warn!("listing deletion follower lost its lease; stopping the pass");
+            break;
+        }
+    }
+    if unhosted > 0 {
+        tracing::info!(
+            unhosted,
+            "listing deletion follower: sellers unknown to the homeserver event stream"
+        );
     }
     Ok(tombstoned)
 }
