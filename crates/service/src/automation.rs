@@ -261,7 +261,7 @@ pub async fn list_seller_listings(
         }
     };
     let rows: Vec<ListingRow> = match sqlx::query_as(&format!(
-        "SELECT {LISTING_COLUMNS} FROM listings WHERE seller_pubky = $1 \
+        "SELECT {LISTING_COLUMNS} FROM listings WHERE seller_pubky = $1 AND deleted_at IS NULL \
          AND (server_revision > $2 OR (server_revision = $2 AND aggregate_id > $3)) \
          ORDER BY server_revision, aggregate_id LIMIT $4"
     ))
@@ -323,7 +323,8 @@ pub async fn get_seller_listing(
         );
     }
     let row: Option<ListingRow> = match sqlx::query_as(&format!(
-        "SELECT {LISTING_COLUMNS} FROM listings WHERE seller_pubky = $1 AND listing_id = $2"
+        "SELECT {LISTING_COLUMNS} FROM listings \
+         WHERE seller_pubky = $1 AND listing_id = $2 AND deleted_at IS NULL"
     ))
     .bind(&seller)
     .bind(&listing_id)

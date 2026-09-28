@@ -678,7 +678,41 @@ impl HomeserverListingClient for CommandMirrorHomeserver {
 pub struct FakeHomeserver {
     records: HomeserverRecordMap,
     drop_records: HomeserverRecordMap,
+    events: HomeserverEventLog,
     pub base_url: String,
+}
+
+/// The homeserver's event table: users it hosts and every write, in cursor
+/// order. `/events-stream` serves it the way
+/// `pubky-homeserver/src/client_server/routes/events.rs` does.
+#[derive(Default)]
+pub struct FakeEventLog {
+    hosted: std::collections::HashSet<String>,
+    entries: Vec<FakeEvent>,
+    next_cursor: u64,
+}
+
+#[derive(Clone)]
+struct FakeEvent {
+    user: String,
+    kind: &'static str,
+    path: String,
+    cursor: u64,
+}
+
+type HomeserverEventLog = Arc<Mutex<FakeEventLog>>;
+
+impl FakeEventLog {
+    fn record(&mut self, user: &str, kind: &'static str, path: String) {
+        self.hosted.insert(user.to_string());
+        self.next_cursor += 1;
+        self.entries.push(FakeEvent {
+            user: user.to_string(),
+            kind,
+            path,
+            cursor: self.next_cursor,
+        });
+    }
 }
 
 impl FakeHomeserver {
@@ -691,6 +725,42 @@ impl FakeHomeserver {
             .lock()
             .expect("fake homeserver records lock")
             .insert((seller_pubky.to_string(), listing_id.to_string()), record);
+        self.events.lock().expect("fake event log lock").record(
+            seller_pubky,
+            "PUT",
+            format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}"),
+        );
+    }
+
+    /// The seller deletes the record: the fetch 404s and the event stream
+    /// gains a `DEL`.
+    pub fn delete_record(&self, seller_pubky: &str, listing_id: &str) {
+        self.records
+            .lock()
+            .expect("fake homeserver records lock")
+            .remove(&(seller_pubky.to_string(), listing_id.to_string()));
+        self.events.lock().expect("fake event log lock").record(
+            seller_pubky,
+            "DEL",
+            format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}"),
+        );
+    }
+
+    /// A record removed without the homeserver recording its delete: the
+    /// fetch 404s but no `DEL` exists.
+    pub fn drop_record_silently(&self, seller_pubky: &str, listing_id: &str) {
+        self.records
+            .lock()
+            .expect("fake homeserver records lock")
+            .remove(&(seller_pubky.to_string(), listing_id.to_string()));
+    }
+
+    /// Writes an unrelated file so the user is hosted with some history.
+    pub fn put_other_file(&self, user: &str, path: &str) {
+        self.events
+            .lock()
+            .expect("fake event log lock")
+            .record(user, "PUT", path.to_string());
     }
 
     pub fn put_drop_record(&self, seller_pubky: &str, drop_id: &str, record: Value) {
@@ -727,9 +797,83 @@ async fn serve_homeserver_record(
     }
 }
 
+/// Batch-mode `/events-stream`: `user` (optionally `user:cursor`, exclusive),
+/// `path` prefix, `reverse`, `limit`. An unhosted user is 404 `Not Found`;
+/// a missing user is 400, as on the real homeserver.
+async fn serve_event_stream(
+    axum::extract::State(log): axum::extract::State<HomeserverEventLog>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (mut user, mut path, mut reverse, mut limit) = (None, None, false, None);
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        match key.as_ref() {
+            "user" => user = Some(value.to_string()),
+            "path" => path = Some(value.to_string()),
+            "reverse" => reverse = value == "true",
+            "limit" => limit = value.parse::<usize>().ok(),
+            _ => {}
+        }
+    }
+    let Some(user) = user else {
+        return (StatusCode::BAD_REQUEST, "user parameter is required").into_response();
+    };
+    let (user, cursor) = match user.split_once(':') {
+        Some((user, cursor)) => (
+            user.to_string(),
+            Some(cursor.parse::<u64>().expect("numeric cursor")),
+        ),
+        None => (user, None),
+    };
+    let log = log.lock().expect("fake event log lock");
+    if !log.hosted.contains(&user) {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+    let mut matching: Vec<FakeEvent> = log
+        .entries
+        .iter()
+        .filter(|event| event.user == user)
+        .filter(|event| {
+            path.as_ref()
+                .is_none_or(|path| event.path.starts_with(path))
+        })
+        .filter(|event| match cursor {
+            Some(cursor) if reverse => event.cursor < cursor,
+            Some(cursor) => event.cursor > cursor,
+            None => true,
+        })
+        .cloned()
+        .collect();
+    if reverse {
+        matching.reverse();
+    }
+    matching.truncate(limit.unwrap_or(usize::MAX));
+    let body: String = matching
+        .iter()
+        .map(|event| {
+            let content_hash = if event.kind == "PUT" {
+                "data: content_hash: w56e7VajQXh40ap5Rs7BmmsBYq4DLweSfTRZKOKfJjM=\n"
+            } else {
+                ""
+            };
+            format!(
+                "event: {}\ndata: pubky://{}{}\ndata: cursor: {}\n{content_hash}\n",
+                event.kind, event.user, event.path, event.cursor
+            )
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        body,
+    )
+        .into_response()
+}
+
 pub async fn spawn_fake_homeserver() -> FakeHomeserver {
     let records: HomeserverRecordMap = Arc::default();
     let drop_records: HomeserverRecordMap = Arc::default();
+    let events: HomeserverEventLog = Arc::default();
     let router = Router::new()
         .route(
             "/pub/pubky.app/marketplace/v1/listings/{listing_id}",
@@ -743,6 +887,11 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
                     axum::routing::get(serve_homeserver_record),
                 )
                 .with_state(drop_records.clone()),
+        )
+        .merge(
+            Router::new()
+                .route("/events-stream", axum::routing::get(serve_event_stream))
+                .with_state(events.clone()),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -756,6 +905,7 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
     FakeHomeserver {
         records,
         drop_records,
+        events,
         base_url: format!("http://{addr}"),
     }
 }

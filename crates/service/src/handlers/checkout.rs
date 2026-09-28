@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::executor::insert_event;
 use crate::handlers::holds::{HOLDING_COPY, HOLD_SOURCE_DROP_CLAIM};
-use crate::handlers::{current_listing_revision, fetch_listing, fetch_listing_for_update};
+use crate::handlers::{
+    current_listing_revision, fetch_live_listing, fetch_live_listing_for_update,
+};
 use crate::locks::LocksKeys;
 use crate::model::{money_json, ListingRow, OrderRow, PaymentRow, ProjectionContext};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
@@ -46,7 +48,7 @@ pub async fn handle(
     // (drop-then-listing, the order every gating and release path shares).
     let mut peeked: Vec<(&CheckoutLine, ListingRow)> = Vec::with_capacity(payload.lines.len());
     for line in &payload.lines {
-        let Some(listing) = fetch_listing(tx, &line.listing_aggregate_id).await? else {
+        let Some(listing) = fetch_live_listing(tx, &line.listing_aggregate_id).await? else {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::NotFound,
                 ErrorCode::NotFound,
@@ -103,7 +105,8 @@ pub async fn handle(
 
     let mut resolved: Vec<(&CheckoutLine, ListingRow)> = Vec::with_capacity(peeked.len());
     for (line, _) in peeked {
-        let Some(listing) = fetch_listing_for_update(tx, &line.listing_aggregate_id).await? else {
+        let Some(listing) = fetch_live_listing_for_update(tx, &line.listing_aggregate_id).await?
+        else {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::NotFound,
                 ErrorCode::NotFound,

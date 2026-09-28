@@ -15,8 +15,8 @@ use uuid::Uuid;
 use crate::clock::format_timestamp;
 use crate::executor::insert_event;
 use crate::handlers::{
-    fetch_auction_reserve, fetch_listing, fetch_listing_for_update, insert_notification_intent,
-    LISTING_COLUMNS,
+    fetch_auction_reserve, fetch_listing, fetch_live_listing, fetch_live_listing_for_update,
+    insert_notification_intent, LISTING_COLUMNS,
 };
 use crate::homeserver::{
     award_terms_from_bytes, award_terms_from_bytes_for_variant, AwardListingSnapshot,
@@ -67,7 +67,7 @@ pub async fn create(
     homeserver: Option<&dyn HomeserverListingClient>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let Some(listing) = fetch_listing(tx, &command.aggregate_id).await? else {
+    let Some(listing) = fetch_live_listing(tx, &command.aggregate_id).await? else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
@@ -367,7 +367,10 @@ pub async fn counter(
     } else {
         None
     };
-    let Some(listing) = fetch_listing(tx, &offer.listing_aggregate_id).await? else {
+    let Some(listing) = fetch_live_listing(tx, &offer.listing_aggregate_id)
+        .await?
+        .filter(|listing| listing.accepts_commitment_created_at(offer.created_at))
+    else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
@@ -648,7 +651,10 @@ pub async fn accept(
             "Offer amount must use the listing asset and exponent.",
         )));
     }
-    let Some(listing) = fetch_listing_for_update(tx, &offer.listing_aggregate_id).await? else {
+    let Some(listing) = fetch_live_listing_for_update(tx, &offer.listing_aggregate_id)
+        .await?
+        .filter(|listing| listing.accepts_commitment_created_at(offer.created_at))
+    else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,

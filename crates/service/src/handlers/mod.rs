@@ -35,7 +35,8 @@ pub const LISTING_COLUMNS: &str = "aggregate_id, seller_pubky, listing_id, title
      available_quantity, reserved_quantity, sold_quantity, unit_price_amount_minor, \
      unit_price_currency, unit_price_exponent, shipping_minor, sale_format, auction, \
      fulfillment_methods, digital_lock_policy_uri, digital_lock_criterion_id, updated_at, \
-     digital_delivery_kind, digital_delivery_content_type, digital_delivery_size_bytes";
+     digital_delivery_kind, digital_delivery_content_type, digital_delivery_size_bytes, \
+     deleted_at, deleted_event_cursor, recreated_at";
 
 pub const AUCTION_RESERVE_COLUMNS: &str = "listing_aggregate_id, listing_revision, \
      record_revision, reserve_amount_minor, reserve_currency, reserve_exponent, \
@@ -63,6 +64,28 @@ pub async fn fetch_listing_for_update(
     .bind(aggregate_id)
     .fetch_optional(&mut **tx)
     .await
+}
+
+/// [`fetch_listing`] for paths that create a new commitment (checkout,
+/// offers, reserves, bids): a tombstoned listing reads as absent.
+pub async fn fetch_live_listing(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: &str,
+) -> Result<Option<ListingRow>, sqlx::Error> {
+    Ok(fetch_listing(tx, aggregate_id)
+        .await?
+        .filter(|listing| !listing.is_deleted()))
+}
+
+/// [`fetch_listing_for_update`] for commitment paths. The row lock is still
+/// taken on a tombstoned listing, so the deletion cannot race the caller.
+pub async fn fetch_live_listing_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: &str,
+) -> Result<Option<ListingRow>, sqlx::Error> {
+    Ok(fetch_listing_for_update(tx, aggregate_id)
+        .await?
+        .filter(|listing| !listing.is_deleted()))
 }
 
 pub async fn fetch_auction_reserve(

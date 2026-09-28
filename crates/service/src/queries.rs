@@ -227,14 +227,15 @@ pub async fn get_band_consent(
 /// buyer identity beyond the auction's current leader, which the auction
 /// state already makes visible to every bidder. An auction bidder additionally
 /// receives only their own proxy maximum and the minimum next maximum accepted
-/// for that bidder; this field is absent for other viewers.
+/// for that bidder; this field is absent for other viewers. A tombstoned
+/// listing is not found.
 pub async fn get_listing(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Path(aggregate_id): Path<String>,
 ) -> Response {
     let listing: Result<Option<ListingRow>, sqlx::Error> = sqlx::query_as(&format!(
-        "SELECT {LISTING_COLUMNS} FROM listings WHERE aggregate_id = $1"
+        "SELECT {LISTING_COLUMNS} FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL"
     ))
     .bind(&aggregate_id)
     .fetch_optional(&state.pool)

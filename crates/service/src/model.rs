@@ -93,6 +93,15 @@ pub struct ListingRow {
     pub digital_delivery_kind: Option<String>,
     pub digital_delivery_content_type: Option<String>,
     pub digital_delivery_size_bytes: Option<i64>,
+    /// Set when the seller's homeserver confirmed the record's deletion. The
+    /// row stays for past orders; nothing new may commit against it.
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// The homeserver event cursor of the confirming `DEL`.
+    pub deleted_event_cursor: Option<String>,
+    /// Set when a record re-created at the same id revived a tombstoned row.
+    /// Offers, awards, and unpaid orders created earlier belong to the
+    /// deleted listing and cannot take stock from the revived one.
+    pub recreated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -150,6 +159,33 @@ impl std::fmt::Display for ListingProjectionError {
 impl std::error::Error for ListingProjectionError {}
 
 impl ListingRow {
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+
+    /// Whether an offer, award, or order created at `created_at` may still
+    /// take stock from this listing: never after a deletion, and not across
+    /// a revival.
+    pub fn accepts_commitment_created_at(&self, created_at: DateTime<Utc>) -> bool {
+        !self.is_deleted()
+            && self
+                .recreated_at
+                .is_none_or(|recreated_at| created_at >= recreated_at)
+    }
+
+    /// The `listing.sync` result for a tombstoned listing. It carries no
+    /// stock, price, or record data: the listing is gone for everyone who
+    /// is not a party to one of its past orders.
+    pub fn deleted_projection(&self) -> Value {
+        json!({
+            "aggregate_id": self.aggregate_id,
+            "seller_pubky": self.seller_pubky,
+            "listing_id": self.listing_id,
+            "server_revision": self.server_revision,
+            "deleted_at": self.deleted_at.map(format_timestamp),
+        })
+    }
+
     pub fn unit_price_json(&self) -> Value {
         money_json(
             self.unit_price_amount_minor,

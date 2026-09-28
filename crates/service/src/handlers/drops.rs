@@ -162,11 +162,12 @@ pub async fn sync(
     // command deliberately does NOT auto-register.
     let mut missing: Vec<&str> = Vec::new();
     for listing_id in &record.listing_ids {
-        let registered: Option<(String,)> =
-            sqlx::query_as("SELECT aggregate_id FROM listings WHERE aggregate_id = $1")
-                .bind(ids::listing_aggregate_id(&payload.seller_pubky, listing_id))
-                .fetch_optional(&mut **tx)
-                .await?;
+        let registered: Option<(String,)> = sqlx::query_as(
+            "SELECT aggregate_id FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(ids::listing_aggregate_id(&payload.seller_pubky, listing_id))
+        .fetch_optional(&mut **tx)
+        .await?;
         if registered.is_none() {
             missing.push(listing_id);
         }

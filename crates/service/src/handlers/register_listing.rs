@@ -112,7 +112,13 @@ pub async fn handle(
 
     let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
     let current_revision = current.as_ref().map(|c| c.server_revision).unwrap_or(0);
-    if command.expected_revision != current_revision {
+    // A tombstoned listing reads as absent everywhere, so a client
+    // re-creating the id registers it as new (`expected_revision` 0). The
+    // deleted row's revision chain does not bind the re-created record.
+    let reviving = current.as_ref().is_some_and(ListingRow::is_deleted);
+    if command.expected_revision != current_revision
+        && !(reviving && command.expected_revision == 0)
+    {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
@@ -120,7 +126,17 @@ pub async fn handle(
             current_revision,
         )));
     }
-    if let Some(current) = &current {
+    if reviving
+        && (payload.sale_format != SaleFormat::FixedPrice
+            || current
+                .as_ref()
+                .is_some_and(|deleted| deleted.sale_format != "fixed_price"))
+    {
+        return Ok(Err(
+            crate::handlers::sync_listing::recreated_auction_refused(),
+        ));
+    }
+    if let Some(current) = current.as_ref().filter(|_| !reviving) {
         if payload.listing_revision <= current.listing_revision {
             return Ok(Err(CommandFailure::refused_with_revision(
                 crate::refusal_audit::RefusalKind::RevisionConflict,
@@ -209,6 +225,11 @@ pub async fn handle(
 /// `fetch_listing_for_update`) and made its own authority and revision
 /// decisions; this enforces only the inventory invariant that survives both
 /// paths — quantity can never fall below committed (reserved + sold) stock.
+///
+/// A tombstoned `current` is revived: the tombstone clears, `recreated_at`
+/// is stamped, and available stock is the new record's quantity minus the
+/// holds and sales the deleted listing still owes. Its earlier available
+/// count (seller adjustments, restocks while deleted) is discarded.
 // Eight positional facts of one write; both callers must supply all of them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_registration(
@@ -304,7 +325,9 @@ pub(crate) async fn apply_registration(
              server_revision = $6, state = $7, total_quantity = $8, available_quantity = $9, \
              unit_price_amount_minor = $10, unit_price_currency = $11, unit_price_exponent = $12, \
              shipping_minor = $13, sale_format = $14, auction = $15, fulfillment_methods = $16, \
-             digital_lock_policy_uri = $17, digital_lock_criterion_id = $18, updated_at = $19 \
+             digital_lock_policy_uri = $17, digital_lock_criterion_id = $18, updated_at = $19, \
+             recreated_at = CASE WHEN deleted_at IS NULL THEN recreated_at ELSE $19 END, \
+             deleted_at = NULL, deleted_event_cursor = NULL \
              WHERE aggregate_id = $1 AND server_revision = $2",
         )
         .bind(aggregate_id)

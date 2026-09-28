@@ -58,6 +58,108 @@ pub enum HomeserverRawFetchOutcome {
     Unavailable,
 }
 
+/// Where Shop writes a seller's listing records.
+pub const LISTINGS_PATH: &str = "/pub/pubky.app/marketplace/v1/listings/";
+/// Upper bound on one `/events-stream` batch body. A batch is at most
+/// `limit` short entries; anything larger is not a homeserver answer.
+const MAX_EVENT_STREAM_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeserverEventKind {
+    Put,
+    Del,
+}
+
+/// One entry of the homeserver's per-user event stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeserverEvent {
+    pub kind: HomeserverEventKind,
+    /// `pubky://{user}{path}`.
+    pub uri: String,
+    /// The homeserver's event id, as the decimal string it sends.
+    pub cursor: String,
+}
+
+/// A batch read of `GET /events-stream?user=…`. The homeserver answers 404
+/// for a user it does not host, which is how a 404 record fetch for an
+/// unhosted seller is told apart from a deleted record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HomeserverEventsOutcome {
+    Events(Vec<HomeserverEvent>),
+    UnknownUser,
+    Unavailable,
+}
+
+/// Parses a batch-mode (`live=false`) `/events-stream` body:
+///
+/// ```text
+/// event: DEL
+/// data: pubky://{user}/pub/pubky.app/marketplace/v1/listings/{id}
+/// data: cursor: 431001
+/// ```
+///
+/// `PUT` entries also carry `data: content_hash: …`, which is ignored.
+/// Anything else (an unknown event type, a missing uri or cursor, a
+/// non-numeric cursor) rejects the whole batch.
+pub fn parse_event_stream(body: &str) -> Option<Vec<HomeserverEvent>> {
+    fn finish(
+        kind: &mut Option<HomeserverEventKind>,
+        uri: &mut Option<String>,
+        cursor: &mut Option<String>,
+        events: &mut Vec<HomeserverEvent>,
+    ) -> Option<()> {
+        match (kind.take(), uri.take(), cursor.take()) {
+            (None, None, None) => Some(()),
+            (Some(kind), Some(uri), Some(cursor)) => {
+                events.push(HomeserverEvent { kind, uri, cursor });
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    let mut events = Vec::new();
+    let (mut kind, mut uri, mut cursor) = (None, None, None);
+    for line in body.lines() {
+        if line.is_empty() {
+            finish(&mut kind, &mut uri, &mut cursor, &mut events)?;
+        } else if line.starts_with(':') {
+            continue;
+        } else if let Some(name) = line.strip_prefix("event: ") {
+            if kind.is_some() {
+                return None;
+            }
+            kind = Some(match name {
+                "PUT" => HomeserverEventKind::Put,
+                "DEL" => HomeserverEventKind::Del,
+                _ => return None,
+            });
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(value) = data.strip_prefix("cursor: ") {
+                if cursor.is_some()
+                    || value.is_empty()
+                    || value.len() > 20
+                    || !value.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return None;
+                }
+                cursor = Some(value.to_string());
+            } else if data.starts_with("pubky://") {
+                if uri.is_some() {
+                    return None;
+                }
+                uri = Some(data.to_string());
+            } else if !data.starts_with("content_hash: ") {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    finish(&mut kind, &mut uri, &mut cursor, &mut events)?;
+    Some(events)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AwardVariantSnapshot {
     pub id: String,
@@ -422,6 +524,20 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
         let _ = (seller_pubky, deliverable_id, version, max_len);
         Box::pin(async { DeliverableFetchOutcome::Unavailable })
     }
+
+    /// Reads one batch of the seller's event stream under `path` (a prefix
+    /// match), strictly after `after_cursor` in the requested direction.
+    fn listing_events<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        path: &'a str,
+        after_cursor: Option<&'a str>,
+        reverse: bool,
+        limit: u16,
+    ) -> Pin<Box<dyn Future<Output = HomeserverEventsOutcome> + Send + 'a>> {
+        let _ = (seller_pubky, path, after_cursor, reverse, limit);
+        Box::pin(async { HomeserverEventsOutcome::Unavailable })
+    }
 }
 
 /// The production client: a real
@@ -721,6 +837,77 @@ impl HomeserverListingClient for HttpHomeserverClient {
             DeliverableFetchOutcome::Found {
                 blake3: hasher.finalize().to_hex().to_string(),
                 len,
+            }
+        })
+    }
+
+    fn listing_events<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        path: &'a str,
+        after_cursor: Option<&'a str>,
+        reverse: bool,
+        limit: u16,
+    ) -> Pin<Box<dyn Future<Output = HomeserverEventsOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let prefix = pubky_host_prefix(seller_pubky);
+            let user = match after_cursor {
+                Some(cursor) => format!("{seller_pubky}:{cursor}"),
+                None => seller_pubky.to_string(),
+            };
+            let limit = limit.to_string();
+            let mut query = vec![("user", user.as_str()), ("path", path), ("limit", &limit)];
+            if reverse {
+                query.push(("reverse", "true"));
+            }
+            let mut response = match self
+                .http
+                .get(format!("{}/events-stream", self.base_url))
+                .query(&query)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    tracing::warn!("homeserver event stream transport failure");
+                    return HomeserverEventsOutcome::Unavailable;
+                }
+            };
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return HomeserverEventsOutcome::UnknownUser;
+            }
+            if !status.is_success() {
+                tracing::warn!(
+                    pubky_host_prefix = %prefix,
+                    status = %status,
+                    "homeserver event stream rejected"
+                );
+                return HomeserverEventsOutcome::Unavailable;
+            }
+            let mut body = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if body.len() + chunk.len() > MAX_EVENT_STREAM_BYTES {
+                            return HomeserverEventsOutcome::Unavailable;
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(_) => return HomeserverEventsOutcome::Unavailable,
+                }
+            }
+            let parsed = std::str::from_utf8(&body).ok().and_then(parse_event_stream);
+            match parsed {
+                Some(events) => HomeserverEventsOutcome::Events(events),
+                None => {
+                    tracing::warn!(
+                        pubky_host_prefix = %prefix,
+                        "homeserver event stream returned an unparseable batch"
+                    );
+                    HomeserverEventsOutcome::Unavailable
+                }
             }
         })
     }
@@ -1443,5 +1630,60 @@ mod tests {
 
         assert_eq!(outcome, HomeserverFetchOutcome::NotFound);
         server.abort();
+    }
+
+    const STAGING_SELLER_EVENTS: &str =
+        include_str!("../tests/fixtures/homeserver_events/staging-seller-listings.sse");
+    const STAGING_SELLER: &str = "7oboeqnfgtf5d6gohz1wao7rboe1q3ynexkbm5tmq4u49kxzej9y";
+
+    #[test]
+    fn parses_the_captured_staging_event_stream() {
+        let events = parse_event_stream(STAGING_SELLER_EVENTS).expect("captured batch parses");
+        assert_eq!(events.len(), 10);
+        let uri = |id: &str| format!("pubky://{STAGING_SELLER}{LISTINGS_PATH}{id}");
+        assert_eq!(
+            events[0],
+            HomeserverEvent {
+                kind: HomeserverEventKind::Put,
+                uri: uri("e2d1a596b9ca450a8cc2b24a4f0e1be2"),
+                cursor: "363815".to_string(),
+            }
+        );
+        let last_for = |id: &str| {
+            events
+                .iter()
+                .rev()
+                .find(|event| event.uri == uri(id))
+                .map(|event| (event.kind, event.cursor.as_str()))
+        };
+        assert_eq!(
+            last_for("w4i_mujp0ovw_a"),
+            Some((HomeserverEventKind::Del, "431001"))
+        );
+        assert_eq!(
+            last_for("w4i_mujp0ovw_b"),
+            Some((HomeserverEventKind::Del, "430988"))
+        );
+        assert_eq!(
+            last_for("w4i_mujp0ovw_c"),
+            Some((HomeserverEventKind::Del, "430989"))
+        );
+    }
+
+    #[test]
+    fn rejects_event_stream_batches_it_cannot_read_exactly() {
+        assert_eq!(parse_event_stream(""), Some(vec![]));
+        for body in [
+            "event: MOVE\ndata: pubky://u/pub/x\ndata: cursor: 1\n\n",
+            "event: DEL\ndata: pubky://u/pub/x\n\n",
+            "event: DEL\ndata: cursor: 1\n\n",
+            "event: DEL\ndata: pubky://u/pub/x\ndata: cursor: 1a\n\n",
+            "event: DEL\ndata: pubky://u/pub/x\ndata: cursor: 1\ndata: cursor: 2\n\n",
+            "event: DEL\nevent: PUT\ndata: pubky://u/pub/x\ndata: cursor: 1\n\n",
+            "event: DEL\ndata: pubky://u/pub/x\ndata: extra\ndata: cursor: 1\n\n",
+            "retry: 5\n\n",
+        ] {
+            assert_eq!(parse_event_stream(body), None, "{body:?}");
+        }
     }
 }
