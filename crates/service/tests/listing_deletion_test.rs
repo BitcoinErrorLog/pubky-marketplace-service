@@ -402,6 +402,7 @@ async fn a_deleted_auction_takes_no_bids_and_closes_unsold(pool: PgPool) {
     let mut tx = app.pool.begin().await.expect("tx");
     let (deleted, _) = marketplace_service::listing_deletion::tombstone(
         &mut tx,
+        marketplace_service::listing_deletion::DeletionAuthority::Command,
         &aggregate_id,
         "7",
         "system",
@@ -946,6 +947,7 @@ async fn late_settlement(
             let mut tx = app.pool.begin().await.expect("tx");
             marketplace_service::listing_deletion::tombstone(
                 &mut tx,
+                marketplace_service::listing_deletion::DeletionAuthority::Command,
                 &aggregate_id,
                 "9",
                 "system",
@@ -1011,6 +1013,7 @@ async fn a_held_manual_review_on_a_deleted_listing_still_resolves_paid(pool: PgP
     let mut tx = app.pool.begin().await.expect("tx");
     marketplace_service::listing_deletion::tombstone(
         &mut tx,
+        marketplace_service::listing_deletion::DeletionAuthority::Command,
         &listing_aggregate(&seller.pubky),
         "9",
         "system",
@@ -1067,6 +1070,7 @@ async fn a_deleted_auctions_bid_history_is_kept_for_its_parties_only(pool: PgPoo
     let mut tx = app.pool.begin().await.expect("tx");
     marketplace_service::listing_deletion::tombstone(
         &mut tx,
+        marketplace_service::listing_deletion::DeletionAuthority::Command,
         &aggregate_id,
         "9",
         "system",
@@ -1154,6 +1158,7 @@ async fn a_tombstone_takes_drop_and_listing_locks_in_the_sell_out_confirm_order(
         let _ = go_rx.await;
         let deleted = marketplace_service::listing_deletion::tombstone(
             &mut tx,
+            marketplace_service::listing_deletion::DeletionAuthority::Command,
             &tombstone_id,
             "9",
             "system",
@@ -1281,6 +1286,7 @@ async fn tombstone_now(pool: &PgPool, aggregate_id: &str, now: chrono::DateTime<
     let mut tx = pool.begin().await.expect("tombstone tx");
     marketplace_service::listing_deletion::tombstone(
         &mut tx,
+        marketplace_service::listing_deletion::DeletionAuthority::Command,
         aggregate_id,
         "9",
         "system",
@@ -1950,15 +1956,18 @@ async fn the_follower_cursor_never_moves_backwards(pool: PgPool) {
         follow_homeserver_deletions(&pass).await
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut ahead = app.pool.begin().await.expect("cursor tx");
+    declare_authority(&mut ahead, &format!("follower:{holder}:{fence}")).await;
     sqlx::query(
         "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
          VALUES ($1, '50', $2)",
     )
     .bind(&seller.pubky)
     .bind(app.clock.now())
-    .execute(&app.pool)
+    .execute(&mut *ahead)
     .await
     .expect("cursor moved ahead");
+    ahead.commit().await.expect("cursor commits");
 
     assert_eq!(pass.await.expect("pass joins").expect("pass"), 0);
     assert_eq!(
@@ -2019,6 +2028,335 @@ async fn the_follower_counts_its_deadlines_from_before_it_waits_for_the_lease_ro
     assert!(
         elapsed < std::time::Duration::from_millis(1_500),
         "the wait for the lease row was added to the pass: {elapsed:?}"
+    );
+}
+
+/// Declares a deletion authority for the rest of `tx`, as the service does.
+async fn declare_authority(tx: &mut sqlx::Transaction<'static, sqlx::Postgres>, authority: &str) {
+    sqlx::query("SELECT set_config('marketplace.listing_deletion_authority', $1, true)")
+        .bind(authority)
+        .execute(&mut **tx)
+        .await
+        .expect("deletion authority");
+}
+
+// The follower's SQL as the image before migration 0050 runs it
+// (`e1a56c2` listing_deletion.rs and workers.rs), verbatim.
+const OLD_IMAGE_ACQUIRE: &str = "INSERT INTO worker_leases (task, holder, lease_until) \
+     VALUES ($1, $2, $3) ON CONFLICT (task) DO UPDATE SET holder = EXCLUDED.holder, \
+     lease_until = EXCLUDED.lease_until \
+     WHERE worker_leases.lease_until <= $4 OR worker_leases.holder = EXCLUDED.holder";
+const OLD_IMAGE_LIVE_READ: &str = "SELECT seller_pubky, listing_id FROM listings \
+     WHERE aggregate_id = $1 AND deleted_at IS NULL";
+const OLD_IMAGE_RELEASE_BINDINGS: &str =
+    "UPDATE drop_listings SET active = FALSE, released = TRUE \
+     WHERE seller_pubky = $1 AND listing_id = $2 AND NOT released";
+const OLD_IMAGE_TOMBSTONE: &str =
+    "UPDATE listings SET deleted_at = $2, deleted_event_cursor = $3, \
+     server_revision = server_revision + 1, updated_at = $2 \
+     WHERE aggregate_id = $1 AND deleted_at IS NULL RETURNING server_revision";
+const OLD_IMAGE_RECORD_POLL: &str = "INSERT INTO listing_deletion_cursors \
+     (seller_pubky, event_cursor, polled_at) \
+     SELECT $1, $2, $3 WHERE EXISTS ( \
+         SELECT 1 FROM worker_leases \
+         WHERE task = $4 AND holder = $5 AND lease_until > $6) \
+     ON CONFLICT (seller_pubky) DO UPDATE SET \
+         event_cursor = COALESCE(EXCLUDED.event_cursor, listing_deletion_cursors.event_cursor), \
+         polled_at = EXCLUDED.polled_at";
+
+async fn old_image_acquire(app: &TestApp, holder: Uuid) {
+    let now = app.clock.now();
+    let taken = sqlx::query(OLD_IMAGE_ACQUIRE)
+        .bind(marketplace_service::workers::TASK_LISTING_DELETIONS)
+        .bind(holder)
+        .bind(now + chrono::Duration::seconds(30))
+        .bind(now)
+        .execute(&app.pool)
+        .await
+        .expect("old-image acquire");
+    assert_eq!(taken.rows_affected(), 1, "the old image holds the lease");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_old_image_tombstone_held_across_a_new_image_takeover_never_commits(pool: PgPool) {
+    use marketplace_service::listing_deletion::follow_homeserver_deletions;
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 3).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    homeserver.put_drop_record(
+        &seller.pubky,
+        "overlap_drop",
+        common::drop_record_json(
+            &seller.pubky,
+            "overlap_drop",
+            1,
+            &[LISTING_ID],
+            &common::ts_after(3600),
+            None,
+            1,
+            1,
+        ),
+    );
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &common::sync_drop_command(&seller.pubky, "overlap_drop", 130),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "announced drop: {body}");
+    let drop_id = common::drop_aggregate(&seller.pubky, "overlap_drop");
+
+    // The old image confirmed the seller's DEL (cursor 2); the seller then
+    // re-created the record (cursor 3).
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    homeserver.put_record(&seller.pubky, LISTING_ID, record(2, 3));
+    let old_holder = Uuid::new_v4();
+    old_image_acquire(&app, old_holder).await;
+    let mut old = app.pool.begin().await.expect("old-image tombstone tx");
+    let live: Option<(String, String)> = sqlx::query_as(OLD_IMAGE_LIVE_READ)
+        .bind(&aggregate_id)
+        .fetch_optional(&mut *old)
+        .await
+        .expect("old-image live read");
+    assert!(live.is_some());
+
+    // Its write stalls past the lease. The new image takes over and reads
+    // the DEL and the later PUT.
+    app.clock.advance_seconds(31);
+    let new_holder = Uuid::new_v4();
+    let fence = take_follower_lease(&app, new_holder).await;
+    let pass = follower_pass(&app.state, new_holder, fence, 10_000);
+    assert_eq!(
+        follow_homeserver_deletions(&pass).await.expect("new pass"),
+        0
+    );
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("3")
+    );
+
+    // The old write resumes.
+    sqlx::query(OLD_IMAGE_RELEASE_BINDINGS)
+        .bind(&seller.pubky)
+        .bind(LISTING_ID)
+        .execute(&mut *old)
+        .await
+        .expect("old-image binding release runs");
+    let refused = sqlx::query(OLD_IMAGE_TOMBSTONE)
+        .bind(&aggregate_id)
+        .bind(app.clock.now())
+        .bind("2")
+        .execute(&mut *old)
+        .await
+        .expect_err("the old-image tombstone must be refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("no current deletion authority"),
+        "{refused}"
+    );
+    old.rollback().await.expect("old tx rolls back");
+
+    // A follower authority whose fence is no longer the lease row's is
+    // refused the same way.
+    let mut stale = app.pool.begin().await.expect("stale authority tx");
+    declare_authority(&mut stale, &format!("follower:{new_holder}:{}", fence - 1)).await;
+    let refused = sqlx::query(OLD_IMAGE_TOMBSTONE)
+        .bind(&aggregate_id)
+        .bind(app.clock.now())
+        .bind("2")
+        .execute(&mut *stale)
+        .await
+        .expect_err("a stale fence must be refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("no current deletion authority"),
+        "{refused}"
+    );
+    stale.rollback().await.expect("stale tx rolls back");
+
+    assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
+    assert!(deleted_events(&app.pool, &aggregate_id).await.is_empty());
+    assert_eq!(
+        unreleased_bindings(&app.pool, &drop_id).await,
+        1,
+        "the refused tombstone released no binding"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_old_image_cursor_write_cannot_move_the_follower_cursor(pool: PgPool) {
+    use marketplace_service::workers::{try_acquire_fenced_lease, TASK_LISTING_DELETIONS};
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 1).await;
+    let old_holder = Uuid::new_v4();
+    old_image_acquire(&app, old_holder).await;
+    let old_now = app.clock.now();
+    let old_poll = |pool: PgPool, seller: String, cursor: &'static str| async move {
+        sqlx::query(OLD_IMAGE_RECORD_POLL)
+            .bind(seller)
+            .bind(cursor)
+            .bind(old_now)
+            .bind(TASK_LISTING_DELETIONS)
+            .bind(old_holder)
+            .bind(old_now)
+            .execute(&pool)
+            .await
+    };
+
+    // While it still holds the lease, the old image cannot write the cursor.
+    let refused = old_poll(app.pool.clone(), seller.pubky.clone(), "1")
+        .await
+        .expect_err("an old-image cursor write must be refused");
+    assert!(
+        refused.to_string().contains("no current follower lease"),
+        "{refused}"
+    );
+    assert_eq!(seller_cursor(&app.pool, &seller.pubky).await, None);
+
+    // The reviewer's overlap: the old statement checks its lease before the
+    // new image's takeover commits and writes after it.
+    app.clock.advance_seconds(31);
+    let new_holder = Uuid::new_v4();
+    let mut takeover = app.pool.begin().await.expect("takeover tx");
+    let fence = try_acquire_fenced_lease(
+        &mut *takeover,
+        TASK_LISTING_DELETIONS,
+        new_holder,
+        app.clock.now(),
+        30,
+    )
+    .await
+    .expect("takeover")
+    .expect("the old lease lapsed");
+    declare_authority(&mut takeover, &format!("follower:{new_holder}:{fence}")).await;
+    sqlx::query(
+        "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
+         VALUES ($1, '3', $2)",
+    )
+    .bind(&seller.pubky)
+    .bind(app.clock.now())
+    .execute(&mut *takeover)
+    .await
+    .expect("new-image cursor");
+    // The guard refuses the statement before it would wait on the new
+    // row; either way it cannot land once the takeover commits.
+    let stale = tokio::spawn(old_poll(app.pool.clone(), seller.pubky.clone(), "1"));
+    wait_for_finish_or_lock_wait(&app.pool, &stale, "INSERT INTO listing_deletion_cursors").await;
+    takeover.commit().await.expect("takeover commits");
+    let refused = stale
+        .await
+        .expect("old statement joins")
+        .expect_err("the stale old-image cursor must be refused");
+    assert!(
+        refused.to_string().contains("no current follower lease"),
+        "{refused}"
+    );
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("3")
+    );
+
+    // Even the current follower cannot move the cursor backwards.
+    let mut current = app.pool.begin().await.expect("current tx");
+    declare_authority(&mut current, &format!("follower:{new_holder}:{fence}")).await;
+    let refused = sqlx::query(
+        "UPDATE listing_deletion_cursors SET event_cursor = '2' WHERE seller_pubky = $1",
+    )
+    .bind(&seller.pubky)
+    .execute(&mut *current)
+    .await
+    .expect_err("a backwards cursor must be refused");
+    assert!(refused.to_string().contains("move backwards"), "{refused}");
+    current.rollback().await.expect("current tx rolls back");
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("3")
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_delete_confirmed_before_a_revival_cannot_hide_the_revived_listing(pool: PgPool) {
+    use marketplace_service::listing_deletion::{tombstone, DeletionAuthority};
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 1).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    let tombstone_at = |cursor: &'static str| {
+        let pool = app.pool.clone();
+        let aggregate_id = aggregate_id.clone();
+        let now = app.clock.now();
+        async move {
+            let mut tx = pool.begin().await.expect("tombstone tx");
+            let deleted = tombstone(
+                &mut tx,
+                DeletionAuthority::Command,
+                &aggregate_id,
+                cursor,
+                "system",
+                Uuid::new_v4(),
+                now,
+            )
+            .await;
+            if matches!(deleted, Ok(Some(_))) {
+                tx.commit().await.expect("tombstone commits");
+            }
+            deleted.map(|deleted| deleted.is_some())
+        }
+    };
+    assert!(tombstone_at("2").await.expect("first delete"));
+    revive(&app, &homeserver, &seller, 131).await;
+    let marker: Option<String> =
+        sqlx::query_scalar("SELECT revived_from_cursor FROM listings WHERE aggregate_id = $1")
+            .bind(&aggregate_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("revival marker");
+    assert_eq!(marker.as_deref(), Some("2"));
+
+    // The service skips a delete no newer than the one the revival
+    // superseded.
+    assert!(!tombstone_at("2").await.expect("stale delete"));
+    assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
+
+    // The database refuses it from any writer, even with an authority.
+    let mut raw = app.pool.begin().await.expect("raw tx");
+    declare_authority(&mut raw, "command").await;
+    let refused = sqlx::query(OLD_IMAGE_TOMBSTONE)
+        .bind(&aggregate_id)
+        .bind(app.clock.now())
+        .bind("2")
+        .execute(&mut *raw)
+        .await
+        .expect_err("a delete older than the revival must be refused");
+    assert!(
+        refused.to_string().contains("predates the revival"),
+        "{refused}"
+    );
+    raw.rollback().await.expect("raw tx rolls back");
+
+    // The marker never moves backwards.
+    let mut raw = app.pool.begin().await.expect("marker tx");
+    let refused =
+        sqlx::query("UPDATE listings SET revived_from_cursor = '1' WHERE aggregate_id = $1")
+            .bind(&aggregate_id)
+            .execute(&mut *raw)
+            .await
+            .expect_err("a backwards marker must be refused");
+    assert!(refused.to_string().contains("move backwards"), "{refused}");
+    raw.rollback().await.expect("marker tx rolls back");
+
+    // A newer delete of the revived record tombstones it.
+    assert!(tombstone_at("4").await.expect("newer delete"));
+    assert_eq!(
+        tombstone_row(&app.pool, &aggregate_id).await.0,
+        Some("4".to_string())
     );
 }
 

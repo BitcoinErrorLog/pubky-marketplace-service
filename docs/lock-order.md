@@ -69,3 +69,6 @@ The listing deletion follower share-locks its `worker_leases` row at the
 start of each write transaction and takes no other lease row. A takeover
 updates that row in a single statement that holds no other lock, so
 nothing waiting on the lease row holds a lock the follower could wait on.
+Migration 0050's guard triggers share-lock the same row again inside the
+follower's own transaction, which already holds it; a `listing.sync`
+tombstone declares `command` and does not touch the lease row.

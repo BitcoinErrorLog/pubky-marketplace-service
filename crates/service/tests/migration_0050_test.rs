@@ -1,7 +1,9 @@
-//! 0050: `worker_leases.fence`. Existing lease rows read 0, the file reruns
-//! over them, every acquisition (renewals included) raises the fence while
-//! a refused one leaves it, and a fenced release never touches a later
-//! acquisition's lease.
+//! 0050: `worker_leases.fence` and the listing deletion guards. Existing
+//! lease rows read 0, the file reruns over them and keeps its guards, every
+//! acquisition (renewals included) raises the fence while a refused one
+//! leaves it, and a fenced release never touches a later acquisition's
+//! lease. The guards against older binaries are exercised in
+//! `listing_deletion_test.rs`.
 
 use chrono::Utc;
 use marketplace_service::workers::{
@@ -29,11 +31,37 @@ async fn migration_0050_fences_every_lease_acquisition_and_is_rerunnable(pool: P
         .execute(&pool)
         .await
         .expect("a lease row written without a fence");
-    sqlx::raw_sql(include_str!("../migrations/0050_worker_lease_fence.sql"))
-        .execute(&pool)
-        .await
-        .expect("0050 must be directly rerunnable");
+    sqlx::raw_sql(include_str!(
+        "../migrations/0050_listing_deletion_fence.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("0050 must be directly rerunnable");
     assert_eq!(lease(&pool, "legacy").await.1, 0);
+    let guards: Vec<String> = sqlx::query_scalar(
+        "SELECT tgname::text FROM pg_trigger WHERE NOT tgisinternal \
+         AND tgname IN ('listings_deletion_guard', 'listing_deletion_cursors_guard') \
+         ORDER BY tgname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("guard triggers");
+    assert_eq!(
+        guards,
+        ["listing_deletion_cursors_guard", "listings_deletion_guard"],
+        "a rerun keeps one of each guard"
+    );
+    let refused = sqlx::query(
+        "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
+         VALUES ('seller', '1', now())",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("an undeclared cursor write is refused after a rerun");
+    assert!(
+        refused.to_string().contains("no current follower lease"),
+        "{refused}"
+    );
 
     let acquire = |holder: Uuid| try_acquire_fenced_lease(&pool, "probe", holder, now, 30);
     assert_eq!(acquire(a).await.expect("first"), Some(1));

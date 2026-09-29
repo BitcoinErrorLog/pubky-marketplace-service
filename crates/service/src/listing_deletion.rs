@@ -113,23 +113,58 @@ pub async fn confirm_deleted(
     }
 }
 
+/// Who may tombstone, declared to the database for the rest of the
+/// transaction. Migration 0050's triggers refuse a tombstone, or a follower
+/// cursor write, whose transaction declares none, and a follower authority
+/// whose holder and fence are no longer the lease row's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionAuthority {
+    /// A `listing.sync` that confirmed the delete itself.
+    Command,
+    /// The follower pass holding this lease.
+    Follower { holder: Uuid, fence: i64 },
+}
+
+impl DeletionAuthority {
+    fn setting(self) -> String {
+        match self {
+            DeletionAuthority::Command => "command".to_string(),
+            DeletionAuthority::Follower { holder, fence } => format!("follower:{holder}:{fence}"),
+        }
+    }
+
+    async fn declare(self, tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT set_config('marketplace.listing_deletion_authority', $1, true)")
+            .bind(self.setting())
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+}
+
 /// Tombstones a live listing inside the caller's transaction and records
 /// `listing.deleted` at the bumped revision. Stock columns are left as they
 /// are: holds and paid orders still settle against them. Returns `None`
-/// when the listing is missing or already tombstoned.
+/// when the listing is missing or already tombstoned, or when `event_cursor`
+/// is no newer than the delete a revival of the listing superseded: that
+/// delete was confirmed before the record came back.
 pub async fn tombstone(
     tx: &mut Transaction<'_, Postgres>,
+    authority: DeletionAuthority,
     aggregate_id: &str,
     event_cursor: &str,
     actor: &str,
     command_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<Option<(ListingRow, Uuid)>, sqlx::Error> {
+    authority.declare(tx).await?;
     let live: Option<(String, String)> = sqlx::query_as(
         "SELECT seller_pubky, listing_id FROM listings \
-         WHERE aggregate_id = $1 AND deleted_at IS NULL",
+         WHERE aggregate_id = $1 AND deleted_at IS NULL \
+         AND (revived_from_cursor IS NULL OR $2::numeric > revived_from_cursor::numeric)",
     )
     .bind(aggregate_id)
+    .bind(event_cursor)
     .fetch_optional(&mut **tx)
     .await?;
     let Some((seller_pubky, listing_id)) = live else {
@@ -304,6 +339,13 @@ impl FollowerPass<'_> {
         tokio::time::Instant::now() >= self.deadline
     }
 
+    fn authority(&self) -> DeletionAuthority {
+        DeletionAuthority::Follower {
+            holder: self.holder,
+            fence: self.fence,
+        }
+    }
+
     async fn begin(&self) -> Result<Option<Transaction<'static, Postgres>>, sqlx::Error> {
         begin_by(self.pool, self.lease_deadline).await
     }
@@ -383,6 +425,7 @@ impl FollowerPass<'_> {
                 }
                 let deleted = tombstone(
                     &mut tx,
+                    self.authority(),
                     &aggregate_id,
                     &cursor,
                     crate::workers::SYSTEM_ACTOR,
@@ -417,6 +460,7 @@ impl FollowerPass<'_> {
                 if !self.holds_lease(&mut tx).await? {
                     return Ok(Some(Err(Halt::LeaseLost)));
                 }
+                self.authority().declare(&mut tx).await?;
                 sqlx::query(
                     "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
                      VALUES ($1, $2, $3) \

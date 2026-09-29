@@ -543,7 +543,7 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 /// delivery 0043, accepted offer fulfillment methods 0044, Paykit
 /// delivery state 0045, per-user priv data keys 0046, listing
 /// tombstones 0047, notification review reasons 0048, outbox
-/// quarantine 0049, and fenced worker leases 0050.
+/// quarantine 0049, and fenced listing deletion 0050.
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
