@@ -9,6 +9,7 @@ mod test_migrator;
 #[cfg(any(test, feature = "test-faults"))]
 pub use test_migrator::TEST_MIGRATOR;
 
+pub mod address_search;
 pub mod attestor;
 pub mod auth;
 pub mod automation;
@@ -129,6 +130,10 @@ pub struct AppState {
     /// Durable Pubky grant-flow runtime. `None` keeps the rollout surface
     /// disabled; no legacy or in-memory fallback is used.
     pub grant: Option<Arc<grant::GrantRuntime>>,
+    /// The address autocomplete proxy (`POST /v0/address/suggest`). `None`
+    /// when `ADDRESS_SEARCH_DISABLED` is set or in tests that do not use it:
+    /// the route then answers `address_search_unavailable`.
+    pub address_search: Option<Arc<address_search::AddressSearchRuntime>>,
 }
 
 impl AppState {
@@ -174,6 +179,7 @@ impl AppState {
             refusal_audit: None,
             refusal_audit_retention_pool: None,
             grant: None,
+            address_search: None,
         }
     }
 
@@ -219,6 +225,14 @@ impl AppState {
 
     pub fn with_refusal_audit_retention_pool(mut self, pool: PgPool) -> Self {
         self.refusal_audit_retention_pool = Some(pool);
+        self
+    }
+
+    pub fn with_address_search(
+        mut self,
+        address_search: Option<Arc<address_search::AddressSearchRuntime>>,
+    ) -> Self {
+        self.address_search = address_search;
         self
     }
 

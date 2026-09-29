@@ -152,6 +152,16 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     tracing::info!("priv data key sealing coherence probe passed");
 
+    let address_search = marketplace_service::address_search::runtime_from_env()?;
+    tracing::info!(
+        address_search = if address_search.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        "address search proxy resolved"
+    );
+
     let bind_addr = config.bind_addr;
     let state = AppState::new(pool, Arc::new(SystemClock), config)
         .with_locks(locks)
@@ -163,7 +173,8 @@ async fn main() -> anyhow::Result<()> {
         .with_priv_keys(priv_keys)
         .with_refusal_audit(refusal_audit)
         .with_refusal_audit_retention_pool(audit_retention_pool)
-        .with_grant(grant);
+        .with_grant(grant)
+        .with_address_search(address_search);
     workers::spawn(state.clone());
     marketplace_service::automation::spawn_webhook_worker(state.clone());
     marketplace_service::grant::spawn(state.clone());
