@@ -775,8 +775,7 @@ async fn a_slow_homeserver_cannot_hold_the_follower_past_its_deadline(pool: PgPo
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_expired_holder_cannot_rewind_the_follower_cursor(pool: PgPool) {
-    use marketplace_service::listing_deletion::{follow_homeserver_deletions, FollowerPass};
-    use marketplace_service::workers::{release_lease, try_acquire_lease, TASK_LISTING_DELETIONS};
+    use marketplace_service::listing_deletion::follow_homeserver_deletions;
 
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
@@ -789,24 +788,10 @@ async fn an_expired_holder_cannot_rewind_the_follower_cursor(pool: PgPool) {
     // Holder A reads the page of three PUTs; the answer is slow.
     homeserver.set_delay(std::time::Duration::from_millis(1_500));
     let holder_a = Uuid::new_v4();
-    assert!(try_acquire_lease(
-        &app.pool,
-        TASK_LISTING_DELETIONS,
-        holder_a,
-        app.clock.now(),
-        30
-    )
-    .await
-    .expect("lease A"));
+    let fence_a = take_follower_lease(&app, holder_a).await;
     let state = app.state.clone();
     let pass_a = tokio::spawn(async move {
-        let pass = FollowerPass {
-            pool: &state.pool,
-            homeserver: state.homeserver.as_deref().expect("homeserver"),
-            clock: state.clock.as_ref(),
-            holder: holder_a,
-            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
-        };
+        let pass = follower_pass(&state, holder_a, fence_a, 10_000);
         follow_homeserver_deletions(&pass).await
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -819,30 +804,14 @@ async fn an_expired_holder_cannot_rewind_the_follower_cursor(pool: PgPool) {
     homeserver.set_delay(std::time::Duration::ZERO);
     app.clock.advance_seconds(31);
     let holder_b = Uuid::new_v4();
-    assert!(try_acquire_lease(
-        &app.pool,
-        TASK_LISTING_DELETIONS,
-        holder_b,
-        app.clock.now(),
-        30
-    )
-    .await
-    .expect("lease B"));
-    let pass = FollowerPass {
-        pool: &app.pool,
-        homeserver: app.state.homeserver.as_deref().expect("homeserver"),
-        clock: app.clock.as_ref(),
-        holder: holder_b,
-        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
-    };
+    let fence_b = take_follower_lease(&app, holder_b).await;
+    let pass = follower_pass(&app.state, holder_b, fence_b, 10_000);
     assert_eq!(follow_homeserver_deletions(&pass).await.expect("pass B"), 3);
     assert_eq!(
         seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
         Some("6")
     );
-    release_lease(&app.pool, TASK_LISTING_DELETIONS, holder_b, app.clock.now())
-        .await
-        .expect("release B");
+    pass.release_lease().await.expect("release B");
 
     // A's stale page (through cursor 3) arrives after B finished: its write
     // is refused, and the cursor stays where B left it.
@@ -852,6 +821,41 @@ async fn an_expired_holder_cannot_rewind_the_follower_cursor(pool: PgPool) {
         Some("6")
     );
     assert_eq!(tombstoned_ids(&app.pool, &seller.pubky).await, ids);
+}
+
+/// Takes the follower lease for `holder` at the test clock and returns its
+/// fence.
+async fn take_follower_lease(app: &TestApp, holder: Uuid) -> i64 {
+    marketplace_service::workers::try_acquire_fenced_lease(
+        &app.pool,
+        marketplace_service::workers::TASK_LISTING_DELETIONS,
+        holder,
+        app.clock.now(),
+        30,
+    )
+    .await
+    .expect("lease query")
+    .expect("the follower lease is free")
+}
+
+/// A follower pass for a lease already taken, with both deadlines
+/// `millis` from now.
+fn follower_pass(
+    state: &marketplace_service::AppState,
+    holder: Uuid,
+    fence: i64,
+    millis: u64,
+) -> marketplace_service::listing_deletion::FollowerPass<'_> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(millis);
+    marketplace_service::listing_deletion::FollowerPass {
+        pool: &state.pool,
+        homeserver: state.homeserver.as_deref().expect("homeserver"),
+        clock: state.clock.as_ref(),
+        holder,
+        fence,
+        deadline,
+        lease_deadline: deadline,
+    }
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -1580,4 +1584,385 @@ async fn a_drop_sync_refuses_a_listing_re_created_while_it_was_binding(pool: PgP
             .await
             .expect("listing");
     assert_eq!(generation, 1);
+}
+
+/// Waits until `task` has finished or another backend is blocked on a lock
+/// while running a statement that contains `fragment`.
+async fn wait_for_finish_or_lock_wait<T>(
+    pool: &PgPool,
+    task: &tokio::task::JoinHandle<T>,
+    fragment: &str,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if task.is_finished() {
+            return;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+             AND wait_event_type = 'Lock' AND strpos(query, $1) > 0",
+        )
+        .bind(fragment)
+        .fetch_one(pool)
+        .await
+        .expect("lock wait poll");
+        if waiting >= 1 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "neither finished nor waited on {fragment:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Statements of this test's database blocked on a lock right now.
+async fn lock_waiters(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT left(query, 120) FROM pg_stat_activity \
+         WHERE datname = current_database() AND pid <> pg_backend_pid() \
+         AND wait_event_type = 'Lock'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("lock waiters")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn every_follower_statement_ends_at_the_lease_deadline(pool: PgPool) {
+    use marketplace_service::listing_deletion::follow_homeserver_deletions;
+    use marketplace_service::workers::TASK_LISTING_DELETIONS;
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 1).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    let holder = Uuid::new_v4();
+    let fence = take_follower_lease(&app, holder).await;
+    let pass = follower_pass(&app.state, holder, fence, 10_000);
+    assert_eq!(
+        follow_homeserver_deletions(&pass)
+            .await
+            .expect("first pass"),
+        0
+    );
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("1")
+    );
+
+    // Each blocker holds a lock one follower statement needs. The pass
+    // gives the statement one second, the time left in its lease.
+    let scenarios: [(&str, &str, Option<&str>, bool); 4] = [
+        (
+            "cursor write",
+            "SELECT 1 FROM listing_deletion_cursors WHERE seller_pubky = $1 FOR UPDATE",
+            Some(seller.pubky.as_str()),
+            false,
+        ),
+        (
+            "due sellers",
+            "LOCK TABLE listing_deletion_cursors IN ACCESS EXCLUSIVE MODE",
+            None,
+            false,
+        ),
+        (
+            "lease check",
+            "SELECT 1 FROM worker_leases WHERE task = $1 FOR UPDATE",
+            Some(TASK_LISTING_DELETIONS),
+            true,
+        ),
+        (
+            "tombstone",
+            "SELECT 1 FROM listings WHERE aggregate_id = $1 FOR UPDATE",
+            Some(aggregate_id.as_str()),
+            true,
+        ),
+    ];
+    let mut deleted_on_homeserver = false;
+    for (label, blocker_sql, bind, deleted) in scenarios {
+        if deleted && !deleted_on_homeserver {
+            homeserver.delete_record(&seller.pubky, LISTING_ID);
+            deleted_on_homeserver = true;
+        }
+        app.clock.advance_seconds(61);
+        let fence = take_follower_lease(&app, holder).await;
+        let mut blocker = app.pool.begin().await.expect("blocker tx");
+        let mut query = sqlx::query(blocker_sql);
+        if let Some(value) = bind {
+            query = query.bind(value);
+        }
+        query.execute(&mut *blocker).await.expect(label);
+
+        let started = std::time::Instant::now();
+        let pass = follower_pass(&app.state, holder, fence, 1_000);
+        let tombstoned = follow_homeserver_deletions(&pass).await.expect(label);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_500),
+            "{label}: the pass outlived its lease: {elapsed:?}"
+        );
+        assert_eq!(tombstoned, 0, "{label}");
+
+        // The server cancelled the blocked statement: nothing still waits
+        // on the blocker's lock.
+        let settle = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let waiting = lock_waiters(&app.pool).await;
+            if waiting.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < settle,
+                "{label}: a follower statement outlived the lease: {waiting:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        blocker.rollback().await.expect("release the blocker");
+        assert_eq!(
+            tombstone_row(&app.pool, &aggregate_id).await.0,
+            None,
+            "{label}"
+        );
+        assert_eq!(
+            seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+            Some("1"),
+            "{label}"
+        );
+    }
+
+    // Nothing was left behind: the next pass settles the deletion.
+    app.clock.advance_seconds(61);
+    let fence = take_follower_lease(&app, holder).await;
+    let pass = follower_pass(&app.state, holder, fence, 10_000);
+    assert_eq!(
+        follow_homeserver_deletions(&pass).await.expect("last pass"),
+        1
+    );
+    assert_eq!(
+        tombstone_row(&app.pool, &aggregate_id).await.0,
+        Some("2".to_string())
+    );
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("2")
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_follower_stops_waiting_for_a_connection_at_the_lease_deadline(pool: PgPool) {
+    use marketplace_service::listing_deletion::follow_homeserver_deletions;
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 1).await;
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    let holder = Uuid::new_v4();
+    let fence = take_follower_lease(&app, holder).await;
+
+    let size = app.pool.options().get_max_connections();
+    let mut held = Vec::new();
+    for _ in 0..size {
+        held.push(app.pool.acquire().await.expect("pool connection"));
+    }
+    let started = std::time::Instant::now();
+    let pass = follower_pass(&app.state, holder, fence, 1_000);
+    let tombstoned = follow_homeserver_deletions(&pass)
+        .await
+        .expect("starved pass");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(2_500),
+        "the pass waited for a connection past its lease: {elapsed:?}"
+    );
+    assert_eq!(tombstoned, 0);
+    drop(held);
+
+    let pass = follower_pass(&app.state, holder, fence, 10_000);
+    assert_eq!(
+        follow_homeserver_deletions(&pass).await.expect("fed pass"),
+        1
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_pass_whose_lease_was_taken_over_tombstones_nothing(pool: PgPool) {
+    use marketplace_service::listing_deletion::follow_homeserver_deletions;
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 1).await;
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    let aggregate_id = listing_aggregate(&seller.pubky);
+
+    // A confirms the deletion slowly; its lease lapses and B takes it.
+    homeserver.set_delay(std::time::Duration::from_millis(600));
+    let holder_a = Uuid::new_v4();
+    let fence_a = take_follower_lease(&app, holder_a).await;
+    let state = app.state.clone();
+    let pass_a = tokio::spawn(async move {
+        let pass = follower_pass(&state, holder_a, fence_a, 10_000);
+        follow_homeserver_deletions(&pass).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    app.clock.advance_seconds(31);
+    take_follower_lease(&app, Uuid::new_v4()).await;
+
+    assert_eq!(pass_a.await.expect("pass A joins").expect("pass A"), 0);
+    assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
+    assert!(deleted_events(&app.pool, &aggregate_id).await.is_empty());
+    assert_eq!(seller_cursor(&app.pool, &seller.pubky).await, None);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_renewed_or_expired_lease_refuses_the_stale_pass(pool: PgPool) {
+    use marketplace_service::listing_deletion::follow_homeserver_deletions;
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    for scenario in ["renewed by the same holder", "expired"] {
+        let seller = new_actor(&app).await;
+        published_listing(&app, &homeserver, &seller, 1).await;
+        homeserver.delete_record(&seller.pubky, LISTING_ID);
+        let aggregate_id = listing_aggregate(&seller.pubky);
+
+        homeserver.set_delay(std::time::Duration::from_millis(600));
+        let holder = Uuid::new_v4();
+        let fence = take_follower_lease(&app, holder).await;
+        let state = app.state.clone();
+        let stale = tokio::spawn(async move {
+            let pass = follower_pass(&state, holder, fence, 10_000);
+            follow_homeserver_deletions(&pass).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        app.clock.advance_seconds(31);
+        if scenario == "expired" {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT fence FROM worker_leases WHERE task = 'listing_deletions'"
+                )
+                .fetch_one(&app.pool)
+                .await
+                .expect("lease row"),
+                fence,
+                "nobody took the expired lease"
+            );
+        } else {
+            assert!(take_follower_lease(&app, holder).await > fence);
+        }
+
+        assert_eq!(
+            stale.await.expect("stale pass joins").expect("stale pass"),
+            0,
+            "{scenario}"
+        );
+        assert_eq!(
+            tombstone_row(&app.pool, &aggregate_id).await.0,
+            None,
+            "{scenario}"
+        );
+        assert_eq!(
+            seller_cursor(&app.pool, &seller.pubky).await,
+            None,
+            "{scenario}"
+        );
+        homeserver.set_delay(std::time::Duration::ZERO);
+        app.clock.advance_seconds(31);
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_takeover_waits_for_the_fenced_write_in_flight(pool: PgPool) {
+    use marketplace_service::listing_deletion::follow_homeserver_deletions;
+    use marketplace_service::workers::{try_acquire_fenced_lease, TASK_LISTING_DELETIONS};
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 1).await;
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    let aggregate_id = listing_aggregate(&seller.pubky);
+
+    // A's tombstone passes its lease check, then waits on the listing row.
+    let mut blocker = app.pool.begin().await.expect("blocker tx");
+    sqlx::query("SELECT 1 FROM listings WHERE aggregate_id = $1 FOR UPDATE")
+        .bind(&aggregate_id)
+        .execute(&mut *blocker)
+        .await
+        .expect("listing row held");
+    let holder_a = Uuid::new_v4();
+    let fence_a = take_follower_lease(&app, holder_a).await;
+    let state = app.state.clone();
+    let pass_a = tokio::spawn(async move {
+        let pass = follower_pass(&state, holder_a, fence_a, 10_000);
+        follow_homeserver_deletions(&pass).await
+    });
+    wait_for_lock_wait(&app.pool, "UPDATE listings SET deleted_at").await;
+
+    // A's lease lapses. B's takeover waits until A's write ends.
+    app.clock.advance_seconds(31);
+    let pool = app.pool.clone();
+    let now = app.clock.now();
+    let takeover = tokio::spawn(async move {
+        try_acquire_fenced_lease(&pool, TASK_LISTING_DELETIONS, Uuid::new_v4(), now, 30).await
+    });
+    wait_for_finish_or_lock_wait(&app.pool, &takeover, "INSERT INTO worker_leases").await;
+    assert!(
+        !takeover.is_finished(),
+        "the takeover did not wait for the write in flight"
+    );
+
+    blocker.rollback().await.expect("release the listing row");
+    assert_eq!(pass_a.await.expect("pass A joins").expect("pass A"), 1);
+    let fence_b = takeover
+        .await
+        .expect("takeover joins")
+        .expect("takeover query")
+        .expect("B takes the expired lease");
+    assert!(fence_b > fence_a);
+    assert_eq!(
+        tombstone_row(&app.pool, &aggregate_id).await.0,
+        Some("2".to_string())
+    );
+    // A's cursor write came after the takeover and was refused.
+    assert_eq!(seller_cursor(&app.pool, &seller.pubky).await, None);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_follower_cursor_never_moves_backwards(pool: PgPool) {
+    use marketplace_service::listing_deletion::follow_homeserver_deletions;
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    for id in ["mono_0", "mono_1", "mono_2"] {
+        homeserver.put_record(&seller.pubky, id, record(1, 1));
+        register_as(&app, &seller, id, 1).await;
+    }
+
+    // The pass reads the page of three PUTs slowly; meanwhile the stored
+    // cursor moves past it.
+    homeserver.set_delay(std::time::Duration::from_millis(600));
+    let holder = Uuid::new_v4();
+    let fence = take_follower_lease(&app, holder).await;
+    let state = app.state.clone();
+    let pass = tokio::spawn(async move {
+        let pass = follower_pass(&state, holder, fence, 10_000);
+        follow_homeserver_deletions(&pass).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sqlx::query(
+        "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
+         VALUES ($1, '50', $2)",
+    )
+    .bind(&seller.pubky)
+    .bind(app.clock.now())
+    .execute(&app.pool)
+    .await
+    .expect("cursor moved ahead");
+
+    assert_eq!(pass.await.expect("pass joins").expect("pass"), 0);
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("50")
+    );
 }

@@ -20,6 +20,12 @@
 //! and disputes resolve against it and the quantity ledger keeps
 //! balancing), while public reads, seller lists, and every new commitment
 //! skip it.
+//!
+//! The follower runs under a fenced lease (`worker_leases.fence`, 0050).
+//! Each of its database units is one transaction whose statements the
+//! server cancels at the lease deadline, and each write first share-locks
+//! the lease row and proceeds only while it still names this pass. The
+//! cursor it writes never moves backwards.
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -182,13 +188,101 @@ enum SettleOutcome {
     Unsettled,
 }
 
-/// One follower pass: its lease identity and its wall-clock deadline.
+/// Why a pass stopped before its due sellers ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Halt {
+    /// The lease deadline passed before the database work finished.
+    OutOfTime,
+    /// The lease row no longer names this pass: it expired, another holder
+    /// took it, or a later acquisition renewed it.
+    LeaseLost,
+}
+
+/// Opens a transaction for work that must end by `deadline`. The server
+/// cancels any of its statements still running at the deadline, one
+/// waiting on a row lock included, and ends the session if it sits idle
+/// inside the transaction that long, so no lock the transaction takes
+/// outlives the deadline. `None` when the deadline has already passed.
+async fn begin_by(
+    pool: &PgPool,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Transaction<'static, Postgres>>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Ok(None);
+    }
+    let millis = remaining.as_millis().max(1).to_string();
+    sqlx::query(
+        "SELECT set_config('statement_timeout', $1, true), \
+         set_config('idle_in_transaction_session_timeout', $1, true)",
+    )
+    .bind(&millis)
+    .execute(&mut *tx)
+    .await?;
+    Ok(Some(tx))
+}
+
+/// Waits for one unit of database work no longer than `deadline`, even
+/// when no pool connection is free. A statement the server cancelled at
+/// the deadline, or a unit still running when it passes, is `None`; that
+/// unit committed nothing it had not already committed.
+async fn by_deadline<T>(
+    deadline: tokio::time::Instant,
+    unit: impl std::future::Future<Output = Result<Option<T>, sqlx::Error>>,
+) -> Result<Option<T>, sqlx::Error> {
+    match tokio::time::timeout_at(deadline, unit).await {
+        Ok(Err(error)) if is_statement_timeout(&error) => Ok(None),
+        Ok(result) => result,
+        Err(_) => Ok(None),
+    }
+}
+
+fn is_statement_timeout(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some("57014"))
+}
+
+/// Takes the follower's lease and returns its fence, waiting on the lease
+/// row no longer than `deadline`. `None` when another live holder owns the
+/// task, or when the row stayed locked by another pass's in-flight fenced
+/// write until the deadline.
+pub async fn acquire_follower_lease(
+    pool: &PgPool,
+    holder: Uuid,
+    now: DateTime<Utc>,
+    lease_seconds: i64,
+    deadline: tokio::time::Instant,
+) -> Result<Option<i64>, sqlx::Error> {
+    by_deadline(deadline, async {
+        let Some(mut tx) = begin_by(pool, deadline).await? else {
+            return Ok(None);
+        };
+        let fence = crate::workers::try_acquire_fenced_lease(
+            &mut *tx,
+            crate::workers::TASK_LISTING_DELETIONS,
+            holder,
+            now,
+            lease_seconds,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(fence)
+    })
+    .await
+}
+
+/// One follower pass: its fenced lease and its two deadlines.
 pub struct FollowerPass<'a> {
     pub pool: &'a PgPool,
     pub homeserver: &'a dyn HomeserverListingClient,
     pub clock: &'a dyn crate::clock::Clock,
     pub holder: Uuid,
+    /// The fence [`acquire_follower_lease`] returned for this pass.
+    pub fence: i64,
+    /// Homeserver work stops here.
     pub deadline: tokio::time::Instant,
+    /// The lease ends here; no database work of the pass outlives it.
+    pub lease_deadline: tokio::time::Instant,
 }
 
 impl FollowerPass<'_> {
@@ -202,75 +296,162 @@ impl FollowerPass<'_> {
         tokio::time::Instant::now() >= self.deadline
     }
 
+    async fn begin(&self) -> Result<Option<Transaction<'static, Postgres>>, sqlx::Error> {
+        begin_by(self.pool, self.lease_deadline).await
+    }
+
+    async fn within_lease<T>(
+        &self,
+        unit: impl std::future::Future<Output = Result<Option<T>, sqlx::Error>>,
+    ) -> Result<Option<T>, sqlx::Error> {
+        by_deadline(self.lease_deadline, unit).await
+    }
+
+    /// Share-locks this pass's lease row and reports whether it still is
+    /// the lease the pass took, unexpired. Every write of the pass checks
+    /// this first in its own transaction: a takeover or renewal updates
+    /// the row, so it waits until that transaction ends, and a row that
+    /// names another holder or fence, or has expired, refuses the write.
+    async fn holds_lease(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+    ) -> Result<bool, sqlx::Error> {
+        let held: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM worker_leases \
+             WHERE task = $1 AND holder = $2 AND fence = $3 AND lease_until > $4 \
+             FOR SHARE",
+        )
+        .bind(crate::workers::TASK_LISTING_DELETIONS)
+        .bind(self.holder)
+        .bind(self.fence)
+        .bind(self.clock.now())
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(held.is_some())
+    }
+
     async fn settle_deletion(
         &self,
         seller_pubky: &str,
         listing_id: &str,
-    ) -> anyhow::Result<SettleOutcome> {
+    ) -> anyhow::Result<Result<SettleOutcome, Halt>> {
         let aggregate_id = marketplace_domain::ids::listing_aggregate_id(seller_pubky, listing_id);
-        let live: Option<(String,)> = sqlx::query_as(
-            "SELECT aggregate_id FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL",
-        )
-        .bind(&aggregate_id)
-        .fetch_optional(self.pool)
-        .await?;
-        if live.is_none() {
-            return Ok(SettleOutcome::NotDeleted);
+        let live = self
+            .within_lease(async {
+                let Some(mut tx) = self.begin().await? else {
+                    return Ok(None);
+                };
+                let live: Option<String> = sqlx::query_scalar(
+                    "SELECT aggregate_id FROM listings \
+                     WHERE aggregate_id = $1 AND deleted_at IS NULL",
+                )
+                .bind(&aggregate_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(Some(live.is_some()))
+            })
+            .await?;
+        match live {
+            None => return Ok(Err(Halt::OutOfTime)),
+            Some(false) => return Ok(Ok(SettleOutcome::NotDeleted)),
+            Some(true) => {}
         }
         let cursor = match self
             .bounded(confirm_deleted(self.homeserver, seller_pubky, listing_id))
             .await
         {
             Some(DeletionCheck::Deleted { cursor }) => cursor,
-            Some(DeletionCheck::NotDeleted) => return Ok(SettleOutcome::NotDeleted),
-            Some(DeletionCheck::Unavailable) | None => return Ok(SettleOutcome::Unsettled),
+            Some(DeletionCheck::NotDeleted) => return Ok(Ok(SettleOutcome::NotDeleted)),
+            Some(DeletionCheck::Unavailable) | None => return Ok(Ok(SettleOutcome::Unsettled)),
         };
-        let mut tx = self.pool.begin().await?;
-        let tombstoned = tombstone(
-            &mut tx,
-            &aggregate_id,
-            &cursor,
-            crate::workers::SYSTEM_ACTOR,
-            Uuid::new_v4(),
-            self.clock.now(),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(if tombstoned.is_some() {
-            SettleOutcome::Tombstoned
-        } else {
-            SettleOutcome::NotDeleted
-        })
+        let written = self
+            .within_lease(async {
+                let Some(mut tx) = self.begin().await? else {
+                    return Ok(None);
+                };
+                if !self.holds_lease(&mut tx).await? {
+                    return Ok(Some(Err(Halt::LeaseLost)));
+                }
+                let deleted = tombstone(
+                    &mut tx,
+                    &aggregate_id,
+                    &cursor,
+                    crate::workers::SYSTEM_ACTOR,
+                    Uuid::new_v4(),
+                    self.clock.now(),
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(Some(Ok(if deleted.is_some() {
+                    SettleOutcome::Tombstoned
+                } else {
+                    SettleOutcome::NotDeleted
+                })))
+            })
+            .await?;
+        Ok(written.unwrap_or(Err(Halt::OutOfTime)))
     }
 
-    /// Records a poll only while this pass still holds the task lease, so a
-    /// holder whose lease expired mid-pass cannot rewind the cursor a later
-    /// holder advanced. Returns false when the lease is gone and nothing was
-    /// written.
+    /// Records a poll while the pass holds its lease. The cursor only
+    /// moves forward: one older than the stored cursor keeps the stored one.
     async fn record_poll(
         &self,
         seller_pubky: &str,
         cursor: Option<&str>,
         polled_at: DateTime<Utc>,
-    ) -> Result<bool, sqlx::Error> {
-        let written = sqlx::query(
-            "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
-             SELECT $1, $2, $3 WHERE EXISTS ( \
-                 SELECT 1 FROM worker_leases \
-                 WHERE task = $4 AND holder = $5 AND lease_until > $6) \
-             ON CONFLICT (seller_pubky) DO UPDATE SET \
-                 event_cursor = COALESCE(EXCLUDED.event_cursor, listing_deletion_cursors.event_cursor), \
-                 polled_at = EXCLUDED.polled_at",
-        )
-        .bind(seller_pubky)
-        .bind(cursor)
-        .bind(polled_at)
-        .bind(crate::workers::TASK_LISTING_DELETIONS)
-        .bind(self.holder)
-        .bind(self.clock.now())
-        .execute(self.pool)
+    ) -> Result<Result<(), Halt>, sqlx::Error> {
+        let written = self
+            .within_lease(async {
+                let Some(mut tx) = self.begin().await? else {
+                    return Ok(None);
+                };
+                if !self.holds_lease(&mut tx).await? {
+                    return Ok(Some(Err(Halt::LeaseLost)));
+                }
+                sqlx::query(
+                    "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (seller_pubky) DO UPDATE SET \
+                         event_cursor = CASE \
+                             WHEN listing_deletion_cursors.event_cursor IS NULL \
+                                 OR EXCLUDED.event_cursor::numeric \
+                                     > listing_deletion_cursors.event_cursor::numeric \
+                             THEN EXCLUDED.event_cursor \
+                             ELSE listing_deletion_cursors.event_cursor END, \
+                         polled_at = EXCLUDED.polled_at",
+                )
+                .bind(seller_pubky)
+                .bind(cursor)
+                .bind(polled_at)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(Some(Ok(())))
+            })
+            .await?;
+        Ok(written.unwrap_or(Err(Halt::OutOfTime)))
+    }
+
+    /// Ends this pass's lease, unless a later acquisition already owns it.
+    pub async fn release_lease(&self) -> Result<(), sqlx::Error> {
+        self.within_lease(async {
+            let Some(mut tx) = self.begin().await? else {
+                return Ok(None);
+            };
+            crate::workers::release_fenced_lease(
+                &mut *tx,
+                crate::workers::TASK_LISTING_DELETIONS,
+                self.holder,
+                self.fence,
+                self.clock.now(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(Some(()))
+        })
         .await?;
-        Ok(written.rows_affected() == 1)
+        Ok(())
     }
 }
 
@@ -291,22 +472,35 @@ fn event_listing_id<'a>(seller_pubky: &str, uri: &'a str) -> Option<&'a str> {
 /// [`FOLLOW_SETTLES_PER_PASS`] per pass. The seller's cursor advances to the
 /// last event before the first one that could not be settled (homeserver
 /// unavailable, deadline, or settle cap), so nothing is skipped. The pass
-/// stops at the deadline or when its lease is gone. Returns the number of
-/// listings tombstoned.
+/// stops at the deadline, when its database work reaches the lease
+/// deadline, or when its lease is gone. Returns the number of listings
+/// tombstoned.
 pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Result<u64> {
     let now = pass.clock.now();
-    let due: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT s.seller_pubky, c.event_cursor \
-         FROM (SELECT DISTINCT seller_pubky FROM listings WHERE deleted_at IS NULL) s \
-         LEFT JOIN listing_deletion_cursors c ON c.seller_pubky = s.seller_pubky \
-         WHERE c.polled_at IS NULL OR c.polled_at <= $1 \
-         ORDER BY c.polled_at NULLS FIRST, s.seller_pubky \
-         LIMIT $2",
-    )
-    .bind(now - chrono::Duration::seconds(FOLLOW_POLL_SECONDS))
-    .bind(FOLLOW_SELLERS_PER_PASS)
-    .fetch_all(pass.pool)
-    .await?;
+    let due = pass
+        .within_lease(async {
+            let Some(mut tx) = pass.begin().await? else {
+                return Ok(None);
+            };
+            let due: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT s.seller_pubky, c.event_cursor \
+                 FROM (SELECT DISTINCT seller_pubky FROM listings WHERE deleted_at IS NULL) s \
+                 LEFT JOIN listing_deletion_cursors c ON c.seller_pubky = s.seller_pubky \
+                 WHERE c.polled_at IS NULL OR c.polled_at <= $1 \
+                 ORDER BY c.polled_at NULLS FIRST, s.seller_pubky \
+                 LIMIT $2",
+            )
+            .bind(now - chrono::Duration::seconds(FOLLOW_POLL_SECONDS))
+            .bind(FOLLOW_SELLERS_PER_PASS)
+            .fetch_all(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(Some(due))
+        })
+        .await?;
+    let Some(due) = due else {
+        return Ok(halted(0, Halt::OutOfTime));
+    };
 
     let mut tombstoned = 0u64;
     let mut settles = 0usize;
@@ -330,11 +524,11 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
                 if outcome == HomeserverEventsOutcome::UnknownUser {
                     unhosted += 1;
                 }
-                if !pass
+                if let Err(halt) = pass
                     .record_poll(&seller_pubky, None, pass.clock.now())
                     .await?
                 {
-                    break;
+                    return Ok(halted(tombstoned, halt));
                 }
                 continue;
             }
@@ -359,12 +553,13 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
                 }
                 settles += 1;
                 match pass.settle_deletion(&seller_pubky, listing_id).await? {
-                    SettleOutcome::Tombstoned => tombstoned += 1,
-                    SettleOutcome::NotDeleted => {}
-                    SettleOutcome::Unsettled => {
+                    Ok(SettleOutcome::Tombstoned) => tombstoned += 1,
+                    Ok(SettleOutcome::NotDeleted) => {}
+                    Ok(SettleOutcome::Unsettled) => {
                         complete = false;
                         break;
                     }
+                    Err(halt) => return Ok(halted(tombstoned, halt)),
                 }
             }
             settled_through = Some(event.cursor.as_str());
@@ -377,12 +572,11 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
         } else {
             pass.clock.now()
         };
-        if !pass
+        if let Err(halt) = pass
             .record_poll(&seller_pubky, settled_through, polled_at)
             .await?
         {
-            tracing::warn!("listing deletion follower lost its lease; stopping the pass");
-            break;
+            return Ok(halted(tombstoned, halt));
         }
     }
     if unhosted > 0 {
@@ -392,6 +586,20 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
         );
     }
     Ok(tombstoned)
+}
+
+fn halted(tombstoned: u64, halt: Halt) -> u64 {
+    match halt {
+        Halt::OutOfTime => {
+            tracing::warn!(
+                "listing deletion follower reached its lease deadline; stopping the pass"
+            )
+        }
+        Halt::LeaseLost => {
+            tracing::warn!("listing deletion follower lost its lease; stopping the pass")
+        }
+    }
+    tombstoned
 }
 
 #[cfg(test)]
