@@ -88,5 +88,7 @@ with plain builds.
 | One active drop per listing generation | `drop_listings_one_active_per_listing` (0047) |
 | Follower cursors, leases | primary keys of `listing_deletion_cursors`, `worker_leases` |
 
-The follower's fenced lease (0050) adds a column to `worker_leases`, one row
-per background task, and no index.
+0050 (fenced listing deletion) adds `worker_leases.fence`,
+`listings.revived_from_cursor`, and two guard triggers, and no index. It
+sets `lock_timeout` so its brief `listings` locks cannot queue behind a
+long transaction.
