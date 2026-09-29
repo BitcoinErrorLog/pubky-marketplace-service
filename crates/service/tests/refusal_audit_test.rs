@@ -30,13 +30,23 @@ use uuid::Uuid;
 static ADMIN_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
 static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 
-/// Waits until the writer has finished `target` envelopes in total. The
-/// writer signals as each envelope's attempt loop returns, so the wait has no
-/// completion deadline: retries slip with load and the signal still arrives.
-/// The only clock is a stall guard. If no envelope settles for `STALL` and the
-/// writer's outcome or retry counters do not move, the writer is stuck (or an
-/// envelope never reached it) and the test fails with the writer's counters
-/// instead of hanging.
+/// Envelopes that either reached the writer or were terminally rejected by
+/// the non-blocking producer. Producer-side rejection is a real audit outcome:
+/// an unverified writer, full queue, or closed queue never reaches the writer
+/// and therefore never emits a settlement notification.
+fn refusal_envelopes_terminal(runtime: &RefusalAuditRuntime) -> u64 {
+    let metrics = runtime.metrics();
+    runtime
+        .envelopes_settled()
+        .saturating_add(metrics.dropped_queue_full)
+        .saturating_add(metrics.dropped_queue_closed)
+        .saturating_add(metrics.dropped_writer_unverified)
+}
+
+/// Waits until `target` envelopes have reached any terminal path. The writer
+/// signals as each accepted envelope's attempt loop returns; producer-side
+/// drops are read from the outcome counters. The only clock is a stall guard.
+/// Retry movement resets that guard without weakening the outcome assertions.
 fn refusal_writer_made_progress(
     before: &RefusalAuditMetricsSnapshot,
     after: &RefusalAuditMetricsSnapshot,
@@ -52,34 +62,31 @@ fn refusal_writer_made_progress(
         || before.retries_statement_timeout != after.retries_statement_timeout
         || before.retries_db_error != after.retries_db_error
         || before.writer_panics != after.writer_panics
-        || before.queue_depth != after.queue_depth
-        || before.pending_loss_gap != after.pending_loss_gap
-        || before.writer_authority_verified != after.writer_authority_verified
-        || before.consecutive_unhealthy_intervals != after.consecutive_unhealthy_intervals
 }
 
-async fn wait_for_settled(runtime: &RefusalAuditRuntime, target: u64, what: &str) {
+async fn wait_for_terminal(runtime: &RefusalAuditRuntime, target: u64, what: &str) {
     const STALL: StdDuration = StdDuration::from_secs(60);
     loop {
-        let seen = runtime.envelopes_settled();
+        let seen = refusal_envelopes_terminal(runtime);
         if seen >= target {
             return;
         }
+        let settled = runtime.envelopes_settled();
         let metrics_before = runtime.metrics();
-        if tokio::time::timeout(STALL, runtime.wait_until_envelopes_settled(seen + 1))
+        if tokio::time::timeout(STALL, runtime.wait_until_envelopes_settled(settled + 1))
             .await
             .is_ok()
         {
             continue;
         }
         let metrics_after = runtime.metrics();
-        if runtime.envelopes_settled() > seen
+        if refusal_envelopes_terminal(runtime) > seen
             || refusal_writer_made_progress(&metrics_before, &metrics_after)
         {
             continue;
         }
         panic!(
-            "{what}: writer settled {seen} of {target} and made no progress for \
+            "{what}: audit reached {seen} of {target} terminal outcomes and made no progress for \
              {STALL:?}: {:?}",
             metrics_after
         );
@@ -2685,7 +2692,7 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     let writer = actual_writer_fixture(&pool).await;
     let before = domain_snapshot(&pool).await;
     let mut golden = Vec::with_capacity(cases.len());
-    let settled_before = writer.runtime.envelopes_settled();
+    let terminal_before = refusal_envelopes_terminal(&writer.runtime);
     for case in &cases {
         let response = send_refusal_case(case, Arc::clone(&writer.runtime)).await;
         if case.kind == RefusalKind::NotFound {
@@ -2707,10 +2714,10 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     );
     // The writer commits, then increments its counters, then marks the
     // envelope settled. Waiting on that mark is the completion condition.
-    wait_for_settled(
+    wait_for_terminal(
         &writer.runtime,
-        settled_before + cases.len() as u64,
-        "healthy writer settles every envelope",
+        terminal_before + cases.len() as u64,
+        "healthy writer reaches a terminal outcome for every envelope",
     )
     .await;
     assert_eq!(
@@ -2735,7 +2742,7 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     sqlx::raw_sql("CREATE FUNCTION refusal_audit_timeout_fixture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$; CREATE TRIGGER refusal_audit_timeout_fixture BEFORE INSERT OR UPDATE ON command_refusal_audit_buckets FOR EACH ROW EXECUTE FUNCTION refusal_audit_timeout_fixture();")
         .execute(&pool).await.expect("timeout writer fixture");
     let timeout_drops_before = writer.runtime.metrics().dropped_after_retries;
-    let timeout_settled_before = writer.runtime.envelopes_settled();
+    let timeout_terminal_before = refusal_envelopes_terminal(&writer.runtime);
     for (case, expected) in cases.iter().zip(&golden) {
         let actual = tokio::time::timeout(
             StdDuration::from_secs(5),
@@ -2758,10 +2765,10 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     // spend the rest of the sleep while the connection closes, three attempts
     // per envelope. The writer marks each envelope settled when that loop
     // returns; the drop counter is the outcome.
-    wait_for_settled(
+    wait_for_terminal(
         &writer.runtime,
-        timeout_settled_before + cases.len() as u64,
-        "timed-out writer settles every envelope",
+        timeout_terminal_before + cases.len() as u64,
+        "timed-out writer reaches a terminal outcome for every envelope",
     )
     .await;
     assert_eq!(
@@ -2782,7 +2789,7 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         .await
         .expect("only writer slot on a pool of 1");
     let exhausted_drops_before = writer.runtime.metrics().dropped_after_retries;
-    let exhausted_settled_before = writer.runtime.envelopes_settled();
+    let exhausted_terminal_before = refusal_envelopes_terminal(&writer.runtime);
     for (case, expected) in cases.iter().zip(&golden) {
         // Domain work under load exceeds 250ms. A handler that awaited the
         // held writer would add three 100ms acquires per queued envelope and
@@ -2809,10 +2816,10 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     // acquires time out and the attempt loop then records the drop. That
     // loop marks the envelope settled when it returns. Under load the
     // acquire timers slip; the settlement mark is the completion condition.
-    wait_for_settled(
+    wait_for_terminal(
         &writer.runtime,
-        exhausted_settled_before + cases.len() as u64,
-        "exhausted writer settles every envelope",
+        exhausted_terminal_before + cases.len() as u64,
+        "exhausted writer reaches a terminal outcome for every envelope",
     )
     .await;
     assert_eq!(
