@@ -169,14 +169,19 @@ fn osm_id(properties: &PhotonProperties, index: usize) -> String {
     }
 }
 
+/// The upstream answered 200 with something that is not a Photon result set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedUpstream;
+
 /// Maps a Photon response to address suggestions. Results that cannot fill
 /// Address line 1 (a city, a country) are dropped.
 pub fn normalize(
     body: &[u8],
     query: &str,
     country_filter: Option<&str>,
-) -> Result<Vec<Suggestion>, ()> {
-    let collection: PhotonCollection = serde_json::from_slice(body).map_err(|_| ())?;
+) -> Result<Vec<Suggestion>, MalformedUpstream> {
+    let collection: PhotonCollection =
+        serde_json::from_slice(body).map_err(|_| MalformedUpstream)?;
     let typed_number = typed_house_number(query);
     let mut seen: Vec<(String, String, String)> = Vec::new();
     let mut suggestions = Vec::new();
@@ -653,7 +658,7 @@ impl AddressSearchRuntime {
         let suggestions = match self.client.search(query, country).await {
             Ok(body) => match normalize(&body, query, country) {
                 Ok(suggestions) => suggestions,
-                Err(()) => {
+                Err(MalformedUpstream) => {
                     tracing::warn!("address search upstream answer was unreadable");
                     self.open_breaker(now());
                     return Err(SearchError::Unavailable {
