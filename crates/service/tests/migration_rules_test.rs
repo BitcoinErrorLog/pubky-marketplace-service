@@ -65,12 +65,14 @@ fn violations(sql: &str) -> Vec<String> {
         let builds =
             statement.starts_with("CREATE INDEX ") || statement.starts_with("CREATE UNIQUE INDEX ");
         let drops = statement.starts_with("DROP INDEX ") || statement.starts_with("REINDEX ");
+        let words: Vec<&str> = statement
+            .split([' ', '(', ')', ','])
+            .filter(|word| !word.is_empty())
+            .collect();
         let constraint = statement.starts_with("ALTER TABLE ")
-            && (statement.contains(" UNIQUE (")
-                || statement.contains(" UNIQUE(")
-                || statement.contains(" PRIMARY KEY (")
-                || statement.contains(" PRIMARY KEY(")
-                || statement.contains(" EXCLUDE "))
+            && (words.contains(&"UNIQUE")
+                || words.contains(&"EXCLUDE")
+                || words.windows(2).any(|pair| pair == ["PRIMARY", "KEY"]))
             && !statement.contains(" USING INDEX ");
         if constraint {
             let table = word_after(statement, "ALTER TABLE ").unwrap_or_default();
@@ -184,6 +186,18 @@ fn the_rule_refuses_every_blocking_or_unsafe_shape() {
             "a unique constraint built in place",
             "ALTER TABLE listings ADD CONSTRAINT listings_probe_key UNIQUE (title);",
         ),
+        (
+            "an inline unique column",
+            "ALTER TABLE listings ADD COLUMN probe INT UNIQUE;",
+        ),
+        (
+            "an inline primary key column",
+            "ALTER TABLE worker_leases ADD COLUMN probe BIGINT PRIMARY KEY;",
+        ),
+        (
+            "an exclusion constraint",
+            "ALTER TABLE listings ADD CONSTRAINT listings_probe_excl EXCLUDE USING gist (title WITH =);",
+        ),
     ] {
         assert!(!violations(sql).is_empty(), "{label} passed the rule");
     }
@@ -204,6 +218,14 @@ fn the_rule_refuses_every_blocking_or_unsafe_shape() {
         (
             "a constraint attached to a concurrently built index",
             "ALTER TABLE listings ADD CONSTRAINT listings_probe_key UNIQUE USING INDEX a_idx;",
+        ),
+        (
+            "a column whose name mentions unique",
+            "ALTER TABLE worker_leases ADD COLUMN IF NOT EXISTS unique_runs BIGINT NOT NULL DEFAULT 0;",
+        ),
+        (
+            "dropping a unique constraint",
+            "ALTER TABLE listings DROP CONSTRAINT IF EXISTS listings_probe_unique;",
         ),
     ] {
         assert_eq!(violations(sql), Vec::<String>::new(), "{label}");

@@ -11,9 +11,9 @@ A plain `CREATE INDEX` holds a `SHARE` lock on its table for the whole
 build, which blocks every `INSERT`, `UPDATE`, and `DELETE`. On `listings`,
 `orders`, `payments`, or `events` that pauses checkout, payment
 confirmation, and the workers until the build ends. A plain `DROP INDEX`
-takes an `ACCESS EXCLUSIVE` lock, which also blocks reads. Constraints
-added with `UNIQUE (...)`, `PRIMARY KEY (...)`, or `EXCLUDE` build their
-index the same way.
+takes an `ACCESS EXCLUSIVE` lock, which also blocks reads. A `UNIQUE`,
+`PRIMARY KEY`, or `EXCLUDE` constraint added to an existing table, as a
+table constraint or inline on a new column, builds its index the same way.
 
 Every migration after 0049 that builds, drops, or rebuilds an index on a
 table the same file did not create uses this shape:
