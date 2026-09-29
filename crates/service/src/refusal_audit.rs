@@ -17,7 +17,9 @@ use sha2::Sha256;
 use sqlx::pool::PoolConnection;
 use sqlx::{Acquire, PgPool, Postgres};
 use subtle::ConstantTimeEq;
-use tokio::sync::{mpsc, watch, Mutex};
+#[cfg(any(test, feature = "test-faults"))]
+use tokio::sync::watch;
+use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 const HKDF_SALT: &[u8] = b"marketplace/refusal-audit/hkdf-salt/v1";
@@ -437,6 +439,7 @@ pub struct RefusalAuditRuntime {
     metrics: Arc<RefusalAuditMetrics>,
     panic_next_writer: Arc<AtomicBool>,
     /// One increment each time the writer finishes an envelope.
+    #[cfg(any(test, feature = "test-faults"))]
     settled_tx: watch::Sender<u64>,
 }
 
@@ -467,10 +470,12 @@ impl RefusalAuditRuntime {
         let receiver = Arc::new(Mutex::new(receiver));
         let metrics = Arc::new(RefusalAuditMetrics::default());
         let panic_next_writer = Arc::new(AtomicBool::new(false));
+        #[cfg(any(test, feature = "test-faults"))]
         let (settled_tx, _) = watch::channel(0);
         let supervisor_metrics = metrics.clone();
         let supervisor_keys = keys.clone();
         let supervisor_panic = panic_next_writer.clone();
+        #[cfg(any(test, feature = "test-faults"))]
         let supervisor_settled = settled_tx.clone();
         tokio::spawn(async move {
             loop {
@@ -495,6 +500,7 @@ impl RefusalAuditRuntime {
                 let worker_metrics = supervisor_metrics.clone();
                 let worker_keys = supervisor_keys.clone();
                 let worker_panic = supervisor_panic.clone();
+                #[cfg(any(test, feature = "test-faults"))]
                 let worker_settled = supervisor_settled.clone();
                 let worker = tokio::spawn(async move {
                     writer_loop(
@@ -503,6 +509,7 @@ impl RefusalAuditRuntime {
                         worker_metrics,
                         worker_keys,
                         worker_panic,
+                        #[cfg(any(test, feature = "test-faults"))]
                         worker_settled,
                     )
                     .await
@@ -535,6 +542,7 @@ impl RefusalAuditRuntime {
             keys,
             metrics,
             panic_next_writer,
+            #[cfg(any(test, feature = "test-faults"))]
             settled_tx,
         }
     }
@@ -660,7 +668,7 @@ async fn writer_loop(
     metrics: Arc<RefusalAuditMetrics>,
     keys: AuditKeys,
     _panic_next_writer: Arc<AtomicBool>,
-    settled: watch::Sender<u64>,
+    #[cfg(any(test, feature = "test-faults"))] settled: watch::Sender<u64>,
 ) {
     let mut probe_interval = tokio::time::interval(Duration::from_secs(5));
     probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -706,7 +714,15 @@ async fn writer_loop(
                 if _panic_next_writer.swap(false, Ordering::Relaxed) {
                     panic!("injected refusal-audit writer panic");
                 }
-                deliver_with_retries(&pool, &envelope, &metrics, &keys, &settled).await;
+                deliver_with_retries(
+                    &pool,
+                    &envelope,
+                    &metrics,
+                    &keys,
+                    #[cfg(any(test, feature = "test-faults"))]
+                    &settled,
+                )
+                .await;
             }
         }
     }
@@ -714,8 +730,10 @@ async fn writer_loop(
 
 /// Notifies waiters after the attempt loop returns, once the outcome
 /// counters have moved.
+#[cfg(any(test, feature = "test-faults"))]
 struct SettleOnDrop<'a>(&'a watch::Sender<u64>);
 
+#[cfg(any(test, feature = "test-faults"))]
 impl Drop for SettleOnDrop<'_> {
     fn drop(&mut self) {
         self.0
@@ -728,8 +746,9 @@ async fn deliver_with_retries(
     envelope: &RefusalEnvelope,
     metrics: &RefusalAuditMetrics,
     keys: &AuditKeys,
-    settled: &watch::Sender<u64>,
+    #[cfg(any(test, feature = "test-faults"))] settled: &watch::Sender<u64>,
 ) {
+    #[cfg(any(test, feature = "test-faults"))]
     let _settled = SettleOnDrop(settled);
     for attempt in 0..DELIVERY_ATTEMPTS {
         if attempt > 0 {
@@ -1773,6 +1792,7 @@ mod tests {
             keys,
             metrics: metrics.clone(),
             panic_next_writer: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "test-faults"))]
             settled_tx,
         };
         let envelope = RefusalEnvelope {
