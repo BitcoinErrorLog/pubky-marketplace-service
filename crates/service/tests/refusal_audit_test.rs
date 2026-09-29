@@ -29,6 +29,32 @@ use uuid::Uuid;
 static ADMIN_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
 static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 
+/// Waits until the writer has finished `target` envelopes in total. The
+/// writer signals as each envelope's attempt loop returns, so the wait has no
+/// completion deadline: retries slip with load and the signal still arrives.
+/// The only clock is a stall guard. If no envelope settles for `STALL`, the
+/// writer is stuck (or an envelope never reached it) and the test fails with
+/// the writer's counters instead of hanging.
+async fn wait_for_settled(runtime: &RefusalAuditRuntime, target: u64, what: &str) {
+    const STALL: StdDuration = StdDuration::from_secs(60);
+    loop {
+        let seen = runtime.envelopes_settled();
+        if seen >= target {
+            return;
+        }
+        if tokio::time::timeout(STALL, runtime.wait_until_envelopes_settled(seen + 1))
+            .await
+            .is_err()
+        {
+            panic!(
+                "{what}: writer settled {seen} of {target} and made no progress for \
+                 {STALL:?}: {:?}",
+                runtime.metrics()
+            );
+        }
+    }
+}
+
 async fn poll_until(bound: StdDuration, mut ready: impl AsyncFnMut() -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + bound;
     loop {
@@ -2650,10 +2676,12 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     );
     // The writer commits, then increments its counters, then marks the
     // envelope settled. Waiting on that mark is the completion condition.
-    writer
-        .runtime
-        .wait_until_envelopes_settled(settled_before + cases.len() as u64)
-        .await;
+    wait_for_settled(
+        &writer.runtime,
+        settled_before + cases.len() as u64,
+        "healthy writer settles every envelope",
+    )
+    .await;
     assert_eq!(
         writer.runtime.metrics().delivered,
         cases.len() as u64,
@@ -2699,10 +2727,12 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     // spend the rest of the sleep while the connection closes, three attempts
     // per envelope. The writer marks each envelope settled when that loop
     // returns; the drop counter is the outcome.
-    writer
-        .runtime
-        .wait_until_envelopes_settled(timeout_settled_before + cases.len() as u64)
-        .await;
+    wait_for_settled(
+        &writer.runtime,
+        timeout_settled_before + cases.len() as u64,
+        "timed-out writer settles every envelope",
+    )
+    .await;
     assert_eq!(
         writer
             .runtime
@@ -2748,10 +2778,12 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     // acquires time out and the attempt loop then records the drop. That
     // loop marks the envelope settled when it returns. Under load the
     // acquire timers slip; the settlement mark is the completion condition.
-    writer
-        .runtime
-        .wait_until_envelopes_settled(exhausted_settled_before + cases.len() as u64)
-        .await;
+    wait_for_settled(
+        &writer.runtime,
+        exhausted_settled_before + cases.len() as u64,
+        "exhausted writer settles every envelope",
+    )
+    .await;
     assert_eq!(
         writer
             .runtime

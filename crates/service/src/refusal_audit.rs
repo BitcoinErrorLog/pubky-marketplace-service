@@ -437,9 +437,7 @@ pub struct RefusalAuditRuntime {
     metrics: Arc<RefusalAuditMetrics>,
     panic_next_writer: Arc<AtomicBool>,
     /// One increment each time the writer finishes an envelope.
-    /// Read by [`Self::envelopes_settled`]; also keeps the watch open.
     settled_tx: watch::Sender<u64>,
-    settled_rx: watch::Receiver<u64>,
 }
 
 impl fmt::Debug for RefusalAuditRuntime {
@@ -469,7 +467,7 @@ impl RefusalAuditRuntime {
         let receiver = Arc::new(Mutex::new(receiver));
         let metrics = Arc::new(RefusalAuditMetrics::default());
         let panic_next_writer = Arc::new(AtomicBool::new(false));
-        let (settled_tx, settled_rx) = watch::channel(0);
+        let (settled_tx, _) = watch::channel(0);
         let supervisor_metrics = metrics.clone();
         let supervisor_keys = keys.clone();
         let supervisor_panic = panic_next_writer.clone();
@@ -538,7 +536,6 @@ impl RefusalAuditRuntime {
             metrics,
             panic_next_writer,
             settled_tx,
-            settled_rx,
         }
     }
 
@@ -610,6 +607,7 @@ impl RefusalAuditRuntime {
     /// Envelopes the writer has finished attempting, whatever the outcome.
     /// The count moves when the attempt loop returns, after the outcome
     /// counter (`delivered`, `dropped_after_retries`, and the rest).
+    #[cfg(any(test, feature = "test-faults"))]
     pub fn envelopes_settled(&self) -> u64 {
         *self.settled_tx.borrow()
     }
@@ -617,8 +615,9 @@ impl RefusalAuditRuntime {
     /// Waits until [`envelopes_settled`](Self::envelopes_settled) reaches
     /// `target`. The writer notifies as each envelope finishes; the wait
     /// follows that signal.
+    #[cfg(any(test, feature = "test-faults"))]
     pub async fn wait_until_envelopes_settled(&self, target: u64) {
-        let mut settled = self.settled_rx.clone();
+        let mut settled = self.settled_tx.subscribe();
         loop {
             if *settled.borrow_and_update() >= target {
                 return;
@@ -719,8 +718,8 @@ struct SettleOnDrop<'a>(&'a watch::Sender<u64>);
 
 impl Drop for SettleOnDrop<'_> {
     fn drop(&mut self) {
-        let next = self.0.borrow().saturating_add(1);
-        let _ = self.0.send(next);
+        self.0
+            .send_modify(|settled| *settled = settled.saturating_add(1));
     }
 }
 
@@ -1733,7 +1732,7 @@ mod tests {
         };
         let root = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
         let keys = AuditKeys::parse(&root, "1", None, None).unwrap();
-        let (settled_tx, _settled_rx) = watch::channel(0);
+        let (settled_tx, _) = watch::channel(0);
         deliver_with_retries(&pool, &envelope, &metrics, &keys, &settled_tx).await;
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.retries_acquire_timeout, 3);
@@ -1768,14 +1767,13 @@ mod tests {
             .writer_authority_verified
             .store(true, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
-        let (settled_tx, settled_rx) = watch::channel(0);
+        let (settled_tx, _) = watch::channel(0);
         let runtime = RefusalAuditRuntime {
             sender,
             keys,
             metrics: metrics.clone(),
             panic_next_writer: Arc::new(AtomicBool::new(false)),
             settled_tx,
-            settled_rx,
         };
         let envelope = RefusalEnvelope {
             occurred_at: Utc::now(),
