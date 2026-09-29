@@ -1324,6 +1324,9 @@ pub(crate) async fn reacquire_hold(
     // covers the auction listing, whose quantities the reservation expiry
     // returned). The listing state follows the same rule as the ordinary
     // hold acquisition: fully reserved means `reserved`.
+    crate::handlers::lock_listings_in_order(tx, crate::handlers::order_line_listings(order))
+        .await
+        .map_err(|e| ResolutionFailure::Internal("listing locks".into(), e.to_string()))?;
     let lines = order.lines.as_array().expect("order lines are an array");
     for line in lines {
         let aggregate_id = line["listing_aggregate_id"]

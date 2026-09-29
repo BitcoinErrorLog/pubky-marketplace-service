@@ -342,6 +342,8 @@ pub(crate) async fn confirm_order(
     // Move each line's quantity from reserved to sold under the quantity
     // balance constraint; the listing machine declares reserved -> sold for
     // exactly this payment confirmation.
+    crate::handlers::lock_listings_in_order(tx, crate::handlers::order_line_listings(&order))
+        .await?;
     let lines = order.lines.as_array().expect("order lines are an array");
     for line in lines {
         let aggregate_id = line["listing_aggregate_id"]

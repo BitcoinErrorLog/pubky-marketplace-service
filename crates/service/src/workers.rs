@@ -123,20 +123,38 @@ pub async fn try_acquire_lease(
     now: DateTime<Utc>,
     lease_seconds: i64,
 ) -> Result<bool, sqlx::Error> {
+    Ok(
+        try_acquire_fenced_lease(pool, task, holder, now, lease_seconds)
+            .await?
+            .is_some(),
+    )
+}
+
+/// [`try_acquire_lease`] returning the lease's fence: a number that grows
+/// with every acquisition, renewals included, so a pass can tell whether
+/// the lease row is still the one it took. `None` when another live
+/// holder owns the task.
+pub async fn try_acquire_fenced_lease<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    task: &str,
+    holder: Uuid,
+    now: DateTime<Utc>,
+    lease_seconds: i64,
+) -> Result<Option<i64>, sqlx::Error> {
     let lease_until = now + chrono::Duration::seconds(lease_seconds);
-    let result = sqlx::query(
-        "INSERT INTO worker_leases (task, holder, lease_until) VALUES ($1, $2, $3) \
+    sqlx::query_scalar(
+        "INSERT INTO worker_leases (task, holder, lease_until, fence) VALUES ($1, $2, $3, 1) \
          ON CONFLICT (task) DO UPDATE SET holder = EXCLUDED.holder, \
-         lease_until = EXCLUDED.lease_until \
-         WHERE worker_leases.lease_until <= $4 OR worker_leases.holder = EXCLUDED.holder",
+         lease_until = EXCLUDED.lease_until, fence = worker_leases.fence + 1 \
+         WHERE worker_leases.lease_until <= $4 OR worker_leases.holder = EXCLUDED.holder \
+         RETURNING fence",
     )
     .bind(task)
     .bind(holder)
     .bind(lease_until)
     .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() == 1)
+    .fetch_optional(executor)
+    .await
 }
 
 /// Ends the holder's lease so any instance can take the task immediately.
@@ -152,6 +170,28 @@ pub async fn release_lease(
         .bind(now)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// [`release_lease`] for a fenced pass: a no-op once a later acquisition,
+/// by this holder or another, owns the row.
+pub async fn release_fenced_lease<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    task: &str,
+    holder: Uuid,
+    fence: i64,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE worker_leases SET lease_until = LEAST(lease_until, $4) \
+         WHERE task = $1 AND holder = $2 AND fence = $3",
+    )
+    .bind(task)
+    .bind(holder)
+    .bind(fence)
+    .bind(now)
+    .execute(executor)
+    .await?;
     Ok(())
 }
 
@@ -4187,13 +4227,21 @@ pub async fn run_once(
         // The lease is taken at the current time, not the pass start: the
         // tasks above may have run for a while, and the follower's writes
         // check the lease against the clock.
+        // Both deadlines count from before the acquisition, so time spent
+        // waiting on the lease row comes out of the pass, not on top of
+        // the lease.
+        let started = tokio::time::Instant::now();
+        let deadline = started
+            + std::time::Duration::from_millis(state.config.listing_deletion_pass_budget_ms);
+        let lease_deadline =
+            started + std::time::Duration::from_secs(u64::try_from(lease_seconds).unwrap_or(0));
         let lease_now = state.clock.now();
-        if try_acquire_lease(
+        if let Some(fence) = crate::listing_deletion::acquire_follower_lease(
             &state.pool,
-            TASK_LISTING_DELETIONS,
             holder,
             lease_now,
             lease_seconds,
+            deadline,
         )
         .await?
         {
@@ -4202,19 +4250,12 @@ pub async fn run_once(
                 homeserver,
                 clock: state.clock.as_ref(),
                 holder,
-                deadline: tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(
-                        state.config.listing_deletion_pass_budget_ms,
-                    ),
+                fence,
+                deadline,
+                lease_deadline,
             };
             let result = crate::listing_deletion::follow_homeserver_deletions(&pass).await;
-            release_lease(
-                &state.pool,
-                TASK_LISTING_DELETIONS,
-                holder,
-                state.clock.now(),
-            )
-            .await?;
+            pass.release_lease().await?;
             match result {
                 Ok(tombstoned) => summary.listings_tombstoned = tombstoned,
                 Err(error) => {

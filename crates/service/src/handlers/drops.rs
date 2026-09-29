@@ -344,6 +344,10 @@ async fn apply_resync(
 /// seen here, and one still waiting cannot release bindings until this
 /// commits. A binding that commits while a tombstone waits keeps the
 /// deleted generation, which gating ignores once the listing is re-created.
+///
+/// The share locks are taken in `aggregate_id` order, the order every
+/// multi-listing transaction locks in (see
+/// [`crate::handlers::lock_listings_in_order`]).
 async fn insert_drop_listing_bindings(
     tx: &mut Transaction<'_, Postgres>,
     drop: &DropRow,

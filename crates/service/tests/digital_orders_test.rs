@@ -1978,6 +1978,7 @@ async fn a_deleted_listing_still_delivers_its_paid_digital_order(pool: PgPool) {
     let mut tx = app.pool.begin().await.expect("tx");
     marketplace_service::listing_deletion::tombstone(
         &mut tx,
+        marketplace_service::listing_deletion::DeletionAuthority::Command,
         &listing,
         "9",
         "system",

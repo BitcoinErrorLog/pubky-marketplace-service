@@ -28,7 +28,9 @@ use crate::homeserver::{
     registration_payload_from_record, HomeserverFetchOutcome, HomeserverListingClient,
     MalformedDigitalLock,
 };
-use crate::listing_deletion::{latest_event_is_delete, tombstone, DeletionCheck};
+use crate::listing_deletion::{
+    latest_event_is_delete, tombstone, DeletionAuthority, DeletionCheck,
+};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 pub async fn handle(
@@ -312,6 +314,7 @@ async fn settle_missing_record(
     };
     match tombstone(
         tx,
+        DeletionAuthority::Command,
         &command.aggregate_id,
         &cursor,
         actor,
