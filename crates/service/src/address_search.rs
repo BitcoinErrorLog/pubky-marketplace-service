@@ -130,19 +130,51 @@ fn first_non_empty(values: &[&Option<String>]) -> String {
         .unwrap_or_default()
 }
 
-/// The leading house number a buyer typed ("42 Union St" -> "42"), used only
-/// when OpenStreetMap matched the street but has no point for that number.
+/// The house number a buyer typed ahead of the street ("42 Union St" ->
+/// "42"). Ordinals ("5th", "42nd") are street names, not house numbers.
 fn typed_house_number(query: &str) -> Option<String> {
     let mut tokens = query.split_whitespace();
     let first = tokens.next()?;
     tokens.next()?;
-    let valid = first.len() <= 10
-        && first.chars().next().is_some_and(|c| c.is_ascii_digit())
-        && first.chars().filter(|c| c.is_ascii_digit()).count() <= 6
-        && first
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '/');
-    valid.then(|| first.to_string())
+    let (digits, suffix) = first.split_at(
+        first
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(first.len()),
+    );
+    let plain = !digits.is_empty()
+        && digits.len() <= 6
+        && (suffix.is_empty()
+            || (suffix.len() == 1 && suffix.chars().all(|c| c.is_ascii_alphabetic())));
+    let range = first.split_once(['-', '/']).is_some_and(|(left, right)| {
+        !left.is_empty()
+            && !right.is_empty()
+            && left.len() <= 6
+            && right.len() <= 6
+            && left.chars().all(|c| c.is_ascii_digit())
+            && right.chars().all(|c| c.is_ascii_digit())
+    });
+    (plain || range).then(|| first.to_string())
+}
+
+/// True when the street plausibly is the one the buyer is typing: the typed
+/// text after the number starts the street name, or the street name starts
+/// the typed text. Photon's fuzzy neighbours ("Bedford Street" for "Union
+/// Street New Bedford") never receive the buyer's number.
+fn street_matches_typed(street: &str, query: &str, number: &str) -> bool {
+    let rest = query
+        .trim()
+        .strip_prefix(number)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let street = street.to_lowercase();
+    if rest.is_empty() || street.starts_with(&format!("{} ", number.to_lowercase())) {
+        return false;
+    }
+    let first_word = rest.split(' ').next().unwrap_or("");
+    street.starts_with(first_word) || rest.starts_with(&street)
 }
 
 fn compose_line1(country: &str, number: &str, street: &str) -> String {
@@ -211,8 +243,11 @@ pub fn normalize(
         let (line1, precision) = if !number.is_empty() {
             (compose_line1(&country, &number, &street_name), "house")
         } else {
-            let typed = typed_number.clone().unwrap_or_default();
-            (compose_line1(&country, &typed, &street_name), "street")
+            let typed = typed_number
+                .as_deref()
+                .filter(|number| street_matches_typed(&street_name, query, number))
+                .unwrap_or("");
+            (compose_line1(&country, typed, &street_name), "street")
         };
         let city = first_non_empty(&[&properties.city, &properties.district, &properties.locality]);
         let region = clean(properties.state.as_deref());

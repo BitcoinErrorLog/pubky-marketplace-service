@@ -41,11 +41,11 @@
     },
     {
       "id": "w11779545",
-      "primary": "42 Bedford Street",
+      "primary": "Bedford Street",
       "secondary": "Rahway, New Jersey 07065",
       "precision": "street",
       "address": {
-        "line1": "42 Bedford Street",
+        "line1": "Bedford Street",
         "city": "Rahway",
         "region": "New Jersey",
         "postal_code": "07065",
