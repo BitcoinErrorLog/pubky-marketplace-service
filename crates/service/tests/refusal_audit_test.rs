@@ -52,6 +52,10 @@ fn refusal_writer_made_progress(
         || before.retries_statement_timeout != after.retries_statement_timeout
         || before.retries_db_error != after.retries_db_error
         || before.writer_panics != after.writer_panics
+        || before.queue_depth != after.queue_depth
+        || before.pending_loss_gap != after.pending_loss_gap
+        || before.writer_authority_verified != after.writer_authority_verified
+        || before.consecutive_unhealthy_intervals != after.consecutive_unhealthy_intervals
 }
 
 async fn wait_for_settled(runtime: &RefusalAuditRuntime, target: u64, what: &str) {
