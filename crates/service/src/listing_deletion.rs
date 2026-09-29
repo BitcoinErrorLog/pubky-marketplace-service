@@ -198,10 +198,14 @@ enum Halt {
     LeaseLost,
 }
 
+/// How much earlier than the deadline the server cancels a statement, so
+/// the cancellation reaches a caller that is still waiting for it.
+const SERVER_CANCEL_MARGIN: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Opens a transaction for work that must end by `deadline`. The server
-/// cancels any of its statements still running at the deadline, one
-/// waiting on a row lock included, and ends the session if it sits idle
-/// inside the transaction that long, so no lock the transaction takes
+/// cancels any of its statements still running just before the deadline,
+/// one waiting on a row lock included, and ends the session if it sits
+/// idle inside the transaction that long, so no lock the transaction takes
 /// outlives the deadline. `None` when the deadline has already passed.
 async fn begin_by(
     pool: &PgPool,
@@ -212,7 +216,11 @@ async fn begin_by(
     if remaining.is_zero() {
         return Ok(None);
     }
-    let millis = remaining.as_millis().max(1).to_string();
+    let millis = remaining
+        .saturating_sub(SERVER_CANCEL_MARGIN)
+        .as_millis()
+        .max(1)
+        .to_string();
     sqlx::query(
         "SELECT set_config('statement_timeout', $1, true), \
          set_config('idle_in_transaction_session_timeout', $1, true)",
@@ -224,7 +232,7 @@ async fn begin_by(
 }
 
 /// Waits for one unit of database work no longer than `deadline`, even
-/// when no pool connection is free. A statement the server cancelled at
+/// when no pool connection is free. A statement the server cancelled for
 /// the deadline, or a unit still running when it passes, is `None`; that
 /// unit committed nothing it had not already committed.
 async fn by_deadline<T>(

@@ -1967,6 +1967,61 @@ async fn the_follower_cursor_never_moves_backwards(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_follower_counts_its_deadlines_from_before_it_waits_for_the_lease_row(pool: PgPool) {
+    use marketplace_service::workers::{release_lease, TASK_LISTING_DELETIONS};
+
+    let mut config = marketplace_service::config::Config::for_tests();
+    config.worker_lease_seconds = 2;
+    config.listing_deletion_pass_budget_ms = 1_000;
+    let (app, homeserver) = common::test_app_with_homeserver_config(pool, config).await;
+    let seller = new_actor(&app).await;
+    let ids: Vec<String> = (0..5).map(|index| format!("wait_{index}")).collect();
+    for id in &ids {
+        homeserver.put_record(&seller.pubky, id, record(1, 1));
+        register_as(&app, &seller, id, 1).await;
+        homeserver.delete_record(&seller.pubky, id);
+    }
+    let previous = Uuid::new_v4();
+    take_follower_lease(&app, previous).await;
+    release_lease(&app.pool, TASK_LISTING_DELETIONS, previous, app.clock.now())
+        .await
+        .expect("previous pass released");
+    homeserver.set_delay(std::time::Duration::from_millis(300));
+
+    // Another pass's write holds the free lease row for 800 ms.
+    let mut blocker = app.pool.begin().await.expect("blocker tx");
+    sqlx::query("SELECT 1 FROM worker_leases WHERE task = $1 FOR UPDATE")
+        .bind(TASK_LISTING_DELETIONS)
+        .execute(&mut *blocker)
+        .await
+        .expect("lease row held");
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        blocker.rollback().await
+    });
+    let started = std::time::Instant::now();
+    marketplace_service::workers::run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("worker pass");
+    let elapsed = started.elapsed();
+    release
+        .await
+        .expect("blocker task")
+        .expect("blocker released");
+    // The pass waited 800 ms for its lease row, then had what was left of
+    // its one-second budget. Counted from the acquisition instead, it
+    // would confirm deletions until 1.8 s.
+    assert!(
+        elapsed >= std::time::Duration::from_millis(800),
+        "the pass did not wait for the lease row: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(1_500),
+        "the wait for the lease row was added to the pass: {elapsed:?}"
+    );
+}
+
 const LOWER_LISTING: &str = "order_a";
 const HIGHER_LISTING: &str = "order_b";
 
