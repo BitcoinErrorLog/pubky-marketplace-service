@@ -29,28 +29,6 @@ use uuid::Uuid;
 static ADMIN_LOGIN_FIXTURE: Mutex<()> = Mutex::const_new(());
 static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 
-/// Poll until `current` reaches `target`, or panic with the last value.
-/// The audit writer commits the bucket row and only then increments
-/// `delivered`, so a row check and a counter check are not one observation.
-async fn poll_metric(
-    bound: StdDuration,
-    mut current: impl FnMut() -> u64,
-    target: u64,
-    what: &str,
-) {
-    let deadline = tokio::time::Instant::now() + bound;
-    loop {
-        let value = current();
-        if value >= target {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("{what}: {value} of {target}");
-        }
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
-    }
-}
-
 async fn poll_until(bound: StdDuration, mut ready: impl AsyncFnMut() -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + bound;
     loop {
@@ -2650,6 +2628,7 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     let writer = actual_writer_fixture(&pool).await;
     let before = domain_snapshot(&pool).await;
     let mut golden = Vec::with_capacity(cases.len());
+    let settled_before = writer.runtime.envelopes_settled();
     for case in &cases {
         let response = send_refusal_case(case, Arc::clone(&writer.runtime)).await;
         if case.kind == RefusalKind::NotFound {
@@ -2669,13 +2648,17 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         before,
         "healthy writer changes no domain facts"
     );
-    poll_metric(
-        StdDuration::from_secs(30),
-        || writer.runtime.metrics().delivered,
+    // The writer commits, then increments its counters, then marks the
+    // envelope settled. Waiting on that mark is the completion condition.
+    writer
+        .runtime
+        .wait_until_envelopes_settled(settled_before + cases.len() as u64)
+        .await;
+    assert_eq!(
+        writer.runtime.metrics().delivered,
         cases.len() as u64,
-        "all healthy catalog fixtures delivered",
-    )
-    .await;
+        "all healthy catalog fixtures delivered"
+    );
     let produced = sqlx::query_scalar::<_, i16>(
         "SELECT DISTINCT refusal_kind FROM command_refusal_audit_buckets ORDER BY refusal_kind",
     )
@@ -2693,6 +2676,7 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     sqlx::raw_sql("CREATE FUNCTION refusal_audit_timeout_fixture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$; CREATE TRIGGER refusal_audit_timeout_fixture BEFORE INSERT OR UPDATE ON command_refusal_audit_buckets FOR EACH ROW EXECUTE FUNCTION refusal_audit_timeout_fixture();")
         .execute(&pool).await.expect("timeout writer fixture");
     let timeout_drops_before = writer.runtime.metrics().dropped_after_retries;
+    let timeout_settled_before = writer.runtime.envelopes_settled();
     for (case, expected) in cases.iter().zip(&golden) {
         let actual = tokio::time::timeout(
             StdDuration::from_secs(5),
@@ -2713,20 +2697,21 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     );
     // The fixture sleeps 1s in the insert. Cancelling that statement can still
     // spend the rest of the sleep while the connection closes, three attempts
-    // per envelope. Stop as soon as every drop lands; the cap covers that cost.
-    poll_metric(
-        StdDuration::from_secs(180),
-        || {
-            writer
-                .runtime
-                .metrics()
-                .dropped_after_retries
-                .saturating_sub(timeout_drops_before)
-        },
+    // per envelope. The writer marks each envelope settled when that loop
+    // returns; the drop counter is the outcome.
+    writer
+        .runtime
+        .wait_until_envelopes_settled(timeout_settled_before + cases.len() as u64)
+        .await;
+    assert_eq!(
+        writer
+            .runtime
+            .metrics()
+            .dropped_after_retries
+            .saturating_sub(timeout_drops_before),
         cases.len() as u64,
-        "every timed-out envelope exhausts three attempts",
-    )
-    .await;
+        "every timed-out envelope exhausts three attempts"
+    );
     sqlx::raw_sql("DROP TRIGGER refusal_audit_timeout_fixture ON command_refusal_audit_buckets; DROP FUNCTION refusal_audit_timeout_fixture();")
         .execute(&pool).await.expect("remove timeout fixture");
 
@@ -2736,10 +2721,11 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         .await
         .expect("only writer slot on a pool of 1");
     let exhausted_drops_before = writer.runtime.metrics().dropped_after_retries;
+    let exhausted_settled_before = writer.runtime.envelopes_settled();
     for (case, expected) in cases.iter().zip(&golden) {
         // Domain work under load exceeds 250ms. A handler that awaited the
         // held writer would add three 100ms acquires per queued envelope and
-        // miss this cap on the later cases. The drop poll below is the
+        // miss this cap on the later cases. Settlement below is the
         // completion condition.
         let actual = tokio::time::timeout(
             StdDuration::from_secs(5),
@@ -2758,21 +2744,23 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         before,
         "exhausted writer changes no domain facts"
     );
-    // Acquire timeout is 100ms, three attempts per envelope (~15s idle for the
-    // catalog). Main CI elapsed a 20s cap while the counter was still moving.
-    poll_metric(
-        StdDuration::from_secs(90),
-        || {
-            writer
-                .runtime
-                .metrics()
-                .dropped_after_retries
-                .saturating_sub(exhausted_drops_before)
-        },
+    // The only writer connection is held above, so each envelope's three
+    // acquires time out and the attempt loop then records the drop. That
+    // loop marks the envelope settled when it returns. Under load the
+    // acquire timers slip; the settlement mark is the completion condition.
+    writer
+        .runtime
+        .wait_until_envelopes_settled(exhausted_settled_before + cases.len() as u64)
+        .await;
+    assert_eq!(
+        writer
+            .runtime
+            .metrics()
+            .dropped_after_retries
+            .saturating_sub(exhausted_drops_before),
         cases.len() as u64,
-        "every exhausted envelope exhausts three attempts",
-    )
-    .await;
+        "every exhausted envelope exhausts three attempts"
+    );
     drop(held_writer);
 
     let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8; 32]);
