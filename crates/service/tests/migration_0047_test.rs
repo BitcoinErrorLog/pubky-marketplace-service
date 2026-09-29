@@ -94,19 +94,38 @@ async fn a_tombstone_always_carries_its_homeserver_evidence(pool: PgPool) {
     assert!(mark(&pool, "boots_01", true, Some("7")).await);
     assert!(mark(&pool, "boots_01", false, None).await);
 
+    // 0050 admits a cursor write only from the current follower lease.
+    let holder = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO worker_leases (task, holder, lease_until, fence) \
+         VALUES ('listing_deletions', $1, now() + interval '1 hour', 1)",
+    )
+    .bind(holder)
+    .execute(&pool)
+    .await
+    .expect("follower lease");
     for (label, cursor, ok) in [
         ("numeric", Some("42"), true),
         ("null", None, true),
         ("text", Some("x"), false),
     ] {
+        let mut tx = pool.begin().await.expect("cursor tx");
+        sqlx::query("SELECT set_config('marketplace.listing_deletion_authority', $1, true)")
+            .bind(format!("follower:{holder}:1"))
+            .execute(&mut *tx)
+            .await
+            .expect("follower authority");
         let inserted = sqlx::query(
             "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
              VALUES ($1, $2, now())",
         )
         .bind(format!("{label}-seller"))
         .bind(cursor)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await;
+        if inserted.is_ok() {
+            tx.commit().await.expect("cursor commits");
+        }
         assert_eq!(inserted.is_ok(), ok, "{label}");
     }
 }
