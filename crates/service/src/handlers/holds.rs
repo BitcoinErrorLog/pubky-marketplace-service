@@ -28,7 +28,7 @@ use marketplace_domain::state_machines::{can_transition, listing_machine};
 use marketplace_domain::ErrorCode;
 use sqlx::{Postgres, Transaction};
 
-use crate::handlers::fetch_listing_for_update;
+use crate::handlers::{fetch_listing_for_update, lock_listings_in_order, order_line_listings};
 use crate::model::OrderRow;
 use crate::queries::ORDER_COLUMNS;
 use crate::result::CommandFailure;
@@ -85,6 +85,7 @@ pub(crate) async fn release_lines(
     now: DateTime<Utc>,
 ) -> Result<Result<(), CommandFailure>, sqlx::Error> {
     let column = held.column();
+    lock_listings_in_order(tx, order_line_listings(order)).await?;
     let lines = order.lines.as_array().expect("order lines are an array");
     for line in lines {
         let aggregate_id = line["listing_aggregate_id"]
@@ -170,6 +171,7 @@ pub async fn acquire_payment_hold(
         return Ok(Ok(rearmed));
     }
 
+    lock_listings_in_order(tx, order_line_listings(&order)).await?;
     let lines = order.lines.as_array().expect("order lines are an array");
     for line in lines {
         let aggregate_id = line["listing_aggregate_id"]

@@ -103,6 +103,13 @@ pub async fn handle(
         }
     }
 
+    crate::handlers::lock_listings_in_order(
+        tx,
+        peeked
+            .iter()
+            .map(|(line, _)| line.listing_aggregate_id.as_str()),
+    )
+    .await?;
     let mut resolved: Vec<(&CheckoutLine, ListingRow)> = Vec::with_capacity(peeked.len());
     for (line, _) in peeked {
         let Some(listing) = fetch_live_listing_for_update(tx, &line.listing_aggregate_id).await?

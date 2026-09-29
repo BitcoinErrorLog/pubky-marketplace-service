@@ -1966,3 +1966,344 @@ async fn the_follower_cursor_never_moves_backwards(pool: PgPool) {
         Some("50")
     );
 }
+
+const LOWER_LISTING: &str = "order_a";
+const HIGHER_LISTING: &str = "order_b";
+
+/// Registers `order_a` and `order_b` with three units each. Their aggregate
+/// ids sort in that order.
+async fn two_listings(
+    app: &TestApp,
+    homeserver: Option<&FakeHomeserver>,
+    seller: &TestActor,
+    register: fn(&str, i64) -> Value,
+) -> (String, String) {
+    for listing_id in [LOWER_LISTING, HIGHER_LISTING] {
+        if let Some(homeserver) = homeserver {
+            homeserver.put_record(&seller.pubky, listing_id, record(1, 3));
+        }
+        let mut command = register(&seller.pubky, 3);
+        command["command_id"] = json!(Uuid::new_v4());
+        command["aggregate_id"] = json!(format!("listing:{}_{listing_id}", seller.pubky));
+        command["payload"]["listing_id"] = json!(listing_id);
+        let (status, body) = execute(app, &seller.token, &command).await;
+        assert_eq!(status, StatusCode::OK, "register {listing_id}: {body}");
+    }
+    (
+        format!("listing:{}_{LOWER_LISTING}", seller.pubky),
+        format!("listing:{}_{HIGHER_LISTING}", seller.pubky),
+    )
+}
+
+/// A checkout of one unit of each listing, the higher aggregate id first.
+async fn higher_first_checkout(
+    app: &TestApp,
+    seller: &TestActor,
+    lower: &str,
+    higher: &str,
+) -> Value {
+    let revision = |aggregate_id: &str| {
+        let pool = app.pool.clone();
+        let aggregate_id = aggregate_id.to_string();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT server_revision FROM listings WHERE aggregate_id = $1",
+            )
+            .bind(aggregate_id)
+            .fetch_one(&pool)
+            .await
+            .expect("listing revision")
+        }
+    };
+    let mut checkout = common::checkout_command_with_id(&seller.pubky, &Uuid::new_v4().to_string());
+    checkout["payload"]["lines"] = json!([
+        { "listing_aggregate_id": higher, "expected_revision": revision(higher).await, "quantity": 1 },
+        { "listing_aggregate_id": lower, "expected_revision": revision(lower).await, "quantity": 1 },
+    ]);
+    checkout
+}
+
+/// Checks out both listings higher first and returns the order and payment
+/// ids.
+async fn higher_first_order(
+    app: &TestApp,
+    buyer: &TestActor,
+    seller: &TestActor,
+    lower: &str,
+    higher: &str,
+) -> (String, String) {
+    let checkout = higher_first_checkout(app, seller, lower, higher).await;
+    let (status, body) = execute(app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "two-line checkout: {body}");
+    assert_eq!(body["result"]["orders"].as_array().map(Vec::len), Some(1));
+    (
+        body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    )
+}
+
+/// Runs the command `spawn` starts, which locks the listings of a two-line
+/// order whose lines name the higher aggregate id first, beside a
+/// `drop.sync` that share-locks both listings. A share lock on the lower
+/// listing, held by a third transaction, pauses the command on it; the
+/// sync then takes what it can. Once the share lock goes, a command that
+/// locked in line order holds the higher listing while it waits on the
+/// sync's lock on the lower one, and the sync waits on the higher one:
+/// Postgres aborts one of them.
+async fn beside_a_drop_sync<T: Send + 'static>(
+    app: &TestApp,
+    sync_app: &TestApp,
+    homeserver: &FakeHomeserver,
+    seller: &TestActor,
+    lower: &str,
+    spawn: impl FnOnce() -> tokio::task::JoinHandle<T>,
+) -> T {
+    let mut blocker = app.pool.begin().await.expect("blocker tx");
+    sqlx::query("SELECT 1 FROM listings WHERE aggregate_id = $1 FOR SHARE")
+        .bind(lower)
+        .execute(&mut *blocker)
+        .await
+        .expect("lower listing share-locked");
+    let command = spawn();
+    wait_for_finish_or_lock_wait(&app.pool, &command, "listings").await;
+    assert!(
+        !command.is_finished(),
+        "the command did not wait on the lower listing"
+    );
+
+    homeserver.put_drop_record(
+        &seller.pubky,
+        "order_drop",
+        common::drop_record_json(
+            &seller.pubky,
+            "order_drop",
+            1,
+            &[LOWER_LISTING, HIGHER_LISTING],
+            &common::ts_after(3600),
+            None,
+            1,
+            1,
+        ),
+    );
+    let sync = spawn_command(
+        sync_app,
+        seller,
+        common::sync_drop_command(&seller.pubky, "order_drop", 900),
+    );
+    wait_for_finish_or_lock_wait(&app.pool, &sync, "FOR SHARE OF l").await;
+    blocker.rollback().await.expect("release the lower listing");
+
+    let (status, body) = sync.await.expect("sync task");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "drop.sync beside the command: {body}"
+    );
+    command.await.expect("command task")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_multi_line_checkout_and_a_drop_sync_lock_listings_in_one_order(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (lower, higher) = two_listings(&app, Some(&homeserver), &seller, register_command).await;
+    let checkout = higher_first_checkout(&app, &seller, &lower, &higher).await;
+    let (status, body) = beside_a_drop_sync(&app, &app, &homeserver, &seller, &lower, || {
+        spawn_command(&app, &buyer, checkout)
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK, "checkout beside the sync: {body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_multi_line_payment_hold_and_a_drop_sync_lock_listings_in_one_order(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (lower, higher) = two_listings(&app, Some(&homeserver), &seller, register_command).await;
+    let (_, payment_id) = higher_first_order(&app, &buyer, &seller, &lower, &higher).await;
+    let (status, body) = beside_a_drop_sync(&app, &app, &homeserver, &seller, &lower, || {
+        spawn_command(
+            &app,
+            &buyer,
+            payment_command(&payment_id, 1, "detected", 0, 901),
+        )
+    })
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "payment start beside the sync: {body}"
+    );
+    let (reserved,): (i64,) = sqlx::query_as(
+        "SELECT SUM(reserved_quantity)::bigint FROM listings WHERE aggregate_id IN ($1, $2)",
+    )
+    .bind(&lower)
+    .bind(&higher)
+    .fetch_one(&app.pool)
+    .await
+    .expect("reserved units");
+    assert_eq!(reserved, 2, "both lines are held");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_multi_line_payment_confirmation_and_a_drop_sync_lock_listings_in_one_order(
+    pool: PgPool,
+) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (lower, higher) = two_listings(&app, Some(&homeserver), &seller, register_command).await;
+    let (_, payment_id) = higher_first_order(&app, &buyer, &seller, &lower, &higher).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &payment_command(&payment_id, 1, "detected", 0, 902),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment start: {body}");
+    let (status, body) = beside_a_drop_sync(&app, &app, &homeserver, &seller, &lower, || {
+        spawn_command(
+            &app,
+            &buyer,
+            payment_command(&payment_id, 2, "confirmed", 1, 903),
+        )
+    })
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "confirmation beside the sync: {body}"
+    );
+    let (sold,): (i64,) = sqlx::query_as(
+        "SELECT SUM(sold_quantity)::bigint FROM listings WHERE aggregate_id IN ($1, $2)",
+    )
+    .bind(&lower)
+    .bind(&higher)
+    .fetch_one(&app.pool)
+    .await
+    .expect("sold units");
+    assert_eq!(sold, 2, "both lines are sold");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_multi_line_hold_release_and_a_drop_sync_lock_listings_in_one_order(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (lower, higher) = two_listings(&app, Some(&homeserver), &seller, register_command).await;
+    let (_, payment_id) = higher_first_order(&app, &buyer, &seller, &lower, &higher).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &payment_command(&payment_id, 1, "detected", 0, 904),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment start: {body}");
+    let after_window = app.clock.now() + chrono::Duration::days(1);
+    let expired = beside_a_drop_sync(&app, &app, &homeserver, &seller, &lower, || {
+        let state = app.state.clone();
+        tokio::spawn(async move {
+            marketplace_service::workers::expire_due_payment_windows(&state, after_window)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
+    .await;
+    assert_eq!(expired, Ok(1), "the hold released beside the sync");
+    let (reserved,): (i64,) = sqlx::query_as(
+        "SELECT SUM(reserved_quantity)::bigint FROM listings WHERE aggregate_id IN ($1, $2)",
+    )
+    .bind(&lower)
+    .bind(&higher)
+    .fetch_one(&app.pool)
+    .await
+    .expect("reserved units");
+    assert_eq!(reserved, 0, "both lines are released");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_late_bitcoin_reacquire_and_a_drop_sync_lock_listings_in_one_order(pool: PgPool) {
+    use common::paykit_review::{enable_bitcoin, status_confirmed};
+
+    let (app, _stripe, paykit) = common::test_app_with_payments(pool).await;
+    // The payments app mirrors listing records but serves no drops; the
+    // sync runs through a second app on the same database.
+    let homeserver = common::spawn_fake_homeserver().await;
+    let sync_app =
+        common::test_app_with_homeserver_client(app.pool.clone(), homeserver.client()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    paykit.set_allocation_mode("shared_manual");
+    enable_bitcoin(&app, &paykit, &seller).await;
+    let (lower, higher) = two_listings(&app, None, &seller, common::register_sat_command).await;
+    let (order_id, _) = higher_first_order(&app, &buyer, &seller, &lower, &higher).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{order_id}/payment-method"),
+        Some(&buyer.token),
+        &json!({ "method": "bitcoin" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bind: {body}");
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    marketplace_service::workers::drain_outbox(&app.pool, client, app.clock.now(), 30)
+        .await
+        .expect("activation delivers");
+    let order_uuid = Uuid::parse_str(&order_id).expect("order uuid");
+    let reference = marketplace_service::payments::attempt_reference(order_uuid, 1);
+
+    // The hold lapses; the money arrives late and reacquires both lines.
+    let after_window = app.clock.now() + chrono::Duration::seconds(7300);
+    assert!(
+        marketplace_service::workers::expire_due_payment_windows(&app.state, after_window)
+            .await
+            .expect("payment-window reaper")
+            >= 1
+    );
+    let mut late = status_confirmed("shared_manual", true, 2);
+    late["late_settlement"] = json!(true);
+    paykit.set_status(&reference, late);
+    let poll_at = after_window + chrono::Duration::seconds(60);
+    let applied = beside_a_drop_sync(&app, &sync_app, &homeserver, &seller, &lower, || {
+        let state = app.state.clone();
+        tokio::spawn(async move {
+            let client = state
+                .payments
+                .as_ref()
+                .and_then(|payments| payments.paykit.as_ref())
+                .expect("paykit client");
+            marketplace_service::workers::verify_due_paykit_payments(&state, client, poll_at)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
+    .await;
+    assert_eq!(
+        applied,
+        Ok(1),
+        "the late settlement applied beside the sync"
+    );
+    let (state, committed): (String, i64) = sqlx::query_as(
+        "SELECT o.state, (SELECT SUM(reserved_quantity + sold_quantity)::bigint FROM listings          WHERE aggregate_id IN ($2, $3)) FROM orders o WHERE o.id = $1",
+    )
+    .bind(order_uuid)
+    .bind(&lower)
+    .bind(&higher)
+    .fetch_one(&app.pool)
+    .await
+    .expect("late facts");
+    assert_eq!(committed, 2, "both lines were reacquired (order {state})");
+}

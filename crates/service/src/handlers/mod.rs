@@ -66,6 +66,51 @@ pub async fn fetch_listing_for_update(
     .await
 }
 
+/// Row-locks every listing in `aggregate_ids` in aggregate-id order, one
+/// statement, before a transaction touches any of them line by line.
+///
+/// Listing rows have one lock order: ascending `aggregate_id`, the order
+/// `drop.sync` share-locks its listings in. A transaction that locks or
+/// updates several listings (a multi-line checkout, hold, release,
+/// payment confirmation, or late-settlement reacquire) takes them all here
+/// first, so it never holds one listing while it waits for a lower one
+/// that another of these transactions already holds. The per-line locks
+/// that follow are re-locks this transaction already owns. Drop rows and
+/// drop bindings still come before any listing lock.
+pub async fn lock_listings_in_order<'a>(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), sqlx::Error> {
+    let mut ids: Vec<&str> = aggregate_ids.into_iter().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() < 2 {
+        return Ok(());
+    }
+    sqlx::query_scalar::<_, String>(
+        "SELECT aggregate_id FROM listings WHERE aggregate_id = ANY($1) \
+         ORDER BY aggregate_id FOR UPDATE",
+    )
+    .bind(&ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The listing aggregate ids of an order's lines.
+pub fn order_line_listings(order: &OrderRow) -> impl Iterator<Item = &str> {
+    order
+        .lines
+        .as_array()
+        .expect("order lines are an array")
+        .iter()
+        .map(|line| {
+            line["listing_aggregate_id"]
+                .as_str()
+                .expect("order line carries its listing aggregate id")
+        })
+}
+
 /// [`fetch_listing`] for paths that create a new commitment (checkout,
 /// offers, reserves, bids): a tombstoned listing reads as absent.
 pub async fn fetch_live_listing(
