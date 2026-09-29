@@ -257,7 +257,10 @@ fn assert_no_payout_identifiers(context: &str, body: &Value) {
             "{context}: response exposes `{needle}`: {body}"
         );
     }
-    assert!(!text.contains('@'), "{context}: response carries an email: {body}");
+    assert!(
+        !text.contains('@'),
+        "{context}: response carries an email: {body}"
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -286,7 +289,10 @@ async fn public_config_never_exposes_payout_identifiers_to_anyone(pool: PgPool) 
             "stripe_payment_link",
             "stripe_restricted_key_set",
         ] {
-            assert!(body.get(field).is_none(), "{who}: `{field}` present: {body}");
+            assert!(
+                body.get(field).is_none(),
+                "{who}: `{field}` present: {body}"
+            );
         }
     }
 
