@@ -193,8 +193,8 @@ async fn payment_config_upserts_and_never_returns_the_restricted_key(pool: PgPoo
         Some(vec![
             "bitcoin_available",
             "bitcoin_offer_available",
-            "paypal_merchant_email",
-            "stripe_payment_link",
+            "paypal_available",
+            "stripe_available",
         ])
     );
 }
@@ -232,7 +232,153 @@ async fn payment_config_validation_refuses_bad_inputs(pool: PgPool) {
     // Nothing was stored by the rejected writes.
     let (status, body) = get_public_config(&app, &seller.pubky).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["stripe_payment_link"], Value::Null);
+    assert_eq!(body["stripe_available"], json!(false));
+    assert_eq!(body["paypal_available"], json!(false));
+}
+
+const MERCHANT_EMAIL: &str = "merchant@example.com";
+const STRIPE_LINK: &str = "https://buy.stripe.com/test_abc123";
+
+/// Fails when a response body carries any configured payout or contact
+/// identifier, in any casing or URL encoding.
+fn assert_no_payout_identifiers(context: &str, body: &Value) {
+    let text = body.to_string().to_ascii_lowercase();
+    for needle in [
+        MERCHANT_EMAIL,
+        "merchant%40example.com",
+        "example.com",
+        STRIPE_LINK,
+        "buy.stripe.com",
+        "test_abc123",
+        &RESTRICTED_KEY.to_ascii_lowercase(),
+    ] {
+        assert!(
+            !text.contains(needle),
+            "{context}: response exposes `{needle}`: {body}"
+        );
+    }
+    assert!(!text.contains('@'), "{context}: response carries an email: {body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn public_config_never_exposes_payout_identifiers_to_anyone(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let seller = new_actor(&app).await;
+    let stranger = new_actor(&app).await;
+    let (status, body) = put_config(&app, &seller.token, &full_config_body()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    paykit.set_claimed(&seller.pubky);
+
+    let path = format!("/v0/sellers/{}/payment-config", seller.pubky);
+    for (who, token) in [
+        ("unauthenticated", None),
+        ("another signed-in user", Some(stranger.token.as_str())),
+        ("the seller themself", Some(seller.token.as_str())),
+    ] {
+        let (status, body) = send(app.router.clone(), "GET", &path, token, &Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{who}: {body}");
+        assert_no_payout_identifiers(who, &body);
+        assert_eq!(body["paypal_available"], json!(true), "{who}");
+        assert_eq!(body["stripe_available"], json!(true), "{who}");
+        assert_eq!(body["bitcoin_offer_available"], json!(true), "{who}");
+        for field in [
+            "paypal_merchant_email",
+            "stripe_payment_link",
+            "stripe_restricted_key_set",
+        ] {
+            assert!(body.get(field).is_none(), "{who}: `{field}` present: {body}");
+        }
+    }
+
+    // A Stripe link without the verification key is not an acceptable rail.
+    let (status, body) = put_config(
+        &app,
+        &seller.token,
+        &json!({ "bitcoin_enabled": false, "stripe_payment_link": STRIPE_LINK, "stripe_restricted_key": "" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = get_public_config(&app, &seller.pubky).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_payout_identifiers("link without key", &body);
+    assert_eq!(body["stripe_available"], json!(false));
+    assert_eq!(body["paypal_available"], json!(false));
+    assert_eq!(body["bitcoin_available"], json!(false));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn unauthenticated_routes_never_expose_payout_identifiers(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    put_config(&app, &seller.token, &full_config_body()).await;
+    paykit.set_claimed(&seller.pubky);
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for path in [
+        "/health".to_string(),
+        "/ready".to_string(),
+        format!("/v0/sellers/{}/payment-config", seller.pubky),
+        "/v0/sellers/not-a-pubky/payment-config".to_string(),
+        "/v0/sellers/me/payment-config".to_string(),
+        format!("/v1/orders/{}", order.order_id),
+        "/v1/orders".to_string(),
+        format!("/v1/sellers/{}/orders", seller.pubky),
+    ] {
+        let (_, body) = send(app.router.clone(), "GET", &path, None, &Value::Null).await;
+        assert_no_payout_identifiers(&path, &body);
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_paypal_email_reaches_only_the_bound_orders_participants(pool: PgPool) {
+    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let stranger = new_actor(&app).await;
+    put_config(&app, &seller.token, &full_config_body()).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    // Before the bind, the buyer's own order view carries no identifier.
+    let unbound = read_order(&app, &buyer.token, &order.order_id).await;
+    assert_no_payout_identifiers("unbound order", &unbound);
+
+    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for token in [&buyer.token, &seller.token] {
+        let view = read_order(&app, token, &order.order_id).await;
+        let url = view["fiat_checkout_url"]
+            .as_str()
+            .expect("participants read the checkout url");
+        assert!(url.contains("business=merchant%40example.com"), "{url}");
+    }
+
+    let path = format!("/v1/orders/{}", order.order_id);
+    let (status, body) = send(app.router.clone(), "GET", &path, None, &Value::Null).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_no_payout_identifiers("unauthenticated order read", &body);
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        &path,
+        Some(&stranger.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_no_payout_identifiers("non-participant order read", &body);
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        "/v1/orders",
+        Some(&stranger.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_no_payout_identifiers("non-participant order list", &body);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

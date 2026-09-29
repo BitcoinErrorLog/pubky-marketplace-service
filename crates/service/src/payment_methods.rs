@@ -287,11 +287,37 @@ pub async fn get_own_payment_config(
     }
 }
 
+/// The unauthenticated rail projection. Booleans only: a seller's PayPal
+/// email, Stripe payment link, and any other payout or contact identifier
+/// never leave the service here. The PayPal email reaches a buyer only inside
+/// the `fiat_checkout_url` of an order they bound to PayPal, which only the
+/// order's participants can read.
+fn public_config_view(
+    bitcoin_available: bool,
+    bitcoin_offer_available: bool,
+    paypal_available: bool,
+    stripe_available: bool,
+) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "bitcoin_available": bitcoin_available,
+            "bitcoin_offer_available": bitcoin_offer_available,
+            "paypal_available": paypal_available,
+            "stripe_available": stripe_available,
+        })),
+    )
+        .into_response()
+}
+
 /// `GET /v0/sellers/{pubky}/payment-config` (public): the buyer-facing rail
 /// availability. `bitcoin_available` is true only when the seller enabled it
 /// AND their watch-only account is actually claimed on paykit-server.
 /// `bitcoin_offer_available` is the cached rail-wide Paykit gate. Older
 /// paykit-server responses without that field derive it from `status`.
+/// `paypal_available` is a stored merchant email; `stripe_available` is a
+/// stored payment link plus restricted key (the same rule as
+/// `seller_has_rail`), since Stripe payments are verified with that key.
 pub async fn get_payment_config(
     State(state): State<AppState>,
     Path(seller_pubky): Path<String>,
@@ -326,16 +352,7 @@ pub async fn get_payment_config(
         None => false,
     };
     let Some(config) = config else {
-        return (
-            StatusCode::OK,
-            Json(json!({
-                "bitcoin_available": false,
-                "bitcoin_offer_available": rail_health,
-                "stripe_payment_link": Value::Null,
-                "paypal_merchant_email": Value::Null,
-            })),
-        )
-            .into_response();
+        return public_config_view(false, rail_health, false, false);
     };
     let bitcoin_available = if config.bitcoin_enabled {
         let paykit = state
@@ -360,16 +377,12 @@ pub async fn get_payment_config(
     } else {
         false
     };
-    (
-        StatusCode::OK,
-        Json(json!({
-            "bitcoin_available": bitcoin_available,
-            "bitcoin_offer_available": rail_health,
-            "stripe_payment_link": config.stripe_payment_link,
-            "paypal_merchant_email": config.paypal_merchant_email,
-        })),
+    public_config_view(
+        bitcoin_available,
+        rail_health,
+        config.paypal_merchant_email.is_some(),
+        config.stripe_payment_link.is_some() && config.stripe_restricted_key_ciphertext.is_some(),
     )
-        .into_response()
 }
 
 async fn fetch_payment_for_order_update(

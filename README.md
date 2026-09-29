@@ -127,6 +127,15 @@ it serves `false` rather than returning 503.
 A seller's new Paykit claim becomes visible to buyers within
 `PAYKIT_POLL_SECONDS`.
 
+The endpoint is unauthenticated, so it returns booleans only:
+`paypal_available` (a merchant email is stored) and `stripe_available` (a
+payment link and restricted key are stored). It never returns the seller's
+PayPal email, Stripe payment link, or any other payout or contact identifier.
+The PayPal email reaches a buyer only inside the `fiat_checkout_url` of an
+order they bound to PayPal (`POST /v0/orders/{id}/payment-method`), which only
+that order's buyer and seller can read. The seller reads their own stored
+values from the authenticated `GET /v0/sellers/me/payment-config`.
+
 During deployment ordering, an older paykit-server response without
 `bitcoin_offer_available` is compatible: `electrum: "ready"` or
 `electrum: { "state": "ready" }` maps to `true`, and any other shape maps to
