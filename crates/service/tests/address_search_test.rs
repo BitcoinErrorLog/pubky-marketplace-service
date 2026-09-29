@@ -230,6 +230,46 @@ fn street_only_match_keeps_the_typed_house_number() {
 }
 
 #[test]
+fn a_typed_number_is_not_attached_to_a_fuzzy_neighbour_street() {
+    let suggestions = normalize(US_UNION, "42 Union Street New Bedford", Some("US")).unwrap();
+    let rahway = suggestions
+        .iter()
+        .find(|s| s.address.city == "Rahway")
+        .expect("the fuzzy neighbour is still offered");
+    assert_eq!(rahway.address.line1, "Bedford Street");
+    assert_eq!(rahway.precision, "street");
+    let brooklyn = suggestions
+        .iter()
+        .find(|s| s.address.city == "New York")
+        .expect("the Union Street in New York is offered");
+    assert_eq!(brooklyn.address.line1, "42 Union Street");
+}
+
+#[test]
+fn ordinals_and_unmatched_numbers_are_not_house_numbers() {
+    let street = |name: &str, query: &str| {
+        let body = json!({"features": [{"properties": {
+            "type": "street", "name": name, "city": "New York", "state": "New York",
+            "postcode": "10001", "countrycode": "US", "osm_type": "W", "osm_id": 7
+        }}]})
+        .to_string();
+        normalize(body.as_bytes(), query, Some("US")).unwrap()[0]
+            .address
+            .line1
+            .clone()
+    };
+    assert_eq!(street("5th Avenue", "5th Avenue New York"), "5th Avenue");
+    assert_eq!(street("42nd Street", "42nd Street New York"), "42nd Street");
+    assert_eq!(street("42nd Street", "42 42nd Street"), "42 42nd Street");
+    assert_eq!(street("Broadway", "1250 Broadway"), "1250 Broadway");
+    assert_eq!(street("Broadway", "1250B Broadway"), "1250B Broadway");
+    assert_eq!(street("Broadway", "12-14 Broadway"), "12-14 Broadway");
+    assert_eq!(street("Main Street", "1234567 Main Street"), "Main Street");
+    assert_eq!(street("Union Street", "42 Uni"), "42 Union Street");
+    assert_eq!(street("Union Street", "42"), "Union Street");
+}
+
+#[test]
 fn without_a_typed_number_a_street_match_fills_the_street_only() {
     let suggestions = normalize(US_UNION, "Union Street New Bedford", Some("US")).unwrap();
     assert_eq!(suggestions[0].address.line1, "Union Street");
