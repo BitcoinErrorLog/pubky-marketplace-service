@@ -231,6 +231,9 @@ pub fn build_router(state: AppState) -> Router {
             "/v0/drops/{seller_pubky}/{drop_id}",
             get(queries::get_public_drop),
         )
+        // Public: address autocomplete over OpenStreetMap data. The query is
+        // a POST body, never logged, and never bound to a session.
+        .route("/v0/address/suggest", post(crate::address_search::suggest))
         // Public: PayPal's IPN callback. Unauthenticated by nature;
         // authenticity is the postback, authorization is the match against
         // the seller's configured email and the exact order total.
