@@ -5,7 +5,8 @@ use std::ops::AsyncFnMut;
 
 use chrono::{Duration, Timelike, Utc};
 use marketplace_service::refusal_audit::{
-    AuditKeys, CommandKind, RefusalAuditRuntime, RefusalKind, SurfaceKind,
+    AuditKeys, CommandKind, RefusalAuditMetricsSnapshot, RefusalAuditRuntime, RefusalKind,
+    SurfaceKind,
 };
 use marketplace_service::{
     clock::AdjustableClock,
@@ -32,9 +33,27 @@ static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 /// Waits until the writer has finished `target` envelopes in total. The
 /// writer signals as each envelope's attempt loop returns, so the wait has no
 /// completion deadline: retries slip with load and the signal still arrives.
-/// The only clock is a stall guard. If no envelope settles for `STALL`, the
-/// writer is stuck (or an envelope never reached it) and the test fails with
-/// the writer's counters instead of hanging.
+/// The only clock is a stall guard. If no envelope settles for `STALL` and the
+/// writer's outcome or retry counters do not move, the writer is stuck (or an
+/// envelope never reached it) and the test fails with the writer's counters
+/// instead of hanging.
+fn refusal_writer_made_progress(
+    before: &RefusalAuditMetricsSnapshot,
+    after: &RefusalAuditMetricsSnapshot,
+) -> bool {
+    before.delivered != after.delivered
+        || before.dropped_after_retries != after.dropped_after_retries
+        || before.dropped_queue_full != after.dropped_queue_full
+        || before.dropped_queue_closed != after.dropped_queue_closed
+        || before.dropped_writer_unverified != after.dropped_writer_unverified
+        || before.dropped_ambiguous_commit != after.dropped_ambiguous_commit
+        || before.retries_acquire_timeout != after.retries_acquire_timeout
+        || before.retries_authority_verification != after.retries_authority_verification
+        || before.retries_statement_timeout != after.retries_statement_timeout
+        || before.retries_db_error != after.retries_db_error
+        || before.writer_panics != after.writer_panics
+}
+
 async fn wait_for_settled(runtime: &RefusalAuditRuntime, target: u64, what: &str) {
     const STALL: StdDuration = StdDuration::from_secs(60);
     loop {
@@ -42,16 +61,24 @@ async fn wait_for_settled(runtime: &RefusalAuditRuntime, target: u64, what: &str
         if seen >= target {
             return;
         }
+        let metrics_before = runtime.metrics();
         if tokio::time::timeout(STALL, runtime.wait_until_envelopes_settled(seen + 1))
             .await
-            .is_err()
+            .is_ok()
         {
-            panic!(
-                "{what}: writer settled {seen} of {target} and made no progress for \
-                 {STALL:?}: {:?}",
-                runtime.metrics()
-            );
+            continue;
         }
+        let metrics_after = runtime.metrics();
+        if runtime.envelopes_settled() > seen
+            || refusal_writer_made_progress(&metrics_before, &metrics_after)
+        {
+            continue;
+        }
+        panic!(
+            "{what}: writer settled {seen} of {target} and made no progress for \
+             {STALL:?}: {:?}",
+            metrics_after
+        );
     }
 }
 
