@@ -461,7 +461,7 @@ pub struct AddressSearchRuntime {
     upstream_per_second: f64,
     upstream_capacity: f64,
     inner: Mutex<Inner>,
-    flights: Mutex<HashMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
+    flights: Flights,
 }
 
 impl std::fmt::Debug for AddressSearchRuntime {
@@ -469,6 +469,32 @@ impl std::fmt::Debug for AddressSearchRuntime {
         f.debug_struct("AddressSearchRuntime")
             .field("client", &self.client)
             .finish()
+    }
+}
+
+type Flights = Mutex<HashMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>;
+
+/// One lookup's hold on its query's single flight. Dropping it, including
+/// when the request is cancelled mid-upstream call, removes the key once no
+/// other lookup holds it.
+struct FlightSlot<'a> {
+    gate: Option<Arc<tokio::sync::Mutex<()>>>,
+    key: CacheKey,
+    flights: &'a Flights,
+}
+
+impl Drop for FlightSlot<'_> {
+    fn drop(&mut self) {
+        self.gate.take();
+        let Ok(mut flights) = self.flights.lock() else {
+            return;
+        };
+        if flights
+            .get(&self.key)
+            .is_some_and(|gate| Arc::strong_count(gate) == 1)
+        {
+            flights.remove(&self.key);
+        }
     }
 }
 
@@ -650,23 +676,20 @@ impl AddressSearchRuntime {
                 retry_after_seconds,
             });
         }
-        let gate = self
-            .flights
-            .lock()
-            .expect("address search flights lock")
-            .entry(key)
-            .or_default()
-            .clone();
-        let result = self.fetch_once(&gate, key, &now, query, country).await;
-        drop(gate);
-        let mut flights = self.flights.lock().expect("address search flights lock");
-        if flights
-            .get(&key)
-            .is_some_and(|gate| Arc::strong_count(gate) == 1)
-        {
-            flights.remove(&key);
-        }
-        result
+        let slot = FlightSlot {
+            gate: Some(
+                self.flights
+                    .lock()
+                    .expect("address search flights lock")
+                    .entry(key)
+                    .or_default()
+                    .clone(),
+            ),
+            key,
+            flights: &self.flights,
+        };
+        let gate = slot.gate.as_deref().expect("flight gate is set");
+        self.fetch_once(gate, key, &now, query, country).await
     }
 
     async fn fetch_once<F>(
@@ -865,5 +888,42 @@ pub async fn suggest(State(state): State<AppState>, request: Request) -> Respons
             "Address suggestions are unavailable.",
             Some(retry_after_seconds),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AddressSearchRuntime;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_lookup_cancelled_during_the_upstream_call_leaves_no_flight_behind() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let runtime =
+            AddressSearchRuntime::new(&format!("http://127.0.0.1:{port}"), None, 30, 2).unwrap();
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            runtime.search(
+                chrono::Utc::now,
+                "203.0.113.1",
+                "42 Union Street",
+                Some("US"),
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the upstream never answered");
+        assert!(
+            runtime.flights.lock().unwrap().is_empty(),
+            "the cancelled lookup's flight key was removed"
+        );
+        silent.abort();
     }
 }
