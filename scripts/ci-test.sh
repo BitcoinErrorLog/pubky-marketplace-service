@@ -9,6 +9,11 @@
 #
 # --jobs 1 keeps a single test binary's pools open. Each #[sqlx::test] pool
 # defaults to 10 connections and Postgres max_connections is 100.
+#
+# Usage: scripts/ci-test.sh [package...]
+# No arguments tests the whole workspace (CI and the full pre-push gate).
+# Package names limit the run to those packages (the fast pre-push gate);
+# the integration binaries run only when marketplace-service is named.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -39,8 +44,26 @@ is_serial() {
   return 1
 }
 
-echo "ci-test: lib and bins, ${THREADS} threads"
-cargo test --workspace --jobs 1 --lib --bins --no-fail-fast -- --test-threads="$THREADS"
+scope=(--workspace)
+service=1
+if [ "$#" -gt 0 ]; then
+  scope=()
+  service=0
+  for pkg in "$@"; do
+    scope+=(-p "$pkg")
+    if [ "$pkg" = marketplace-service ]; then
+      service=1
+    fi
+  done
+fi
+
+echo "ci-test: lib and bins (${scope[*]}), ${THREADS} threads"
+cargo test "${scope[@]}" --jobs 1 --lib --bins --no-fail-fast -- --test-threads="$THREADS"
+
+if [ "$service" != 1 ]; then
+  echo "ci-test: integration tests skipped (marketplace-service not selected)"
+  exit 0
+fi
 
 parallel_args=()
 for file in crates/service/tests/*.rs; do
