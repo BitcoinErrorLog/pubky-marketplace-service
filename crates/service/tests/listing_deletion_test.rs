@@ -1983,6 +1983,7 @@ async fn the_follower_counts_its_deadlines_from_before_it_waits_for_the_lease_ro
     let mut config = marketplace_service::config::Config::for_tests();
     config.worker_lease_seconds = 2;
     config.listing_deletion_pass_budget_ms = 1_000;
+    let pass_budget = std::time::Duration::from_millis(config.listing_deletion_pass_budget_ms);
     let (app, homeserver) = common::test_app_with_homeserver_config(pool, config).await;
     let seller = new_actor(&app).await;
     let ids: Vec<String> = (0..5).map(|index| format!("wait_{index}")).collect();
@@ -1996,38 +1997,59 @@ async fn the_follower_counts_its_deadlines_from_before_it_waits_for_the_lease_ro
     release_lease(&app.pool, TASK_LISTING_DELETIONS, previous, app.clock.now())
         .await
         .expect("previous pass released");
-    homeserver.set_delay(std::time::Duration::from_millis(300));
 
-    // Another pass's write holds the free lease row for 800 ms.
+    // Another pass's write holds the free lease row. The follower blocks
+    // in its acquisition until this transaction ends.
     let mut blocker = app.pool.begin().await.expect("blocker tx");
     sqlx::query("SELECT 1 FROM worker_leases WHERE task = $1 FOR UPDATE")
         .bind(TASK_LISTING_DELETIONS)
         .execute(&mut *blocker)
         .await
         .expect("lease row held");
-    let release = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-        blocker.rollback().await
+    let state = app.state.clone();
+    let now = app.clock.now();
+    let mut pass = tokio::spawn(async move {
+        marketplace_service::workers::run_once(&state, Uuid::new_v4(), now).await
     });
-    let started = std::time::Instant::now();
-    marketplace_service::workers::run_once(&app.state, Uuid::new_v4(), app.clock.now())
-        .await
-        .expect("worker pass");
-    let elapsed = started.elapsed();
-    release
-        .await
-        .expect("blocker task")
-        .expect("blocker released");
-    // The pass waited 800 ms for its lease row, then had what was left of
-    // its one-second budget. Counted from the acquisition instead, it
-    // would confirm deletions until 1.8 s.
+    wait_for_lock_wait(&app.pool, "INSERT INTO worker_leases").await;
+
+    // The pass budget is a tokio Instant captured before that acquisition.
+    // Freezing the clock and sleeping the budget advances that Instant
+    // through the whole budget while the row is still locked. The
+    // acquisition times out on that same Instant, so the pass finishes
+    // still waiting on the row and confirms nothing. A budget captured
+    // after the acquisition would leave the pass blocked here: its
+    // acquire deadline is the lease (2s), which this sleep does not reach.
+    let finished_while_held = {
+        struct Resume;
+        impl Drop for Resume {
+            fn drop(&mut self) {
+                tokio::time::resume();
+            }
+        }
+        tokio::time::pause();
+        let _resume = Resume;
+        tokio::select! {
+            biased;
+            result = &mut pass => Some(result),
+            _ = tokio::time::sleep(pass_budget) => None,
+        }
+    };
+    blocker.rollback().await.expect("blocker released");
+    let passed = finished_while_held.is_some();
+    let summary = match finished_while_held {
+        Some(result) => result.expect("worker pass joins").expect("worker pass"),
+        None => pass.await.expect("worker pass joins").expect("worker pass"),
+    };
     assert!(
-        elapsed >= std::time::Duration::from_millis(800),
-        "the pass did not wait for the lease row: {elapsed:?}"
+        passed,
+        "the follower was still waiting on the lease row after its pass budget; \
+         tombstoned once the row was released: {}",
+        summary.listings_tombstoned
     );
-    assert!(
-        elapsed < std::time::Duration::from_millis(1_500),
-        "the wait for the lease row was added to the pass: {elapsed:?}"
+    assert_eq!(
+        summary.listings_tombstoned, 0,
+        "the pass confirmed deletions after its budget was spent waiting"
     );
 }
 
