@@ -5,7 +5,7 @@ use marketplace_domain::commands::{
 };
 use marketplace_domain::{ids, ErrorCode};
 use serde_json::{json, Value};
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::clock::format_timestamp;
@@ -69,19 +69,52 @@ fn register_addresses_its_own_listing(
 }
 
 /// The `listing.register` payload whose public record the executor must read
-/// before its transaction, or `None` for every other command.
-pub fn public_record_request<'c>(
+/// before its transaction, or `None` for every other command. A register at
+/// `expected_revision` 0 for a tombstoned listing would revive it, which
+/// only the seller's re-published record authorizes. A listing tombstoned
+/// after this read reaches the handler with no record, which refuses the
+/// revival.
+pub async fn public_record_request<'c>(
+    pool: &PgPool,
     actor: &str,
     command: &'c Command,
-) -> Option<&'c RegisterListingPayload> {
+) -> Result<Option<&'c RegisterListingPayload>, sqlx::Error> {
     let CommandPayload::RegisterListing(payload) = &command.payload else {
-        return None;
+        return Ok(None);
     };
-    if !register_addresses_its_own_listing(actor, command, payload) || !needs_public_record(payload)
-    {
-        return None;
+    if !register_addresses_its_own_listing(actor, command, payload) {
+        return Ok(None);
     }
-    Some(payload)
+    if needs_public_record(payload) {
+        return Ok(Some(payload));
+    }
+    if command.expected_revision != 0 {
+        return Ok(None);
+    }
+    let tombstoned: Option<bool> =
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM listings WHERE aggregate_id = $1")
+            .bind(&command.aggregate_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(tombstoned.unwrap_or(false).then_some(payload))
+}
+
+/// A revival is a re-creation: the seller's homeserver must hold the record
+/// again. A tombstone stands for a delete that is still the record's latest
+/// event, and a register must not reverse it.
+fn refuse_revival_without_record(prefetched: &RegisterRecordPrefetch) -> Option<CommandFailure> {
+    match prefetched {
+        RegisterRecordPrefetch::Found(_) => None,
+        RegisterRecordPrefetch::NotFound => Some(record_not_found()),
+        RegisterRecordPrefetch::Unavailable => Some(record_unavailable()),
+        RegisterRecordPrefetch::NotNeeded | RegisterRecordPrefetch::NoHomeserver => {
+            Some(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "This listing was deleted. Publish its record again to re-create it.",
+            ))
+        }
+    }
 }
 
 pub async fn prefetch_public_record(
@@ -263,6 +296,11 @@ pub async fn handle(
         return Ok(Err(
             crate::handlers::sync_listing::recreated_auction_refused(),
         ));
+    }
+    if reviving {
+        if let Some(refusal) = refuse_revival_without_record(prefetched) {
+            return Ok(Err(refusal));
+        }
     }
     if let Some(current) = current.as_ref().filter(|_| !reviving) {
         if payload.listing_revision <= current.listing_revision {
@@ -708,4 +746,33 @@ fn auction_json(
         "leader_pubky": existing("leader_pubky").unwrap_or(Value::Null),
         "bid_count": existing("bid_count").unwrap_or(json!(0)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{refuse_revival_without_record, RegisterRecordPrefetch};
+    use marketplace_domain::ErrorCode;
+    use serde_json::json;
+
+    // A listing tombstoned after the executor decided no record was needed
+    // reaches the handler with `NotNeeded`; only a found record revives.
+    #[test]
+    fn only_a_found_record_revives_a_tombstoned_listing() {
+        assert!(refuse_revival_without_record(&RegisterRecordPrefetch::Found(json!({}))).is_none());
+        for (prefetched, code) in [
+            (RegisterRecordPrefetch::NotFound, ErrorCode::NotFound),
+            (
+                RegisterRecordPrefetch::Unavailable,
+                ErrorCode::UpstreamUnavailable,
+            ),
+            (RegisterRecordPrefetch::NotNeeded, ErrorCode::InvalidState),
+            (
+                RegisterRecordPrefetch::NoHomeserver,
+                ErrorCode::InvalidState,
+            ),
+        ] {
+            let refusal = refuse_revival_without_record(&prefetched).expect("refused");
+            assert_eq!(refusal.code(), code);
+        }
+    }
 }

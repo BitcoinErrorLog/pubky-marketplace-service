@@ -1976,11 +1976,13 @@ async fn a_deleted_listing_still_delivers_its_paid_digital_order(pool: PgPool) {
 
     let listing = aggregate(&seller.pubky, "guide_01");
     let mut tx = app.pool.begin().await.expect("tx");
+    let epoch = record_epoch(&mut tx, &listing).await;
     marketplace_service::listing_deletion::tombstone(
         &mut tx,
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &listing,
         "9",
+        epoch,
         "system",
         Uuid::new_v4(),
         app.clock.now(),
@@ -2011,4 +2013,14 @@ async fn a_deleted_listing_still_delivers_its_paid_digital_order(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "seller evidence: {body}");
+}
+
+/// The listing's `record_epoch`, as a tombstone's caller observes it before
+/// confirming the delete.
+async fn record_epoch(conn: &mut sqlx::PgConnection, aggregate_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT record_epoch FROM listings WHERE aggregate_id = $1")
+        .bind(aggregate_id)
+        .fetch_one(conn)
+        .await
+        .expect("record epoch")
 }
