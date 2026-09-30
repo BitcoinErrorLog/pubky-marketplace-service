@@ -10,8 +10,16 @@
 # the shell patterns (root Cargo.toml and Cargo.lock, toolchain files, shared
 # fixtures) affects every package, so the function prints the single line
 # --workspace. A file under no package that matches no pattern (docs, CI,
-# the gate scripts) selects nothing. Otherwise it prints one package name per
-# line, sorted. A package whose name cannot be read also selects --workspace.
+# the gate scripts) selects nothing.
+#
+# The changed packages are then widened to every workspace member that
+# depends on one of them, directly or through other members, by any kind of
+# dependency (normal, dev or build), from `cargo metadata` resolve. A change
+# to a library therefore tests everything built on it. The result is one
+# package name per line, in byte order.
+#
+# A package whose name cannot be read, or a `cargo metadata` or jq failure,
+# selects --workspace: an unknown graph runs everything.
 #
 # Returns 1 when git cannot diff against <base>.
 
@@ -45,8 +53,37 @@ prepush_package_of_dir() {
   done
 }
 
+# Prints the named workspace members plus every member that depends on one
+# of them, transitively, one per line in byte order. Runs in the workspace
+# root. Returns 1 when the graph cannot be read.
+prepush_with_dependents() {
+  local metadata names
+  names="$(printf '%s\n' "$@" | jq -R . | jq -sc .)" || return 1
+  # --locked: the gate never rewrites Cargo.lock. A lock that needs changes
+  # means a root manifest changed, which already selects --workspace.
+  metadata="$(cargo metadata --format-version 1 --locked 2>/dev/null)" || return 1
+  printf '%s' "$metadata" | jq -r --argjson changed "$names" '
+    .workspace_members as $members
+    | (.packages
+        | map(select(.id as $id | $members | index($id)))
+        | map({key: .id, value: .name})
+        | from_entries) as $name
+    | [.resolve.nodes[]
+        | select($name[.id] != null)
+        | {name: $name[.id], deps: [.deps[].pkg | $name[.] | select(. != null)]}
+      ] as $nodes
+    | def widen($set):
+        ($set + [$nodes[] | select(any(.deps[]; . as $d | $set | index($d))) | .name]
+          | unique) as $next
+        | if ($next | length) == ($set | length) then $set else widen($next) end;
+      if ($changed - [$name[]] | length) > 0 then error("not a workspace member") else . end
+      | widen($changed | unique)
+      | .[]
+  '
+}
+
 prepush_changed_packages() {
-  local base="$1" diff_out untracked file pattern pkg
+  local base="$1" diff_out untracked file pattern pkg widened
   shift
   diff_out="$(git diff --name-only --no-renames "$base")" || return 1
   untracked="$(git ls-files --others --exclude-standard)"
@@ -68,7 +105,11 @@ prepush_changed_packages() {
     fi
     [ -n "$pkg" ] && names+=("$pkg")
   done < <(printf '%s\n%s\n' "$diff_out" "$untracked")
-  if [ "${#names[@]}" -gt 0 ]; then
-    printf '%s\n' "${names[@]}" | sort -u
+  [ "${#names[@]}" -gt 0 ] || return 0
+  if ! widened="$(prepush_with_dependents "${names[@]}")" || [ -z "$widened" ]; then
+    echo "prepush: cannot read the package graph (cargo metadata); testing the workspace" >&2
+    echo "--workspace"
+    return 0
   fi
+  printf '%s\n' "$widened"
 }

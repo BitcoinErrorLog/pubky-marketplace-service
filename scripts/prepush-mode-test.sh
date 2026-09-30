@@ -8,15 +8,23 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/prepush-mode-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+# A caller's CARGO_TARGET_DIR would make the gate seed its private target by
+# copying that directory.
+unset CARGO_TARGET_DIR
 
 fail() {
   echo "FAIL: $*" >&2
   exit 1
 }
 
+REAL_CARGO="$(command -v cargo)"
 mkdir -p "$WORK/bin"
+# metadata goes to the real cargo, so package widening reads a real graph.
 cat > "$WORK/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = metadata ]; then
+  exec "$REAL_CARGO" "$@"
+fi
 printf '%s\n' "$*" >> "$FAKE_LOG/cargo"
 EOF
 cat > "$WORK/bin/docker" <<'EOF'
@@ -27,30 +35,39 @@ case "$*" in
 esac
 exit 0
 EOF
-chmod +x "$WORK/bin/cargo" "$WORK/bin/docker"
+mkdir -p "$WORK/broken"
+printf '#!/usr/bin/env bash\nexit 101\n' > "$WORK/broken/cargo"
+chmod +x "$WORK/bin/cargo" "$WORK/bin/docker" "$WORK/broken/cargo"
+export REAL_CARGO
 
+# A real two-crate workspace: the service depends on the domain by path, as
+# in this repository.
 manifest() {
-  mkdir -p "$1"
-  printf '[package]\nname = "%s"\nversion = "0.1.0"\n' "$2" > "$1/Cargo.toml"
+  mkdir -p "$1/src"
+  printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' "$2" > "$1/Cargo.toml"
+  if [ -n "${3:-}" ]; then
+    printf '\n[dependencies]\n%s = { path = "%s" }\n' "$3" "$4" >> "$1/Cargo.toml"
+  fi
+  printf '// lib\n' > "$1/src/lib.rs"
+  printf '// extra\n' > "$1/src/extra.rs"
 }
 
 git init -q "$WORK/ws"
 cd "$WORK/ws"
 git config user.email test@example.invalid
 git config user.name test
-printf '[workspace]\nmembers = ["crates/domain", "crates/service"]\n' > Cargo.toml
-printf '# lock\n' > Cargo.lock
+printf '[workspace]\nresolver = "2"\nmembers = ["crates/domain", "crates/service"]\n' > Cargo.toml
 manifest crates/domain marketplace-domain
-manifest crates/service marketplace-service
-mkdir -p crates/domain/src crates/service/src crates/service/tests docs contracts scripts
-printf '// lib\n' > crates/domain/src/lib.rs
-printf '// lib\n' > crates/service/src/lib.rs
+manifest crates/service marketplace-service marketplace-domain ../domain
+"$REAL_CARGO" generate-lockfile --offline --quiet
+mkdir -p crates/service/tests docs contracts scripts
 printf '// t\n' > crates/service/tests/orders_test.rs
 printf '// t\n' > crates/service/tests/refusal_audit_test.rs
 printf 'doc\n' > docs/readme.md
 printf '{}\n' > contracts/endpoints.json
 cp "$DIR/prepush.sh" "$DIR/prepush-stamp.sh" "$DIR/prepush-packages.sh" \
   "$DIR/heavy-lock.sh" "$DIR/ci-test.sh" scripts/
+printf '/target\n' > .gitignore
 git add -A
 git commit -qm base
 BASE="$(git rev-parse HEAD)"
@@ -64,20 +81,27 @@ reset_ws() {
   git reset -q --hard "$BASE"
   git clean -qfd
 }
+both="marketplace-domain marketplace-service"
 
 echo "test: packages: no change selects nothing"
 [ -z "$(pkgs)" ] || fail "clean tree: $(pkgs)"
 
-echo "test: packages: a committed change selects its package"
+echo "test: packages: a domain change also selects its dependent marketplace-service"
 printf '// x\n' >> crates/domain/src/lib.rs
 git commit -qam domain
-[ "$(pkgs)" = marketplace-domain ] || fail "domain commit: $(pkgs)"
+[ "$(pkgs)" = "$both" ] || fail "domain commit: $(pkgs)"
+reset_ws
+
+echo "test: packages: a service change selects only the service"
+printf '// x\n' >> crates/service/src/lib.rs
+git commit -qam service
+[ "$(pkgs)" = marketplace-service ] || fail "service commit: $(pkgs)"
 reset_ws
 
 echo "test: packages: staged, unstaged and untracked files count"
 printf '// x\n' >> crates/domain/src/lib.rs
 git add crates/domain/src/lib.rs
-[ "$(pkgs)" = marketplace-domain ] || fail "staged: $(pkgs)"
+[ "$(pkgs)" = "$both" ] || fail "staged: $(pkgs)"
 reset_ws
 printf '// x\n' >> crates/service/src/lib.rs
 [ "$(pkgs)" = marketplace-service ] || fail "unstaged: $(pkgs)"
@@ -87,11 +111,11 @@ printf '// new\n' > crates/service/tests/new_test.rs
 reset_ws
 
 echo "test: packages: deletes and both sides of a rename count"
-git rm -q crates/domain/src/lib.rs
-[ "$(pkgs)" = marketplace-domain ] || fail "delete: $(pkgs)"
+git rm -q crates/service/src/extra.rs
+[ "$(pkgs)" = marketplace-service ] || fail "delete: $(pkgs)"
 reset_ws
-git mv crates/domain/src/lib.rs crates/service/src/moved.rs
-[ "$(pkgs)" = "marketplace-domain marketplace-service" ] || fail "rename: $(pkgs)"
+git mv crates/service/src/extra.rs crates/domain/src/moved.rs
+[ "$(pkgs)" = "$both" ] || fail "rename: $(pkgs)"
 reset_ws
 
 echo "test: packages: a file outside every package selects nothing"
@@ -112,10 +136,43 @@ printf '[package]\nversion = "0.1.0"\n' > crates/domain/Cargo.toml
 [ "$(pkgs)" = --workspace ] || fail "nameless manifest: $(pkgs)"
 reset_ws
 
+echo "test: packages: an unreadable package graph selects --workspace"
+printf '// x\n' >> crates/service/src/lib.rs
+got="$(PATH="$WORK/broken:$PATH" pkgs 2>/dev/null)"
+[ "$got" = --workspace ] || fail "failing cargo metadata: $got"
+reset_ws
+
+echo "test: packages: widening is transitive and counts dev-dependencies"
+(
+  git init -q "$WORK/chain"
+  cd "$WORK/chain"
+  printf '[workspace]\nresolver = "2"\nmembers = ["a", "b", "c", "d", "e"]\n' > Cargo.toml
+  for spec in "a:" "b:a" "c:b" "e:"; do
+    name="${spec%%:*}"
+    dep="${spec#*:}"
+    mkdir -p "$name/src"
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' "$name" > "$name/Cargo.toml"
+    [ -z "$dep" ] || printf '\n[dependencies]\n%s = { path = "../%s" }\n' "$dep" "$dep" >> "$name/Cargo.toml"
+    printf '// lib\n' > "$name/src/lib.rs"
+  done
+  mkdir -p d/src
+  printf '[package]\nname = "d"\nversion = "0.1.0"\nedition = "2021"\n\n[dev-dependencies]\na = { path = "../a" }\n' > d/Cargo.toml
+  printf '// lib\n' > d/src/lib.rs
+  "$REAL_CARGO" generate-lockfile --offline --quiet
+  got="$(prepush_with_dependents a | tr '\n' ' ' | sed 's/ $//')"
+  [ "$got" = "a b c d" ] || fail "chain from a: $got"
+  got="$(prepush_with_dependents c e | tr '\n' ' ' | sed 's/ $//')"
+  [ "$got" = "c e" ] || fail "leaves: $got"
+)
+
 echo "test: packages: a base git cannot read fails"
 if prepush_changed_packages 0000000000000000000000000000000000000001 >/dev/null 2>&1; then
   fail "unknown base returned 0"
 fi
+
+echo "test: packages: this repository's graph widens marketplace-domain to marketplace-service"
+got="$(cd "$DIR/.." && prepush_with_dependents marketplace-domain | tr '\n' ' ' | sed 's/ $//')"
+[ "$got" = "$both" ] || fail "repository graph: $got"
 
 # The real gate. Each case commits one change on top of the base, so the
 # selection is that change alone and no stamp is reused.
@@ -140,17 +197,19 @@ commit_change() {
   git commit -qam "change $1"
 }
 
-echo "test: gate: fast runs fmt, clippy and lib tests for a domain-only change"
+echo "test: gate: fast widens a domain change to the service and its integration binaries"
 commit_change crates/domain/src/lib.rs
 st="$(gate)"
 expect_ok "$st" "domain fast" fast
 cargo_log | grep -qx 'fmt --check' || fail "domain fast: no fmt: $(cargo_log)"
-cargo_log | grep -qx 'clippy -p marketplace-domain --all-targets -- -D warnings' \
+cargo_log | grep -qx 'clippy -p marketplace-domain -p marketplace-service --all-targets -- -D warnings' \
   || fail "domain fast: clippy: $(cargo_log)"
-cargo_log | grep -q '^test -p marketplace-domain --jobs 1 --lib --bins ' \
+cargo_log | grep -q '^test -p marketplace-domain -p marketplace-service --jobs 1 --lib --bins ' \
   || fail "domain fast: lib tests: $(cargo_log)"
-if cargo_log | grep -q -- '--workspace\|--test \|marketplace-service'; then
-  fail "domain fast ran more than the domain: $(cargo_log)"
+cargo_log | grep -q '^test -p marketplace-service --jobs 1 --test orders_test ' \
+  || fail "domain fast: integration binaries: $(cargo_log)"
+if cargo_log | grep -q -- '--workspace'; then
+  fail "domain fast used --workspace: $(cargo_log)"
 fi
 
 echo "test: gate: fast runs the integration binaries for a service change"
