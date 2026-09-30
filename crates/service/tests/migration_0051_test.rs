@@ -1,10 +1,11 @@
 //! 0051: `listings.record_epoch` and the tombstone rule that reads it. A
 //! row that predates the file keeps its state across a rerun and its stuck
-//! revival stays due; the epoch advances only on revivals and record
-//! fields, never on request; a tombstone commits only with the current
-//! epoch declared, so an older binary's commits nothing, and the delete a
-//! revival superseded retires the row once the current epoch is declared.
-//! The service paths are exercised in `listing_deletion_test.rs`.
+//! revival stays due; the epoch advances on revivals, record fields and a
+//! one-step confirmation, and cannot be set otherwise; a tombstone commits
+//! only with the current epoch declared, so an older binary's commits
+//! nothing, and the delete a revival superseded retires the row once the
+//! current epoch is declared. The service paths are exercised in
+//! `listing_deletion_test.rs`.
 
 use sqlx::PgPool;
 
@@ -129,9 +130,18 @@ async fn migration_0051_fences_tombstones_on_the_record_epoch_and_is_rerunnable(
             "UPDATE listings SET shipping_minor = 100 WHERE aggregate_id = $1",
             2,
         ),
+        // A sync that confirms an unchanged record advances it by one.
+        (
+            "UPDATE listings SET record_epoch = record_epoch + 1 WHERE aggregate_id = $1",
+            3,
+        ),
+        (
+            "UPDATE listings SET record_epoch = record_epoch + 2 WHERE aggregate_id = $1",
+            3,
+        ),
         (
             "UPDATE listings SET listing_revision = 2 WHERE aggregate_id = $1",
-            3,
+            4,
         ),
     ] {
         sqlx::query(statement)
@@ -143,7 +153,7 @@ async fn migration_0051_fences_tombstones_on_the_record_epoch_and_is_rerunnable(
     }
 
     // A binary that declares no epoch, or a stale one, commits no tombstone.
-    for observed in [None, Some(1), Some(2)] {
+    for observed in [None, Some(1), Some(3)] {
         let refused = tombstone(&pool, "5", observed)
             .await
             .expect_err("a tombstone without the current epoch");
@@ -154,11 +164,11 @@ async fn migration_0051_fences_tombstones_on_the_record_epoch_and_is_rerunnable(
     }
     // With it, a delete older than the superseded one is still refused,
     // and the superseded one retires the row.
-    let refused = tombstone(&pool, "4", Some(3))
+    let refused = tombstone(&pool, "4", Some(4))
         .await
         .expect_err("an older delete");
     assert!(refused.contains("predates the revival"), "{refused}");
-    tombstone(&pool, "5", Some(3))
+    tombstone(&pool, "5", Some(4))
         .await
         .expect("the superseded delete, confirmed at the current epoch");
     let cursor: Option<String> =

@@ -37,9 +37,11 @@ before its transaction and refuses the revival unless the record is there
 was tombstoned after that read).
 
 `listings.record_epoch` (0051) counts the record-derived writes the service
-accepted for a row: a revival, or a change to a field the seller's record
-supplies (a register, a sync, a sync's healing). A trigger maintains it for
-every writer. Every tombstone caller reads the epoch before it confirms the
+accepted for a row: a revival, a change to a field the seller's record
+supplies (a register, a sync, a sync's healing), or a sync that found the
+record and changed nothing, which advances it by one explicitly. A trigger
+maintains it for every writer; a statement can advance it by exactly one
+and never set it otherwise. Every tombstone caller reads the epoch before it confirms the
 delete against the homeserver, and the tombstone commits only while the
 locked row still has that epoch. So a register or sync that lands between
 the confirmation and the tombstone, including a re-publish after a delete,
@@ -61,7 +63,7 @@ for every writer:
 | Tombstone (`deleted_at` NULL to set) | the transaction declares no `marketplace.listing_deletion_authority`, or declares `follower:<holder>:<fence>` that is not the current lease row |
 | Tombstone | the transaction does not declare the row's current `record_epoch` in `marketplace.listing_deletion_observed_epoch` (0051); a binary before 0051 declares none |
 | Tombstone | its `DEL` cursor is older than the delete a revival of the listing superseded (`revived_from_cursor`) |
-| `record_epoch` | set by a statement: the trigger keeps it unless a revival or a record field changes |
+| `record_epoch` | set by a statement to anything but one more: the trigger keeps it unless a revival or a record field changes |
 | Revival marker | it would move backwards |
 | Follower cursor insert or update | no current follower authority, or the cursor would move backwards |
 | Follower cursor delete | always |

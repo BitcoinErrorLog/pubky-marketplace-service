@@ -3198,3 +3198,61 @@ async fn unanswered_revivals_rotate_behind_the_ones_not_yet_tried(pool: PgPool) 
     all.push("z_0".to_string());
     assert_eq!(tombstoned_ids(&app.pool, &seller.pubky).await, all);
 }
+
+/// Sol delta review of `953f227`: the seller re-publishes the identical
+/// record after a delete was confirmed, and a `listing.sync` that changes
+/// nothing succeeds. The delete confirmed before it must not retire it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_unchanged_record_synced_after_the_delete_was_confirmed_is_never_retired(pool: PgPool) {
+    use marketplace_service::listing_deletion::{
+        confirm_deleted, observe_live, tombstone, DeletionAuthority, DeletionCheck,
+    };
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    homeserver.put_record(&seller.pubky, LISTING_ID, record(1, 2));
+    let (status, body) = sync_as(&app, &seller, &seller.pubky, 95).await;
+    assert_eq!(status, StatusCode::OK, "registration by sync: {body}");
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    let client = app.state.homeserver.as_deref().expect("homeserver");
+
+    let observed = observe_live(&app.pool, &aggregate_id)
+        .await
+        .expect("observation")
+        .expect("live");
+    assert_eq!(
+        confirm_deleted(client, &seller.pubky, LISTING_ID).await,
+        DeletionCheck::Deleted {
+            cursor: "2".to_string()
+        }
+    );
+
+    homeserver.put_record(&seller.pubky, LISTING_ID, record(1, 2));
+    let (status, body) = sync_as(&app, &seller, &seller.pubky, 96).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["kind"], json!("listing"));
+    assert_eq!(body["event_ids"], json!([]), "the sync changed nothing");
+
+    let mut tx = app.pool.begin().await.expect("tombstone tx");
+    let deleted = tombstone(
+        &mut tx,
+        DeletionAuthority::Command,
+        &aggregate_id,
+        "2",
+        observed.record_epoch,
+        "system",
+        Uuid::new_v4(),
+        app.clock.now(),
+    )
+    .await
+    .expect("tombstone");
+    assert!(
+        deleted.is_none(),
+        "the sync confirmed the record afterwards"
+    );
+    tx.commit().await.expect("commits nothing");
+    assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
+    let (status, _) = get(&app, &seller.token, &format!("/v1/listings/{aggregate_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+}

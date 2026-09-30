@@ -8,9 +8,11 @@
 -- the record path, and nothing could tombstone the row.
 --
 -- * `listings.record_epoch` counts the record-derived writes the service
---   accepted for the row: a revival, or a change to any field the seller's
---   record supplies. The trigger below maintains it for every writer; no
---   statement can set it.
+--   accepted for the row: a revival, a change to any field the seller's
+--   record supplies, or a sync that found the record and changed nothing
+--   (it advances the epoch by one explicitly). The trigger below maintains
+--   it for every writer: a statement can advance it by exactly one, never
+--   set it otherwise.
 -- * A tombstone commits only when its transaction declares, in
 --   `marketplace.listing_deletion_observed_epoch`, the epoch the row had
 --   before the delete was confirmed against the homeserver, and that is
@@ -51,7 +53,7 @@ BEGIN
         OR NEW.digital_lock_policy_uri IS DISTINCT FROM OLD.digital_lock_policy_uri
         OR NEW.digital_lock_criterion_id IS DISTINCT FROM OLD.digital_lock_criterion_id THEN
         NEW.record_epoch := OLD.record_epoch + 1;
-    ELSE
+    ELSIF NEW.record_epoch IS DISTINCT FROM OLD.record_epoch + 1 THEN
         NEW.record_epoch := OLD.record_epoch;
     END IF;
     RETURN NEW;
