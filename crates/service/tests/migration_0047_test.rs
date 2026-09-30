@@ -21,13 +21,22 @@ async fn insert_listing(pool: &PgPool, listing_id: &str) {
 }
 
 /// Sets or clears the tombstone columns directly, declaring the `command`
-/// deletion authority that 0050's guard requires of a tombstone.
+/// deletion authority that 0050's guard requires of a tombstone and the
+/// current record epoch that 0051's requires.
 async fn mark(pool: &PgPool, listing_id: &str, deleted: bool, cursor: Option<&str>) -> bool {
     let mut tx = pool.begin().await.expect("mark tx");
     sqlx::query("SELECT set_config('marketplace.listing_deletion_authority', 'command', true)")
         .execute(&mut *tx)
         .await
         .expect("deletion authority");
+    sqlx::query(
+        "SELECT set_config('marketplace.listing_deletion_observed_epoch', \
+         (SELECT record_epoch::text FROM listings WHERE listing_id = $1), true)",
+    )
+    .bind(listing_id)
+    .execute(&mut *tx)
+    .await
+    .expect("observed epoch");
     let marked = sqlx::query(
         "UPDATE listings SET deleted_at = CASE WHEN $2 THEN now() END, \
          deleted_event_cursor = $3 WHERE listing_id = $1",

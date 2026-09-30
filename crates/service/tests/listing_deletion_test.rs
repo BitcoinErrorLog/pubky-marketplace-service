@@ -400,12 +400,13 @@ async fn a_deleted_auction_takes_no_bids_and_closes_unsold(pool: PgPool) {
 
     let aggregate_id = listing_aggregate(&seller.pubky);
     let mut tx = app.pool.begin().await.expect("tx");
+    let epoch = record_epoch(&mut tx, &aggregate_id).await;
     let (deleted, _) = marketplace_service::listing_deletion::tombstone(
         &mut tx,
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &aggregate_id,
         "7",
-        0,
+        epoch,
         "system",
         Uuid::new_v4(),
         app.clock.now(),
@@ -946,12 +947,13 @@ async fn late_settlement(
     match between {
         "deleted" => {
             let mut tx = app.pool.begin().await.expect("tx");
+            let epoch = record_epoch(&mut tx, &aggregate_id).await;
             marketplace_service::listing_deletion::tombstone(
                 &mut tx,
                 marketplace_service::listing_deletion::DeletionAuthority::Command,
                 &aggregate_id,
                 "9",
-                0,
+                epoch,
                 "system",
                 Uuid::new_v4(),
                 after_window,
@@ -1013,12 +1015,13 @@ async fn a_held_manual_review_on_a_deleted_listing_still_resolves_paid(pool: PgP
     let buyer = new_actor(&app).await;
     let (order_id, _reference) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;
     let mut tx = app.pool.begin().await.expect("tx");
+    let epoch = record_epoch(&mut tx, &listing_aggregate(&seller.pubky)).await;
     marketplace_service::listing_deletion::tombstone(
         &mut tx,
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &listing_aggregate(&seller.pubky),
         "9",
-        0,
+        epoch,
         "system",
         Uuid::new_v4(),
         app.clock.now(),
@@ -1071,12 +1074,13 @@ async fn a_deleted_auctions_bid_history_is_kept_for_its_parties_only(pool: PgPoo
     assert_eq!(status, StatusCode::OK, "live history is public");
 
     let mut tx = app.pool.begin().await.expect("tx");
+    let epoch = record_epoch(&mut tx, &aggregate_id).await;
     marketplace_service::listing_deletion::tombstone(
         &mut tx,
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &aggregate_id,
         "9",
-        0,
+        epoch,
         "system",
         Uuid::new_v4(),
         app.clock.now(),
@@ -1160,12 +1164,13 @@ async fn a_tombstone_takes_drop_and_listing_locks_in_the_sell_out_confirm_order(
             .await?;
         let _ = ready_tx.send(());
         let _ = go_rx.await;
+        let epoch = record_epoch(&mut tx, &tombstone_id).await;
         let deleted = marketplace_service::listing_deletion::tombstone(
             &mut tx,
             marketplace_service::listing_deletion::DeletionAuthority::Command,
             &tombstone_id,
             "9",
-            0,
+            epoch,
             "system",
             Uuid::new_v4(),
             now,
@@ -1289,12 +1294,13 @@ fn spawn_command(
 
 async fn tombstone_now(pool: &PgPool, aggregate_id: &str, now: chrono::DateTime<chrono::Utc>) {
     let mut tx = pool.begin().await.expect("tombstone tx");
+    let epoch = record_epoch(&mut tx, aggregate_id).await;
     marketplace_service::listing_deletion::tombstone(
         &mut tx,
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         aggregate_id,
         "9",
-        0,
+        epoch,
         "system",
         Uuid::new_v4(),
         now,
@@ -2059,6 +2065,16 @@ async fn the_follower_counts_its_deadlines_from_before_it_waits_for_the_lease_ro
     );
 }
 
+/// Declares the record epoch a tombstone's caller observed, as the service
+/// does.
+async fn declare_observed_epoch(tx: &mut sqlx::Transaction<'static, sqlx::Postgres>, epoch: i64) {
+    sqlx::query("SELECT set_config('marketplace.listing_deletion_observed_epoch', $1, true)")
+        .bind(epoch.to_string())
+        .execute(&mut **tx)
+        .await
+        .expect("observed epoch");
+}
+
 /// Declares a deletion authority for the rest of `tx`, as the service does.
 async fn declare_authority(tx: &mut sqlx::Transaction<'static, sqlx::Postgres>, authority: &str) {
     sqlx::query("SELECT set_config('marketplace.listing_deletion_authority', $1, true)")
@@ -2316,7 +2332,7 @@ async fn a_delete_confirmed_before_a_revival_cannot_hide_the_revived_listing(poo
     let seller = new_actor(&app).await;
     published_listing(&app, &homeserver, &seller, 1).await;
     let aggregate_id = listing_aggregate(&seller.pubky);
-    let tombstone_at = |cursor: &'static str| {
+    let tombstone_at = |cursor: &'static str, observed_epoch: i64| {
         let pool = app.pool.clone();
         let aggregate_id = aggregate_id.clone();
         let now = app.clock.now();
@@ -2327,7 +2343,7 @@ async fn a_delete_confirmed_before_a_revival_cannot_hide_the_revived_listing(poo
                 DeletionAuthority::Command,
                 &aggregate_id,
                 cursor,
-                0,
+                observed_epoch,
                 "system",
                 Uuid::new_v4(),
                 now,
@@ -2339,7 +2355,7 @@ async fn a_delete_confirmed_before_a_revival_cannot_hide_the_revived_listing(poo
             deleted.map(|deleted| deleted.is_some())
         }
     };
-    assert!(tombstone_at("2").await.expect("first delete"));
+    assert!(tombstone_at("2", 0).await.expect("first delete"));
     revive(&app, &homeserver, &seller, 131).await;
     let marker: Option<String> =
         sqlx::query_scalar("SELECT revived_from_cursor FROM listings WHERE aggregate_id = $1")
@@ -2351,24 +2367,46 @@ async fn a_delete_confirmed_before_a_revival_cannot_hide_the_revived_listing(poo
 
     // The service skips a delete no newer than the one the revival
     // superseded.
-    assert!(!tombstone_at("2").await.expect("stale delete"));
+    // Confirmed with the first delete, before the revival.
+    assert!(!tombstone_at("2", 0).await.expect("stale delete"));
     assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
 
-    // The database refuses it from any writer, even with an authority.
-    let mut raw = app.pool.begin().await.expect("raw tx");
-    declare_authority(&mut raw, "command").await;
-    let refused = sqlx::query(OLD_IMAGE_TOMBSTONE)
-        .bind(&aggregate_id)
-        .bind(app.clock.now())
-        .bind("2")
-        .execute(&mut *raw)
-        .await
-        .expect_err("a delete older than the revival must be refused");
-    assert!(
-        refused.to_string().contains("predates the revival"),
-        "{refused}"
-    );
-    raw.rollback().await.expect("raw tx rolls back");
+    // The database refuses it from any writer, even with an authority:
+    // without the epoch observed after the revival, and, with it, for a
+    // delete older than the one the revival superseded.
+    let current = record_epoch(
+        &mut app.pool.acquire().await.expect("connection"),
+        &aggregate_id,
+    )
+    .await;
+    for (declared, cursor, refusal) in [
+        (
+            None,
+            "2",
+            "the record changed after the delete was confirmed",
+        ),
+        (
+            Some(0),
+            "2",
+            "the record changed after the delete was confirmed",
+        ),
+        (Some(current), "1", "predates the revival"),
+    ] {
+        let mut raw = app.pool.begin().await.expect("raw tx");
+        declare_authority(&mut raw, "command").await;
+        if let Some(epoch) = declared {
+            declare_observed_epoch(&mut raw, epoch).await;
+        }
+        let refused = sqlx::query(OLD_IMAGE_TOMBSTONE)
+            .bind(&aggregate_id)
+            .bind(app.clock.now())
+            .bind(cursor)
+            .execute(&mut *raw)
+            .await
+            .expect_err("a stale tombstone must be refused");
+        assert!(refused.to_string().contains(refusal), "{refused}");
+        raw.rollback().await.expect("raw tx rolls back");
+    }
 
     // The marker never moves backwards.
     let mut raw = app.pool.begin().await.expect("marker tx");
@@ -2382,7 +2420,7 @@ async fn a_delete_confirmed_before_a_revival_cannot_hide_the_revived_listing(poo
     raw.rollback().await.expect("marker tx rolls back");
 
     // A newer delete of the revived record tombstones it.
-    assert!(tombstone_at("4").await.expect("newer delete"));
+    assert!(tombstone_at("4", current).await.expect("newer delete"));
     assert_eq!(
         tombstone_row(&app.pool, &aggregate_id).await.0,
         Some("4".to_string())
@@ -2772,13 +2810,12 @@ async fn deleted_then_revived_without_a_record(
     let (status, body) = sync_as(app, seller, &seller.pubky, 90).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["result"]["kind"], json!("listing_deleted"));
+    let deleted_at_cursor = tombstone_row(&app.pool, &aggregate_id).await.0;
     app.clock.advance_seconds(1);
     old_image_revival(&app.pool, &aggregate_id, app.clock.now()).await;
     assert_eq!(
-        revived_from_cursor(&app.pool, &aggregate_id)
-            .await
-            .as_deref(),
-        Some("2"),
+        revived_from_cursor(&app.pool, &aggregate_id).await,
+        deleted_at_cursor,
         "the revival marks the DEL it claims to supersede"
     );
     aggregate_id
@@ -2893,8 +2930,8 @@ async fn the_follower_confirms_a_re_created_listing_once_and_keeps_it(pool: PgPo
     revive(&app, &homeserver, &seller, 93).await;
 
     let checks = |pool: PgPool| async move {
-        sqlx::query_as::<_, (String, i64, chrono::DateTime<chrono::Utc>)>(
-            "SELECT aggregate_id, generation, checked_at FROM listing_revival_checks",
+        sqlx::query_as::<_, (String, Option<i64>, chrono::DateTime<chrono::Utc>)>(
+            "SELECT aggregate_id, checked_generation, attempted_at FROM listing_revival_checks",
         )
         .fetch_all(&pool)
         .await
@@ -2907,7 +2944,10 @@ async fn the_follower_confirms_a_re_created_listing_once_and_keeps_it(pool: PgPo
     assert_eq!(summary.listings_tombstoned, 0);
     assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
     let first = checks(app.pool.clone()).await;
-    assert_eq!(first, vec![(aggregate_id.clone(), 1, app.clock.now())]);
+    assert_eq!(
+        first,
+        vec![(aggregate_id.clone(), Some(1), app.clock.now())]
+    );
 
     app.clock.advance_seconds(61);
     let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
@@ -2927,4 +2967,234 @@ async fn the_follower_confirms_a_re_created_listing_once_and_keeps_it(pool: PgPo
         tombstone_row(&app.pool, &aggregate_id).await.0.as_deref(),
         Some("4")
     );
+}
+
+/// The listing's `record_epoch`, as a tombstone's caller observes it before
+/// confirming the delete.
+async fn record_epoch(conn: &mut sqlx::PgConnection, aggregate_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT record_epoch FROM listings WHERE aggregate_id = $1")
+        .bind(aggregate_id)
+        .fetch_one(conn)
+        .await
+        .expect("record epoch")
+}
+
+/// A stuck revival of `listing_id`: published, deleted, tombstoned by a
+/// sync, then revived by the pre-fix register with no record behind it.
+async fn stuck_revival(
+    app: &TestApp,
+    homeserver: &FakeHomeserver,
+    seller: &TestActor,
+    listing_id: &str,
+    number: u64,
+) -> String {
+    homeserver.put_record(&seller.pubky, listing_id, record(1, 1));
+    register_as(app, seller, listing_id, 1).await;
+    homeserver.delete_record(&seller.pubky, listing_id);
+    let (status, body) = execute(
+        app,
+        &seller.token,
+        &sync_command(&seller.pubky, listing_id, number),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["kind"], json!("listing_deleted"));
+    let aggregate_id = format!("listing:{}_{listing_id}", seller.pubky);
+    old_image_revival(&app.pool, &aggregate_id, app.clock.now()).await;
+    aggregate_id
+}
+
+/// Sol review of `e7c0650`, finding 1, in its exact order: the follower
+/// reads the stuck revival, confirms its delete against the homeserver, and
+/// before it writes the seller publishes the record again and registers it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_record_registered_after_the_delete_was_confirmed_is_never_retired(pool: PgPool) {
+    use marketplace_service::listing_deletion::{
+        confirm_deleted, observe_live, tombstone, DeletionAuthority, DeletionCheck,
+    };
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let aggregate_id = deleted_then_revived_without_a_record(&app, &homeserver, &seller).await;
+    let client = app.state.homeserver.as_deref().expect("homeserver");
+
+    let observed = observe_live(&app.pool, &aggregate_id)
+        .await
+        .expect("observation")
+        .expect("the revival is live");
+    assert_eq!(
+        confirm_deleted(client, &seller.pubky, LISTING_ID).await,
+        DeletionCheck::Deleted {
+            cursor: "2".to_string()
+        }
+    );
+
+    homeserver.put_record(&seller.pubky, LISTING_ID, record(2, 1));
+    let mut register = register_command(&seller.pubky, 1);
+    register["command_id"] = json!(Uuid::new_v4());
+    register["expected_revision"] = body_revision(&app, &aggregate_id).await;
+    register["payload"]["listing_revision"] = json!(2);
+    let (status, body) = execute(&app, &seller.token, &register).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "register after the confirmation: {body}"
+    );
+
+    let mut tx = app.pool.begin().await.expect("tombstone tx");
+    let deleted = tombstone(
+        &mut tx,
+        DeletionAuthority::Command,
+        &aggregate_id,
+        "2",
+        observed.record_epoch,
+        "system",
+        Uuid::new_v4(),
+        app.clock.now(),
+    )
+    .await
+    .expect("tombstone");
+    assert!(
+        deleted.is_none(),
+        "the confirmed delete predates the record"
+    );
+    tx.commit().await.expect("commits nothing");
+    assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
+
+    // Neither the follower nor a sync retires it afterwards.
+    let summary =
+        marketplace_service::workers::run_once(&app.state, Uuid::new_v4(), app.clock.now())
+            .await
+            .expect("worker pass");
+    assert_eq!(summary.listings_tombstoned, 0);
+    let (status, body) = sync_as(&app, &seller, &seller.pubky, 94).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["kind"], json!("listing"));
+    assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
+}
+
+/// The same race inside a follower pass: its tombstone waits on the row
+/// while a record is accepted, re-reads the row when the lock is granted,
+/// writes nothing, and leaves the seller's cursor before the `DEL`.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_follower_retries_a_delete_whose_record_was_accepted_while_it_waited(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 1).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+
+    let mut writer = app.pool.begin().await.expect("record writer tx");
+    sqlx::query("SELECT 1 FROM listings WHERE aggregate_id = $1 FOR UPDATE")
+        .bind(&aggregate_id)
+        .execute(&mut *writer)
+        .await
+        .expect("row lock");
+    let state = app.state.clone();
+    let now = app.clock.now();
+    let holder = Uuid::new_v4();
+    let pass = tokio::spawn(async move {
+        marketplace_service::workers::run_once(&state, holder, now)
+            .await
+            .map(|summary| summary.listings_tombstoned)
+            .map_err(|error| error.to_string())
+    });
+    wait_for_lock_wait(&app.pool, "UPDATE listings SET deleted_at").await;
+    homeserver.put_record(&seller.pubky, LISTING_ID, record(2, 1));
+    sqlx::query("UPDATE listings SET listing_revision = 2 WHERE aggregate_id = $1")
+        .bind(&aggregate_id)
+        .execute(&mut *writer)
+        .await
+        .expect("the accepted record");
+    writer.commit().await.expect("record commits");
+
+    assert_eq!(pass.await.expect("pass joins"), Ok(0));
+    assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
+    assert_eq!(deleted_events(&app.pool, &aggregate_id).await, vec![]);
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("1"),
+        "the DEL is read again"
+    );
+
+    app.clock.advance_seconds(61);
+    let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("next pass");
+    assert_eq!(
+        summary.listings_tombstoned, 0,
+        "the later PUT supersedes it"
+    );
+    assert_eq!(
+        seller_cursor(&app.pool, &seller.pubky).await.as_deref(),
+        Some("3")
+    );
+}
+
+/// Sol review of `e7c0650`, finding 2: a seller whose deletions fill every
+/// forward settle of the pass does not keep a stuck revival waiting.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_full_forward_pass_still_confirms_revivals(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let busy = new_actor(&app).await;
+    let ids: Vec<String> = (0..25).map(|index| format!("bulk_{index:02}")).collect();
+    for id in &ids {
+        homeserver.put_record(&busy.pubky, id, record(1, 1));
+        register_as(&app, &busy, id, 1).await;
+    }
+    for id in &ids {
+        homeserver.delete_record(&busy.pubky, id);
+    }
+    let seller = new_actor(&app).await;
+    let stuck = deleted_then_revived_without_a_record(&app, &homeserver, &seller).await;
+
+    let summary =
+        marketplace_service::workers::run_once(&app.state, Uuid::new_v4(), app.clock.now())
+            .await
+            .expect("worker pass");
+    assert_eq!(tombstoned_ids(&app.pool, &busy.pubky).await.len(), 20);
+    assert_eq!(summary.listings_tombstoned, 21);
+    assert_eq!(
+        tombstone_row(&app.pool, &stuck).await.0,
+        revived_from_cursor(&app.pool, &stuck).await
+    );
+}
+
+/// Sol review of `e7c0650`, finding 2: more revivals the homeserver cannot
+/// answer for than one pass confirms do not hide the ones behind them, and
+/// every revival is confirmed once the homeserver answers.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn unanswered_revivals_rotate_behind_the_ones_not_yet_tried(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let failing: Vec<String> = (0..6).map(|index| format!("a_{index}")).collect();
+    let mut number = 200;
+    for id in &failing {
+        stuck_revival(&app, &homeserver, &seller, id, number).await;
+        homeserver.fail_record(&seller.pubky, id);
+        number += 1;
+    }
+    let last = stuck_revival(&app, &homeserver, &seller, "z_0", number).await;
+    let holder = Uuid::new_v4();
+    let pass = || {
+        app.clock.advance_seconds(61);
+        marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+    };
+
+    pass().await.expect("first pass");
+    assert_eq!(tombstone_row(&app.pool, &last).await.0, None);
+    pass().await.expect("second pass");
+    assert!(
+        tombstone_row(&app.pool, &last).await.0.is_some(),
+        "the revival behind five unanswered ones is confirmed on the next pass"
+    );
+
+    for id in &failing {
+        homeserver.heal_record(&seller.pubky, id);
+    }
+    pass().await.expect("third pass");
+    pass().await.expect("fourth pass");
+    let mut all = failing.clone();
+    all.push("z_0".to_string());
+    assert_eq!(tombstoned_ids(&app.pool, &seller.pubky).await, all);
 }

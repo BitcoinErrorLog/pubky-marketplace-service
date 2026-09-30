@@ -57,6 +57,9 @@ const FOLLOW_SELLERS_PER_PASS: i64 = 10;
 /// Deletions confirmed per pass; each costs two homeserver requests.
 const FOLLOW_SETTLES_PER_PASS: usize = 20;
 const FOLLOW_POLL_SECONDS: i64 = 60;
+/// Revived listings confirmed per pass, before the forward read and within
+/// the first half of the pass, so neither starves the other.
+const FOLLOW_REVIVAL_CHECKS_PER_PASS: i64 = 5;
 
 pub fn listing_record_path(listing_id: &str) -> String {
     format!("{LISTINGS_PATH}{listing_id}")
@@ -147,39 +150,52 @@ impl DeletionAuthority {
     }
 }
 
-/// The live listing's generation, read before its deletion is confirmed.
-/// `None` when the listing is missing or already tombstoned.
-pub async fn live_generation<'e>(
+/// A live listing as read before its deletion is confirmed against the
+/// homeserver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveListing {
+    /// Counts revivals.
+    pub generation: i64,
+    /// Counts the record-derived writes the service accepted (0051).
+    pub record_epoch: i64,
+}
+
+/// Reads the live listing. `None` when it is missing or already tombstoned.
+pub async fn observe_live<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     aggregate_id: &str,
-) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT generation FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL",
+) -> Result<Option<LiveListing>, sqlx::Error> {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT generation, record_epoch FROM listings \
+         WHERE aggregate_id = $1 AND deleted_at IS NULL",
     )
     .bind(aggregate_id)
     .fetch_optional(executor)
-    .await
+    .await?;
+    Ok(row.map(|(generation, record_epoch)| LiveListing {
+        generation,
+        record_epoch,
+    }))
 }
 
-/// A live row this delete may tombstone: none of its revivals superseded
-/// the delete, or the delete is the one its latest revival claimed to
-/// supersede and was confirmed after that revival, at `$3` (0051).
-const TOMBSTONE_FENCE: &str = "(revived_from_cursor IS NULL \
-     OR $2::numeric > revived_from_cursor::numeric \
-     OR ($2::numeric = revived_from_cursor::numeric AND generation = $3))";
+/// A live row this delete may tombstone: the service accepted no record
+/// for it since `$3` was observed, and no revival superseded a newer
+/// delete. The delete a revival superseded qualifies: confirmed after the
+/// revival (the revival advanced the epoch), it is still the record's
+/// latest event, so nothing backs the revival.
+const TOMBSTONE_FENCE: &str = "record_epoch = $3 \
+     AND (revived_from_cursor IS NULL OR $2::numeric >= revived_from_cursor::numeric)";
 
 /// Tombstones a live listing inside the caller's transaction and records
 /// `listing.deleted` at the bumped revision. Stock columns are left as they
 /// are: holds and paid orders still settle against them.
 ///
-/// `observed_generation` is the listing's [`live_generation`] read before
-/// the caller confirmed the delete at `event_cursor`. Returns `None` when
-/// the listing is missing or already tombstoned, when `event_cursor` is
-/// older than the delete a revival superseded, or when it is that delete
-/// and the revival happened after `observed_generation` was read: the
-/// delete was confirmed before the record came back. A delete that is
-/// still the latest event after the revival proves the revival had no
-/// record behind it, so it tombstones the row.
+/// `observed_epoch` is the listing's `record_epoch` from [`observe_live`],
+/// read before the caller confirmed the delete at `event_cursor`. Returns
+/// `None`, having written nothing, when the listing is missing or already
+/// tombstoned, when a register, sync or revival changed its record since
+/// that read, or when `event_cursor` is older than the delete a revival
+/// superseded. The fence is evaluated on the row the tombstone locks.
 // Eight positional facts of one write; both callers must supply all of them.
 #[allow(clippy::too_many_arguments)]
 pub async fn tombstone(
@@ -187,14 +203,14 @@ pub async fn tombstone(
     authority: DeletionAuthority,
     aggregate_id: &str,
     event_cursor: &str,
-    observed_generation: i64,
+    observed_epoch: i64,
     actor: &str,
     command_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<Option<(ListingRow, Uuid)>, sqlx::Error> {
     authority.declare(tx).await?;
-    sqlx::query("SELECT set_config('marketplace.listing_deletion_observed_generation', $1, true)")
-        .bind(observed_generation.to_string())
+    sqlx::query("SELECT set_config('marketplace.listing_deletion_observed_epoch', $1, true)")
+        .bind(observed_epoch.to_string())
         .execute(&mut **tx)
         .await?;
     let live: Option<(String, String)> = sqlx::query_as(&format!(
@@ -203,12 +219,15 @@ pub async fn tombstone(
     ))
     .bind(aggregate_id)
     .bind(event_cursor)
-    .bind(observed_generation)
+    .bind(observed_epoch)
     .fetch_optional(&mut **tx)
     .await?;
     let Some((seller_pubky, listing_id)) = live else {
         return Ok(None);
     };
+    // The binding release is undone when the fenced write below finds the
+    // row changed while it waited for the lock.
+    let mut write = sqlx::Acquire::begin(&mut **tx).await?;
     // A drop bound to the deleted listing must not gate, or draw on, a
     // record later re-created at the same id. Releasing the binding takes it
     // out of gating the way `drop.release_listings` does; only an advanced
@@ -221,24 +240,26 @@ pub async fn tombstone(
     )
     .bind(&seller_pubky)
     .bind(&listing_id)
-    .execute(&mut **tx)
+    .execute(&mut *write)
     .await?;
     let deleted: Option<ListingRow> = sqlx::query_as(&format!(
-        "UPDATE listings SET deleted_at = $2, deleted_event_cursor = $3, \
-         server_revision = server_revision + 1, updated_at = $2 \
-         WHERE aggregate_id = $1 AND deleted_at IS NULL \
+        "UPDATE listings SET deleted_at = $4, deleted_event_cursor = $2, \
+         server_revision = server_revision + 1, updated_at = $4 \
+         WHERE aggregate_id = $1 AND deleted_at IS NULL AND {TOMBSTONE_FENCE} \
          RETURNING {LISTING_COLUMNS}"
     ))
     .bind(aggregate_id)
-    .bind(now)
     .bind(event_cursor)
-    .fetch_optional(&mut **tx)
+    .bind(observed_epoch)
+    .bind(now)
+    .fetch_optional(&mut *write)
     .await?;
     let Some(deleted) = deleted else {
+        write.rollback().await?;
         return Ok(None);
     };
     let event_id = insert_event(
-        tx,
+        &mut write,
         command_id,
         aggregate_id,
         deleted.server_revision,
@@ -247,6 +268,7 @@ pub async fn tombstone(
         now,
     )
     .await?;
+    write.commit().await?;
     tracing::info!(
         seller_pubky_prefix = %deleted.seller_pubky.get(..8).unwrap_or_default(),
         "listing tombstoned after its homeserver record was deleted"
@@ -262,7 +284,9 @@ enum SettleOutcome {
     NotDeleted {
         observed: Option<i64>,
     },
-    /// The homeserver could not answer, or the pass ran out of time.
+    /// The homeserver could not answer, the pass ran out of time, or the
+    /// service accepted the listing's record after the delete was
+    /// confirmed: settle again later.
     Unsettled,
 }
 
@@ -434,18 +458,18 @@ impl FollowerPass<'_> {
                 let Some(mut tx) = self.begin().await? else {
                     return Ok(None);
                 };
-                let generation = live_generation(&mut *tx, &aggregate_id).await?;
+                let live = observe_live(&mut *tx, &aggregate_id).await?;
                 tx.commit().await?;
-                Ok(Some(generation))
+                Ok(Some(live))
             })
             .await?;
         let observed = match live {
             None => return Ok(Err(Halt::OutOfTime)),
             Some(None) => return Ok(Ok(SettleOutcome::NotDeleted { observed: None })),
-            Some(Some(generation)) => generation,
+            Some(Some(live)) => live,
         };
         let not_deleted = SettleOutcome::NotDeleted {
-            observed: Some(observed),
+            observed: Some(observed.generation),
         };
         let cursor = match self
             .bounded(confirm_deleted(self.homeserver, seller_pubky, listing_id))
@@ -468,18 +492,24 @@ impl FollowerPass<'_> {
                     self.authority(),
                     &aggregate_id,
                     &cursor,
-                    observed,
+                    observed.record_epoch,
                     crate::workers::SYSTEM_ACTOR,
                     Uuid::new_v4(),
                     self.clock.now(),
                 )
                 .await?;
-                tx.commit().await?;
-                Ok(Some(Ok(if deleted.is_some() {
+                let outcome = if deleted.is_some() {
                     SettleOutcome::Tombstoned
                 } else {
-                    not_deleted.clone()
-                })))
+                    match observe_live(&mut *tx, &aggregate_id).await? {
+                        Some(now_live) if now_live.record_epoch != observed.record_epoch => {
+                            SettleOutcome::Unsettled
+                        }
+                        _ => not_deleted.clone(),
+                    }
+                };
+                tx.commit().await?;
+                Ok(Some(Ok(outcome)))
             })
             .await?;
         Ok(written.unwrap_or(Err(Halt::OutOfTime)))
@@ -526,13 +556,14 @@ impl FollowerPass<'_> {
         Ok(written.unwrap_or(Err(Halt::OutOfTime)))
     }
 
-    /// Records, while the pass holds its lease, that the revived listing's
-    /// `generation` was confirmed not deleted. A recorded generation never
-    /// moves backwards.
-    async fn record_revival_check(
+    /// Records, while the pass holds its lease, an attempt to confirm a
+    /// revived listing, and the generation it confirmed not deleted when
+    /// it did. The attempt time moves the listing behind every revival not
+    /// tried since; a confirmed generation never moves backwards.
+    async fn record_revival_attempt(
         &self,
         aggregate_id: &str,
-        generation: i64,
+        confirmed_generation: Option<i64>,
     ) -> Result<Result<(), Halt>, sqlx::Error> {
         let written = self
             .within_lease(async {
@@ -543,14 +574,17 @@ impl FollowerPass<'_> {
                     return Ok(Some(Err(Halt::LeaseLost)));
                 }
                 sqlx::query(
-                    "INSERT INTO listing_revival_checks (aggregate_id, generation, checked_at) \
+                    "INSERT INTO listing_revival_checks \
+                         (aggregate_id, checked_generation, attempted_at) \
                      VALUES ($1, $2, $3) \
                      ON CONFLICT (aggregate_id) DO UPDATE SET \
-                         generation = EXCLUDED.generation, checked_at = EXCLUDED.checked_at \
-                     WHERE listing_revival_checks.generation < EXCLUDED.generation",
+                         attempted_at = EXCLUDED.attempted_at, \
+                         checked_generation = GREATEST( \
+                             listing_revival_checks.checked_generation, \
+                             EXCLUDED.checked_generation)",
                 )
                 .bind(aggregate_id)
-                .bind(generation)
+                .bind(confirmed_generation)
                 .bind(self.clock.now())
                 .execute(&mut *tx)
                 .await?;
@@ -593,18 +627,29 @@ fn event_listing_id<'a>(seller_pubky: &str, uri: &'a str) -> Option<&'a str> {
 }
 
 /// One worker pass of the deletion follower, bounded by `pass.deadline`.
-/// For up to [`FOLLOW_SELLERS_PER_PASS`] sellers with live listings whose
+/// It first confirms up to [`FOLLOW_REVIVAL_CHECKS_PER_PASS`] revived
+/// listings (`check_revivals`) within the first half of the pass. Then, for
+/// up to [`FOLLOW_SELLERS_PER_PASS`] sellers with live listings whose
 /// last poll is older than [`FOLLOW_POLL_SECONDS`], reads the next batch of
 /// their listing events in order. A `DEL` that is the batch's latest event
 /// for its listing is settled through [`confirm_deleted`], at most
 /// [`FOLLOW_SETTLES_PER_PASS`] per pass. The seller's cursor advances to the
 /// last event before the first one that could not be settled (homeserver
-/// unavailable, deadline, or settle cap), so nothing is skipped. The settles
-/// left then go to `check_revivals`. The pass stops at the deadline, when
-/// its database work reaches the lease deadline, or when its lease is gone.
-/// Returns the number of listings tombstoned.
+/// unavailable, deadline, settle cap, or a record accepted after the
+/// delete was confirmed), so nothing is skipped. The pass stops at the
+/// deadline, when its database work reaches the lease deadline, or when its
+/// lease is gone. Returns the number of listings tombstoned.
 pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Result<u64> {
     let now = pass.clock.now();
+    let started = tokio::time::Instant::now();
+    let revival_pass = FollowerPass {
+        deadline: started + pass.deadline.saturating_duration_since(started) / 2,
+        ..*pass
+    };
+    let mut tombstoned = match check_revivals(&revival_pass).await? {
+        Ok(retired) => retired,
+        Err((retired, halt)) => return Ok(halted(retired, halt)),
+    };
     let due = pass
         .within_lease(async {
             let Some(mut tx) = pass.begin().await? else {
@@ -627,10 +672,9 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
         })
         .await?;
     let Some(due) = due else {
-        return Ok(halted(0, Halt::OutOfTime));
+        return Ok(halted(tombstoned, Halt::OutOfTime));
     };
 
-    let mut tombstoned = 0u64;
     let mut settles = 0usize;
     let mut unhosted = 0usize;
     for (seller_pubky, cursor) in due {
@@ -707,10 +751,6 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
             return Ok(halted(tombstoned, halt));
         }
     }
-    match check_revivals(pass, FOLLOW_SETTLES_PER_PASS.saturating_sub(settles)).await? {
-        Ok(retired) => tombstoned += retired,
-        Err((retired, halt)) => return Ok(halted(tombstoned + retired, halt)),
-    }
     if unhosted > 0 {
         tracing::info!(
             unhosted,
@@ -720,18 +760,16 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
     Ok(tombstoned)
 }
 
-/// Confirms up to `limit` revived listings not yet confirmed at their
-/// current generation. A revival whose superseded `DEL` is behind the
-/// seller's cursor is invisible to the forward read; one no record backs
-/// is tombstoned here. A revival confirmed not deleted is recorded and
-/// not read again until it is revived again; one the homeserver could not
-/// answer for stays due. `Err` carries the tombstones written before the
-/// pass halted.
-async fn check_revivals(
-    pass: &FollowerPass<'_>,
-    limit: usize,
-) -> anyhow::Result<Result<u64, (u64, Halt)>> {
-    if limit == 0 || pass.expired() {
+/// Confirms up to [`FOLLOW_REVIVAL_CHECKS_PER_PASS`] revived listings not
+/// yet confirmed at their current generation, least recently tried first.
+/// A revival whose superseded `DEL` is behind the seller's cursor is
+/// invisible to the forward read; one no record backs is tombstoned here.
+/// Every attempt is recorded, so a revival the homeserver could not answer
+/// for stays due behind every revival not yet tried, and each due revival
+/// is tried within as many passes as there are quotas of revivals ahead of
+/// it. `Err` carries the tombstones written before the pass halted.
+async fn check_revivals(pass: &FollowerPass<'_>) -> anyhow::Result<Result<u64, (u64, Halt)>> {
+    if pass.expired() {
         return Ok(Ok(0));
     }
     let due = pass
@@ -743,11 +781,11 @@ async fn check_revivals(
                 "SELECT l.aggregate_id, l.seller_pubky, l.listing_id FROM listings l \
                  LEFT JOIN listing_revival_checks c ON c.aggregate_id = l.aggregate_id \
                  WHERE l.deleted_at IS NULL AND l.revived_from_cursor IS NOT NULL \
-                 AND (c.generation IS NULL OR c.generation < l.generation) \
-                 ORDER BY c.checked_at NULLS FIRST, l.aggregate_id \
+                 AND (c.checked_generation IS NULL OR c.checked_generation < l.generation) \
+                 ORDER BY c.attempted_at NULLS FIRST, l.aggregate_id \
                  LIMIT $1",
             )
-            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(FOLLOW_REVIVAL_CHECKS_PER_PASS)
             .fetch_all(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -762,17 +800,21 @@ async fn check_revivals(
         if pass.expired() {
             break;
         }
-        match pass.settle_deletion(&seller_pubky, &listing_id).await? {
-            Ok(SettleOutcome::Tombstoned) => tombstoned += 1,
-            Ok(SettleOutcome::NotDeleted {
-                observed: Some(generation),
-            }) => {
-                if let Err(halt) = pass.record_revival_check(&aggregate_id, generation).await? {
-                    return Ok(Err((tombstoned, halt)));
-                }
+        let confirmed = match pass.settle_deletion(&seller_pubky, &listing_id).await? {
+            Ok(SettleOutcome::Tombstoned) => {
+                tombstoned += 1;
+                continue;
             }
-            Ok(SettleOutcome::NotDeleted { observed: None } | SettleOutcome::Unsettled) => {}
+            Ok(SettleOutcome::NotDeleted { observed: None }) => continue,
+            Ok(SettleOutcome::NotDeleted { observed }) => observed,
+            Ok(SettleOutcome::Unsettled) => None,
             Err(halt) => return Ok(Err((tombstoned, halt))),
+        };
+        if let Err(halt) = pass
+            .record_revival_attempt(&aggregate_id, confirmed)
+            .await?
+        {
+            return Ok(Err((tombstoned, halt)));
         }
     }
     Ok(Ok(tombstoned))
