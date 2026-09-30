@@ -92,3 +92,8 @@ with plain builds.
 `listings.revived_from_cursor`, and two guard triggers, and no index. It
 sets `lock_timeout` so its brief `listings` locks cannot queue behind a
 long transaction.
+
+0051 (listing revival proof) replaces the `listings` guard function and
+creates `listing_revival_checks` with its primary key, and builds no index
+on an existing table. No index serves the follower's revival read (live
+listings with `revived_from_cursor` set); it filters the live listings.

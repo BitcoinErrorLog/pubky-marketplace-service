@@ -59,35 +59,40 @@ pub async fn execute(
     // conflicting reuse of the command id is answered from its stored result
     // without the homeserver. `command_results` rows are never updated or
     // deleted, so that result is the one the locked lookup below would find.
-    let (prefetched, _flight) =
-        match crate::handlers::register_listing::public_record_request(actor, &command) {
-            Some(payload) => {
-                let flight = state.command_flights.enter(actor, command.command_id).await;
-                if let Some((stored_hash, stored_result)) =
-                    stored_command_result(&state.pool, actor, command.command_id).await?
-                {
-                    return Ok(stored_result_response(
-                        state,
-                        actor,
-                        &command,
-                        &request_hash,
-                        &stored_hash,
-                        stored_result,
-                        started,
-                    ));
-                }
-                let prefetched = crate::handlers::register_listing::prefetch_public_record(
-                    state.homeserver.as_deref(),
-                    payload,
-                )
-                .await;
-                (prefetched, Some(flight))
+    let (prefetched, _flight) = match crate::handlers::register_listing::public_record_request(
+        &state.pool,
+        actor,
+        &command,
+    )
+    .await?
+    {
+        Some(payload) => {
+            let flight = state.command_flights.enter(actor, command.command_id).await;
+            if let Some((stored_hash, stored_result)) =
+                stored_command_result(&state.pool, actor, command.command_id).await?
+            {
+                return Ok(stored_result_response(
+                    state,
+                    actor,
+                    &command,
+                    &request_hash,
+                    &stored_hash,
+                    stored_result,
+                    started,
+                ));
             }
-            None => (
-                crate::handlers::register_listing::RegisterRecordPrefetch::NotNeeded,
-                None,
-            ),
-        };
+            let prefetched = crate::handlers::register_listing::prefetch_public_record(
+                state.homeserver.as_deref(),
+                payload,
+            )
+            .await;
+            (prefetched, Some(flight))
+        }
+        None => (
+            crate::handlers::register_listing::RegisterRecordPrefetch::NotNeeded,
+            None,
+        ),
+    };
 
     let mut tx = state.pool.begin().await?;
 

@@ -29,7 +29,7 @@ use crate::homeserver::{
     MalformedDigitalLock,
 };
 use crate::listing_deletion::{
-    latest_event_is_delete, tombstone, DeletionAuthority, DeletionCheck,
+    latest_event_is_delete, live_generation, tombstone, DeletionAuthority, DeletionCheck,
 };
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -307,6 +307,9 @@ async fn settle_missing_record(
     if current.is_deleted() {
         return Ok(Ok(deleted_success(&current, vec![])));
     }
+    let Some(observed_generation) = live_generation(&mut **tx, &command.aggregate_id).await? else {
+        return Ok(Err(not_found()));
+    };
     let DeletionCheck::Deleted { cursor } =
         latest_event_is_delete(homeserver, &payload.seller_pubky, &payload.listing_id).await
     else {
@@ -317,6 +320,7 @@ async fn settle_missing_record(
         DeletionAuthority::Command,
         &command.aggregate_id,
         &cursor,
+        observed_generation,
         actor,
         command.command_id,
         now,

@@ -15,6 +15,28 @@ the `listing_deletions` lease.
   names the pass's holder and fence and has not expired; a takeover waits
   for a write in flight.
 - **Monotonic cursor.** The cursor for a seller never moves backwards.
+- **Revivals are confirmed.** Each pass also confirms revived listings not
+  yet confirmed at their current generation (`listing_revival_checks`,
+  0051), within the same settle budget. A revival whose record is gone and
+  whose superseded `DEL` is still the record's latest event is tombstoned,
+  even when that `DEL` is behind the seller's cursor. A revival the
+  homeserver could not answer for stays due.
+
+## Revivals
+
+A tombstoned listing is revived only by its re-published record:
+`listing.sync` revives from the record it fetched, and `listing.register`
+at `expected_revision` 0 for a tombstoned id reads the seller's record
+before its transaction and refuses the revival unless the record is there
+(`NOT_FOUND`, `UPSTREAM_UNAVAILABLE`, or `INVALID_STATE` when the listing
+was tombstoned after that read).
+
+A revival records the `DEL` it superseded in `revived_from_cursor`. A later
+tombstone needs a newer `DEL`, or that same `DEL` confirmed after the
+revival: the caller reads the listing's `generation` before it reads the
+homeserver, and the tombstone commits only while the generation is
+unchanged. Every revival advances the generation, so a delete confirmed
+before a re-creation still cannot hide the re-created listing.
 
 ## Database guards (migration 0050)
 
@@ -24,7 +46,7 @@ for every writer:
 | Write | Refused when |
 |---|---|
 | Tombstone (`deleted_at` NULL to set) | the transaction declares no `marketplace.listing_deletion_authority`, or declares `follower:<holder>:<fence>` that is not the current lease row |
-| Tombstone | its `DEL` cursor is no newer than the delete a revival of the listing superseded (`revived_from_cursor`) |
+| Tombstone | its `DEL` cursor is older than the delete a revival of the listing superseded (`revived_from_cursor`), or is that delete and the transaction does not declare the listing's current generation in `marketplace.listing_deletion_observed_generation` (0051) |
 | Revival marker | it would move backwards |
 | Follower cursor insert or update | no current follower authority, or the cursor would move backwards |
 | Follower cursor delete | always |

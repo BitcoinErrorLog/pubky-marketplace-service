@@ -405,6 +405,7 @@ async fn a_deleted_auction_takes_no_bids_and_closes_unsold(pool: PgPool) {
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &aggregate_id,
         "7",
+        0,
         "system",
         Uuid::new_v4(),
         app.clock.now(),
@@ -950,6 +951,7 @@ async fn late_settlement(
                 marketplace_service::listing_deletion::DeletionAuthority::Command,
                 &aggregate_id,
                 "9",
+                0,
                 "system",
                 Uuid::new_v4(),
                 after_window,
@@ -1016,6 +1018,7 @@ async fn a_held_manual_review_on_a_deleted_listing_still_resolves_paid(pool: PgP
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &listing_aggregate(&seller.pubky),
         "9",
+        0,
         "system",
         Uuid::new_v4(),
         app.clock.now(),
@@ -1073,6 +1076,7 @@ async fn a_deleted_auctions_bid_history_is_kept_for_its_parties_only(pool: PgPoo
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &aggregate_id,
         "9",
+        0,
         "system",
         Uuid::new_v4(),
         app.clock.now(),
@@ -1161,6 +1165,7 @@ async fn a_tombstone_takes_drop_and_listing_locks_in_the_sell_out_confirm_order(
             marketplace_service::listing_deletion::DeletionAuthority::Command,
             &tombstone_id,
             "9",
+            0,
             "system",
             Uuid::new_v4(),
             now,
@@ -1289,6 +1294,7 @@ async fn tombstone_now(pool: &PgPool, aggregate_id: &str, now: chrono::DateTime<
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         aggregate_id,
         "9",
+        0,
         "system",
         Uuid::new_v4(),
         now,
@@ -2321,6 +2327,7 @@ async fn a_delete_confirmed_before_a_revival_cannot_hide_the_revived_listing(poo
                 DeletionAuthority::Command,
                 &aggregate_id,
                 cursor,
+                0,
                 "system",
                 Uuid::new_v4(),
                 now,
@@ -2721,4 +2728,203 @@ async fn a_late_bitcoin_reacquire_and_a_drop_sync_lock_listings_in_one_order(poo
     .await
     .expect("late facts");
     assert_eq!(committed, 2, "both lines were reacquired (order {state})");
+}
+
+/// A revival as the image before `revived_from_cursor` could be superseded
+/// wrote it for a bare `listing.register` (`apply_registration`'s UPDATE),
+/// with no record on the homeserver behind it.
+async fn old_image_revival(pool: &PgPool, aggregate_id: &str, now: chrono::DateTime<chrono::Utc>) {
+    let revived = sqlx::query(
+        "UPDATE listings SET server_revision = server_revision + 1, updated_at = $2, \
+         recreated_at = $2, generation = generation + 1, \
+         deleted_at = NULL, deleted_event_cursor = NULL \
+         WHERE aggregate_id = $1 AND deleted_at IS NOT NULL",
+    )
+    .bind(aggregate_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("old-image revival");
+    assert_eq!(revived.rows_affected(), 1);
+}
+
+async fn revived_from_cursor(pool: &PgPool, aggregate_id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT revived_from_cursor FROM listings WHERE aggregate_id = $1")
+        .bind(aggregate_id)
+        .fetch_one(pool)
+        .await
+        .expect("revival marker")
+}
+
+/// A seller deleted a listing whose tombstone a sync had already written, and
+/// the revival that followed had no record behind it: production listing
+/// `676aca2a`, 2026-09-30 04:24:31 UTC, a `listing.sync` tombstone at
+/// revision 2 and a `listing.register` revival at revision 3 half a second
+/// later.
+async fn deleted_then_revived_without_a_record(
+    app: &TestApp,
+    homeserver: &FakeHomeserver,
+    seller: &TestActor,
+) -> String {
+    published_listing(app, homeserver, seller, 1).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    let (status, body) = sync_as(app, seller, &seller.pubky, 90).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["kind"], json!("listing_deleted"));
+    app.clock.advance_seconds(1);
+    old_image_revival(&app.pool, &aggregate_id, app.clock.now()).await;
+    assert_eq!(
+        revived_from_cursor(&app.pool, &aggregate_id)
+            .await
+            .as_deref(),
+        Some("2"),
+        "the revival marks the DEL it claims to supersede"
+    );
+    aggregate_id
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_register_without_a_record_cannot_revive_a_deleted_listing(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 1).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    let (status, body) = sync_as(&app, &seller, &seller.pubky, 90).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["kind"], json!("listing_deleted"));
+
+    // The seller's client registers the deleted id again with no record
+    // on the homeserver.
+    let mut register = register_command(&seller.pubky, 1);
+    register["command_id"] = json!(Uuid::new_v4());
+    let (status, body) = execute(&app, &seller.token, &register).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "baseless revival: {body}");
+    assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
+    assert_eq!(
+        tombstone_row(&app.pool, &aggregate_id).await.0.as_deref(),
+        Some("2")
+    );
+    let (status, _) = get(&app, &buyer.token, &format!("/v1/listings/{aggregate_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A record published at the id again still revives it.
+    homeserver.put_record(&seller.pubky, LISTING_ID, record(1, 1));
+    register["command_id"] = json!(Uuid::new_v4());
+    let (status, body) = execute(&app, &seller.token, &register).await;
+    assert_eq!(status, StatusCode::OK, "revival from a record: {body}");
+    assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn sync_retires_a_revival_whose_latest_homeserver_event_is_its_delete(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let aggregate_id = deleted_then_revived_without_a_record(&app, &homeserver, &seller).await;
+    let (status, body) = get(&app, &buyer.token, &format!("/v1/listings/{aggregate_id}")).await;
+    assert_eq!(status, StatusCode::OK, "the stray projection: {body}");
+    assert_eq!(body_revision(&app, &aggregate_id).await, json!(3));
+
+    let (status, body) = sync_as(&app, &seller, &seller.pubky, 91).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sync after the stray revival: {body}"
+    );
+    assert_eq!(body["result"]["kind"], json!("listing_deleted"));
+    assert_eq!(body["revision"], json!(4));
+    assert_eq!(
+        tombstone_row(&app.pool, &aggregate_id).await.0.as_deref(),
+        Some("2")
+    );
+    let (status, _) = get(&app, &buyer.token, &format!("/v1/listings/{aggregate_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_follower_retires_a_revival_behind_its_cursor(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let aggregate_id = deleted_then_revived_without_a_record(&app, &homeserver, &seller).await;
+
+    // The follower read the DEL while the revival stood and moved past it.
+    let holder = Uuid::new_v4();
+    let fence = take_follower_lease(&app, holder).await;
+    let mut tx = app.pool.begin().await.expect("cursor tx");
+    declare_authority(&mut tx, &format!("follower:{holder}:{fence}")).await;
+    sqlx::query(
+        "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
+         VALUES ($1, '2', $2)",
+    )
+    .bind(&seller.pubky)
+    .bind(app.clock.now())
+    .execute(&mut *tx)
+    .await
+    .expect("cursor past the DEL");
+    tx.commit().await.expect("cursor commits");
+
+    app.clock.advance_seconds(61);
+    let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass");
+    assert_eq!(summary.listings_tombstoned, 1);
+    assert_eq!(
+        tombstone_row(&app.pool, &aggregate_id).await.0.as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        deleted_events(&app.pool, &aggregate_id).await,
+        vec![(2, seller.pubky.clone()), (4, "system".to_string())]
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_follower_confirms_a_re_created_listing_once_and_keeps_it(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 1).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    let (status, body) = sync_as(&app, &seller, &seller.pubky, 92).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    revive(&app, &homeserver, &seller, 93).await;
+
+    let checks = |pool: PgPool| async move {
+        sqlx::query_as::<_, (String, i64, chrono::DateTime<chrono::Utc>)>(
+            "SELECT aggregate_id, generation, checked_at FROM listing_revival_checks",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("revival checks")
+    };
+    let holder = Uuid::new_v4();
+    let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass");
+    assert_eq!(summary.listings_tombstoned, 0);
+    assert_eq!(tombstone_row(&app.pool, &aggregate_id).await.0, None);
+    let first = checks(app.pool.clone()).await;
+    assert_eq!(first, vec![(aggregate_id.clone(), 1, app.clock.now())]);
+
+    app.clock.advance_seconds(61);
+    let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("second worker pass");
+    assert_eq!(summary.listings_tombstoned, 0);
+    assert_eq!(checks(app.pool.clone()).await, first, "confirmed once");
+
+    // Deleted again, the forward read retires it with the newer DEL.
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    app.clock.advance_seconds(61);
+    let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("third worker pass");
+    assert_eq!(summary.listings_tombstoned, 1);
+    assert_eq!(
+        tombstone_row(&app.pool, &aggregate_id).await.0.as_deref(),
+        Some("4")
+    );
 }

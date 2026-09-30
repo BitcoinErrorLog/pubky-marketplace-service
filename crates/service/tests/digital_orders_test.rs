@@ -1981,6 +1981,7 @@ async fn a_deleted_listing_still_delivers_its_paid_digital_order(pool: PgPool) {
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &listing,
         "9",
+        0,
         "system",
         Uuid::new_v4(),
         app.clock.now(),
