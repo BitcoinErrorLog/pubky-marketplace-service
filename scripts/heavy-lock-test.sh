@@ -190,4 +190,59 @@ wait "$next" || fail "SIGKILL: next gate failed"
 wait "$killed" 2>/dev/null || true
 echo "SIGKILL ok"
 
+echo "test: vrt and cargo refuse below the disk floor"
+rm -rf "$HEAVY_LOCK_DIR"
+mkdir -p "$HEAVY_LOCK_DIR"
+logdir="$HEAVY_LOCK_DIR/logs"
+mkdir -p "$logdir"
+for class in vrt cargo; do
+  set +e
+  HEAVY_DISK_VOLUMES="$HEAVY_LOCK_DIR" HEAVY_DISK_FLOOR_GIB=999999999 \
+    run_heavy "$class" bash -c 'printf ran > "$1"' _ "$logdir/$class" \
+    2>"$logdir/$class.err"
+  st=$?
+  set -e
+  [ "$st" != 0 ] || fail "disk floor: $class ran below the floor"
+  [ ! -e "$logdir/$class" ] || fail "disk floor: $class command started"
+  grep -q "refusing class=${class}" "$logdir/$class.err" \
+    || fail "disk floor: $class printed no refusal"
+  ls "$HEAVY_LOCK_DIR/${class}.q"/*.ticket >/dev/null 2>&1 \
+    && fail "disk floor: $class left a ticket"
+done
+echo "disk floor refusal ok"
+
+echo "test: node ignores the disk floor; vrt runs above it; unmounted volumes are skipped"
+HEAVY_DISK_VOLUMES="$HEAVY_LOCK_DIR" HEAVY_DISK_FLOOR_GIB=999999999 \
+  run_heavy node bash -c 'printf ran > "$1"' _ "$logdir/node"
+[ -f "$logdir/node" ] || fail "disk floor: node did not run"
+HEAVY_DISK_VOLUMES="$HEAVY_LOCK_DIR /nonexistent-heavy-lock-volume" HEAVY_DISK_FLOOR_GIB=0 \
+  run_heavy vrt bash -c 'printf ran > "$1"' _ "$logdir/vrt-ok"
+[ -f "$logdir/vrt-ok" ] || fail "disk floor: vrt did not run above the floor"
+echo "disk floor pass ok"
+
+echo "test: the floor is rechecked after the queue wait"
+late_vol="$HEAVY_LOCK_DIR/late-volume"
+run_heavy vrt bash -c 'printf hold > "$1"; sleep 3' _ "$logdir/late-holder" \
+  >"$logdir/late-holder.out" 2>"$logdir/late-holder.err" &
+holder=$!
+track "$holder"
+wait_for "$logdir/late-holder" hold || fail "recheck: holder did not start"
+HEAVY_DISK_VOLUMES="$late_vol" HEAVY_DISK_FLOOR_GIB=999999999 \
+  run_heavy vrt bash -c 'printf ran > "$1"' _ "$logdir/late" \
+  >"$logdir/late.out" 2>"$logdir/late.err" &
+late=$!
+track "$late"
+wait_for "$logdir/late.err" waiting || fail "recheck: waiter did not queue"
+mkdir -p "$late_vol"
+set +e
+wait "$late"
+st=$?
+set -e
+[ "$st" != 0 ] || fail "recheck: waiter ran below the floor"
+[ ! -e "$logdir/late" ] || fail "recheck: waiter command started"
+grep -q 'refusing class=vrt' "$logdir/late.err" || fail "recheck: no refusal"
+wait "$holder" || fail "recheck: holder failed"
+ls "$HEAVY_LOCK_DIR/vrt.q"/*.ticket >/dev/null 2>&1 && fail "recheck: ticket left behind"
+echo "disk floor recheck ok"
+
 echo "ALL OK"
