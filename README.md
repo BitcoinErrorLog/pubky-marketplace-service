@@ -108,6 +108,11 @@ Railway IaC `preserve()`):
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |
 | `PAYPAL_CHECKOUT_URL` | `https://www.paypal.com/cgi-bin/webscr` | PayPal `_xclick` checkout base. HTTPS only; host must be `www.paypal.com` (live) or `www.sandbox.paypal.com`. Default stays live. |
 | `SHIPPO_API_BASE` | `https://api.goshippo.com` | Shippo API base for the seller-token label integration (`/v0/sellers/me/shipping-config`, `/v0/orders/{id}/shipping/*`); tests point it at a local double |
+| `ADDRESS_SEARCH_UPSTREAM_URL` | `https://photon.komoot.io` | Photon geocoder behind `POST /v0/address/suggest`. HTTPS only (http for loopback in tests). Point it at a self-hosted Photon to stop using the public instance |
+| `ADDRESS_SEARCH_DISABLED` | unset | `1`/`true` turns the address proxy off; the route answers `address_search_unavailable` |
+| `ADDRESS_SEARCH_CLIENT_IP_HEADER` | unset | name of a header set by a trusted edge that carries the client address (last value is used); unset keys the per-client limit on the socket peer |
+| `ADDRESS_SEARCH_CLIENT_PER_MINUTE` | `30` | sustained address searches per client per minute (burst 8), 1–10000 |
+| `ADDRESS_SEARCH_UPSTREAM_PER_SECOND` | `2` | address searches sent upstream per second across all clients (burst 3 seconds' worth), 1–10000 |
 | `SANDBOX_PAYMENTS_ENABLED` | `false` | accept `payment.sandbox_advance` at all; must stay `false` on any deployment handling real orders |
 | `PICKUP_DETAILS_ENCRYPTION_KEY` | unset | 32-byte hex key sealing local-pickup details and pinned payment snapshots at rest (XChaCha20-Poly1305); must differ from the Locks key material; pickup is OFF without it |
 | `PICKUP_DETAILS_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous pickup key for the dual-key read window during rotation; the re-seal worker migrates both sealed families to the current key |
@@ -140,6 +145,28 @@ During deployment ordering, an older paykit-server response without
 `bitcoin_offer_available` is compatible: `electrum: "ready"` or
 `electrum: { "state": "ready" }` maps to `true`, and any other shape maps to
 `false`. When present, the field is authoritative.
+
+### Address autocomplete proxy
+
+`POST /v0/address/suggest` with `{"q": "42 Union Street New Bedford", "country": "US"}`
+(`q` 4–120 characters, `country` optional) returns up to five address
+suggestions built from OpenStreetMap data through Photon, plus the required
+`attribution` (`© OpenStreetMap contributors`, link to the ODbL notice). The
+public Nominatim instance forbids autocomplete; Photon is built for it.
+
+- Public and unauthenticated: a query is never tied to a session. The query is
+  a POST body, never logged, and never stored; cache keys are salted hashes in
+  memory only, with a 30-minute TTL and 4096 entries.
+- The upstream sees this service's address, a fixed User-Agent and the query:
+  no cookies, Referer, forwarded address or Accept-Language.
+- Limits: per client (30 per minute, burst 8) and across all clients toward
+  the upstream (2 per second by default). Identical concurrent queries share
+  one upstream call. An upstream 429, 5xx, timeout or unreadable answer opens a
+  60-second breaker (503 `address_search_unavailable` with `Retry-After`);
+  cached answers still serve.
+- A street-only match keeps the buyer's typed leading house number on line 1
+  (`precision: "street"`); an OpenStreetMap house match is `precision: "house"`.
+  `region` is Photon's state name; clients map it to their own codes.
 
 ### Two-phase Paykit payment requests
 
