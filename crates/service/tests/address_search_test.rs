@@ -347,6 +347,46 @@ fn upstream_configuration_is_validated() {
     assert!(AddressSearchRuntime::new("https://photon.komoot.io", None, 30, 0).is_err());
 }
 
+#[test]
+fn the_client_address_comes_only_from_the_configured_header() {
+    let peer: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-real-ip", "203.0.113.9".parse().unwrap());
+    headers.insert(
+        "x-forwarded-for",
+        "198.51.100.1, 203.0.113.7".parse().unwrap(),
+    );
+
+    let unset = AddressSearchRuntime::new("https://photon.komoot.io", None, 30, 2).unwrap();
+    assert_eq!(
+        unset.client_address(&headers, Some(peer)),
+        "10.0.0.5",
+        "without a configured header, forwarding headers are ignored"
+    );
+
+    let forwarded = AddressSearchRuntime::new(
+        "https://photon.komoot.io",
+        Some(axum::http::HeaderName::from_static("x-forwarded-for")),
+        30,
+        2,
+    )
+    .unwrap();
+    assert_eq!(
+        forwarded.client_address(&headers, Some(peer)),
+        "203.0.113.7",
+        "the last value is the one the trusted edge appended"
+    );
+
+    let mut malformed = HeaderMap::new();
+    malformed.insert("x-forwarded-for", "203.0.113.7, not-an-ip".parse().unwrap());
+    assert_eq!(forwarded.client_address(&malformed, Some(peer)), "10.0.0.5");
+    assert_eq!(
+        forwarded.client_address(&HeaderMap::new(), Some(peer)),
+        "10.0.0.5",
+        "a missing header falls back to the socket peer"
+    );
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn suggestions_reach_the_buyer_with_attribution_and_no_identifying_upstream_headers(
     pool: PgPool,
