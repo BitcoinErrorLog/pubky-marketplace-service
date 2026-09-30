@@ -29,7 +29,7 @@ use crate::homeserver::{
     MalformedDigitalLock,
 };
 use crate::listing_deletion::{
-    latest_event_is_delete, tombstone, DeletionAuthority, DeletionCheck,
+    latest_event_is_delete, observe_live, tombstone, DeletionAuthority, DeletionCheck,
 };
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -160,6 +160,7 @@ pub async fn handle(
         if registration.listing_revision > current_auction.listing_revision {
             return Ok(Err(seller_registration_required()));
         }
+        confirm_record(tx, &command.aggregate_id).await?;
         let viewer_bid =
             crate::handlers::auction::viewer_bid_projection(tx, current_auction, actor).await?;
         let projection = current_auction
@@ -256,6 +257,7 @@ pub async fn handle(
                     }),
                 }));
             }
+            confirm_record(tx, &command.aggregate_id).await?;
             return Ok(Ok(HandlerSuccess {
                 revision: current.server_revision,
                 event_ids: vec![],
@@ -283,6 +285,21 @@ pub async fn handle(
     .await
 }
 
+/// A sync that found the seller's record and changes nothing still proves
+/// the record exists after any delete confirmed before it: it advances the
+/// listing's `record_epoch` on the row it holds locked, so such a delete
+/// cannot tombstone the listing afterwards (0051).
+async fn confirm_record(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE listings SET record_epoch = record_epoch + 1 WHERE aggregate_id = $1")
+        .bind(aggregate_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// The fetch found no record. A registered listing whose deletion the
 /// seller's event stream confirms is tombstoned; an already tombstoned one
 /// is a convergent no-op. Anything else keeps the definitive 404.
@@ -307,6 +324,9 @@ async fn settle_missing_record(
     if current.is_deleted() {
         return Ok(Ok(deleted_success(&current, vec![])));
     }
+    let Some(observed) = observe_live(&mut **tx, &command.aggregate_id).await? else {
+        return Ok(Err(not_found()));
+    };
     let DeletionCheck::Deleted { cursor } =
         latest_event_is_delete(homeserver, &payload.seller_pubky, &payload.listing_id).await
     else {
@@ -317,6 +337,7 @@ async fn settle_missing_record(
         DeletionAuthority::Command,
         &command.aggregate_id,
         &cursor,
+        observed.record_epoch,
         actor,
         command.command_id,
         now,

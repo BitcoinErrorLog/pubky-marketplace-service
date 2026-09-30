@@ -680,8 +680,12 @@ pub struct FakeHomeserver {
     drop_records: HomeserverRecordMap,
     events: HomeserverEventLog,
     delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    failing: HomeserverFailingRecords,
     pub base_url: String,
 }
+
+/// Records whose fetch answers 500, as a failing homeserver would.
+type HomeserverFailingRecords = Arc<Mutex<std::collections::HashSet<(String, String)>>>;
 
 /// The homeserver's event table: users it hosts and every write, in cursor
 /// order. `/events-stream` serves it the way
@@ -756,6 +760,21 @@ impl FakeHomeserver {
             .remove(&(seller_pubky.to_string(), listing_id.to_string()));
     }
 
+    /// Answers 500 for this record's fetch until [`Self::heal_record`].
+    pub fn fail_record(&self, seller_pubky: &str, listing_id: &str) {
+        self.failing
+            .lock()
+            .expect("fake homeserver failing lock")
+            .insert((seller_pubky.to_string(), listing_id.to_string()));
+    }
+
+    pub fn heal_record(&self, seller_pubky: &str, listing_id: &str) {
+        self.failing
+            .lock()
+            .expect("fake homeserver failing lock")
+            .remove(&(seller_pubky.to_string(), listing_id.to_string()));
+    }
+
     /// Delays every response, as a slow homeserver would.
     pub fn set_delay(&self, delay: std::time::Duration) {
         self.delay_ms.store(
@@ -794,6 +813,7 @@ async fn homeserver_delay(delay_ms: &std::sync::atomic::AtomicU64) {
 async fn serve_homeserver_record(
     axum::extract::State(records): axum::extract::State<HomeserverRecordMap>,
     axum::Extension(delay_ms): axum::Extension<Arc<std::sync::atomic::AtomicU64>>,
+    axum::Extension(failing): axum::Extension<HomeserverFailingRecords>,
     axum::extract::Path(listing_id): axum::extract::Path<String>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
@@ -804,6 +824,13 @@ async fn serve_homeserver_record(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
+    if failing
+        .lock()
+        .expect("fake homeserver failing lock")
+        .contains(&(seller.clone(), listing_id.clone()))
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     let stored = records
         .lock()
         .expect("fake homeserver records lock")
@@ -900,6 +927,7 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
     let drop_records: HomeserverRecordMap = Arc::default();
     let events: HomeserverEventLog = Arc::default();
     let delay_ms: Arc<std::sync::atomic::AtomicU64> = Arc::default();
+    let failing: HomeserverFailingRecords = Arc::default();
     let router = Router::new()
         .route(
             "/pub/pubky.app/marketplace/v1/listings/{listing_id}",
@@ -919,7 +947,8 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
                 .route("/events-stream", axum::routing::get(serve_event_stream))
                 .with_state(events.clone()),
         )
-        .layer(axum::Extension(delay_ms.clone()));
+        .layer(axum::Extension(delay_ms.clone()))
+        .layer(axum::Extension(failing.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fake homeserver binds");
@@ -934,6 +963,7 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
         drop_records,
         events,
         delay_ms,
+        failing,
         base_url: format!("http://{addr}"),
     }
 }
