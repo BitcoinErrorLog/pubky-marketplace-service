@@ -41,6 +41,13 @@ if [ ! -t 0 ]; then
   fi
 fi
 
+sha="$(git rev-parse HEAD)"
+# shellcheck source=prepush-stamp.sh
+source "$ROOT/scripts/prepush-stamp.sh"
+if prepush_reuse "$sha"; then
+  exit 0
+fi
+
 # Sibling worktrees share one Cargo target unless this gate overrides it.
 # A shared target can run another tree's test binary. This checkout gets its own.
 shared_target="${CARGO_TARGET_DIR:-}"
@@ -134,6 +141,6 @@ run_heavy cargo cargo clippy --workspace --all-targets -- -D warnings
 echo "prepush: cargo test"
 run_heavy cargo bash scripts/ci-test.sh
 
-sha="$(git rev-parse HEAD)"
+prepush_stamp "$sha"
 seconds="$(( $(date +%s) - start ))"
 echo "PREPUSH OK ${sha} ${seconds}"
