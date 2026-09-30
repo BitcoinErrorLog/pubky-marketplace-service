@@ -17,11 +17,13 @@ cd "$WORK/repo"
 git config user.email test@example.invalid
 git config user.name test
 printf 'a\n' > file.txt
-git add file.txt
+printf 'ignored.txt\n' > .gitignore
+git add file.txt .gitignore
 git commit -qm one
 
 # Same shape as scripts/prepush.sh: reuse check, gate, stamp after a pass.
-# GATE_RESULT=1 makes the gate fail. Each run is a fresh shell, like a push.
+# GATE_RESULT=1 makes the gate fail. GATE_DURING runs inside the gate, after
+# the reuse check and before the stamp. Each run is a fresh shell, like a push.
 gate() {
   GATE_RESULT="${GATE_RESULT:-0}" bash -c '
     set -euo pipefail
@@ -32,6 +34,9 @@ gate() {
     fi
     echo "gate ran" >> "$2"
     [ "$GATE_RESULT" = 0 ] || exit 1
+    if [ -n "${GATE_DURING:-}" ]; then
+      eval "$GATE_DURING"
+    fi
     prepush_stamp "$sha"
     echo "PREPUSH OK ${sha} 1"
   ' _ "$DIR/prepush-stamp.sh" "$WORK/runs"
@@ -86,42 +91,77 @@ gate > /dev/null
 [ "$(runs)" = 5 ] || fail "staged change reused the stamp"
 git reset -q --hard
 
-echo "test: an untracked file does not block reuse"
+echo "test: an untracked file that is not ignored runs the gate"
 printf 'x\n' > untracked.txt
 gate > /dev/null
-[ "$(runs)" = 5 ] || fail "untracked file blocked reuse"
+[ "$(runs)" = 6 ] || fail "untracked file reused the stamp"
+git config status.showUntrackedFiles no
+gate > /dev/null
+[ "$(runs)" = 7 ] || fail "status.showUntrackedFiles=no hid an untracked file"
+git config --unset status.showUntrackedFiles
 rm -f untracked.txt
+
+echo "test: an ignored file does not block reuse"
+printf 'x\n' > ignored.txt
+gate > /dev/null
+[ "$(runs)" = 7 ] || fail "ignored file blocked reuse"
+rm -f ignored.txt
 
 echo "test: a changed tree runs the gate"
 printf 'b\n' > file.txt
 git commit -qam two
 gate > /dev/null
-[ "$(runs)" = 6 ] || fail "changed tree reused the stamp"
+[ "$(runs)" = 8 ] || fail "changed tree reused the stamp"
 gate > /dev/null
-[ "$(runs)" = 6 ] || fail "changed tree's own pass was not reused"
+[ "$(runs)" = 8 ] || fail "changed tree's own pass was not reused"
 
 echo "test: a pass on a dirty tree does not stamp HEAD's tree"
 printf 'c\n' > file.txt
 git commit -qam three
 printf 'dirty\n' >> file.txt
 gate > /dev/null
-[ "$(runs)" = 7 ] || fail "dirty run on a new tree did not run the gate"
+[ "$(runs)" = 9 ] || fail "dirty run on a new tree did not run the gate"
 [ ! -e "$stamp_dir/$(git rev-parse 'HEAD^{tree}')" ] || fail "dirty run stamped HEAD's tree"
 git checkout -q -- file.txt
 gate > /dev/null
-[ "$(runs)" = 8 ] || fail "clean run reused a stamp from a dirty run"
+[ "$(runs)" = 10 ] || fail "clean run reused a stamp from a dirty run"
+
+echo "test: a pass with an untracked file does not stamp HEAD's tree"
+printf 'd\n' > file.txt
+git commit -qam four
+printf 'x\n' > untracked.txt
+gate > /dev/null
+[ "$(runs)" = 11 ] || fail "untracked run on a new tree did not run the gate"
+[ ! -e "$stamp_dir/$(git rev-parse 'HEAD^{tree}')" ] || fail "untracked run stamped HEAD's tree"
+rm -f untracked.txt
+gate > /dev/null
+[ "$(runs)" = 12 ] || fail "clean run reused a stamp from an untracked run"
+
+echo "test: a file that appears during the gate blocks the stamp"
+for during in "printf 'x\\n' > mid-untracked.txt" "printf 'mid\\n' >> file.txt"; do
+  printf 'e\n' >> file.txt
+  git commit -qam "mid $during"
+  before="$(runs)"
+  GATE_DURING="$during" gate > /dev/null
+  [ "$(runs)" = $((before + 1)) ] || fail "clean start did not run the gate ($during)"
+  [ ! -e "$stamp_dir/$(git rev-parse 'HEAD^{tree}')" ] || fail "stamped after: $during"
+  rm -f mid-untracked.txt
+  git checkout -q -- file.txt
+done
+gate > /dev/null
+[ "$(runs)" = 15 ] || fail "clean run after a mid-gate change reused a stamp"
 
 echo "test: a commit with an identical tree reuses the stamp"
 git commit -q --allow-empty -m empty
 out="$(gate)"
-[ "$(runs)" = 8 ] || fail "identical tree ran the gate"
+[ "$(runs)" = 15 ] || fail "identical tree ran the gate"
 printf '%s\n' "$out" | grep -q "^PREPUSH OK $(git rev-parse HEAD) 0 reused:" \
   || fail "identical-tree reuse line: $out"
 
 echo "test: a linked worktree shares the stamp"
 git worktree add -q "$WORK/linked" HEAD
 out="$(cd "$WORK/linked" && gate)"
-[ "$(runs)" = 8 ] || fail "linked worktree ran the gate"
+[ "$(runs)" = 15 ] || fail "linked worktree ran the gate"
 printf '%s\n' "$out" | grep -q ' 0 reused:' || fail "linked reuse line: $out"
 
 echo "ALL OK"
