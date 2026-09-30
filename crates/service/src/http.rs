@@ -221,6 +221,7 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::grant::claim_result),
         )
         // Public: buyers read a seller's available rails before checkout.
+        // Booleans only; no payout or contact identifier.
         .route(
             "/v0/sellers/{pubky}/payment-config",
             get(crate::payment_methods::get_payment_config),
