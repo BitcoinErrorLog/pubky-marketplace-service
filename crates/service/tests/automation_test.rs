@@ -170,6 +170,42 @@ async fn session_admin_cors_preflight_allows_patch_and_delete(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn bitcoin_manual_resolve_cors_preflight_allows_idempotency_key(pool: PgPool) {
+    let app = test_app(pool).await;
+    let request = Request::builder()
+        .method("OPTIONS")
+        .uri(format!("/v0/orders/{}/bitcoin/resolve", Uuid::nil()))
+        .header("origin", "http://localhost:3000")
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "authorization,content-type,idempotency-key",
+        )
+        .body(Body::empty())
+        .expect("preflight builds");
+    let response = app
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("preflight executes");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let allow = response
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        allow
+            .to_ascii_lowercase()
+            .split(',')
+            .any(|allowed| allowed.trim() == "idempotency-key"),
+        "idempotency-key missing from {allow}"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn listing_export_event_cursor_and_sync_many_are_seller_scoped(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
