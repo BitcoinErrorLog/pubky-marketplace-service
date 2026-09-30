@@ -17,11 +17,19 @@
 #                   so a Shop typecheck does not wait behind either.
 #
 # Classes do not exclude each other. A VRT run and two cargo runs can overlap.
+#
+# vrt and cargo refuse to take a slot when a volume in HEAVY_DISK_VOLUMES has
+# less than HEAVY_DISK_FLOOR_GIB free. VRT and Rust builds are what filled
+# /Volumes/vibedrive to 100% and failed with ENOSPC. A volume that is not
+# mounted is skipped. node is not checked.
+#
 # HEAVY_LOCK_DIR overrides the directory (tests). The default is the shared
 # lock directory. This does not take heavy.lock; in-flight worktrees that
 # still lock that file keep their old behavior until they update.
 
 HEAVY_LOCK_DIR="${HEAVY_LOCK_DIR:-/Volumes/t7/vibes-dev/.locks}"
+HEAVY_DISK_FLOOR_GIB="${HEAVY_DISK_FLOOR_GIB:-25}"
+HEAVY_DISK_VOLUMES="${HEAVY_DISK_VOLUMES:-/Volumes/vibedrive /Volumes/t7}"
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   echo "source scripts/heavy-lock.sh" >&2
@@ -38,6 +46,30 @@ heavy_slots() {
       return 1
       ;;
   esac
+}
+
+# 0 when every mounted volume has at least the floor free. Otherwise prints
+# the refusal and returns 1.
+heavy_disk_ok() {
+  local class="$1" vol free_kib free_gib status=0
+  case "$class" in
+    vrt|cargo) ;;
+    *) return 0 ;;
+  esac
+  for vol in $HEAVY_DISK_VOLUMES; do
+    [ -d "$vol" ] || continue
+    free_kib=$(df -Pk "$vol" 2>/dev/null | awk 'NR == 2 { print $4 }')
+    [[ "$free_kib" =~ ^[0-9]+$ ]] || continue
+    free_gib=$((free_kib / 1048576))
+    if [ "$free_gib" -lt "$HEAVY_DISK_FLOOR_GIB" ]; then
+      echo "heavy-lock: refusing class=${class}: ${vol} has ${free_gib} GiB free, floor is ${HEAVY_DISK_FLOOR_GIB} GiB" >&2
+      status=1
+    fi
+  done
+  if [ "$status" -ne 0 ]; then
+    echo "heavy-lock: free space first: stale worktree target dirs under /Volumes/t7/vibes-dev/.cargo-target, unused docker volumes (docker volume ls), and old VRT attachments; see the fleet-resource-hygiene skill" >&2
+  fi
+  return "$status"
 }
 
 etime_to_seconds() {
@@ -241,6 +273,7 @@ run_heavy() {
   local slots seq ahead last i st
   local self_pid pidfile
   slots=$(heavy_slots "$class") || return 1
+  heavy_disk_ok "$class" || return 1
   mkdir -p "$HEAVY_LOCK_DIR"
   # heavy_issue runs inside a command substitution, and that subshell exits
   # as soon as the ticket number is printed. Record this shell, not that
@@ -274,6 +307,12 @@ run_heavy() {
     fi
     sleep 0.25
   done
+  # The wait can be long; recheck just before the slot is taken.
+  if ! heavy_disk_ok "$class"; then
+    heavy_release
+    heavy_disarm_traps
+    return 1
+  fi
   while true; do
     i=1
     while [ "$i" -le "$slots" ]; do
