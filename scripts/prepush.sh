@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# Pre-push gate. Last line on success: PREPUSH OK <sha> <seconds>
+# Pre-push gate. Last line on success: PREPUSH OK <sha> <seconds> <mode>
+#
+# fast (default): cargo fmt, then clippy and tests for the packages the
+#   change touches since the merge base (scripts/prepush-packages.sh). A
+#   change to a workspace-wide file runs the whole workspace; a change to
+#   no package (docs, CI, scripts) runs fmt only.
+# full (PREPUSH_FULL=1, releases): fmt, clippy and every test in the
+#   workspace. CI runs the same on every pull request; fast relies on that.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,6 +18,10 @@ export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.89.0}"
 start=$(date +%s)
 # shellcheck source=heavy-lock.sh
 source "$ROOT/scripts/heavy-lock.sh"
+# shellcheck source=prepush-stamp.sh
+source "$ROOT/scripts/prepush-stamp.sh"
+prepush_mode_init || exit 1
+echo "prepush: mode ${PREPUSH_MODE}"
 
 # Hook stdin lists the refs being pushed. A push whose every commit message
 # contains [skip ci] does not run the gate.
@@ -42,16 +53,46 @@ if [ ! -t 0 ]; then
 fi
 
 sha="$(git rev-parse HEAD)"
-# shellcheck source=prepush-stamp.sh
-source "$ROOT/scripts/prepush-stamp.sh"
 if prepush_reuse "$sha"; then
   exit 0
 fi
 
+packages=()
+if [ "$PREPUSH_MODE" = full ]; then
+  packages=(--workspace)
+else
+  if [ -n "${PREPUSH_BASE:-}" ]; then
+    base="$PREPUSH_BASE"
+  elif git rev-parse --verify --quiet origin/main >/dev/null; then
+    base="$(git merge-base HEAD origin/main)"
+  else
+    echo "prepush: set PREPUSH_BASE to the merge base" >&2
+    exit 1
+  fi
+  # shellcheck source=prepush-packages.sh
+  source "$ROOT/scripts/prepush-packages.sh"
+  selected="$(prepush_changed_packages "$base" \
+    Cargo.toml Cargo.lock rust-toolchain rust-toolchain.toml '.cargo/*' \
+    clippy.toml .clippy.toml rustfmt.toml .rustfmt.toml \
+    'contracts/*' scripts/ci-test.sh)" || {
+    echo "prepush: cannot diff against base ${base}" >&2
+    exit 1
+  }
+  while IFS= read -r line; do
+    [ -n "$line" ] && packages+=("$line")
+  done <<< "$selected"
+fi
+if [ "${#packages[@]}" -eq 0 ]; then
+  echo "prepush: packages (none changed)"
+else
+  echo "prepush: packages ${packages[*]}"
+fi
+
 # Sibling worktrees share one Cargo target unless this gate overrides it.
-# A shared target can run another tree's test binary. This checkout gets its own.
+# A shared target can run another tree's test binary. This checkout gets its own;
+# PREPUSH_CARGO_TARGET names a different one.
 shared_target="${CARGO_TARGET_DIR:-}"
-private_target="/Volumes/t7/vibes-dev/.cargo-target/marketplace-service/$(basename "$ROOT")"
+private_target="${PREPUSH_CARGO_TARGET:-/Volumes/t7/vibes-dev/.cargo-target/marketplace-service/$(basename "$ROOT")}"
 if [ ! -d "$private_target" ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
   seed="${private_target}.partial"
   rm -rf "$seed"
@@ -68,6 +109,25 @@ export CARGO_TARGET_DIR="$private_target"
 
 echo "prepush: cargo fmt"
 cargo fmt --check
+
+if [ "${#packages[@]}" -eq 0 ]; then
+  echo "prepush: clippy and tests skipped (no package changed)"
+  prepush_stamp "$sha"
+  seconds="$(( $(date +%s) - start ))"
+  echo "PREPUSH OK ${sha} ${seconds} ${PREPUSH_MODE}"
+  exit 0
+fi
+
+clippy_scope=()
+test_args=()
+if [ "${packages[0]}" = --workspace ]; then
+  clippy_scope=(--workspace)
+else
+  for pkg in "${packages[@]}"; do
+    clippy_scope+=(-p "$pkg")
+    test_args+=("$pkg")
+  done
+fi
 
 # One container per worktree. A shared name let this gate remove a Postgres
 # container another lane's tests were using, because the name check raced
@@ -136,11 +196,11 @@ if [ "$encryption" != "scram-sha-256" ] || [ "$host_all" != "scram-sha-256" ]; t
 fi
 
 echo "prepush: cargo clippy"
-run_heavy cargo cargo clippy --workspace --all-targets -- -D warnings
+run_heavy cargo cargo clippy "${clippy_scope[@]}" --all-targets -- -D warnings
 
 echo "prepush: cargo test"
-run_heavy cargo bash scripts/ci-test.sh
+run_heavy cargo bash scripts/ci-test.sh ${test_args[@]+"${test_args[@]}"}
 
 prepush_stamp "$sha"
 seconds="$(( $(date +%s) - start ))"
-echo "PREPUSH OK ${sha} ${seconds}"
+echo "PREPUSH OK ${sha} ${seconds} ${PREPUSH_MODE}"
