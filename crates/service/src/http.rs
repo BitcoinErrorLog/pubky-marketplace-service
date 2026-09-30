@@ -22,7 +22,11 @@ pub fn build_router(state: AppState) -> Router {
             Method::PATCH,
             Method::DELETE,
         ])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::HeaderName::from_static("idempotency-key"),
+        ]);
 
     let inventory = Router::new()
         .route(
