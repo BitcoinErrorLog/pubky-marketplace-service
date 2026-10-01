@@ -45,6 +45,17 @@ struct UpstreamInner {
     fetches: usize,
     queries: Vec<String>,
     headers: Vec<HeaderMap>,
+    by_marker: Vec<(String, Canned)>,
+}
+
+/// The answer for any query containing a marker word, overriding the
+/// default answer.
+#[derive(Clone)]
+struct Canned {
+    status: u16,
+    body: Vec<u8>,
+    retry_after: Option<String>,
+    delay_ms: u64,
 }
 
 struct UpstreamDouble {
@@ -60,6 +71,24 @@ impl UpstreamDouble {
     }
     fn set_retry_after(&self, value: Option<&str>) {
         self.state.inner.lock().unwrap().retry_after = value.map(str::to_string);
+    }
+    fn set_for(
+        &self,
+        marker: &str,
+        status: u16,
+        body: &[u8],
+        retry_after: Option<&str>,
+        delay_ms: u64,
+    ) {
+        self.state.inner.lock().unwrap().by_marker.push((
+            marker.to_string(),
+            Canned {
+                status,
+                body: body.to_vec(),
+                retry_after: retry_after.map(str::to_string),
+                delay_ms,
+            },
+        ));
     }
     fn set_delay(&self, delay_ms: u64) {
         self.state.inner.lock().unwrap().delay_ms = delay_ms;
@@ -96,15 +125,29 @@ async fn serve_search(
 ) -> axum::response::Response {
     let (status, body, retry_after, delay) = {
         let mut guard = state.inner.lock().unwrap();
+        let query = query.unwrap_or_default();
         guard.fetches += 1;
-        guard.queries.push(query.unwrap_or_default());
         guard.headers.push(headers);
-        (
-            guard.status,
-            guard.body.clone(),
-            guard.retry_after.clone(),
-            guard.delay_ms,
-        )
+        let canned = guard
+            .by_marker
+            .iter()
+            .find(|(marker, _)| query.contains(marker.as_str()))
+            .map(|(_, canned)| canned.clone());
+        guard.queries.push(query);
+        match canned {
+            Some(canned) => (
+                canned.status,
+                canned.body,
+                canned.retry_after,
+                canned.delay_ms,
+            ),
+            None => (
+                guard.status,
+                guard.body.clone(),
+                guard.retry_after.clone(),
+                guard.delay_ms,
+            ),
+        }
     };
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -133,6 +176,7 @@ async fn spawn_upstream() -> UpstreamDouble {
             fetches: 0,
             queries: Vec::new(),
             headers: Vec::new(),
+            by_marker: Vec::new(),
         })),
     };
     let router = Router::new()
@@ -985,4 +1029,168 @@ async fn query_text_and_client_addresses_never_reach_the_logs(pool: PgPool) {
     for secret in ["ZQXWV", "Marker", "203.0.113.99", "Boulevard"] {
         assert!(!logs.contains(secret), "{secret} reached the logs:\n{logs}");
     }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_success_that_started_before_a_429_does_not_close_the_breaker(pool: PgPool) {
+    let h = harness_with(pool, 30, 100).await;
+    h.upstream.set(429, b"{}");
+    h.upstream.set_retry_after(Some("120"));
+    h.upstream.set_for("Slowok", 200, US_UNION, None, 400);
+
+    let router = h.router.clone();
+    let slow = tokio::spawn(async move {
+        suggest(&router, "198.51.100.40", "10 Slowok Street", Some("US")).await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        fail_lookups(&h, 1, 1).await,
+        120,
+        "the 429 opened the breaker"
+    );
+
+    let (status, _, body) = slow.await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "its own buyer still gets the answer: {body}"
+    );
+
+    let (status, headers, _) =
+        suggest(&h.router, "198.51.100.41", "11 Union Street", Some("US")).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the late success did not close it"
+    );
+    assert!(retry_after(&headers) >= 119);
+    h.app.clock.advance_seconds(61);
+    fail_lookups(&h, 2, 1).await;
+    assert_eq!(
+        h.upstream.fetches(),
+        2,
+        "nothing reached the upstream inside its Retry-After"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_late_429_lengthens_a_shorter_cooldown_already_in_force(pool: PgPool) {
+    let h = harness_with(pool, 30, 100).await;
+    h.upstream.set(500, b"{}");
+    h.upstream
+        .set_for("Slowthrottle", 429, b"{}", Some("120"), 400);
+
+    let router = h.router.clone();
+    let slow = tokio::spawn(async move {
+        suggest(
+            &router,
+            "198.51.100.40",
+            "10 Slowthrottle Street",
+            Some("US"),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        fail_lookups(&h, 1, 3).await,
+        BREAKER_BASE_SECONDS as u64,
+        "three failures opened a short breaker"
+    );
+
+    let (status, headers, _) = slow.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_after(&headers), 120, "the 429 extended it");
+    assert_eq!(h.upstream.fetches(), 4);
+
+    h.app.clock.advance_seconds(BREAKER_BASE_SECONDS + 1);
+    let remaining = fail_lookups(&h, 4, 1).await;
+    assert!(
+        remaining >= 120 - (BREAKER_BASE_SECONDS as u64) - 2,
+        "{remaining}"
+    );
+    assert_eq!(
+        h.upstream.fetches(),
+        4,
+        "no probe before the 429's Retry-After"
+    );
+
+    h.app.clock.advance_seconds(120);
+    h.upstream.set(200, US_UNION);
+    let (status, _, body) =
+        suggest(&h.router, "198.51.100.90", "42 Union Street", Some("US")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_late_429_with_a_shorter_retry_after_does_not_shorten_the_cooldown(pool: PgPool) {
+    let h = harness_with(pool, 30, 100).await;
+    h.upstream.set(429, b"{}");
+    h.upstream.set_retry_after(Some("120"));
+    h.upstream
+        .set_for("Slowthrottle", 429, b"{}", Some("5"), 400);
+
+    let router = h.router.clone();
+    let slow = tokio::spawn(async move {
+        suggest(
+            &router,
+            "198.51.100.40",
+            "10 Slowthrottle Street",
+            Some("US"),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(fail_lookups(&h, 1, 1).await, 120);
+
+    let (status, headers, _) = slow.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(retry_after(&headers) >= 119, "{:?}", headers["retry-after"]);
+
+    h.app.clock.advance_seconds(61);
+    fail_lookups(&h, 2, 1).await;
+    assert_eq!(h.upstream.fetches(), 2);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_probe_success_does_not_close_a_breaker_a_late_429_reopened(pool: PgPool) {
+    let h = harness_with(pool, 30, 100).await;
+    h.upstream.set(500, b"{}");
+    h.upstream
+        .set_for("Slowthrottle", 429, b"{}", Some("120"), 700);
+    h.upstream.set_for("Slowok", 200, US_UNION, None, 1_200);
+
+    let router = h.router.clone();
+    let throttled = tokio::spawn(async move {
+        suggest(
+            &router,
+            "198.51.100.40",
+            "10 Slowthrottle Street",
+            Some("US"),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(fail_lookups(&h, 1, 3).await, BREAKER_BASE_SECONDS as u64);
+    h.app.clock.advance_seconds(BREAKER_BASE_SECONDS + 1);
+
+    let router = h.router.clone();
+    let probe = tokio::spawn(async move {
+        suggest(&router, "198.51.100.41", "20 Slowok Street", Some("US")).await
+    });
+    let (status, headers, _) = throttled.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_after(&headers), 120);
+    let (status, _, body) = probe.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(h.upstream.fetches(), 5);
+
+    let (status, headers, _) =
+        suggest(&h.router, "198.51.100.42", "21 Union Street", Some("US")).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the probe was admitted before the 429 reopened the breaker"
+    );
+    assert!(retry_after(&headers) >= 119);
+    assert_eq!(h.upstream.fetches(), 5);
 }

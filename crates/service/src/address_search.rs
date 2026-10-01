@@ -522,7 +522,14 @@ struct Inner {
 /// upstream 429; then open for a cooldown; then half-open, where exactly one
 /// lookup probes the upstream and either closes the breaker or reopens it
 /// with a doubled cooldown.
+///
+/// `generation` changes on every open, extension and close. An upstream
+/// call admitted in an earlier generation started before the breaker last
+/// changed, so its success or failure says nothing about the current state:
+/// a success never closes a breaker it did not probe, and only a 429 (which
+/// can only lengthen the cooldown) still counts.
 struct Breaker {
+    generation: u64,
     failures: u32,
     open_until: Option<DateTime<Utc>>,
     next_cooldown_seconds: i64,
@@ -530,13 +537,42 @@ struct Breaker {
 }
 
 impl Breaker {
-    fn closed() -> Self {
+    fn closed(generation: u64) -> Self {
         Self {
+            generation,
             failures: 0,
             open_until: None,
             next_cooldown_seconds: BREAKER_BASE_SECONDS,
             probing: false,
         }
+    }
+
+    fn remaining(&self, now: DateTime<Utc>) -> Option<u64> {
+        self.open_until
+            .filter(|until| *until > now)
+            .map(|until| (until - now).num_seconds().max(1) as u64)
+    }
+
+    /// Opens, or keeps open, until at least `now + seconds`; never shortens
+    /// a cooldown already in force. Returns the seconds left.
+    fn open_for(&mut self, now: DateTime<Utc>, seconds: i64) -> u64 {
+        let until = now + ChronoDuration::seconds(seconds);
+        let reopening = self.open_until.is_none_or(|current| current <= now);
+        if self.open_until.is_none_or(|current| current < until) {
+            self.open_until = Some(until);
+            self.generation = self.generation.wrapping_add(1);
+            self.probing = false;
+            if reopening {
+                self.next_cooldown_seconds =
+                    (self.next_cooldown_seconds * 2).min(BREAKER_MAX_SECONDS);
+            }
+            tracing::warn!(
+                cooldown_seconds = seconds,
+                consecutive_failures = self.failures,
+                "address search breaker opened"
+            );
+        }
+        self.remaining(now).unwrap_or(1)
     }
 }
 
@@ -546,21 +582,32 @@ enum Failure {
     Unavailable,
 }
 
-/// The half-open probe a lookup holds. Dropping it unsettled, when the
-/// lookup is cancelled or refused by the upstream budget, frees the probe
-/// for the next lookup.
-struct ProbeSlot<'a> {
+/// A lookup's admission through the breaker: the generation it was admitted
+/// in and whether it holds the half-open probe. Dropping it unsettled, when
+/// the lookup is cancelled or refused by the upstream budget, frees the
+/// probe for the next lookup.
+struct BreakerTicket<'a> {
     inner: &'a Mutex<Inner>,
-    held: bool,
+    generation: u64,
+    probe: bool,
 }
 
-impl Drop for ProbeSlot<'_> {
+impl BreakerTicket<'_> {
+    /// Releases the probe this ticket holds, if the breaker has not moved on.
+    fn settle(&mut self, breaker: &mut Breaker) {
+        if std::mem::replace(&mut self.probe, false) && breaker.generation == self.generation {
+            breaker.probing = false;
+        }
+    }
+}
+
+impl Drop for BreakerTicket<'_> {
     fn drop(&mut self) {
-        if !self.held {
+        if !self.probe {
             return;
         }
         if let Ok(mut inner) = self.inner.lock() {
-            inner.breaker.probing = false;
+            self.settle(&mut inner.breaker);
         }
     }
 }
@@ -644,7 +691,7 @@ impl AddressSearchRuntime {
                 order: VecDeque::new(),
                 clients: HashMap::new(),
                 upstream: None,
-                breaker: Breaker::closed(),
+                breaker: Breaker::closed(0),
             }),
             flights: Mutex::new(HashMap::new()),
         })
@@ -749,31 +796,36 @@ impl AddressSearchRuntime {
 
     fn breaker_remaining(&self, now: DateTime<Utc>) -> Option<u64> {
         let inner = self.inner.lock().expect("address search lock");
-        inner
-            .breaker
-            .open_until
-            .filter(|until| *until > now)
-            .map(|until| (until - now).num_seconds().max(1) as u64)
+        inner.breaker.remaining(now)
     }
 
-    /// Admits a lookup through the breaker. `Ok(true)` when this lookup is
-    /// the half-open probe.
-    fn admit_breaker(&self, now: DateTime<Utc>) -> Result<bool, SearchError> {
+    /// Admits a lookup through the breaker: closed admits everyone, open
+    /// refuses everyone, half-open admits one probe.
+    fn admit_breaker(&self, now: DateTime<Utc>) -> Result<BreakerTicket<'_>, SearchError> {
         let mut inner = self.inner.lock().expect("address search lock");
         let breaker = &mut inner.breaker;
-        match breaker.open_until {
-            None => Ok(false),
-            Some(until) if until > now => Err(SearchError::Unavailable {
-                retry_after_seconds: (until - now).num_seconds().max(1) as u64,
-            }),
-            Some(_) if breaker.probing => Err(SearchError::Unavailable {
-                retry_after_seconds: PROBE_RETRY_AFTER_SECONDS,
-            }),
+        let probe = match breaker.open_until {
+            None => false,
+            Some(until) if until > now => {
+                return Err(SearchError::Unavailable {
+                    retry_after_seconds: (until - now).num_seconds().max(1) as u64,
+                })
+            }
+            Some(_) if breaker.probing => {
+                return Err(SearchError::Unavailable {
+                    retry_after_seconds: PROBE_RETRY_AFTER_SECONDS,
+                })
+            }
             Some(_) => {
                 breaker.probing = true;
-                Ok(true)
+                true
             }
-        }
+        };
+        Ok(BreakerTicket {
+            inner: &self.inner,
+            generation: breaker.generation,
+            probe,
+        })
     }
 
     fn admit_upstream(&self, now: DateTime<Utc>) -> Result<(), SearchError> {
@@ -794,54 +846,70 @@ impl AddressSearchRuntime {
             })
     }
 
-    fn record_success(&self, probe: &mut ProbeSlot<'_>) {
+    /// A success closes an open breaker only when it is the probe admitted
+    /// in the current generation; in a closed breaker it clears the failure
+    /// count. A success admitted before the breaker last changed is ignored.
+    fn record_success(&self, ticket: &mut BreakerTicket<'_>) {
         let mut inner = self.inner.lock().expect("address search lock");
-        if inner.breaker.open_until.is_some() {
-            tracing::info!("address search breaker closed");
+        let breaker = &mut inner.breaker;
+        let current = ticket.generation == breaker.generation;
+        let was_probe = ticket.probe;
+        ticket.settle(breaker);
+        if !current {
+            return;
         }
-        inner.breaker = Breaker::closed();
-        probe.held = false;
+        match breaker.open_until {
+            None => breaker.failures = 0,
+            Some(_) if was_probe => {
+                tracing::info!("address search breaker closed");
+                *breaker = Breaker::closed(breaker.generation.wrapping_add(1));
+            }
+            Some(_) => {}
+        }
     }
 
     /// Counts a failed upstream call and returns the `Retry-After` seconds
-    /// for the lookup that saw it.
+    /// for the lookup that saw it. A 429 always counts and only ever
+    /// lengthens the cooldown; other failures count only in the generation
+    /// they were admitted in, and never while the breaker is open.
     fn record_failure(
         &self,
         now: DateTime<Utc>,
         failure: Failure,
-        probe: &mut ProbeSlot<'_>,
+        ticket: &mut BreakerTicket<'_>,
     ) -> u64 {
         let mut inner = self.inner.lock().expect("address search lock");
         let breaker = &mut inner.breaker;
-        let was_probe = std::mem::replace(&mut probe.held, false);
-        if was_probe {
-            breaker.probing = false;
-        }
-        if let Some(until) = breaker.open_until.filter(|until| *until > now) {
-            return (until - now).num_seconds().max(1) as u64;
-        }
-        breaker.failures = breaker.failures.saturating_add(1);
-        let cooldown = match failure {
+        let current = ticket.generation == breaker.generation;
+        let was_probe = ticket.probe && current;
+        ticket.settle(breaker);
+        match failure {
             Failure::Throttled {
                 retry_after_seconds,
-            } => retry_after_seconds
-                .map(|seconds| i64::try_from(seconds).unwrap_or(THROTTLE_MAX_SECONDS))
-                .unwrap_or(0)
-                .clamp(breaker.next_cooldown_seconds, THROTTLE_MAX_SECONDS),
-            Failure::Unavailable if was_probe || breaker.failures >= BREAKER_FAILURE_THRESHOLD => {
-                breaker.next_cooldown_seconds
+            } => {
+                breaker.failures = breaker.failures.saturating_add(1);
+                let cooldown = retry_after_seconds
+                    .map(|seconds| i64::try_from(seconds).unwrap_or(THROTTLE_MAX_SECONDS))
+                    .unwrap_or(0)
+                    .clamp(breaker.next_cooldown_seconds, THROTTLE_MAX_SECONDS);
+                breaker.open_for(now, cooldown)
             }
-            Failure::Unavailable => return FAILURE_RETRY_AFTER_SECONDS,
-        };
-        breaker.open_until = Some(now + ChronoDuration::seconds(cooldown));
-        breaker.next_cooldown_seconds =
-            (breaker.next_cooldown_seconds * 2).min(BREAKER_MAX_SECONDS);
-        tracing::warn!(
-            cooldown_seconds = cooldown,
-            consecutive_failures = breaker.failures,
-            "address search breaker opened"
-        );
-        cooldown as u64
+            Failure::Unavailable => {
+                if let Some(remaining) = breaker.remaining(now) {
+                    return remaining;
+                }
+                if !current {
+                    return FAILURE_RETRY_AFTER_SECONDS;
+                }
+                breaker.failures = breaker.failures.saturating_add(1);
+                if was_probe || breaker.failures >= BREAKER_FAILURE_THRESHOLD {
+                    let cooldown = breaker.next_cooldown_seconds;
+                    breaker.open_for(now, cooldown)
+                } else {
+                    FAILURE_RETRY_AFTER_SECONDS
+                }
+            }
+        }
     }
 
     /// One suggestion lookup: per-client limit, cache, breaker, per-query
@@ -897,10 +965,7 @@ impl AddressSearchRuntime {
         if let Some(hit) = self.cached(&key, now()) {
             return Ok(hit);
         }
-        let mut probe = ProbeSlot {
-            inner: &self.inner,
-            held: self.admit_breaker(now())?,
-        };
+        let mut ticket = self.admit_breaker(now())?;
         self.admit_upstream(now())?;
         let outcome = match self.client.search(query, country).await {
             Ok(body) => normalize(&body, query, country).map_err(|MalformedUpstream| {
@@ -917,13 +982,13 @@ impl AddressSearchRuntime {
         };
         match outcome {
             Ok(suggestions) => {
-                self.record_success(&mut probe);
+                self.record_success(&mut ticket);
                 let suggestions = Arc::new(suggestions);
                 self.store(key, suggestions.clone(), now());
                 Ok(suggestions)
             }
             Err(failure) => Err(SearchError::Unavailable {
-                retry_after_seconds: self.record_failure(now(), failure, &mut probe),
+                retry_after_seconds: self.record_failure(now(), failure, &mut ticket),
             }),
         }
     }
