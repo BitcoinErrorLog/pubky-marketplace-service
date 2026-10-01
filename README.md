@@ -161,9 +161,16 @@ public Nominatim instance forbids autocomplete; Photon is built for it.
   no cookies, Referer, forwarded address or Accept-Language.
 - Limits: per client (30 per minute, burst 8) and across all clients toward
   the upstream (2 per second by default). Identical concurrent queries share
-  one upstream call. An upstream 429, 5xx, timeout or unreadable answer opens a
-  60-second breaker (503 `address_search_unavailable` with `Retry-After`);
-  cached answers still serve.
+  one upstream call. The upstream gets 6 seconds per call (2 to connect).
+- Failures: a timeout, transport failure, 5xx or unreadable answer fails that
+  lookup with 503 `address_search_unavailable` and `Retry-After: 2`. Three in
+  a row, or one upstream 429, open a breaker: 10 seconds first, doubling on
+  each reopening up to 60, and a 429's own `Retry-After` is honoured up to 10
+  minutes. When the cooldown ends, one lookup probes the upstream (others get
+  `Retry-After: 1`); success closes the breaker and resets the cooldown.
+  Cached answers still serve while it is open. Logs record the failure cause
+  (`timeout`, `connect`, `transport`, or the upstream status) and its latency,
+  never the query.
 - A street-only match keeps the buyer's typed leading house number on line 1
   (`precision: "street"`); an OpenStreetMap house match is `precision: "house"`.
   `region` is Photon's state name; clients map it to their own codes.

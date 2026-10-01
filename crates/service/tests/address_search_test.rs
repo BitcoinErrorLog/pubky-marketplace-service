@@ -22,7 +22,8 @@ use tower::util::ServiceExt;
 use common::{test_app, TestApp};
 use marketplace_service::address_search::{
     normalize, AddressSearchRuntime, PhotonClient, ATTRIBUTION_TEXT, ATTRIBUTION_URL,
-    CACHE_TTL_SECONDS,
+    BREAKER_BASE_SECONDS, BREAKER_MAX_SECONDS, CACHE_TTL_SECONDS, FAILURE_RETRY_AFTER_SECONDS,
+    PROBE_RETRY_AFTER_SECONDS, THROTTLE_MAX_SECONDS,
 };
 use marketplace_service::http::build_router;
 
@@ -39,6 +40,7 @@ struct Upstream {
 struct UpstreamInner {
     status: u16,
     body: Vec<u8>,
+    retry_after: Option<String>,
     delay_ms: u64,
     fetches: usize,
     queries: Vec<String>,
@@ -55,6 +57,9 @@ impl UpstreamDouble {
         let mut guard = self.state.inner.lock().unwrap();
         guard.status = status;
         guard.body = body.to_vec();
+    }
+    fn set_retry_after(&self, value: Option<&str>) {
+        self.state.inner.lock().unwrap().retry_after = value.map(str::to_string);
     }
     fn set_delay(&self, delay_ms: u64) {
         self.state.inner.lock().unwrap().delay_ms = delay_ms;
@@ -89,22 +94,33 @@ async fn serve_search(
     axum::extract::RawQuery(query): axum::extract::RawQuery,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let (status, body, delay) = {
+    let (status, body, retry_after, delay) = {
         let mut guard = state.inner.lock().unwrap();
         guard.fetches += 1;
         guard.queries.push(query.unwrap_or_default());
         guard.headers.push(headers);
-        (guard.status, guard.body.clone(), guard.delay_ms)
+        (
+            guard.status,
+            guard.body.clone(),
+            guard.retry_after.clone(),
+            guard.delay_ms,
+        )
     };
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
-    (
+    let mut response = (
         StatusCode::from_u16(status).unwrap(),
         [("content-type", "application/json")],
         body,
     )
-        .into_response()
+        .into_response();
+    if let Some(value) = retry_after {
+        response
+            .headers_mut()
+            .insert("retry-after", value.parse().unwrap());
+    }
+    response
 }
 
 async fn spawn_upstream() -> UpstreamDouble {
@@ -112,6 +128,7 @@ async fn spawn_upstream() -> UpstreamDouble {
         inner: Arc::new(Mutex::new(UpstreamInner {
             status: 200,
             body: US_UNION.to_vec(),
+            retry_after: None,
             delay_ms: 0,
             fetches: 0,
             queries: Vec::new(),
@@ -136,14 +153,24 @@ struct Harness {
 }
 
 async fn harness_with(pool: PgPool, client_per_minute: u32, upstream_per_second: u32) -> Harness {
+    harness_with_runtime(pool, |base_url| {
+        AddressSearchRuntime::new(
+            base_url,
+            Some(axum::http::HeaderName::from_static("x-real-ip")),
+            client_per_minute,
+            upstream_per_second,
+        )
+        .unwrap()
+    })
+    .await
+}
+
+async fn harness_with_runtime(
+    pool: PgPool,
+    runtime: impl FnOnce(&str) -> AddressSearchRuntime,
+) -> Harness {
     let upstream = spawn_upstream().await;
-    let runtime = AddressSearchRuntime::new(
-        &upstream.base_url,
-        Some(axum::http::HeaderName::from_static("x-real-ip")),
-        client_per_minute,
-        upstream_per_second,
-    )
-    .unwrap();
+    let runtime = runtime(&upstream.base_url);
     let app = test_app(pool).await;
     let state = app
         .state
@@ -648,8 +675,95 @@ async fn the_upstream_is_capped_across_all_clients(pool: PgPool) {
     assert_eq!(h.upstream.fetches(), 3);
 }
 
+fn retry_after(headers: &HeaderMap) -> u64 {
+    headers["retry-after"].to_str().unwrap().parse().unwrap()
+}
+
+/// Fails `count` lookups against a failing upstream, each from its own
+/// client and query, and returns the last lookup's `Retry-After`.
+async fn fail_lookups(h: &Harness, first: usize, count: usize) -> u64 {
+    let mut last = 0;
+    for index in first..first + count {
+        let (status, headers, body) = suggest(
+            &h.router,
+            &format!("198.51.100.{}", index % 250 + 1),
+            &format!("{index} Union Street"),
+            Some("US"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "lookup {index}: {body}"
+        );
+        assert_eq!(body["error"]["code"], "address_search_unavailable");
+        last = retry_after(&headers);
+    }
+    last
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn an_upstream_that_throttles_opens_the_breaker_and_cached_answers_survive(pool: PgPool) {
+async fn one_failed_upstream_call_fails_only_that_lookup(pool: PgPool) {
+    let h = harness(pool).await;
+    h.upstream.set(500, b"{}");
+    assert_eq!(fail_lookups(&h, 1, 1).await, FAILURE_RETRY_AFTER_SECONDS);
+
+    h.upstream.set(200, US_UNION);
+    let (status, _, body) =
+        suggest(&h.router, "198.51.100.77", "42 Union Street", Some("US")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the next lookup reaches the upstream at once: {body}"
+    );
+    assert_eq!(h.upstream.fetches(), 2);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_answer_slower_than_three_seconds_still_reaches_the_buyer(pool: PgPool) {
+    let h = harness(pool).await;
+    h.upstream.set_delay(3_300);
+    let (status, _, body) = suggest(&h.router, "203.0.113.7", "42 Union Street", Some("US")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["suggestions"].as_array().unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn timeouts_open_the_breaker_only_when_they_repeat(pool: PgPool) {
+    let h = harness_with_runtime(pool, |base_url| {
+        AddressSearchRuntime::new(
+            base_url,
+            Some(axum::http::HeaderName::from_static("x-real-ip")),
+            30,
+            100,
+        )
+        .unwrap()
+        .with_upstream_timeout(Duration::from_millis(300))
+        .unwrap()
+    })
+    .await;
+    h.upstream.set_delay(600);
+    assert_eq!(fail_lookups(&h, 1, 2).await, FAILURE_RETRY_AFTER_SECONDS);
+    assert_eq!(fail_lookups(&h, 3, 1).await, BREAKER_BASE_SECONDS as u64);
+    assert_eq!(h.upstream.fetches(), 3);
+
+    fail_lookups(&h, 4, 1).await;
+    assert_eq!(
+        h.upstream.fetches(),
+        3,
+        "the open breaker sends nothing upstream"
+    );
+
+    h.upstream.set_delay(0);
+    h.app.clock.advance_seconds(BREAKER_BASE_SECONDS + 1);
+    let (status, _, body) =
+        suggest(&h.router, "198.51.100.90", "42 Union Street", Some("US")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(h.upstream.fetches(), 4);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_upstream_429_opens_a_short_breaker_and_cached_answers_survive(pool: PgPool) {
     let h = harness(pool).await;
     let (status, _, _) = suggest(&h.router, "203.0.113.7", "42 Union Street", Some("US")).await;
     assert_eq!(status, StatusCode::OK);
@@ -660,7 +774,7 @@ async fn an_upstream_that_throttles_opens_the_breaker_and_cached_answers_survive
         suggest(&h.router, "203.0.113.7", "43 Union Street", Some("US")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"]["code"], "address_search_unavailable");
-    assert_eq!(headers["retry-after"], "60");
+    assert_eq!(retry_after(&headers), BREAKER_BASE_SECONDS as u64);
     assert_eq!(h.upstream.fetches(), 2);
 
     let (status, _, _) = suggest(&h.router, "203.0.113.7", "44 Union Street", Some("US")).await;
@@ -678,11 +792,121 @@ async fn an_upstream_that_throttles_opens_the_breaker_and_cached_answers_survive
         "cached answers are still served: {body}"
     );
 
-    h.app.clock.advance_seconds(61);
+    h.app.clock.advance_seconds(BREAKER_BASE_SECONDS + 1);
     h.upstream.set(200, US_UNION);
     let (status, _, _) = suggest(&h.router, "203.0.113.7", "45 Union Street", Some("US")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h.upstream.fetches(), 3);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_upstream_429_retry_after_is_honoured_up_to_the_cap(pool: PgPool) {
+    let h = harness(pool).await;
+    h.upstream.set(429, b"{}");
+    h.upstream.set_retry_after(Some("120"));
+    assert_eq!(fail_lookups(&h, 1, 1).await, 120);
+
+    h.upstream.set(200, US_UNION);
+    h.upstream.set_retry_after(None);
+    h.app.clock.advance_seconds(61);
+    fail_lookups(&h, 2, 1).await;
+    assert_eq!(
+        h.upstream.fetches(),
+        1,
+        "the upstream asked for 120 seconds"
+    );
+
+    h.app.clock.advance_seconds(60);
+    let (status, _, body) =
+        suggest(&h.router, "198.51.100.90", "42 Union Street", Some("US")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(h.upstream.fetches(), 2);
+
+    h.upstream.set(429, b"{}");
+    h.upstream.set_retry_after(Some("86400"));
+    assert_eq!(fail_lookups(&h, 3, 1).await, THROTTLE_MAX_SECONDS as u64);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_half_open_breaker_probes_once_and_backs_off_until_the_upstream_answers(pool: PgPool) {
+    let h = harness_with(pool, 30, 100).await;
+    h.upstream.set(500, b"{}");
+    assert_eq!(fail_lookups(&h, 1, 3).await, BREAKER_BASE_SECONDS as u64);
+    assert_eq!(h.upstream.fetches(), 3);
+
+    let mut cooldown = BREAKER_BASE_SECONDS;
+    let mut next = 4;
+    let mut fetches = 3;
+    while cooldown < BREAKER_MAX_SECONDS {
+        h.app.clock.advance_seconds(cooldown - 1);
+        fail_lookups(&h, next, 1).await;
+        assert_eq!(
+            h.upstream.fetches(),
+            fetches,
+            "still open after {cooldown}s - 1"
+        );
+        h.app.clock.advance_seconds(2);
+        let reopened = fail_lookups(&h, next + 1, 1).await;
+        fetches += 1;
+        assert_eq!(h.upstream.fetches(), fetches, "one probe after {cooldown}s");
+        let doubled = (cooldown * 2).min(BREAKER_MAX_SECONDS);
+        assert_eq!(
+            reopened, doubled as u64,
+            "a failed probe doubles the cooldown"
+        );
+        cooldown = doubled;
+        next += 2;
+    }
+
+    h.app.clock.advance_seconds(cooldown + 1);
+    h.upstream.set(200, US_UNION);
+    let (status, _, body) =
+        suggest(&h.router, "198.51.100.200", "42 Union Street", Some("US")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a successful probe closes the breaker: {body}"
+    );
+
+    h.upstream.set(500, b"{}");
+    assert_eq!(
+        fail_lookups(&h, 300, 1).await,
+        FAILURE_RETRY_AFTER_SECONDS,
+        "a success resets the failure count"
+    );
+    assert_eq!(
+        fail_lookups(&h, 301, 2).await,
+        BREAKER_BASE_SECONDS as u64,
+        "and the cooldown"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn while_one_lookup_probes_the_others_wait_without_reaching_the_upstream(pool: PgPool) {
+    let h = harness_with(pool, 30, 100).await;
+    h.upstream.set(500, b"{}");
+    fail_lookups(&h, 1, 3).await;
+    h.app.clock.advance_seconds(BREAKER_BASE_SECONDS + 1);
+    h.upstream.set(200, US_UNION);
+    h.upstream.set_delay(400);
+
+    let router = h.router.clone();
+    let probe = tokio::spawn(async move {
+        suggest(&router, "198.51.100.50", "50 Union Street", Some("US")).await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (status, headers, _) =
+        suggest(&h.router, "198.51.100.51", "51 Union Street", Some("US")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_after(&headers), PROBE_RETRY_AFTER_SECONDS);
+
+    let (status, _, body) = probe.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(h.upstream.fetches(), 4);
+
+    let (status, _, _) = suggest(&h.router, "198.51.100.51", "51 Union Street", Some("US")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(h.upstream.fetches(), 5);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
