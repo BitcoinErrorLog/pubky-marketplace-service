@@ -6,7 +6,7 @@ const STAGING_PROJECT_ID = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed";
 const STAGING_ENVIRONMENT_ID = "c67a6435-bb23-453b-9169-764bfa0312e1";
 // `image()` takes a string only. Bump in the same PR as every staging IMAGE connect.
 const STAGING_IMAGE =
-  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service:9b93e9546789321124d4a653ca262f455df5531a36d92d56d4548197cd40d969";
+  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:bd5466011f2bd520b1f310ce4c1416d7de98b1b9382068ebf6bb6f1ea46c887c";
 
 const stagingEnv = {
   ADDRESS_SEARCH_CLIENT_IP_HEADER: preserve(),
