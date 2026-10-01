@@ -48,8 +48,25 @@ pub const UPSTREAM_BURST_SECONDS: f64 = 3.0;
 pub const CACHE_TTL_SECONDS: i64 = 30 * 60;
 pub const CACHE_CAPACITY: usize = 4096;
 pub const CLIENT_TABLE_CAPACITY: usize = 20_000;
-pub const BREAKER_SECONDS: i64 = 60;
-pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
+/// Consecutive upstream failures (timeout, transport, 5xx, unreadable answer)
+/// that open the breaker. A single slow answer from the public instance is
+/// routine and must not take suggestions away from every buyer.
+pub const BREAKER_FAILURE_THRESHOLD: u32 = 3;
+/// First breaker cooldown; each reopening without a success in between
+/// doubles it up to `BREAKER_MAX_SECONDS`.
+pub const BREAKER_BASE_SECONDS: i64 = 10;
+pub const BREAKER_MAX_SECONDS: i64 = 60;
+/// Upper bound on an upstream 429's `Retry-After` that the breaker honours.
+pub const THROTTLE_MAX_SECONDS: i64 = 600;
+/// `Retry-After` for a failure that did not open the breaker.
+pub const FAILURE_RETRY_AFTER_SECONDS: u64 = 2;
+/// `Retry-After` while another request is probing a half-open breaker.
+pub const PROBE_RETRY_AFTER_SECONDS: u64 = 1;
+/// Public Photon answers in about 0.7–2.5 s from the service's region, so
+/// the budget leaves headroom over its tail; a refused connection still
+/// fails fast on the connect timeout.
+pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(6);
+pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const UPSTREAM_BODY_LIMIT: usize = 256 * 1024;
 const UPSTREAM_FETCH_LIMIT: usize = 8;
 const FIELD_MAX_CHARS: usize = 200;
@@ -307,7 +324,9 @@ pub fn normalize(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamError {
-    /// Transport failure, timeout, 429, 5xx, or an unreadable answer.
+    /// A 429, with the upstream's `Retry-After` seconds when it sent them.
+    Throttled { retry_after_seconds: Option<u64> },
+    /// Transport failure, timeout, 5xx, or an unreadable answer.
     Unavailable,
     /// A 4xx the upstream gave for this one query.
     Rejected,
@@ -330,6 +349,11 @@ impl std::fmt::Debug for PhotonClient {
 
 impl PhotonClient {
     pub fn new(base_url: &str) -> anyhow::Result<Self> {
+        Self::with_timeout(base_url, UPSTREAM_TIMEOUT)
+    }
+
+    /// `timeout` bounds the whole exchange, body included.
+    pub fn with_timeout(base_url: &str, timeout: Duration) -> anyhow::Result<Self> {
         let parsed = url::Url::parse(base_url.trim())
             .map_err(|_| anyhow::anyhow!("{ENV_UPSTREAM_URL} must be an absolute URL"))?;
         let loopback = matches!(
@@ -345,7 +369,8 @@ impl PhotonClient {
             anyhow::bail!("{ENV_UPSTREAM_URL} must not carry a query or fragment");
         }
         let http = reqwest::Client::builder()
-            .timeout(UPSTREAM_TIMEOUT)
+            .timeout(timeout)
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT.min(timeout))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(USER_AGENT)
             .build()?;
@@ -373,36 +398,76 @@ impl PhotonClient {
                 pairs.append_pair("countrycode", country);
             }
         }
+        let started = std::time::Instant::now();
+        let elapsed_ms = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let mut response = self
             .http
             .get(url)
             .header(header::ACCEPT, "application/json")
             .send()
             .await
-            .map_err(|_| {
-                tracing::warn!("address search upstream transport failure");
+            .map_err(|failure| {
+                tracing::warn!(
+                    cause = transport_cause(&failure),
+                    elapsed_ms = elapsed_ms(),
+                    "address search upstream transport failure"
+                );
                 UpstreamError::Unavailable
             })?;
         let status = response.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            tracing::warn!(status = status.as_u16(), "address search upstream refused");
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after_seconds = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok());
+            tracing::warn!(
+                status = status.as_u16(),
+                retry_after_seconds,
+                elapsed_ms = elapsed_ms(),
+                "address search upstream refused"
+            );
+            return Err(UpstreamError::Throttled {
+                retry_after_seconds,
+            });
+        }
+        if status.is_server_error() {
+            tracing::warn!(
+                status = status.as_u16(),
+                elapsed_ms = elapsed_ms(),
+                "address search upstream refused"
+            );
             return Err(UpstreamError::Unavailable);
         }
         if !status.is_success() {
             return Err(UpstreamError::Rejected);
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| UpstreamError::Unavailable)?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|failure| {
+            tracing::warn!(
+                cause = transport_cause(&failure),
+                elapsed_ms = elapsed_ms(),
+                "address search upstream transport failure"
+            );
+            UpstreamError::Unavailable
+        })? {
             if body.len() + chunk.len() > UPSTREAM_BODY_LIMIT {
+                tracing::warn!("address search upstream answer exceeded the size limit");
                 return Err(UpstreamError::Unavailable);
             }
             body.extend_from_slice(&chunk);
         }
         Ok(body)
+    }
+}
+
+fn transport_cause(failure: &reqwest::Error) -> &'static str {
+    if failure.is_timeout() {
+        "timeout"
+    } else if failure.is_connect() {
+        "connect"
+    } else {
+        "transport"
     }
 }
 
@@ -450,7 +515,101 @@ struct Inner {
     order: VecDeque<CacheKey>,
     clients: HashMap<[u8; 16], Bucket>,
     upstream: Option<Bucket>,
-    breaker_until: Option<DateTime<Utc>>,
+    breaker: Breaker,
+}
+
+/// Closed until `BREAKER_FAILURE_THRESHOLD` consecutive failures or one
+/// upstream 429; then open for a cooldown; then half-open, where exactly one
+/// lookup probes the upstream and either closes the breaker or reopens it
+/// with a doubled cooldown.
+///
+/// `generation` changes on every open, extension and close. An upstream
+/// call admitted in an earlier generation started before the breaker last
+/// changed, so its success or failure says nothing about the current state:
+/// a success never closes a breaker it did not probe, and only a 429 (which
+/// can only lengthen the cooldown) still counts.
+struct Breaker {
+    generation: u64,
+    failures: u32,
+    open_until: Option<DateTime<Utc>>,
+    next_cooldown_seconds: i64,
+    probing: bool,
+}
+
+impl Breaker {
+    fn closed(generation: u64) -> Self {
+        Self {
+            generation,
+            failures: 0,
+            open_until: None,
+            next_cooldown_seconds: BREAKER_BASE_SECONDS,
+            probing: false,
+        }
+    }
+
+    fn remaining(&self, now: DateTime<Utc>) -> Option<u64> {
+        self.open_until
+            .filter(|until| *until > now)
+            .map(|until| (until - now).num_seconds().max(1) as u64)
+    }
+
+    /// Opens, or keeps open, until at least `now + seconds`; never shortens
+    /// a cooldown already in force. Returns the seconds left.
+    fn open_for(&mut self, now: DateTime<Utc>, seconds: i64) -> u64 {
+        let until = now + ChronoDuration::seconds(seconds);
+        let reopening = self.open_until.is_none_or(|current| current <= now);
+        if self.open_until.is_none_or(|current| current < until) {
+            self.open_until = Some(until);
+            self.generation = self.generation.wrapping_add(1);
+            self.probing = false;
+            if reopening {
+                self.next_cooldown_seconds =
+                    (self.next_cooldown_seconds * 2).min(BREAKER_MAX_SECONDS);
+            }
+            tracing::warn!(
+                cooldown_seconds = seconds,
+                consecutive_failures = self.failures,
+                "address search breaker opened"
+            );
+        }
+        self.remaining(now).unwrap_or(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Failure {
+    Throttled { retry_after_seconds: Option<u64> },
+    Unavailable,
+}
+
+/// A lookup's admission through the breaker: the generation it was admitted
+/// in and whether it holds the half-open probe. Dropping it unsettled, when
+/// the lookup is cancelled or refused by the upstream budget, frees the
+/// probe for the next lookup.
+struct BreakerTicket<'a> {
+    inner: &'a Mutex<Inner>,
+    generation: u64,
+    probe: bool,
+}
+
+impl BreakerTicket<'_> {
+    /// Releases the probe this ticket holds, if the breaker has not moved on.
+    fn settle(&mut self, breaker: &mut Breaker) {
+        if std::mem::replace(&mut self.probe, false) && breaker.generation == self.generation {
+            breaker.probing = false;
+        }
+    }
+}
+
+impl Drop for BreakerTicket<'_> {
+    fn drop(&mut self) {
+        if !self.probe {
+            return;
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            self.settle(&mut inner.breaker);
+        }
+    }
 }
 
 pub struct AddressSearchRuntime {
@@ -532,10 +691,16 @@ impl AddressSearchRuntime {
                 order: VecDeque::new(),
                 clients: HashMap::new(),
                 upstream: None,
-                breaker_until: None,
+                breaker: Breaker::closed(0),
             }),
             flights: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Replaces the default upstream time budget (`UPSTREAM_TIMEOUT`).
+    pub fn with_upstream_timeout(mut self, timeout: Duration) -> anyhow::Result<Self> {
+        self.client = PhotonClient::with_timeout(self.client.base_url.as_str(), timeout)?;
+        Ok(self)
     }
 
     fn client_key(&self, ip: &str) -> [u8; 16] {
@@ -631,10 +796,36 @@ impl AddressSearchRuntime {
 
     fn breaker_remaining(&self, now: DateTime<Utc>) -> Option<u64> {
         let inner = self.inner.lock().expect("address search lock");
-        inner
-            .breaker_until
-            .filter(|until| *until > now)
-            .map(|until| (until - now).num_seconds().max(1) as u64)
+        inner.breaker.remaining(now)
+    }
+
+    /// Admits a lookup through the breaker: closed admits everyone, open
+    /// refuses everyone, half-open admits one probe.
+    fn admit_breaker(&self, now: DateTime<Utc>) -> Result<BreakerTicket<'_>, SearchError> {
+        let mut inner = self.inner.lock().expect("address search lock");
+        let breaker = &mut inner.breaker;
+        let probe = match breaker.open_until {
+            None => false,
+            Some(until) if until > now => {
+                return Err(SearchError::Unavailable {
+                    retry_after_seconds: (until - now).num_seconds().max(1) as u64,
+                })
+            }
+            Some(_) if breaker.probing => {
+                return Err(SearchError::Unavailable {
+                    retry_after_seconds: PROBE_RETRY_AFTER_SECONDS,
+                })
+            }
+            Some(_) => {
+                breaker.probing = true;
+                true
+            }
+        };
+        Ok(BreakerTicket {
+            inner: &self.inner,
+            generation: breaker.generation,
+            probe,
+        })
     }
 
     fn admit_upstream(&self, now: DateTime<Utc>) -> Result<(), SearchError> {
@@ -644,14 +835,81 @@ impl AddressSearchRuntime {
             .upstream
             .get_or_insert_with(|| Bucket::full(capacity, now))
             .take(now, self.upstream_per_second, capacity)
-            .map_err(|retry_after_seconds| SearchError::Unavailable {
-                retry_after_seconds,
+            .map_err(|retry_after_seconds| {
+                tracing::warn!(
+                    retry_after_seconds,
+                    "address search upstream budget exhausted"
+                );
+                SearchError::Unavailable {
+                    retry_after_seconds,
+                }
             })
     }
 
-    fn open_breaker(&self, now: DateTime<Utc>) {
+    /// A success closes an open breaker only when it is the probe admitted
+    /// in the current generation; in a closed breaker it clears the failure
+    /// count. A success admitted before the breaker last changed is ignored.
+    fn record_success(&self, ticket: &mut BreakerTicket<'_>) {
         let mut inner = self.inner.lock().expect("address search lock");
-        inner.breaker_until = Some(now + ChronoDuration::seconds(BREAKER_SECONDS));
+        let breaker = &mut inner.breaker;
+        let current = ticket.generation == breaker.generation;
+        let was_probe = ticket.probe;
+        ticket.settle(breaker);
+        if !current {
+            return;
+        }
+        match breaker.open_until {
+            None => breaker.failures = 0,
+            Some(_) if was_probe => {
+                tracing::info!("address search breaker closed");
+                *breaker = Breaker::closed(breaker.generation.wrapping_add(1));
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Counts a failed upstream call and returns the `Retry-After` seconds
+    /// for the lookup that saw it. A 429 always counts and only ever
+    /// lengthens the cooldown; other failures count only in the generation
+    /// they were admitted in, and never while the breaker is open.
+    fn record_failure(
+        &self,
+        now: DateTime<Utc>,
+        failure: Failure,
+        ticket: &mut BreakerTicket<'_>,
+    ) -> u64 {
+        let mut inner = self.inner.lock().expect("address search lock");
+        let breaker = &mut inner.breaker;
+        let current = ticket.generation == breaker.generation;
+        let was_probe = ticket.probe && current;
+        ticket.settle(breaker);
+        match failure {
+            Failure::Throttled {
+                retry_after_seconds,
+            } => {
+                breaker.failures = breaker.failures.saturating_add(1);
+                let cooldown = retry_after_seconds
+                    .map(|seconds| i64::try_from(seconds).unwrap_or(THROTTLE_MAX_SECONDS))
+                    .unwrap_or(0)
+                    .clamp(breaker.next_cooldown_seconds, THROTTLE_MAX_SECONDS);
+                breaker.open_for(now, cooldown)
+            }
+            Failure::Unavailable => {
+                if let Some(remaining) = breaker.remaining(now) {
+                    return remaining;
+                }
+                if !current {
+                    return FAILURE_RETRY_AFTER_SECONDS;
+                }
+                breaker.failures = breaker.failures.saturating_add(1);
+                if was_probe || breaker.failures >= BREAKER_FAILURE_THRESHOLD {
+                    let cooldown = breaker.next_cooldown_seconds;
+                    breaker.open_for(now, cooldown)
+                } else {
+                    FAILURE_RETRY_AFTER_SECONDS
+                }
+            }
+        }
     }
 
     /// One suggestion lookup: per-client limit, cache, breaker, per-query
@@ -707,34 +965,32 @@ impl AddressSearchRuntime {
         if let Some(hit) = self.cached(&key, now()) {
             return Ok(hit);
         }
-        if let Some(retry_after_seconds) = self.breaker_remaining(now()) {
-            return Err(SearchError::Unavailable {
-                retry_after_seconds,
-            });
-        }
+        let mut ticket = self.admit_breaker(now())?;
         self.admit_upstream(now())?;
-        let suggestions = match self.client.search(query, country).await {
-            Ok(body) => match normalize(&body, query, country) {
-                Ok(suggestions) => suggestions,
-                Err(MalformedUpstream) => {
-                    tracing::warn!("address search upstream answer was unreadable");
-                    self.open_breaker(now());
-                    return Err(SearchError::Unavailable {
-                        retry_after_seconds: BREAKER_SECONDS as u64,
-                    });
-                }
-            },
-            Err(UpstreamError::Rejected) => Vec::new(),
-            Err(UpstreamError::Unavailable) => {
-                self.open_breaker(now());
-                return Err(SearchError::Unavailable {
-                    retry_after_seconds: BREAKER_SECONDS as u64,
-                });
-            }
+        let outcome = match self.client.search(query, country).await {
+            Ok(body) => normalize(&body, query, country).map_err(|MalformedUpstream| {
+                tracing::warn!("address search upstream answer was unreadable");
+                Failure::Unavailable
+            }),
+            Err(UpstreamError::Rejected) => Ok(Vec::new()),
+            Err(UpstreamError::Throttled {
+                retry_after_seconds,
+            }) => Err(Failure::Throttled {
+                retry_after_seconds,
+            }),
+            Err(UpstreamError::Unavailable) => Err(Failure::Unavailable),
         };
-        let suggestions = Arc::new(suggestions);
-        self.store(key, suggestions.clone(), now());
-        Ok(suggestions)
+        match outcome {
+            Ok(suggestions) => {
+                self.record_success(&mut ticket);
+                let suggestions = Arc::new(suggestions);
+                self.store(key, suggestions.clone(), now());
+                Ok(suggestions)
+            }
+            Err(failure) => Err(SearchError::Unavailable {
+                retry_after_seconds: self.record_failure(now(), failure, &mut ticket),
+            }),
+        }
     }
 }
 
@@ -924,6 +1180,42 @@ mod tests {
             runtime.flights.lock().unwrap().is_empty(),
             "the cancelled lookup's flight key was removed"
         );
+        silent.abort();
+    }
+
+    #[tokio::test]
+    async fn a_half_open_probe_cancelled_during_the_upstream_call_frees_the_probe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let runtime =
+            AddressSearchRuntime::new(&format!("http://127.0.0.1:{port}"), None, 30, 2).unwrap();
+        runtime.inner.lock().unwrap().breaker.open_until =
+            Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            runtime.search(
+                chrono::Utc::now,
+                "203.0.113.1",
+                "42 Union Street",
+                Some("US"),
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the upstream never answered");
+        let inner = runtime.inner.lock().unwrap();
+        assert!(!inner.breaker.probing, "the next lookup may probe");
+        assert!(
+            inner.breaker.open_until.is_some(),
+            "a cancelled probe proves nothing, so the breaker stays half-open"
+        );
+        drop(inner);
         silent.abort();
     }
 }
