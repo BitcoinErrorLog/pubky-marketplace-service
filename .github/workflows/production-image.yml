@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/bitcoinerrorlog/pubky-marketplace-service
+  IMAGE_NAME: pubky-marketplace-service
   SOURCE_SHA: ${{ github.event.inputs.source_sha || '2f844c1084c432d8dd6d7e66c320dcaeeb9eb02e' }}
 
 jobs:
@@ -31,6 +31,14 @@ jobs:
       contents: read
       packages: write
     steps:
+      # GHCR names must be lowercase, and the owner follows the repository
+      # through a transfer.
+      - name: Resolve image name from repository owner
+        run: |
+          set -eu
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE=ghcr.io/$owner/$IMAGE_NAME" >> "$GITHUB_ENV"
+
       - name: Check out exact source SHA
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -73,7 +81,7 @@ jobs:
             --file Dockerfile \
             --platform linux/amd64 \
             --label "org.opencontainers.image.revision=$SOURCE_SHA" \
-            --label "org.opencontainers.image.source=https://github.com/BitcoinErrorLog/pubky-marketplace-service" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --tag "$IMAGE:sha-$SOURCE_SHA" \
             --provenance=true \
             --sbom=true \
