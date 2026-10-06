@@ -927,6 +927,13 @@ pub async fn bind_payment_method(
                         "buyer_paykit_wallet_required",
                         "Connect Bitkit (or another Paykit wallet) to pay with Bitcoin.",
                     ),
+                    // A 4xx refusal, so no client treats it as an outage to
+                    // retry: the buyer finishes wallet setup, then pays again.
+                    PaykitRequestError::ReaderSetupPending => method_error(
+                        ErrorCode::InvalidState,
+                        "buyer_paykit_wallet_setup_needed",
+                        "Reader wallet setup needed. Finish setting up Bitkit (or another Paykit wallet) for this identity, then choose Pay again.",
+                    ),
                     PaykitRequestError::Rejected => method_error(
                         ErrorCode::InvalidState,
                         "paykit_rejected",

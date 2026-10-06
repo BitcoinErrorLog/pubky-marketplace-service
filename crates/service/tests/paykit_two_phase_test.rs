@@ -610,10 +610,77 @@ async fn a_buyer_without_a_payable_paykit_wallet_is_told_to_connect_one(pool: Pg
         "nothing is bound"
     );
 
+    assert_eq!(
+        phase_one_calls(&paykit),
+        1,
+        "a terminal refusal is never retried"
+    );
+
     // Once the buyer's wallet is connected, the same order binds.
     paykit.clear_creation_failure();
     let (status, body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+fn phase_one_calls(paykit: &FakePaykit) -> usize {
+    paykit
+        .calls()
+        .into_iter()
+        .filter(|call| call.method == "POST" && call.path == "/v0/payment-requests")
+        .count()
+}
+
+// The buyer has no Paykit App Registry yet (paykit `503 reader_setup_pending`,
+// no `Retry-After`): the refusal asks them to finish wallet setup, as a 4xx
+// that no client retries as an outage, and the service makes one phase-1 call.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_buyer_whose_wallet_setup_is_pending_is_asked_to_finish_it(pool: PgPool) {
+    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    paykit.fail_creation_with_status(503, "reader_setup_pending");
+
+    let (status, body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"]["reason"],
+        json!("buyer_paykit_wallet_setup_needed")
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Reader wallet setup needed")),
+        "{body}"
+    );
+    assert_eq!(phase_one_calls(&paykit), 1, "no automatic retry");
+    let (payment_method, activation): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT payment_method, paykit_activation_state FROM orders WHERE id = $1")
+            .bind(order_uuid(&order.order_id))
+            .fetch_one(&pool)
+            .await
+            .expect("order row exists");
+    assert_eq!(
+        (payment_method, activation),
+        (None, None),
+        "nothing is bound"
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate'"
+        )
+        .await,
+        0,
+        "no activation intent"
+    );
+
+    // The buyer finishes setup and chooses Pay again: the same order binds.
+    paykit.clear_creation_failure();
+    let (status, body) = bind_bitcoin(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(phase_one_calls(&paykit), 2);
 }
 
 // 5. A bodyless 204, a missing field, or an inconsistent total: refused,
