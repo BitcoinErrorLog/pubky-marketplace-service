@@ -31,6 +31,7 @@ pub mod inventory;
 pub mod listing_deletion;
 pub mod locks;
 pub(crate) mod logging;
+pub mod migrations;
 pub mod model;
 pub mod paykit_attempts;
 pub mod payment_availability;
