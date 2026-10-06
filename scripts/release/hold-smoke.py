@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Staging hold-smoke for marketplace-service cutover.
 
-Canonical copy: BitcoinErrorLog/pubky-marketplace-service
+Canonical copy: pubky/pubky-marketplace-service
 `scripts/release/hold-smoke.py`. The release skill points here; do not keep
 a second live copy under .evidence/.
 
