@@ -837,6 +837,11 @@ pub enum PaykitRequestError {
     /// (`reader_not_payable`): they must connect a Paykit wallet such as
     /// Bitkit. Not retryable as is.
     ReaderNotPayable,
+    /// The buyer has no Paykit App Registry yet (`503 reader_setup_pending`,
+    /// sent without `Retry-After` after paykit-server's own bounded reads):
+    /// they must finish setting up a Paykit wallet. Retried only when the
+    /// buyer acts, never automatically.
+    ReaderSetupPending,
     /// Phase 1 returned `total_sats != amount_sats + nonce_sats`: the two
     /// services disagree about money. Refused, alerted, never retried.
     TotalInconsistent,
@@ -1165,6 +1170,7 @@ impl PaykitClient {
         match code.as_str() {
             "creator_session_invalid" => Err(PaykitRequestError::SellerAccountUnavailable),
             "reader_not_payable" => Err(PaykitRequestError::ReaderNotPayable),
+            "reader_setup_pending" => Err(PaykitRequestError::ReaderSetupPending),
             "invalid_request" | "invoice_conflict" => Err(PaykitRequestError::Rejected),
             // `bitcoin_creation_disabled` (503, §C.16) and everything else:
             // refused cleanly as an availability failure, as today.
