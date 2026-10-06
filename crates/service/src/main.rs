@@ -115,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
         .max_connections(20)
         .connect(&config.database_url)
         .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    marketplace_service::migrations::run(&pool).await?;
     tracing::info!("database migrations applied");
     let audit_writer_options: PgConnectOptions = config.refusal_audit_database_url.parse()?;
     let audit_writer_pool = PgPoolOptions::new()
