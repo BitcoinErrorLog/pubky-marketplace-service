@@ -312,7 +312,10 @@ fn public_config_view(
 
 /// `GET /v0/sellers/{pubky}/payment-config` (public): the buyer-facing rail
 /// availability. `bitcoin_available` is true only when the seller enabled it
-/// AND their watch-only account is actually claimed on paykit-server.
+/// AND paykit-server reports them ready to receive (a claimed watch-only
+/// account on the fork; `ready` from the signed `POST /setup/status`
+/// upstream). A seller who must set up Paykit again, or whose status cannot
+/// be read, is not offered Bitcoin.
 /// `bitcoin_offer_available` is the cached rail-wide Paykit gate. Older
 /// paykit-server responses without that field derive it from `status`.
 /// `paypal_available` is a stored merchant email; `stripe_available` is a
@@ -368,7 +371,7 @@ pub async fn get_payment_config(
                         state.clock.as_ref(),
                         state.config.paykit_poll_seconds,
                         state.config.paykit_rail_stale_seconds,
-                        || async { paykit.account_exists(&seller_pubky).await },
+                        || async { paykit.seller_ready(&seller_pubky).await },
                     )
                     .await
             }
