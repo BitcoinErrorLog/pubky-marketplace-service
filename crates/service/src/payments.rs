@@ -1136,7 +1136,10 @@ impl PaykitClient {
                     "creator": pubky_app_key(seller_pubky),
                 }),
             )
-            .map_err(|_| PaykitRequestError::Unavailable)?;
+            .map_err(|error| {
+                tracing::error!(error = %error, "paykit setup status request could not be signed");
+                PaykitRequestError::Unavailable
+            })?;
         let response = self
             .http
             .post(url)
@@ -1198,7 +1201,9 @@ impl PaykitClient {
     }
 
     /// Reads Paykit's rail-wide Bitcoin offer gate (see
-    /// [`rail_offer_available`] for the accepted readiness shapes).
+    /// [`rail_offer_available`] for the accepted readiness shapes). It is
+    /// the public, unsigned `GET /health/ready`, which fork and upstream
+    /// both serve, so it does not depend on [`PaykitApi`].
     pub async fn rail_health(&self) -> Result<bool, PaykitRequestError> {
         let response = self
             .http

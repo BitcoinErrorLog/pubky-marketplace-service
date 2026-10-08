@@ -167,7 +167,11 @@ the service never starts an authorization flow itself.
 the closed `{"status": ...}` contract are outages: the availability cache
 retries every `PAYKIT_POLL_SECONDS` and serves the last known value until
 `PAYKIT_RAIL_STALE_SECONDS`, then `false`. The public `bitcoin_available` and
-`bitcoin_offer_available` fields keep their meaning.
+`bitcoin_offer_available` fields keep their meaning. The rail-wide
+`bitcoin_offer_available` gate is the public, unsigned `GET /health/ready` in
+both modes (upstream answers `status`, `postgres`, `electrum`,
+`paykit_delivery`, `outbox`; only `status: ready` with `electrum: ready` is
+true, and a 503 is an outage).
 
 Flipping the setting is a deployment step: register the service's public key
 in the upstream allowlist first, then set `PAYKIT_SERVER_API=upstream` and

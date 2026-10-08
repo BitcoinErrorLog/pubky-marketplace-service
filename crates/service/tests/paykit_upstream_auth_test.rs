@@ -185,6 +185,54 @@ async fn an_unreachable_paykit_server_is_an_outage() {
     );
 }
 
+/// `paykit-server/src/http/health.rs` `ReadyResponse` at rc9 and #55: the
+/// rail gate is the same public `GET /health/ready` in both APIs.
+fn upstream_ready_body(status: &str, electrum: &str) -> Value {
+    json!({
+        "status": status,
+        "postgres": "ready",
+        "electrum": electrum,
+        "paykit_delivery": "ready",
+        "outbox": "ready",
+    })
+}
+
+#[tokio::test]
+async fn the_rail_gate_reads_upstream_health_ready_in_upstream_mode() {
+    let paykit = upstream_paykit().await;
+    let client = upstream_client(&paykit);
+    for (body, expected) in [
+        (upstream_ready_body("ready", "ready"), true),
+        (upstream_ready_body("degraded", "ready"), false),
+        (upstream_ready_body("degraded", "degraded"), false),
+    ] {
+        paykit.set_rail_health(body.clone());
+        assert_eq!(client.rail_health().await, Ok(expected), "{body}");
+    }
+    paykit.set_rail_health(upstream_ready_body("not_ready", "not_ready"));
+    paykit.fail_rail_health();
+    assert_eq!(
+        client.rail_health().await,
+        Err(PaykitRequestError::Unavailable),
+        "upstream answers 503 when not ready"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_public_rail_flag_follows_upstream_health_ready(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool).await;
+    for (body, expected) in [
+        (upstream_ready_body("ready", "ready"), true),
+        (upstream_ready_body("degraded", "ready"), false),
+    ] {
+        paykit.set_rail_health(body);
+        app.clock.advance_seconds(16);
+        let (status, config) = get_public_config(&app, &new_actor(&app).await.pubky).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(config["bitcoin_offer_available"], json!(expected));
+    }
+}
+
 #[tokio::test]
 async fn upstream_signs_every_request_with_the_preimage() {
     let paykit = upstream_paykit().await;
@@ -222,7 +270,7 @@ async fn the_two_signature_schemes_do_not_verify_against_each_other() {
     assert_eq!(
         upstream_client.seller_ready(SELLER).await,
         Err(PaykitRequestError::Unavailable),
-        "the fork neither serves /setup/status nor accepts the preimage"
+        "a fork server verifies the bare body, so the preimage signature is a 401"
     );
     assert!(fork_server.calls().is_empty());
 }
