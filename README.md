@@ -97,7 +97,8 @@ Railway IaC `preserve()`):
 | `STRIPE_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing seller Stripe restricted keys at rest; setting it enables the `/v0` payment-methods surface |
 | `STRIPE_API_BASE` | `https://api.stripe.com` | Stripe API base URL (overridden only by tests) |
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
-| `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests; its pubky-formatted public key is paykit-server's `marketplace.trusted_public_key` |
+| `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests. Its pubky-formatted public key goes into paykit-server's `[signed_services] trusted_public_keys`, beside the Locks key, when `PAYKIT_SERVER_API=upstream`; on the fork (`fork`, the default) it is `marketplace.trusted_public_key`. See [Paykit server API](#paykit-server-api) |
+| `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` rc9 with the signed-services allowlist, #55). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
 | `PAYKIT_RAIL_STALE_SECONDS` | `60` | stale-out window for cached Paykit rail and seller claim availability; must be at least `PAYKIT_POLL_SECONDS` |
 | `DELIVERY_ASSUME_DAYS` | `14` | days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1) |
@@ -145,6 +146,36 @@ During deployment ordering, an older paykit-server response without
 `bitcoin_offer_available` is compatible: `electrum: "ready"` or
 `electrum: { "state": "ready" }` maps to `true`, and any other shape maps to
 `false`. When present, the field is authoritative.
+
+### Paykit server API
+
+`PAYKIT_SERVER_API` is the one switch between the fork and upstream
+paykit-server. It decides what the `x-paykit-signature` header signs and how
+seller readiness is read; everything else about the client is unchanged.
+
+| | `fork` (default) | `upstream` |
+| --- | --- | --- |
+| Signature covers | the canonical JSON body | `"paykit-http-signature-v1\0" + METHOD + "\0" + path + "\0" + raw body` (the path is the query-free request path, base-URL prefix included) |
+| Trusted key | `marketplace.trusted_public_key` | an entry of `[signed_services] trusted_public_keys` (non-empty allowlist, beside the Locks key) |
+| Seller readiness | public `GET /v0/accounts/{creator}` (`claimed`) | signed `POST /setup/status` with `{"asset":"BTC","creator":"pubky..."}` |
+
+Upstream readiness answers one of three states. Only exactly `ready` makes
+`bitcoin_available` true. `setup_required` means the seller has to set up
+Paykit: the public projection reports `bitcoin_available: false` for it, and
+the service never starts an authorization flow itself.
+`unavailable`, any non-2xx answer, a transport failure and any body outside
+the closed `{"status": ...}` contract are outages: the availability cache
+retries every `PAYKIT_POLL_SECONDS` and serves the last known value until
+`PAYKIT_RAIL_STALE_SECONDS`, then `false`. The public `bitcoin_available` and
+`bitcoin_offer_available` fields keep their meaning.
+
+Flipping the setting is a deployment step: register the service's public key
+in the upstream allowlist first, then set `PAYKIT_SERVER_API=upstream` and
+repoint `PAYKIT_SERVER_URL`; setting it back to `fork` (or unsetting it) and
+repointing is the rollback. Upstream does not serve the payment-request
+lifecycle routes (prepare, activate, void, resolve) yet, so with `upstream`
+a Bitcoin bind answers `paykit_unavailable` until those land. PayPal and
+Stripe are not affected.
 
 ### Address autocomplete proxy
 
