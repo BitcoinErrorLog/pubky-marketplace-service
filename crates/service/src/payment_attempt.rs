@@ -118,7 +118,7 @@ pub struct UpstreamPrepared {
 pub struct AttemptIdentity {
     pub reference: Uuid,
     pub operation_id: String,
-    pub asset: PaymentAsset,
+    pub payment_asset: PaymentAsset,
     pub payment_window_seconds: i32,
 }
 
@@ -131,7 +131,7 @@ pub struct PreparedAttempt {
     pub invoice_id: Uuid,
     pub reference: Uuid,
     pub operation_id: String,
-    pub asset: PaymentAsset,
+    pub payment_asset: PaymentAsset,
     pub total_sats: i64,
     /// The payment window bound at preparation, in seconds. It starts when
     /// activation commits, never at preparation.
@@ -200,15 +200,15 @@ impl PreparedAttempt {
         let Some(row) = row else {
             return Ok(None);
         };
-        let asset: String = row.try_get("paykit_asset")?;
-        let asset =
-            PaymentAsset::from_column(&asset).ok_or(AttemptReadError::UnknownAsset(asset))?;
+        let stored: String = row.try_get("paykit_asset")?;
+        let payment_asset =
+            PaymentAsset::from_column(&stored).ok_or(AttemptReadError::UnknownAsset(stored))?;
         Ok(Some(Self {
             order_id,
             invoice_id: row.try_get("paykit_invoice_id")?,
             reference: row.try_get("paykit_payment_reference")?,
             operation_id: row.try_get("paykit_operation_id")?,
-            asset,
+            payment_asset,
             total_sats: row.try_get("paykit_total_sats")?,
             payment_window_seconds: row.try_get("paykit_payment_window_seconds")?,
             activate_by: row.try_get("paykit_prepare_expires_at")?,

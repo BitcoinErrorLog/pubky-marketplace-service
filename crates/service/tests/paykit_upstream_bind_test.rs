@@ -219,7 +219,7 @@ async fn the_attempt_is_persisted_with_its_activation_deadline_and_no_fork_pins(
         .await
         .expect("attempt reads")
         .expect("an upstream attempt");
-    assert_eq!(attempt.asset, PaymentAsset::Btc);
+    assert_eq!(attempt.payment_asset, PaymentAsset::Btc);
     assert_eq!(attempt.reference, payment_reference(order, 1));
     assert_eq!(attempt.operation_id, operation);
     assert_eq!(attempt.total_sats, AMOUNT_SATS);

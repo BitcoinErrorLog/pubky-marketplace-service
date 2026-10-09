@@ -1103,7 +1103,7 @@ pub async fn bind_payment_method(
                 .bind(attempt.reference)
                 .bind(&attempt.operation_id)
                 .bind(attempt.payment_window_seconds)
-                .bind(attempt.asset.as_str())
+                .bind(attempt.payment_asset.as_str())
                 .execute(&mut *tx)
                 .await?;
             } else if let (Some(stack_id), Some(stack_endpoint)) =
@@ -1269,7 +1269,7 @@ async fn prepare_upstream_attempt(
     let identity = AttemptIdentity {
         reference: payment_reference(order.id, attempt),
         operation_id: operation_id(attempt_reference, attempt),
-        asset: PaymentAsset::Btc,
+        payment_asset: PaymentAsset::Btc,
         payment_window_seconds: i32::try_from(window_seconds).unwrap_or(i32::MAX),
     };
     let prepared = paykit
