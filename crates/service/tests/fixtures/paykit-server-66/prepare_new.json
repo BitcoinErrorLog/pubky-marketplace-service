@@ -2,16 +2,16 @@
   "description": "A new attempt: the first preparation of operation `marketplace-payment:{attempt_reference}:1` for an order's seller and buyer",
   "name": "prepare_new",
   "request": {
-    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyzgrus1dgrp6ujqzeyhen5ghqxupgcrqmuqrn67k6xqpwkhr874by\",\"operation_id\":\"marketplace-payment:RCSYZPCY72B6PT0HDQ7SR225NC:1\",\"payment_window_seconds\":1800,\"reader\":\"pubkydwyreddqufizxkqy7wiho1e4oq6dpfqwmusu9rkh8ndpu49zd3dy\",\"reference\":\"a59ea622-851b-4eab-b7dc-0e5da7f73cea\"}",
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyfakhefh31c9ykt7q31wxpch4t7gu58p8apo4h8rwjcxqug4hikno\",\"operation_id\":\"marketplace-payment:RCSYZPCY72B6PT0HDQ7SR225NC:1\",\"payment_window_seconds\":1800,\"reader\":\"pubky1sr9wqk4pok3ikbrzgy4hep8cykeifhpqk9izb13ezo86ey4wzuo\",\"reference\":\"a59ea622-851b-4eab-b7dc-0e5da7f73cea\"}",
     "method": "POST",
     "path": "/marketplace/payment-requests/prepare",
-    "signature": "PV8GcOphvCnD6HZ6zMi-3e0mQ3BEnjNdOB4W5Wcw1Yv5-kPJ_ZHp5TeJyArTRWXcSMdRpn_xUtum4h7q52qnBg"
+    "signature": "C22djNMYaQR13zqr9ikjf8pRyAcUDmQU_t_LgIdfWMti97F_fsa5RtIbNd-CxSPf0H6xPMg0crWZm9xvw9qbBQ"
   },
   "response": {
-    "body": "{\"invoice_id\":\"9392ebe8-31f4-462e-912d-e9d0175a58e6\",\"state\":\"prepared\",\"total_sats\":120000,\"prepare_expires_at\":\"2026-10-09T12:14:19.906854Z\"}",
+    "body": "{\"invoice_id\":\"6e180b3c-82f0-4368-ac3f-13e2880d9143\",\"state\":\"prepared\",\"total_sats\":120000,\"prepare_expires_at\":\"2026-10-09T14:45:43.807479Z\"}",
     "content_type": "application/json",
     "status": 200
   },
-  "sent_at": "2026-10-09T11:59:19.853429643Z",
-  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+  "sent_at": "2026-10-09T14:30:43.750778732Z",
+  "server_revision": "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8"
 }

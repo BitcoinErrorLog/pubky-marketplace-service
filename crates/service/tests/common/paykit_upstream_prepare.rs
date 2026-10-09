@@ -52,6 +52,9 @@ pub struct PrepareState {
     body_override: Option<Value>,
     /// Requests that reached the preparation logic (past authentication).
     calls: usize,
+    /// New preparations that still store their operation, then answer
+    /// `503 dependency_timeout`: a commit that lands after the deadline.
+    late_commits: usize,
 }
 
 impl Default for PrepareState {
@@ -64,6 +67,7 @@ impl Default for PrepareState {
             expiry_offset_seconds: PREPARE_TTL_SECONDS,
             body_override: None,
             calls: 0,
+            late_commits: 0,
         }
     }
 }
@@ -73,7 +77,9 @@ impl Default for PrepareState {
 /// the code).
 fn error_message(code: &str) -> &'static str {
     match code {
-        "conflict" => "request conflicts with persisted payment state",
+        "operation_conflict" => "operation binding conflicts with persisted payment state",
+        "seller_setup_pending" => "seller Bitcoin receiving setup is needed",
+        "dependency_timeout" => "request deadline exceeded",
         "invalid_request" => "request is invalid",
         "invalid_signature" => "request authentication failed",
         "reader_setup_pending" => "reader wallet setup needed",
@@ -144,7 +150,7 @@ pub(super) async fn serve_upstream_prepare(
         return if *binding == canonical {
             (StatusCode::OK, axum::Json(stored.clone())).into_response()
         } else {
-            refusal(409, "conflict")
+            refusal(409, "operation_conflict")
         };
     }
 
@@ -176,6 +182,10 @@ pub(super) async fn serve_upstream_prepare(
         })
     });
     prepare.operations.insert(key, (canonical, answer.clone()));
+    if prepare.late_commits > 0 {
+        prepare.late_commits -= 1;
+        return refusal(503, "dependency_timeout");
+    }
     (StatusCode::OK, axum::Json(answer)).into_response()
 }
 
@@ -244,6 +254,17 @@ impl FakePaykit {
             .expect("fake paykit lock")
             .prepare
             .expiry_offset_seconds = seconds;
+    }
+
+    /// The next `count` new preparations commit and then answer
+    /// `503 dependency_timeout`, as a request that outlives paykit-server's
+    /// deadline does; the exact retry replays the stored answer.
+    pub fn set_prepare_late_commits(&self, count: usize) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .prepare
+            .late_commits = count;
     }
 
     /// A contract violation: new preparations answer exactly this `200` body.

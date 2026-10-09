@@ -3,7 +3,7 @@
 `../prepare_*.json` are exchanges captured from a running paykit-server at
 [`pubky/paykit-server` #66](https://github.com/pubky/paykit-server/pull/66)
 (`POST /marketplace/payment-requests/prepare`), head
-`3eff69345c749b9ee9f6e036d5d8b8b81e08e698`. Nothing in them is written by
+`f9079d50424f31ff0a7ca3df3a12ddc43c398ea8`. Nothing in them is written by
 hand. The tests read them through `tests/common/paykit_server_66.rs`.
 
 Each file holds the request as sent (`signature` is the `x-paykit-signature`
@@ -24,6 +24,16 @@ homeserver, and the creator's Bitcoin receiving credentials from the
 default `marketplace_prepare_ttl` (15 minutes) and a second with
 `marketplace_prepare_ttl = "1s"` for the replay after expiry.
 
+The two `prepare_*deadline_exceeded` exchanges are the one composed capture:
+the production `PrepareMarketplaceService`, route, signed-service layer and
+`MarketplacePreparationStore`, with a 2 second request deadline (the server
+fixes 15) and a store that holds a new preparation 3 seconds after it
+committed, so the answer is `503 dependency_timeout` for a commit that is
+durable. The creator session and the Reader's registry answer "valid" and
+"capable" there, because the server keeps those validators private and they
+are not what is under test. The exact retry then replays the committed
+preparation.
+
 The signing key is the service test key (seed `66…66`), listed in the
 server's `[signed_services] trusted_public_keys`, plus a second key that is
 not, for `prepare_invalid_signature`. The attempt identities (`operation_id`,
@@ -34,7 +44,7 @@ fails if the derivation stops reproducing them.
 
 ```sh
 git clone https://github.com/pubky/paykit-server && cd paykit-server
-git checkout 3eff69345c749b9ee9f6e036d5d8b8b81e08e698
+git checkout f9079d50424f31ff0a7ca3df3a12ddc43c398ea8
 git apply /path/to/pubky-marketplace-service/crates/service/tests/fixtures/paykit-server-66/capture/capture-harness.patch
 TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 CAPTURE_INPUTS=/path/to/capture/inputs.json CAPTURE_DIR=/tmp/out \

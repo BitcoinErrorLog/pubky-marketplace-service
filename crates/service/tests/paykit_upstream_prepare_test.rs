@@ -187,6 +187,7 @@ fn a_prepared_answer_has_no_stack_nonce_fingerprint_or_payment_deadline() {
         "prepare_next_attempt",
         "prepare_new_short_ttl",
         "prepare_replay_after_ttl",
+        "prepare_replay_after_deadline_exceeded",
     ] {
         let fixture = fixtures::load(name);
         assert_eq!(fixture.status, 200);
@@ -252,7 +253,8 @@ struct ReplayServer {
 async fn replay_server() -> ReplayServer {
     #[derive(Clone)]
     struct Shared {
-        by_request: Arc<HashMap<(String, String), Fixture>>,
+        by_request: Arc<HashMap<(String, String), Vec<Fixture>>>,
+        served: Arc<Mutex<HashMap<(String, String), usize>>>,
         matched: Arc<Mutex<Vec<String>>>,
         unmatched: Arc<Mutex<Vec<(String, String)>>>,
     }
@@ -268,8 +270,16 @@ async fn replay_server() -> ReplayServer {
             .unwrap_or_default()
             .to_string();
         let body = String::from_utf8_lossy(&body).to_string();
-        match shared.by_request.get(&(signature.clone(), body.clone())) {
-            Some(fixture) => {
+        let key = (signature.clone(), body.clone());
+        match shared.by_request.get(&key) {
+            Some(exchanges) => {
+                // Identical requests answer in capture order, the last one
+                // repeating (`prepare_new` then `prepare_replay`; a timeout
+                // after a late commit, then its replay).
+                let mut served = shared.served.lock().expect("lock");
+                let nth = served.entry(key).or_insert(0);
+                let fixture = &exchanges[(*nth).min(exchanges.len() - 1)];
+                *nth += 1;
                 shared
                     .matched
                     .lock()
@@ -298,17 +308,18 @@ async fn replay_server() -> ReplayServer {
             }
         }
     }
-    let mut by_request = HashMap::new();
+    let mut by_request: HashMap<(String, String), Vec<Fixture>> = HashMap::new();
     for fixture in fixtures::load_all() {
-        // Identical requests (`prepare_replay`) answer identically.
         by_request
             .entry((fixture.signature.clone(), fixture.request_body.clone()))
-            .or_insert(fixture);
+            .or_default()
+            .push(fixture);
     }
     let matched = Arc::new(Mutex::new(Vec::new()));
     let unmatched = Arc::new(Mutex::new(Vec::new()));
     let shared = Shared {
         by_request: Arc::new(by_request),
+        served: Arc::new(Mutex::new(HashMap::new())),
         matched: matched.clone(),
         unmatched: unmatched.clone(),
     };
@@ -417,7 +428,7 @@ async fn a_changed_binding_is_refused_and_never_a_buyer_error() {
     let server = replay_server().await;
     let fixture = fixtures::load("prepare_conflict_changed_binding");
     assert_eq!(fixture.status, 409);
-    assert_eq!(fixture.error_code(), "conflict");
+    assert_eq!(fixture.error_code(), "operation_conflict");
     let first = fixtures::load("prepare_new");
     assert_eq!(
         prepare_like(&server, &fixture, Some(first.amount_sats() + 1), None).await,
@@ -476,9 +487,9 @@ async fn each_captured_admission_refusal_maps_to_its_bind_class() {
         ),
         (
             "prepare_seller_without_bitcoin",
-            400,
-            "invalid_request",
-            PaykitRequestError::Rejected,
+            503,
+            "seller_setup_pending",
+            PaykitRequestError::SellerAccountUnavailable,
         ),
     ] {
         let fixture = fixtures::load(name);
@@ -494,6 +505,48 @@ async fn each_captured_admission_refusal_maps_to_its_bind_class() {
         );
     }
     assert!(server.unmatched.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn a_timeout_after_a_late_commit_is_an_outage_and_the_exact_retry_replays() {
+    let timeout = fixtures::load("prepare_deadline_exceeded");
+    let replay = fixtures::load("prepare_replay_after_deadline_exceeded");
+    assert_eq!(
+        (timeout.status, timeout.error_code().as_str()),
+        (503, "dependency_timeout")
+    );
+    assert_eq!(replay.status, 200);
+    assert_eq!(
+        (&timeout.request_body, &timeout.signature),
+        (&replay.request_body, &replay.signature),
+        "the retry is byte for byte the first request"
+    );
+
+    let server = replay_server().await;
+    assert_eq!(
+        prepare_like(&server, &timeout, None, None).await,
+        Err(PaykitRequestError::Unavailable),
+        "the buyer sees an outage"
+    );
+    assert_eq!(
+        prepare_like(&server, &timeout, None, None).await,
+        Ok(parsed(&replay)),
+        "the exact retry gets the preparation that committed late"
+    );
+    assert_eq!(
+        *server.matched.lock().expect("lock"),
+        [
+            "prepare_deadline_exceeded",
+            "prepare_replay_after_deadline_exceeded"
+        ]
+    );
+    assert!(server.unmatched.lock().expect("lock").is_empty());
+
+    let lead = (parsed(&replay).prepare_expires_at - timeout.sent_at).num_milliseconds();
+    assert!(
+        (15 * 60 * 1000 - 1_000..=15 * 60 * 1000 + 1_000).contains(&lead),
+        "the late commit kept its own fifteen minutes from the first request: {lead} ms"
+    );
 }
 
 #[test]
@@ -542,9 +595,10 @@ fn refusals_the_client_never_provokes_still_map_from_the_captured_answers() {
 fn every_named_server_refusal_maps_and_unknown_ones_are_outages() {
     use PaykitRequestError::*;
     for (status, code, expected) in [
-        (409, "conflict", Rejected),
+        (409, "operation_conflict", Rejected),
         (401, "invalid_signature", Unavailable),
         (409, "creator_session_invalid", SellerAccountUnavailable),
+        (503, "seller_setup_pending", SellerAccountUnavailable),
         (400, "invalid_request", Rejected),
         (409, "reader_not_payable", ReaderNotPayable),
         (503, "reader_setup_pending", ReaderSetupPending),
@@ -558,6 +612,8 @@ fn every_named_server_refusal_maps_and_unknown_ones_are_outages() {
         (500, "internal_error", Unavailable),
         (404, "not_found", Unavailable),
         (409, "invoice_conflict", Unavailable),
+        (409, "conflict", Unavailable),
+        (400, "seller_setup_pending", Unavailable),
         (409, "unheard_of", Unavailable),
         (400, "", Unavailable),
     ] {
@@ -751,6 +807,7 @@ async fn the_double_answers_every_captured_request_like_the_real_server() {
                 };
                 paykit.refuse_prepare_for(&party, fixture.status, &fixture.error_code());
             }
+            "prepare_deadline_exceeded" => paykit.set_prepare_late_commits(1),
             _ => {}
         }
         let (status, content_type, body) = post_raw(&paykit, &fixture).await;

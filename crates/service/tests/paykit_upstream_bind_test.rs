@@ -315,7 +315,12 @@ async fn assert_unbound(app: &TestApp, order_id: &str) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn every_server_refusal_maps_to_its_bind_answer_and_binds_nothing(pool: PgPool) {
     for (server_status, code, expected_status, reason) in [
-        (409, "conflict", StatusCode::CONFLICT, "paykit_rejected"),
+        (
+            409,
+            "operation_conflict",
+            StatusCode::CONFLICT,
+            "paykit_rejected",
+        ),
         (
             401,
             "invalid_signature",
@@ -331,6 +336,12 @@ async fn every_server_refusal_maps_to_its_bind_answer_and_binds_nothing(pool: Pg
         (
             409,
             "creator_session_invalid",
+            StatusCode::CONFLICT,
+            "seller_account_unclaimed",
+        ),
+        (
+            503,
+            "seller_setup_pending",
             StatusCode::CONFLICT,
             "seller_account_unclaimed",
         ),
@@ -396,6 +407,57 @@ async fn every_server_refusal_maps_to_its_bind_answer_and_binds_nothing(pool: Pg
         assert_unbound(&app, &order_id).await;
         assert_eq!(paykit.prepare_calls(), 1, "{code}");
     }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_timeout_after_a_late_commit_makes_the_next_bind_a_new_attempt(pool: PgPool) {
+    let (app, paykit, seller, buyer, order_id) = upstream_order(pool.clone()).await;
+    paykit.set_prepare_late_commits(1);
+    let (status, body) = bind_bitcoin(&app, &buyer.token, &order_id).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["reason"], json!("paykit_unavailable"));
+    assert_unbound(&app, &order_id).await;
+
+    let order = order_uuid(&order_id);
+    let seller_key = format!("pubky{}", seller.pubky);
+    let first = operation_id(&attempt_reference(order, 1), 1);
+    let orphan = paykit
+        .prepared_answer(&seller_key, &first)
+        .expect("paykit committed the first preparation although the answer was lost");
+
+    let (status, body) = bind_bitcoin(&app, &buyer.token, &order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second = operation_id(&attempt_reference(order, 2), 2);
+    let kept = paykit
+        .prepared_answer(&seller_key, &second)
+        .expect("second preparation");
+    assert_ne!(orphan["invoice_id"], kept["invoice_id"]);
+
+    let requests = paykit.prepare_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the service never retries the lost attempt"
+    );
+    assert_eq!(requests[0]["operation_id"], json!(first));
+    assert_eq!(requests[1]["operation_id"], json!(second));
+    assert_ne!(requests[0]["reference"], requests[1]["reference"]);
+    let row = attempt_row(&pool, &order_id).await;
+    assert_eq!(
+        row.paykit_invoice_id,
+        Some(
+            kept["invoice_id"]
+                .as_str()
+                .expect("id")
+                .parse()
+                .expect("uuid")
+        ),
+        "the order is pinned to the new attempt, never to the orphan"
+    );
+    assert_eq!(
+        paths_called(&paykit),
+        vec!["/marketplace/payment-requests/prepare"; 2]
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

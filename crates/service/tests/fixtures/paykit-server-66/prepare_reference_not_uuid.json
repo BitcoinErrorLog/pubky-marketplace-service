@@ -2,16 +2,16 @@
   "description": "The fork's 26 character Crockford reference instead of a UUIDv4: refused",
   "name": "prepare_reference_not_uuid",
   "request": {
-    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyzgrus1dgrp6ujqzeyhen5ghqxupgcrqmuqrn67k6xqpwkhr874by\",\"operation_id\":\"marketplace-payment:8AVP9MRKCRH4NSK01JV5QE73WG:5\",\"payment_window_seconds\":1800,\"reader\":\"pubkydwyreddqufizxkqy7wiho1e4oq6dpfqwmusu9rkh8ndpu49zd3dy\",\"reference\":\"8AVP9MRKCRH4NSK01JV5QE73WG\"}",
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyfakhefh31c9ykt7q31wxpch4t7gu58p8apo4h8rwjcxqug4hikno\",\"operation_id\":\"marketplace-payment:8AVP9MRKCRH4NSK01JV5QE73WG:5\",\"payment_window_seconds\":1800,\"reader\":\"pubky1sr9wqk4pok3ikbrzgy4hep8cykeifhpqk9izb13ezo86ey4wzuo\",\"reference\":\"8AVP9MRKCRH4NSK01JV5QE73WG\"}",
     "method": "POST",
     "path": "/marketplace/payment-requests/prepare",
-    "signature": "ysxDh8XlP6K3Ix8Y6-QC58PSRJtYDHud6uzlEZtdOH_Sdae0A0XJjd1-KgDbBoJ0GSoR7E6MbAyiaI5BaA29DQ"
+    "signature": "jXTtJugonQ0-lhJ4vS-c5jyNM3IS91Tk4Pci8QH2QXKNc5_2lB2wnlhuT9dsipRVAIZPB5oJOJNXk1byCaYSDQ"
   },
   "response": {
     "body": "{\"error\":{\"code\":\"invalid_request\",\"message\":\"request is invalid\"}}",
     "content_type": "application/json",
     "status": 400
   },
-  "sent_at": "2026-10-09T11:59:20.010255795Z",
-  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+  "sent_at": "2026-10-09T14:30:43.936539379Z",
+  "server_revision": "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8"
 }

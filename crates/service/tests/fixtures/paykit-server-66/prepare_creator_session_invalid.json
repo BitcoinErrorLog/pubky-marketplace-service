@@ -2,16 +2,16 @@
   "description": "A seller whose stored homeserver session is not valid",
   "name": "prepare_creator_session_invalid",
   "request": {
-    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyst6a6e7sinnunehqyhmuj95iisg38bf6jfocprk7bfnc3du13xiy\",\"operation_id\":\"marketplace-payment:EK0N8V1SXC74FNF8EEPJB0TS58:10\",\"payment_window_seconds\":1800,\"reader\":\"pubkydwyreddqufizxkqy7wiho1e4oq6dpfqwmusu9rkh8ndpu49zd3dy\",\"reference\":\"9502e9eb-b8a4-407b-a674-daf3bca23696\"}",
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyh4kskshjatnhjtkuwdjytzd43uxooaby5kd9htdxd7wfcqg5r6oy\",\"operation_id\":\"marketplace-payment:EK0N8V1SXC74FNF8EEPJB0TS58:10\",\"payment_window_seconds\":1800,\"reader\":\"pubky1sr9wqk4pok3ikbrzgy4hep8cykeifhpqk9izb13ezo86ey4wzuo\",\"reference\":\"9502e9eb-b8a4-407b-a674-daf3bca23696\"}",
     "method": "POST",
     "path": "/marketplace/payment-requests/prepare",
-    "signature": "wIIXpMfYWMTvXefBrgzX0UcEd9d923LldthYzPyfDVB_Gofip7mTtj6NWHhm7mST5Jh64xJxcPxHU1nVok5mBw"
+    "signature": "-wSz1Vy_bC2U9F6TrIqiNN6JTjgNE-EsG5gsbr104_1YVqPZPri2QOmYDHxTQ-7YVnljXCEODhpUsbvprgAdBQ"
   },
   "response": {
     "body": "{\"error\":{\"code\":\"creator_session_invalid\",\"message\":\"creator session is invalid\"}}",
     "content_type": "application/json",
     "status": 409
   },
-  "sent_at": "2026-10-09T11:59:20.215060843Z",
-  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+  "sent_at": "2026-10-09T14:30:44.558327612Z",
+  "server_revision": "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8"
 }

@@ -1,11 +1,11 @@
 diff --git a/paykit-server-e2e/tests/capture_marketplace_prepare.rs b/paykit-server-e2e/tests/capture_marketplace_prepare.rs
 new file mode 100644
-index 0000000..de7a575
+index 0000000..be88775
 --- /dev/null
 +++ b/paykit-server-e2e/tests/capture_marketplace_prepare.rs
-@@ -0,0 +1,669 @@
+@@ -0,0 +1,825 @@
 +//! Captures real `POST /marketplace/payment-requests/prepare` exchanges from a
-+//! running paykit-server (pubky/paykit-server #66 head 3eff693) for the
++//! running paykit-server (pubky/paykit-server #66 head f9079d5) for the
 +//! pubky-marketplace-service contract fixtures.
 +//!
 +//! Real: the production `Server` (router, signed-service auth layer,
@@ -35,11 +35,27 @@ index 0000000..de7a575
 +};
 +use paykit_server::{
 +    Server,
++    application::{
++        create_invoice::{
++            AppRegistryDiscovery, ReaderAuthorization, RegistryDiscoveryError,
++            SessionValidationError, SessionValidator,
++        },
++        marketplace_preparation::{
++            MarketplacePreparationPersistence, PrepareMarketplaceService,
++        },
++    },
 +    bitcoin::{ObservationTarget, ObservedOutput},
 +    config::{BitcoinNetwork, Config, ConfigEnvironment},
 +    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
-+    http::auth::signature_preimage,
-+    persistence::{CreatorCredentials, CreatorStore},
++    http::{
++        auth::{SignedServiceAuth, signature_preimage},
++        marketplace_preparation::marketplace_preparation_router,
++    },
++    persistence::{
++        CreatorCredentials, CreatorStore, MarketplacePreparationInput,
++        MarketplacePreparationPreflight, MarketplacePreparationResult,
++        MarketplacePreparationStore, PersistenceError,
++    },
 +    startup::initialize_database,
 +    workers::observer::{ElectrumPort, ObserverError},
 +};
@@ -54,7 +70,7 @@ index 0000000..de7a575
 +
 +const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 +const PATH: &str = "/marketplace/payment-requests/prepare";
-+const SERVER_REVISION: &str = "3eff69345c749b9ee9f6e036d5d8b8b81e08e698";
++const SERVER_REVISION: &str = "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8";
 +
 +struct NoObservations;
 +
@@ -407,6 +423,91 @@ index 0000000..de7a575
 +    }
 +}
 +
++/// Composed-service captures only: the creator session and the Reader's App
++/// Registry are not under test there, so they answer "valid" and "capable".
++struct ValidSession;
++
++#[async_trait]
++impl SessionValidator for ValidSession {
++    async fn validate(&self, _creator: &CreatorPubky) -> Result<(), SessionValidationError> {
++        Ok(())
++    }
++}
++
++struct CapableRegistries;
++
++#[async_trait]
++impl AppRegistryDiscovery for CapableRegistries {
++    async fn discover(
++        &self,
++        _reader: &ReaderPubky,
++    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, RegistryDiscoveryError> {
++        let mut registry = paykit_lib::PaykitAppRegistry::new(Some(
++            paykit_lib::derive_paykit_noise_public_key(&[8; 32]),
++        ));
++        registry
++            .register_app(
++                paykit_lib::PaykitAppId::new("bitkit").unwrap(),
++                paykit_lib::PaykitApp::new(
++                    "Bitkit",
++                    paykit_lib::PaykitAppCapabilities {
++                        private_payments: false,
++                        payment_requests: true,
++                        receipts: false,
++                        outgoing_payments: true,
++                    },
++                )
++                .unwrap(),
++            )
++            .unwrap();
++        Ok(Some(registry))
++    }
++
++    async fn authorization(
++        &self,
++        _reader: &ReaderPubky,
++    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
++        Ok(ReaderAuthorization::Verified)
++    }
++}
++
++/// The real store, held for `delay` after a NEW preparation committed: the
++/// commit is durable but the request outlives its deadline, which is how a
++/// late successful commit reaches the caller.
++struct LateAfterCommit {
++    inner: MarketplacePreparationStore,
++    delay: Duration,
++}
++
++#[async_trait]
++impl MarketplacePreparationPersistence for LateAfterCommit {
++    async fn preflight(
++        &self,
++        creator: &CreatorPubky,
++        operation_id: &str,
++        request_binding: &[u8],
++    ) -> Result<MarketplacePreparationPreflight, PersistenceError> {
++        MarketplacePreparationPersistence::preflight(
++            &self.inner,
++            creator,
++            operation_id,
++            request_binding,
++        )
++        .await
++    }
++
++    async fn prepare(
++        &self,
++        input: MarketplacePreparationInput<'_>,
++    ) -> Result<MarketplacePreparationResult, PersistenceError> {
++        let result = MarketplacePreparationPersistence::prepare(&self.inner, input).await?;
++        if !result.replayed() {
++            tokio::time::sleep(self.delay).await;
++        }
++        Ok(result)
++    }
++}
++
 +#[tokio::test]
 +async fn capture_marketplace_prepare_exchanges() {
 +    let inputs: Inputs = serde_json::from_slice(
@@ -669,6 +770,61 @@ index 0000000..de7a575
 +        "The same request replayed after the 1 second preparation TTL elapsed: still the stored answer",
 +        &ttl_signature,
 +        &ttl_body,
++        &exchange,
++    );
++
++    // Composed service: the production preparation service, route, signed
++    // authentication layer and `MarketplacePreparationStore`, with a 2 second
++    // request deadline (the server fixes 15) and a store that holds a NEW
++    // preparation 3 seconds after its commit.
++    let late_database = TestDatabase::create().await;
++    let late_config = config(late_database.database_url(), &service_key, None, None);
++    let late_pool = initialize_database(&late_config).await.unwrap();
++    let late_crypto = Arc::new(
++        paykit_server::crypto::Crypto::from_master_key(late_config.master_key().as_bytes())
++            .unwrap(),
++    );
++    let late_creators = CreatorStore::new(&late_pool, late_crypto.clone());
++    let late_seller = create_creator(&bootstrap, &homeserver, &late_creators, 45, true, true).await;
++    let service = Arc::new(
++        PrepareMarketplaceService::new(
++            Arc::new(ValidSession),
++            Arc::new(CapableRegistries),
++            Arc::new(late_creators.clone()),
++            Arc::new(LateAfterCommit {
++                inner: MarketplacePreparationStore::new(&late_pool, late_crypto),
++                delay: Duration::from_secs(3),
++            }),
++            late_config.paykit.app_id.clone(),
++            BitcoinNetwork::Testnet,
++            late_config.paykit.payment_window,
++            late_config.paykit.marketplace_prepare_ttl,
++        )
++        .with_request_deadline(Duration::from_secs(2)),
++    );
++    let router = marketplace_preparation_router(service)
++        .layer(axum::Extension(Arc::new(SignedServiceAuth::from_config(&late_config))));
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let late_address = listener.local_addr().unwrap();
++    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
++    let late_body = canonical(&prepare_body(&late_seller.creator, &buyer, attempt(12), &inputs));
++    let late_signature = sign(&service_key, &late_body);
++    let exchange = send(late_address, &late_signature, &late_body).await;
++    assert_eq!(exchange.status, 503, "{}", exchange.body);
++    recorder.record(
++        "prepare_deadline_exceeded",
++        "A new preparation that commits after the 2 second request deadline (composed service): the caller is told `dependency_timeout` although the commit is durable",
++        &late_signature,
++        &late_body,
++        &exchange,
++    );
++    let exchange = send(late_address, &late_signature, &late_body).await;
++    assert_eq!(exchange.status, 200, "{}", exchange.body);
++    recorder.record(
++        "prepare_replay_after_deadline_exceeded",
++        "The exact retry of the request above: the preparation that committed late is replayed",
++        &late_signature,
++        &late_body,
 +        &exchange,
 +    );
 +    let _ = (&creators, &short_pool);

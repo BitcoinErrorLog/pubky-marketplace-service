@@ -18,11 +18,20 @@
 //! - `operation_id` = `marketplace-payment:{attempt_reference}:{attempt}`
 //!   (the fork's `idempotency_key` with a namespace prefix) scopes the
 //!   preparation at paykit-server, which replays the stored answer for an
-//!   identical request and answers `409 conflict` for a changed one;
+//!   identical request and answers `409 operation_conflict` for a changed one;
 //! - `reference` is a lowercase hyphenated UUIDv4 derived from the order id
 //!   and the attempt number ([`payment_reference`]); it is part of the
 //!   binding, so it must be the same on every retry of an attempt and is
 //!   persisted with the attempt in `orders.paykit_payment_reference`.
+//!
+//! A bind request prepares once. A refused, failed or timed-out call is not
+//! retried within the request: its attempt number is spent (reserved in its
+//! own statement before the bind transaction) and the buyer's next bind
+//! derives the next attempt, a new operation and a new payment reference.
+//! paykit-server may have committed a preparation whose answer was lost (a
+//! `dependency_timeout` after the commit); an exact retry would replay it, but
+//! the new attempt never asks, and the orphan lapses at its activation
+//! deadline without ever being published.
 //!
 //! # Lifecycle in this slice
 //!

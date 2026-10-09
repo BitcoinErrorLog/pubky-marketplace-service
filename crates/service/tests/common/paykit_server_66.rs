@@ -1,14 +1,14 @@
 //! Exchanges captured from a running paykit-server at `pubky/paykit-server`
-//! #66, head `3eff693` (`tests/fixtures/paykit-server-66/`). Nothing in a
+//! #66, head `f9079d5` (`tests/fixtures/paykit-server-66/`). Nothing in a
 //! fixture is written by hand: `capture/README.md` says how they were
 //! captured, and `capture/capture-harness.patch` is the harness.
 
 use serde_json::Value;
 
-pub const SERVER_REVISION: &str = "3eff69345c749b9ee9f6e036d5d8b8b81e08e698";
+pub const SERVER_REVISION: &str = "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8";
 
 /// Every captured exchange, in capture order.
-pub const FIXTURE_NAMES: [&str; 15] = [
+pub const FIXTURE_NAMES: [&str; 17] = [
     "prepare_new",
     "prepare_replay",
     "prepare_conflict_changed_binding",
@@ -24,6 +24,8 @@ pub const FIXTURE_NAMES: [&str; 15] = [
     "prepare_creator_session_invalid",
     "prepare_new_short_ttl",
     "prepare_replay_after_ttl",
+    "prepare_deadline_exceeded",
+    "prepare_replay_after_deadline_exceeded",
 ];
 
 #[derive(Debug, Clone)]

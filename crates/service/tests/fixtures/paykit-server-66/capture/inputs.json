@@ -69,6 +69,12 @@
       "attempt_reference": "YWFA349J8GCG6RYXSNS2S007NC",
       "operation_id": "marketplace-payment:YWFA349J8GCG6RYXSNS2S007NC:11",
       "reference": "22ee0e87-c16a-419c-b92b-8c39958b30fe"
+    },
+    {
+      "attempt": 12,
+      "attempt_reference": "A4BE7TBKJJ7W8W2FQMSP8SXETM",
+      "operation_id": "marketplace-payment:A4BE7TBKJJ7W8W2FQMSP8SXETM:12",
+      "reference": "9264467f-5630-4c27-8c9f-25d80f8f1262"
     }
   ]
 }

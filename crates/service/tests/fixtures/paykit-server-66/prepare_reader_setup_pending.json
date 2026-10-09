@@ -2,16 +2,16 @@
   "description": "A buyer with no App Registry yet",
   "name": "prepare_reader_setup_pending",
   "request": {
-    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyzgrus1dgrp6ujqzeyhen5ghqxupgcrqmuqrn67k6xqpwkhr874by\",\"operation_id\":\"marketplace-payment:QDRTTZ1CCCAQQ1Z6YPHB6DVPYM:7\",\"payment_window_seconds\":1800,\"reader\":\"pubkyta7nzin5uzrohpww1m7xmhgzec9mhig5tbm7q7e9ku66g7g763bo\",\"reference\":\"d478382a-f183-45a1-b8bf-03fceb966192\"}",
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyfakhefh31c9ykt7q31wxpch4t7gu58p8apo4h8rwjcxqug4hikno\",\"operation_id\":\"marketplace-payment:QDRTTZ1CCCAQQ1Z6YPHB6DVPYM:7\",\"payment_window_seconds\":1800,\"reader\":\"pubkyd1cxf1k9niswzucio51o67j5afmdmrz1fwmagc1ndjbiwimdfkco\",\"reference\":\"d478382a-f183-45a1-b8bf-03fceb966192\"}",
     "method": "POST",
     "path": "/marketplace/payment-requests/prepare",
-    "signature": "SOWye63IhAisvOuc9FaLTy7_Cd7oKK1PqBExxTvntM3Epz8MszmKHaYkHZPFYrAwN7s4WEbOCjAWzrU-Mr0PBg"
+    "signature": "JvcDYBHvIMCy0J_IxsgrW3gUUWGY3gf0b1aOqwJtSvaEgUXxabMu2VxCME15hJ4-s43MaTnj4sV5AZUP8eezDA"
   },
   "response": {
     "body": "{\"error\":{\"code\":\"reader_setup_pending\",\"message\":\"reader wallet setup needed\"}}",
     "content_type": "application/json",
     "status": 503
   },
-  "sent_at": "2026-10-09T11:59:20.033508238Z",
-  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+  "sent_at": "2026-10-09T14:30:43.961567358Z",
+  "server_revision": "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8"
 }

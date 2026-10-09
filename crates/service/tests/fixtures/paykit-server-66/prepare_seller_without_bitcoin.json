@@ -2,16 +2,16 @@
   "description": "A seller with no Bitcoin receiving details",
   "name": "prepare_seller_without_bitcoin",
   "request": {
-    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyo1yutk1dcjfehx8tkpgy1xfaou8jged74rkdpf36zqn5jfop1t5y\",\"operation_id\":\"marketplace-payment:1NWD1H5CPGBF81RCJC2Y2SA7B0:9\",\"payment_window_seconds\":1800,\"reader\":\"pubkydwyreddqufizxkqy7wiho1e4oq6dpfqwmusu9rkh8ndpu49zd3dy\",\"reference\":\"28b37d8b-b70a-48bf-982c-967fb209382d\"}",
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkykza5ppqhcgnouwr57bcw53yyihr3p9rgc6tn86e65xe1dpkum64y\",\"operation_id\":\"marketplace-payment:1NWD1H5CPGBF81RCJC2Y2SA7B0:9\",\"payment_window_seconds\":1800,\"reader\":\"pubky1sr9wqk4pok3ikbrzgy4hep8cykeifhpqk9izb13ezo86ey4wzuo\",\"reference\":\"28b37d8b-b70a-48bf-982c-967fb209382d\"}",
     "method": "POST",
     "path": "/marketplace/payment-requests/prepare",
-    "signature": "akOFUsJVzmj9fQKUYsBzced4xssebpXcVkq48k3Nw-dtPkFR8AF1SDm63ONozgXjLVNgIf9qyTsZflFx1_oTBw"
+    "signature": "NMqqWMmE_COTYYT5CkGzVfnnO00lt8CkZCRfLSe-eQ8nVr__Y1PIZzU49rn0sb99mT6bdzBlqIBnMpiPUqyxAA"
   },
   "response": {
-    "body": "{\"error\":{\"code\":\"invalid_request\",\"message\":\"request is invalid\"}}",
+    "body": "{\"error\":{\"code\":\"seller_setup_pending\",\"message\":\"seller Bitcoin receiving setup is needed\"}}",
     "content_type": "application/json",
-    "status": 400
+    "status": 503
   },
-  "sent_at": "2026-10-09T11:59:20.164701854Z",
-  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+  "sent_at": "2026-10-09T14:30:44.506301655Z",
+  "server_revision": "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8"
 }

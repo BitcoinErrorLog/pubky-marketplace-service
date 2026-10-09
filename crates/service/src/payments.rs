@@ -1038,21 +1038,26 @@ pub const UPSTREAM_PREPARE_PATH: &str = "/marketplace/payment-requests/prepare";
 /// classes. Only the codes #66 can answer are named; anything else is an
 /// outage the buyer may retry.
 ///
-/// - `409 conflict`: the operation was prepared with a different binding.
-///   The service derives every field from its own attempt, so this is a bug
-///   here, never a buyer error: refused and alerted.
+/// - `409 operation_conflict`: the operation was prepared with a different
+///   binding. The service derives every field from its own attempt, so this
+///   is a bug here, never a buyer error: refused and alerted.
 /// - `401 invalid_signature`: the signing key is not in paykit-server's
 ///   `[signed_services] trusted_public_keys`. Nothing the buyer can fix:
 ///   alerted, and shown as an outage.
-/// - `409 creator_session_invalid`: the seller must reconnect Paykit.
-/// - `400 invalid_request`: a malformed request, an over-cap window, or a
-///   seller without Bitcoin receiving details (paykit-server answers all
-///   three alike).
+/// - `409 creator_session_invalid` and `503 seller_setup_pending` (the seller
+///   has no Bitcoin receiving details): the seller must (re)do Paykit setup,
+///   the outcome the fork gives a seller without a claimed account.
+/// - `400 invalid_request`: a malformed request or an over-cap window, never
+///   a buyer or seller state.
 /// - `409 reader_not_payable` and `503 reader_setup_pending`: the buyer's
 ///   wallet cannot pay, or is not set up yet.
+/// - `503 dependency_timeout`: the request outlived paykit-server's deadline.
+///   The preparation may still have committed; that is harmless, because it
+///   is unpublished and lapses at its activation deadline, and the buyer's
+///   retry is a new bind attempt (a new operation id), never a replay.
 pub fn upstream_prepare_error(status: reqwest::StatusCode, code: &str) -> PaykitRequestError {
     match (status.as_u16(), code) {
-        (409, "conflict") => {
+        (409, "operation_conflict") => {
             tracing::error!(
                 "ALERT paykit prepare refused a changed binding for one operation; \
                  the service derived a different request for the same attempt"
@@ -1066,7 +1071,9 @@ pub fn upstream_prepare_error(status: reqwest::StatusCode, code: &str) -> Paykit
             );
             PaykitRequestError::Unavailable
         }
-        (409, "creator_session_invalid") => PaykitRequestError::SellerAccountUnavailable,
+        (409, "creator_session_invalid") | (503, "seller_setup_pending") => {
+            PaykitRequestError::SellerAccountUnavailable
+        }
         (400, "invalid_request") => PaykitRequestError::Rejected,
         (409, "reader_not_payable") => PaykitRequestError::ReaderNotPayable,
         (503, "reader_setup_pending") => PaykitRequestError::ReaderSetupPending,
