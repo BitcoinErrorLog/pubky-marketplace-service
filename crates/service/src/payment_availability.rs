@@ -6,6 +6,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::clock::Clock;
+use crate::payments::SetupAsset;
 
 #[derive(Clone, Debug)]
 struct CacheEntry {
@@ -30,7 +31,7 @@ impl Default for CacheEntry {
 #[derive(Clone, Debug, Default)]
 pub struct PaymentAvailabilityCache {
     rail: Arc<RwLock<CacheEntry>>,
-    sellers: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    sellers: Arc<RwLock<HashMap<(String, SetupAsset), CacheEntry>>>,
 }
 
 impl PaymentAvailabilityCache {
@@ -51,7 +52,8 @@ impl PaymentAvailabilityCache {
             .await
     }
 
-    /// Reads one seller's claim status, refreshing at most once per TTL.
+    /// Reads one seller's Bitcoin claim status, refreshing at most once per
+    /// TTL.
     pub async fn seller_claimed<F, Fut, E>(
         &self,
         seller: &str,
@@ -65,16 +67,45 @@ impl PaymentAvailabilityCache {
         Fut: Future<Output = Result<bool, E>>,
         E: std::fmt::Debug,
     {
+        self.seller_ready(
+            seller,
+            SetupAsset::Btc,
+            clock,
+            ttl_seconds,
+            stale_seconds,
+            fetch,
+        )
+        .await
+    }
+
+    /// Reads whether one seller can receive `asset`, refreshing at most once
+    /// per TTL. Every (seller, asset) pair is its own entry, so a seller who
+    /// is ready for Bitcoin is not thereby ready for USDT.
+    pub async fn seller_ready<F, Fut, E>(
+        &self,
+        seller: &str,
+        asset: SetupAsset,
+        clock: &dyn Clock,
+        ttl_seconds: i64,
+        stale_seconds: i64,
+        fetch: F,
+    ) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<bool, E>>,
+        E: std::fmt::Debug,
+    {
+        let key = (seller.to_string(), asset);
         let entry = {
             let sellers = self.sellers.read().await;
-            sellers.get(seller).cloned()
+            sellers.get(&key).cloned()
         };
         let entry = match entry {
             Some(entry) => entry,
             None => {
                 let mut sellers = self.sellers.write().await;
                 sellers
-                    .entry(seller.to_string())
+                    .entry(key.clone())
                     .or_insert_with(CacheEntry::default)
                     .clone()
             }
@@ -86,7 +117,7 @@ impl PaymentAvailabilityCache {
         let _guard = entry.refresh.lock().await;
         let entry = {
             let sellers = self.sellers.read().await;
-            sellers.get(seller).cloned().unwrap_or_default()
+            sellers.get(&key).cloned().unwrap_or_default()
         };
         let now = clock.now();
         if is_fresh(&entry, now, ttl_seconds) {
@@ -95,10 +126,7 @@ impl PaymentAvailabilityCache {
         let result = fetch().await;
         let updated = refreshed(entry, clock.now(), stale_seconds, result);
         let value = updated.value;
-        self.sellers
-            .write()
-            .await
-            .insert(seller.to_string(), updated);
+        self.sellers.write().await.insert(key, updated);
         value
     }
 
@@ -207,6 +235,7 @@ mod tests {
     use crate::clock::{AdjustableClock, Clock};
 
     use super::PaymentAvailabilityCache;
+    use crate::payments::SetupAsset;
 
     fn now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
@@ -271,6 +300,37 @@ mod tests {
         clock.advance_seconds(61);
         cache.evict_stale(clock.now(), 60).await;
         assert_eq!(cache.sellers.read().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn one_seller_has_an_entry_per_asset() {
+        let cache = PaymentAvailabilityCache::default();
+        let clock = AdjustableClock::new(now());
+        assert!(
+            cache
+                .seller_ready("seller", SetupAsset::Btc, &clock, 15, 60, || async {
+                    Ok::<_, &str>(true)
+                })
+                .await
+        );
+        // A Bitcoin-ready seller is not thereby USDT-ready: the USDT entry is
+        // fetched on its own and holds its own value.
+        assert!(
+            !cache
+                .seller_ready("seller", SetupAsset::Usdt, &clock, 15, 60, || async {
+                    Ok::<_, &str>(false)
+                })
+                .await
+        );
+        assert_eq!(cache.sellers.read().await.len(), 2);
+        assert!(
+            cache
+                .seller_claimed("seller", &clock, 15, 60, || async {
+                    Err::<bool, _>("down")
+                })
+                .await,
+            "the Bitcoin entry is still fresh"
+        );
     }
 
     #[tokio::test]

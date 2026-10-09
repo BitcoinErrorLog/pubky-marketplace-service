@@ -26,7 +26,7 @@
 //!   order can no longer accept routes the payment to `manual_review`,
 //!   mirroring the Locks worker — real money is never silently dropped.
 
-use axum::extract::{Path, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -51,7 +51,8 @@ use crate::payment_attempt::{MarketplaceAssets, PaymentAsset, PaymentOption};
 use crate::payments::{
     attempt_reference, upstream_attempt_reference, upstream_operation_id, validate_paypal_email,
     validate_stripe_payment_link, validate_stripe_restricted_key, PaykitApi, PaykitClient,
-    PaykitLifecycleTarget, PaykitPrepared, PaykitRequestError, PaymentsRuntime, StripeError,
+    PaykitLifecycleTarget, PaykitPrepared, PaykitRequestError, PaymentsRuntime, SetupAsset,
+    SetupStatus, StripeError,
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
@@ -152,58 +153,194 @@ pub struct PutPaymentConfigBody {
     paypal_merchant_email: Option<String>,
 }
 
+/// The body of a `PUT` while `USDT_PAYMENTS_ENABLED` is on: the rails of
+/// [`PutPaymentConfigBody`] plus the seller's Shop-level USDT consent. With
+/// the flag off the closed [`PutPaymentConfigBody`] applies, which refuses
+/// `usdt_enabled` as the unknown field it is, byte for byte as before.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutPaymentConfigUsdtBody {
+    bitcoin_enabled: bool,
+    #[serde(default)]
+    stripe_payment_link: Option<String>,
+    #[serde(default)]
+    stripe_restricted_key: Option<String>,
+    #[serde(default)]
+    paypal_merchant_email: Option<String>,
+    /// Absent PRESERVES the stored consent, so a client that predates USDT
+    /// can never switch it off by omission; present replaces it.
+    #[serde(default)]
+    usdt_enabled: Option<bool>,
+}
+
 fn config_view(
     bitcoin_enabled: bool,
     stripe_payment_link: &Option<String>,
     paypal_merchant_email: &Option<String>,
     stripe_restricted_key_set: bool,
     updated_at: DateTime<Utc>,
+    usdt: Option<&UsdtOwnView>,
 ) -> Value {
-    json!({
+    let mut view = json!({
         "bitcoin_enabled": bitcoin_enabled,
         "stripe_payment_link": stripe_payment_link,
         "paypal_merchant_email": paypal_merchant_email,
         "stripe_restricted_key_set": stripe_restricted_key_set,
         "updated_at": format_timestamp(updated_at),
+    });
+    // Only while the USDT flag is on, so every other body is byte-identical
+    // to a build without USDT.
+    if let Some(usdt) = usdt {
+        view["usdt_enabled"] = json!(usdt.enabled);
+        view["usdt_setup"] = json!(usdt.setup.as_str());
+        view["usdt_setup_action"] = json!(usdt.action.map(UsdtSetupAction::as_str));
+    }
+    view
+}
+
+/// What the seller's own config says about USDT while the flag is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsdtOwnView {
+    /// The seller's Shop-level consent, as stored.
+    enabled: bool,
+    setup: UsdtSetup,
+    action: Option<UsdtSetupAction>,
+}
+
+/// `usdt_setup`: whether the seller's Paykit setup can receive USDT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsdtSetup {
+    Ready,
+    SetupRequired,
+    /// Paykit cannot say, or this deployment cannot ask (fork Paykit, no
+    /// Paykit). Never a reason to start an authorization flow.
+    Unavailable,
+}
+
+impl UsdtSetup {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::SetupRequired => "setup_required",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// `usdt_setup_action`: which Paykit flow gets the seller to USDT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsdtSetupAction {
+    /// No Paykit account yet: `/setup` asks for the Bitcoin account and the
+    /// optional USDT address together.
+    Setup,
+    /// An account exists: `/setup/reconnect` can add the USDT address
+    /// without touching the Bitcoin account.
+    Reconnect,
+}
+
+impl UsdtSetupAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Reconnect => "reconnect",
+        }
+    }
+}
+
+/// Maps the two signed `/setup/status` answers to what the seller must do.
+/// `usdt` is the status for `asset: "USDT"`; `authority` is looked up only
+/// when USDT is not ready, and is the status without an asset.
+///
+/// - USDT `ready`: ready, no action.
+/// - USDT `setup_required` and authority `setup_required`: the seller has no
+///   Paykit account, so `setup`.
+/// - USDT `setup_required` and authority `ready`: the account exists and
+///   only lacks the USDT address, so `reconnect`.
+/// - Anything `unavailable` (or unanswered): `unavailable` with no action.
+///   rc10 says callers "must not convert `unavailable` into a new
+///   authorization flow".
+fn usdt_setup_from_statuses(
+    usdt: Option<SetupStatus>,
+    authority: Option<SetupStatus>,
+) -> (UsdtSetup, Option<UsdtSetupAction>) {
+    match (usdt, authority) {
+        (Some(SetupStatus::Ready), _) => (UsdtSetup::Ready, None),
+        (Some(SetupStatus::SetupRequired), Some(SetupStatus::SetupRequired)) => {
+            (UsdtSetup::SetupRequired, Some(UsdtSetupAction::Setup))
+        }
+        (Some(SetupStatus::SetupRequired), Some(SetupStatus::Ready)) => {
+            (UsdtSetup::SetupRequired, Some(UsdtSetupAction::Reconnect))
+        }
+        _ => (UsdtSetup::Unavailable, None),
+    }
+}
+
+/// Asks paykit-server, uncached, what USDT setup the seller needs. Only the
+/// upstream API answers per asset; the fork, or no Paykit at all, is
+/// `unavailable`. The authority lookup runs only when USDT is not ready.
+async fn lookup_usdt_setup(
+    paykit: Option<&PaykitClient>,
+    seller_pubky: &str,
+) -> (UsdtSetup, Option<UsdtSetupAction>) {
+    let Some(paykit) = paykit.filter(|paykit| paykit.api() == PaykitApi::Upstream) else {
+        return usdt_setup_from_statuses(None, None);
+    };
+    let usdt = paykit
+        .upstream_setup_status(seller_pubky, Some(SetupAsset::Usdt))
+        .await
+        .ok();
+    let authority = if usdt == Some(SetupStatus::SetupRequired) {
+        paykit.upstream_setup_status(seller_pubky, None).await.ok()
+    } else {
+        None
+    };
+    usdt_setup_from_statuses(usdt, authority)
+}
+
+async fn usdt_option_enabled<'e, E>(executor: E, seller_pubky: &str) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    let enabled: Option<bool> = sqlx::query_scalar(
+        "SELECT enabled FROM seller_accepted_payment_options \
+         WHERE seller_pubky = $1 AND option_id = $2",
+    )
+    .bind(seller_pubky)
+    .bind(PaymentOption::PaykitUsdtArbitrumOne.id())
+    .fetch_optional(executor)
+    .await?;
+    Ok(enabled.unwrap_or(false))
+}
+
+async fn own_usdt_view(state: &AppState, seller_pubky: &str) -> Result<UsdtOwnView, sqlx::Error> {
+    let enabled = usdt_option_enabled(&state.pool, seller_pubky).await?;
+    let paykit = state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    let (setup, action) = lookup_usdt_setup(paykit, seller_pubky).await;
+    Ok(UsdtOwnView {
+        enabled,
+        setup,
+        action,
     })
 }
 
-/// `PUT /v0/sellers/me/payment-config` (seller session): full replace of the
-/// seller's rail configuration, except the write-only restricted key, which
-/// only an explicit value changes. The restricted key is never returned.
-pub async fn put_payment_config(
-    State(state): State<AppState>,
-    Extension(actor): Extension<Actor>,
-    Json(body): Json<PutPaymentConfigBody>,
-) -> Response {
-    let payments = match payments_runtime(&state) {
-        Ok(payments) => payments,
-        Err(response) => return *response,
-    };
-    if let Some(link) = &body.stripe_payment_link {
-        if let Err(message) = validate_stripe_payment_link(link) {
-            return method_error(ErrorCode::InvalidCommand, "invalid_payment_link", message);
-        }
-    }
-    if let Some(email) = &body.paypal_merchant_email {
-        if let Err(message) = validate_paypal_email(email) {
-            return method_error(ErrorCode::InvalidCommand, "invalid_paypal_email", message);
-        }
-    }
-    // None = preserve; Some(None) = clear; Some(Some(ciphertext)) = replace.
-    let restricted_key_update: Option<Option<Vec<u8>>> = match body.stripe_restricted_key.as_deref()
-    {
-        None => None,
-        Some("") => Some(None),
-        Some(key) => {
-            if let Err(message) = validate_stripe_restricted_key(key) {
-                return method_error(ErrorCode::InvalidCommand, "invalid_restricted_key", message);
-            }
-            Some(Some(payments.stripe_key_cipher.encrypt(&actor.0, key)))
-        }
-    };
-    let now = state.clock.now();
-    let stored: Result<SellerPaymentConfigRow, sqlx::Error> = match restricted_key_update {
+/// How `PUT` changes the stored restricted key: `None` preserves it,
+/// `Some(None)` clears it, `Some(Some(ciphertext))` replaces it.
+type RestrictedKeyUpdate = Option<Option<Vec<u8>>>;
+
+async fn upsert_config<'e, E>(
+    executor: E,
+    seller_pubky: &str,
+    body: &PutPaymentConfigBody,
+    restricted_key_update: &RestrictedKeyUpdate,
+    now: DateTime<Utc>,
+) -> Result<SellerPaymentConfigRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    match restricted_key_update {
         None => {
             sqlx::query_as(&format!(
                 "INSERT INTO seller_payment_configs \
@@ -216,12 +353,12 @@ pub async fn put_payment_config(
                  updated_at = EXCLUDED.updated_at \
                  RETURNING {CONFIG_COLUMNS}"
             ))
-            .bind(&actor.0)
+            .bind(seller_pubky)
             .bind(body.bitcoin_enabled)
             .bind(&body.stripe_payment_link)
             .bind(&body.paypal_merchant_email)
             .bind(now)
-            .fetch_one(&state.pool)
+            .fetch_one(executor)
             .await
         }
         Some(ciphertext) => {
@@ -238,33 +375,159 @@ pub async fn put_payment_config(
                  updated_at = EXCLUDED.updated_at \
                  RETURNING {CONFIG_COLUMNS}"
             ))
-            .bind(&actor.0)
+            .bind(seller_pubky)
             .bind(body.bitcoin_enabled)
             .bind(&body.stripe_payment_link)
-            .bind(&ciphertext)
+            .bind(ciphertext)
             .bind(&body.paypal_merchant_email)
             .bind(now)
-            .fetch_one(&state.pool)
+            .fetch_one(executor)
+            .await
+        }
+    }
+}
+
+async fn upsert_usdt_option<'e, E>(
+    executor: E,
+    seller_pubky: &str,
+    enabled: bool,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    sqlx::query(
+        "INSERT INTO seller_accepted_payment_options \
+         (seller_pubky, option_id, enabled, updated_at) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (seller_pubky, option_id) DO UPDATE SET \
+         enabled = EXCLUDED.enabled, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(seller_pubky)
+    .bind(PaymentOption::PaykitUsdtArbitrumOne.id())
+    .bind(enabled)
+    .bind(now)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `PUT /v0/sellers/me/payment-config` (seller session): full replace of the
+/// seller's rail configuration, except the write-only restricted key, which
+/// only an explicit value changes. The restricted key is never returned.
+///
+/// While `USDT_PAYMENTS_ENABLED` is on the body may also carry
+/// `usdt_enabled`, the seller's Shop-level consent to accept USDT. It is
+/// stored in `seller_accepted_payment_options` in the same transaction as the
+/// rails; absent, the stored consent is kept. The answer then carries the
+/// same `usdt_*` fields as the `GET`. Consent is not gated on readiness: a
+/// seller who is not ready is simply never offered USDT
+/// (`usdt_available` needs both).
+pub async fn put_payment_config(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    request: Request,
+) -> Response {
+    let usdt_flag = state.config.usdt_payments_enabled;
+    let (body, usdt_consent) = if usdt_flag {
+        match Json::<PutPaymentConfigUsdtBody>::from_request(request, &state).await {
+            Ok(Json(body)) => (
+                PutPaymentConfigBody {
+                    bitcoin_enabled: body.bitcoin_enabled,
+                    stripe_payment_link: body.stripe_payment_link,
+                    stripe_restricted_key: body.stripe_restricted_key,
+                    paypal_merchant_email: body.paypal_merchant_email,
+                },
+                body.usdt_enabled,
+            ),
+            Err(rejection) => return rejection.into_response(),
+        }
+    } else {
+        match Json::<PutPaymentConfigBody>::from_request(request, &state).await {
+            Ok(Json(body)) => (body, None),
+            Err(rejection) => return rejection.into_response(),
+        }
+    };
+    let payments = match payments_runtime(&state) {
+        Ok(payments) => payments,
+        Err(response) => return *response,
+    };
+    if let Some(link) = &body.stripe_payment_link {
+        if let Err(message) = validate_stripe_payment_link(link) {
+            return method_error(ErrorCode::InvalidCommand, "invalid_payment_link", message);
+        }
+    }
+    if let Some(email) = &body.paypal_merchant_email {
+        if let Err(message) = validate_paypal_email(email) {
+            return method_error(ErrorCode::InvalidCommand, "invalid_paypal_email", message);
+        }
+    }
+    let restricted_key_update: RestrictedKeyUpdate = match body.stripe_restricted_key.as_deref() {
+        None => None,
+        Some("") => Some(None),
+        Some(key) => {
+            if let Err(message) = validate_stripe_restricted_key(key) {
+                return method_error(ErrorCode::InvalidCommand, "invalid_restricted_key", message);
+            }
+            Some(Some(payments.stripe_key_cipher.encrypt(&actor.0, key)))
+        }
+    };
+    let now = state.clock.now();
+    let stored = match usdt_consent {
+        None => upsert_config(&state.pool, &actor.0, &body, &restricted_key_update, now).await,
+        Some(enabled) => {
+            store_config_with_usdt(
+                &state,
+                &actor.0,
+                &body,
+                &restricted_key_update,
+                enabled,
+                now,
+            )
             .await
         }
     };
-    match stored {
-        Ok(row) => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "payment_config": config_view(
-                    row.bitcoin_enabled,
-                    &row.stripe_payment_link,
-                    &row.paypal_merchant_email,
-                    row.stripe_restricted_key_ciphertext.is_some(),
-                    row.updated_at,
-                ),
-            })),
-        )
-            .into_response(),
-        Err(error) => internal("payment config upsert", &error),
-    }
+    let row = match stored {
+        Ok(row) => row,
+        Err(error) => return internal("payment config upsert", &error),
+    };
+    let usdt = if usdt_flag {
+        match own_usdt_view(&state, &actor.0).await {
+            Ok(view) => Some(view),
+            Err(error) => return internal("payment config upsert", &error),
+        }
+    } else {
+        None
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "payment_config": config_view(
+                row.bitcoin_enabled,
+                &row.stripe_payment_link,
+                &row.paypal_merchant_email,
+                row.stripe_restricted_key_ciphertext.is_some(),
+                row.updated_at,
+                usdt.as_ref(),
+            ),
+        })),
+    )
+        .into_response()
+}
+
+async fn store_config_with_usdt(
+    state: &AppState,
+    seller_pubky: &str,
+    body: &PutPaymentConfigBody,
+    restricted_key_update: &RestrictedKeyUpdate,
+    usdt_enabled: bool,
+    now: DateTime<Utc>,
+) -> Result<SellerPaymentConfigRow, sqlx::Error> {
+    let mut tx = state.pool.begin().await?;
+    let row = upsert_config(&mut *tx, seller_pubky, body, restricted_key_update, now).await?;
+    upsert_usdt_option(&mut *tx, seller_pubky, usdt_enabled, now).await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// `GET /v0/sellers/me/payment-config` (seller session): the seller's own
@@ -272,31 +535,68 @@ pub async fn put_payment_config(
 /// (`bitcoin_enabled` as stored, no paykit availability lookup) so the
 /// settings page can load state on mount. The restricted key is never
 /// returned, only `stripe_restricted_key_set`.
+///
+/// While `USDT_PAYMENTS_ENABLED` is on the body also carries `usdt_enabled`,
+/// `usdt_setup` and `usdt_setup_action` (see [`lookup_usdt_setup`]), read
+/// from paykit-server on every call, never from the availability cache, so
+/// the Shop sees a Bitkit setup or reconnect the moment it completes. A
+/// seller who never saved anything has no row; with the flag on that read is
+/// the empty configuration (epoch `updated_at`) instead of `null`, because
+/// that seller is exactly who needs `usdt_setup_action: "setup"`.
 pub async fn get_own_payment_config(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
 ) -> Response {
-    match load_config(&state.pool, &actor.0).await {
-        Ok(Some(row)) => (
-            StatusCode::OK,
-            Json(json!({
-                "payment_config": config_view(
-                    row.bitcoin_enabled,
-                    &row.stripe_payment_link,
-                    &row.paypal_merchant_email,
-                    row.stripe_restricted_key_ciphertext.is_some(),
-                    row.updated_at,
-                ),
-            })),
-        )
-            .into_response(),
-        Ok(None) => (
-            StatusCode::OK,
-            Json(json!({ "payment_config": Value::Null })),
-        )
-            .into_response(),
-        Err(error) => internal("payment config read", &error),
+    let row = match load_config(&state.pool, &actor.0).await {
+        Ok(row) => row,
+        Err(error) => return internal("payment config read", &error),
+    };
+    if !state.config.usdt_payments_enabled {
+        return match row {
+            Some(row) => (
+                StatusCode::OK,
+                Json(json!({
+                    "payment_config": config_view(
+                        row.bitcoin_enabled,
+                        &row.stripe_payment_link,
+                        &row.paypal_merchant_email,
+                        row.stripe_restricted_key_ciphertext.is_some(),
+                        row.updated_at,
+                        None,
+                    ),
+                })),
+            )
+                .into_response(),
+            None => (
+                StatusCode::OK,
+                Json(json!({ "payment_config": Value::Null })),
+            )
+                .into_response(),
+        };
     }
+    let usdt = match own_usdt_view(&state, &actor.0).await {
+        Ok(view) => view,
+        Err(error) => return internal("payment config read", &error),
+    };
+    let view = match row {
+        Some(row) => config_view(
+            row.bitcoin_enabled,
+            &row.stripe_payment_link,
+            &row.paypal_merchant_email,
+            row.stripe_restricted_key_ciphertext.is_some(),
+            row.updated_at,
+            Some(&usdt),
+        ),
+        None => config_view(
+            false,
+            &None,
+            &None,
+            false,
+            DateTime::<Utc>::UNIX_EPOCH,
+            Some(&usdt),
+        ),
+    };
+    (StatusCode::OK, Json(json!({ "payment_config": view }))).into_response()
 }
 
 /// The unauthenticated rail projection. Booleans only: a seller's PayPal
@@ -309,17 +609,20 @@ fn public_config_view(
     bitcoin_offer_available: bool,
     paypal_available: bool,
     stripe_available: bool,
+    usdt_available: Option<bool>,
 ) -> Response {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "bitcoin_available": bitcoin_available,
-            "bitcoin_offer_available": bitcoin_offer_available,
-            "paypal_available": paypal_available,
-            "stripe_available": stripe_available,
-        })),
-    )
-        .into_response()
+    let mut view = json!({
+        "bitcoin_available": bitcoin_available,
+        "bitcoin_offer_available": bitcoin_offer_available,
+        "paypal_available": paypal_available,
+        "stripe_available": stripe_available,
+    });
+    // Only while the USDT flag is on: the key is absent otherwise, so the
+    // body is byte-identical to a build without USDT.
+    if let Some(usdt_available) = usdt_available {
+        view["usdt_available"] = json!(usdt_available);
+    }
+    (StatusCode::OK, Json(view)).into_response()
 }
 
 /// `GET /v0/sellers/{pubky}/payment-config` (public): the buyer-facing rail
@@ -333,6 +636,13 @@ fn public_config_view(
 /// `paypal_available` is a stored merchant email; `stripe_available` is a
 /// stored payment link plus restricted key (the same rule as
 /// `seller_has_rail`), since Stripe payments are verified with that key.
+/// `usdt_available` exists only while `USDT_PAYMENTS_ENABLED` is on and is
+/// true only when every one of these holds: the deployment speaks to upstream
+/// paykit-server, the seller switched USDT on in the Shop, and the signed
+/// `POST /setup/status` with `asset: "USDT"` says `ready` (cached per
+/// seller and asset, like Bitcoin). A seller whose USDT setup is missing,
+/// whether new, Bitcoin-only or Ring-only, or whose status cannot be read,
+/// is not offered USDT.
 pub async fn get_payment_config(
     State(state): State<AppState>,
     Path(seller_pubky): Path<String>,
@@ -366,8 +676,17 @@ pub async fn get_payment_config(
         }
         None => false,
     };
+    let usdt_flag = state.config.usdt_payments_enabled;
+    let usdt_available = if usdt_flag {
+        match seller_usdt_available(&state, &seller_pubky).await {
+            Ok(available) => Some(available),
+            Err(error) => return internal("payment config read", &error),
+        }
+    } else {
+        None
+    };
     let Some(config) = config else {
-        return public_config_view(false, rail_health, false, false);
+        return public_config_view(false, rail_health, false, false, usdt_available);
     };
     let bitcoin_available = if config.bitcoin_enabled {
         let paykit = state
@@ -397,7 +716,40 @@ pub async fn get_payment_config(
         rail_health,
         config.paypal_merchant_email.is_some(),
         config.stripe_payment_link.is_some() && config.stripe_restricted_key_ciphertext.is_some(),
+        usdt_available,
     )
+}
+
+/// Whether a seller is offered USDT right now (see [`get_payment_config`]).
+/// The seller's consent is read first so a seller who never opted in costs
+/// no Paykit lookup.
+async fn seller_usdt_available(state: &AppState, seller_pubky: &str) -> Result<bool, sqlx::Error> {
+    if !usdt_option_enabled(&state.pool, seller_pubky).await? {
+        return Ok(false);
+    }
+    let Some(paykit) = state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
+        .filter(|paykit| paykit.api() == PaykitApi::Upstream)
+    else {
+        return Ok(false);
+    };
+    Ok(state
+        .payment_availability
+        .seller_ready(
+            seller_pubky,
+            SetupAsset::Usdt,
+            state.clock.as_ref(),
+            state.config.paykit_poll_seconds,
+            state.config.paykit_rail_stale_seconds,
+            || async {
+                paykit
+                    .seller_ready_for(seller_pubky, SetupAsset::Usdt)
+                    .await
+            },
+        )
+        .await)
 }
 
 async fn fetch_payment_for_order_update(
