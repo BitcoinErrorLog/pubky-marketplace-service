@@ -993,6 +993,32 @@ impl PaykitApi {
     }
 }
 
+/// The asset a seller's readiness is asked for (`asset` of the signed
+/// `POST /setup/status`). Also the second half of the availability cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SetupAsset {
+    Btc,
+    Usdt,
+}
+
+impl SetupAsset {
+    /// The wire value paykit-server's closed `asset` field takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Btc => "BTC",
+            Self::Usdt => "USDT",
+        }
+    }
+}
+
+/// The coarse state `POST /setup/status` answers with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupStatus {
+    Ready,
+    SetupRequired,
+    Unavailable,
+}
+
 /// The bytes paykit-server verifies the `x-paykit-signature` over:
 /// `"paykit-http-signature-v1\0" + METHOD + "\0" + path + "\0" + raw_body`,
 /// with the method upper-cased and `path` the query-free request path
@@ -1180,19 +1206,67 @@ impl PaykitClient {
     /// failure and any body outside the closed `{"status": ...}` contract
     /// are all retryable outages.
     async fn upstream_setup_ready(&self, seller_pubky: &str) -> Result<bool, PaykitRequestError> {
+        match self
+            .upstream_setup_status(seller_pubky, Some(SetupAsset::Btc))
+            .await?
+        {
+            SetupStatus::Ready => Ok(true),
+            SetupStatus::SetupRequired => Ok(false),
+            SetupStatus::Unavailable => Err(PaykitRequestError::Unavailable),
+        }
+    }
+
+    /// Whether the seller can receive `asset` right now, for the public
+    /// availability cache: `Ok(true)` only for `ready`, `Ok(false)` for
+    /// `setup_required`, and an error whenever paykit-server cannot say, so
+    /// the cache keeps serving its last value until it goes stale. Fork
+    /// paykit-server has no per-asset readiness: only Bitcoin is answered
+    /// there, and any other asset is never ready.
+    pub async fn seller_ready_for(
+        &self,
+        seller_pubky: &str,
+        asset: SetupAsset,
+    ) -> Result<bool, PaykitRequestError> {
+        match self.api {
+            PaykitApi::Fork if asset == SetupAsset::Btc => {
+                self.fork_account_claimed(seller_pubky).await
+            }
+            PaykitApi::Fork => Ok(false),
+            PaykitApi::Upstream => match self
+                .upstream_setup_status(seller_pubky, Some(asset))
+                .await?
+            {
+                SetupStatus::Ready => Ok(true),
+                SetupStatus::SetupRequired => Ok(false),
+                SetupStatus::Unavailable => Err(PaykitRequestError::Unavailable),
+            },
+        }
+    }
+
+    /// The signed `POST /setup/status` of `pubky/paykit-server` rc10, for one
+    /// creator. With an `asset` it answers whether the approved receiving
+    /// details can accept it; without one it answers whether the creator's
+    /// Paykit authority itself is usable. The body is closed
+    /// (`{"asset"?, "creator"}`) and so is the answer
+    /// (`{"status": "ready" | "setup_required" | "unavailable"}`): a non-2xx
+    /// answer, a transport failure and anything outside the contract are
+    /// `Err(Unavailable)`. Nothing here ever starts a Paykit authorization
+    /// flow: rc10 says callers "must not convert `unavailable` into a new
+    /// authorization flow".
+    pub async fn upstream_setup_status(
+        &self,
+        seller_pubky: &str,
+        asset: Option<SetupAsset>,
+    ) -> Result<SetupStatus, PaykitRequestError> {
         let url = format!("{}/setup/status", self.base_url);
-        let (body, signature) = self
-            .signed_body(
-                &url,
-                &serde_json::json!({
-                    "asset": "BTC",
-                    "creator": pubky_app_key(seller_pubky),
-                }),
-            )
-            .map_err(|error| {
-                tracing::error!(error = %error, "paykit setup status request could not be signed");
-                PaykitRequestError::Unavailable
-            })?;
+        let mut request = serde_json::json!({ "creator": pubky_app_key(seller_pubky) });
+        if let Some(asset) = asset {
+            request["asset"] = serde_json::json!(asset.as_str());
+        }
+        let (body, signature) = self.signed_body(&url, &request).map_err(|error| {
+            tracing::error!(error = %error, "paykit setup status request could not be signed");
+            PaykitRequestError::Unavailable
+        })?;
         let response = self
             .http
             .post(url)
@@ -1215,9 +1289,9 @@ impl PaykitClient {
             .and_then(|object| object.get("status"))
             .and_then(serde_json::Value::as_str);
         match status {
-            Some("ready") => Ok(true),
-            Some("setup_required") => Ok(false),
-            Some("unavailable") => Err(PaykitRequestError::Unavailable),
+            Some("ready") => Ok(SetupStatus::Ready),
+            Some("setup_required") => Ok(SetupStatus::SetupRequired),
+            Some("unavailable") => Ok(SetupStatus::Unavailable),
             _ => {
                 tracing::warn!("paykit setup status answered outside its contract");
                 Err(PaykitRequestError::Unavailable)

@@ -246,7 +246,7 @@ The contract tests replay exchanges captured from a real paykit-server at
 
 The service can carry USDT (USDT0 on Arbitrum One) as a payment method beside
 Bitcoin and PayPal. It is built behind `USDT_PAYMENTS_ENABLED`, default off.
-This slice is the asset model and the flag; readiness, status and finality,
+The asset model, the flag and seller readiness are in; status and finality,
 the Paykit bind and refunds are separate slices.
 
 - **Model.** `orders.payment_method` stays the buyer-facing label and gains
@@ -273,6 +273,46 @@ the Paykit bind and refunds are separate slices.
   Off, the key is absent and `usdt` is an `invalid_method` with today's
   message. The Shop shows USDT only when its own flag is on and `/health`
   reports it.
+- **Seller readiness.** While the flag is on, a seller's own payment config
+  (`GET`/`PUT /v0/sellers/me/payment-config`) also carries
+  `usdt_enabled` (the seller's Shop-level consent, stored in
+  `seller_accepted_payment_options`), `usdt_setup` (`ready`, `setup_required`
+  or `unavailable`) and `usdt_setup_action` (`setup`, `reconnect` or `null`),
+  and the public config (`GET /v0/sellers/{pubky}/payment-config`) carries
+  `usdt_available`. With the flag off none of these keys exists, a `PUT`
+  carrying `usdt_enabled` is refused as the unknown field it is, and
+  paykit-server is only ever asked about Bitcoin.
+  - Readiness comes only from paykit-server's signed `POST /setup/status`
+    (`PAYKIT_SERVER_API=upstream`): `{asset: "USDT"}` for the seller, and the
+    authority-only `{}` body to tell a seller with no Paykit account
+    (`setup`) from one that only lacks USDT (`reconnect`). The authority is
+    looked up only when USDT is not ready. `unavailable`, a non-2xx answer
+    or an answer outside the closed `{"status": ...}` contract is
+    `usdt_setup: "unavailable"` with no action: the service never turns it
+    into an authorization flow. On the fork, or without Paykit, `usdt_setup`
+    is `unavailable` and paykit-server is not asked.
+  - `usdt_available` is true only when the deployment speaks to upstream
+    paykit-server, the seller consented, and the USDT status is `ready`. It
+    is cached per (seller, asset) like Bitcoin's. The seller's own `GET` and
+    `PUT` read paykit-server uncached, so a Bitkit setup or reconnect shows
+    at once.
+  - A seller who never saved anything reads the empty configuration (epoch
+    `updated_at`) instead of `null` while the flag is on, because that seller
+    is who needs `setup`.
+  - `PUT` replaces the rails, but an absent or `null` `usdt_enabled` leaves
+    the stored consent unchanged; only an explicit boolean changes it. The
+    consent is not gated on readiness, and a seller who is not ready is never
+    offered USDT.
+  - **Upstream gap.** rc10 (and `master` at `c351f15`) answers `ready` for
+    `asset: "USDT"` whenever `[usdt]` is configured and the seller has any
+    receiving detail, including a Bitcoin-only seller who declined the USDT
+    address (`application/setup_status.rs`, `status_for_asset`). The service
+    maps the answer as it is, so on a `[usdt]` deployment `ready` means
+    "`[usdt]` is configured", not "the seller approved a USDT address", and the
+    `reconnect` action appears only where `[usdt]` is not configured. Paykit's
+    own validation of a Marketplace request against the seller's approval
+    remains the safety net. The captured exchanges are in
+    `crates/service/tests/fixtures/paykit-server-rc10/`.
 - **Bind.** Until the upstream Marketplace prepare can carry a USDT request,
   every `usdt` bind is refused with `usdt_unavailable` and leaves the order
   untouched (unbound, unheld, no attempt spent). The log says which
