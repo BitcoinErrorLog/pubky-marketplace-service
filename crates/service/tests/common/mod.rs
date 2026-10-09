@@ -35,8 +35,8 @@ use marketplace_service::locks::{
     LocksKeys, LocksLifecycleClient, LocksLookupOutcome, LocksRuntime,
 };
 use marketplace_service::payments::{
-    PaykitClient, PaykitStatusOutcome, PaykitStatusSource, PaymentsRuntime, PaypalIpnVerifier,
-    ShippoClient, StripeClient, StripeKeyCipher,
+    paykit_signature_preimage, PaykitApi, PaykitClient, PaykitStatusOutcome, PaykitStatusSource,
+    PaymentsRuntime, PaypalIpnVerifier, ShippoClient, StripeClient, StripeKeyCipher,
 };
 use marketplace_service::pickup::PickupKeys;
 use marketplace_service::AppState;
@@ -2031,6 +2031,16 @@ struct FakePaykitState {
     rail_health_requests: usize,
     rail_health_status: u16,
     account_status: u16,
+    /// Which signature preimage the double verifies (the API it plays).
+    api: PaykitApi,
+    /// Seller (bare z32) -> the `/setup/status` answer, when scripted. A
+    /// claimed seller without an entry answers `ready`; anyone else
+    /// `setup_required`.
+    setup_statuses: HashMap<String, String>,
+    /// Status every `/setup/status` call answers with, when forced.
+    setup_status_failure: Option<u16>,
+    /// Body served verbatim instead of the scripted status, when forced.
+    setup_status_body: Option<Value>,
 }
 
 /// A local paykit-server double serving the fork's marketplace surface
@@ -2067,6 +2077,45 @@ impl FakePaykit {
 
     pub fn fail_account_exists(&self) {
         self.state.lock().expect("fake paykit lock").account_status = 503;
+    }
+
+    /// Plays upstream paykit-server: signatures must cover the request
+    /// preimage (method, path, body); a body-only signature is a 401.
+    pub fn use_upstream_api(&self) {
+        self.state.lock().expect("fake paykit lock").api = PaykitApi::Upstream;
+    }
+
+    /// Scripts the `/setup/status` answer (`ready`, `setup_required`,
+    /// `unavailable`, or any other string) for one seller (bare z32).
+    pub fn set_setup_status(&self, seller_pubky: &str, status: &str) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .setup_statuses
+            .insert(seller_pubky.to_string(), status.to_string());
+    }
+
+    /// Makes every `/setup/status` call answer with this HTTP status.
+    pub fn fail_setup_status_with(&self, status: u16) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .setup_status_failure = Some(status);
+    }
+
+    pub fn clear_setup_status_failure(&self) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .setup_status_failure = None;
+    }
+
+    /// Makes every `/setup/status` call answer 200 with exactly this body.
+    pub fn set_setup_status_body(&self, body: Value) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .setup_status_body = Some(body);
     }
 
     pub fn set_claimed(&self, seller_pubky: &str) {
@@ -2276,6 +2325,59 @@ async fn serve_paykit_account(
     (StatusCode::OK, axum::Json(json!({ "claimed": claimed }))).into_response()
 }
 
+/// Upstream `POST /setup/status`: a signed, closed, canonical body
+/// `{"creator", "asset"?}` answered with one coarse state.
+async fn serve_paykit_setup_status(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let host = header_host(&headers);
+    let Some(parsed) = paykit_verify_signed(&state, "POST", "/setup/status", &headers, &body)
+    else {
+        return paykit_unauthorized();
+    };
+    let canonical = serde_json_canonicalizer::to_vec(&parsed).expect("canonicalizes");
+    let closed = parsed.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .all(|key| matches!(key.as_str(), "creator" | "asset"))
+            && object.get("creator").is_some_and(Value::is_string)
+            && object
+                .get("asset")
+                .is_none_or(|asset| matches!(asset.as_str(), Some("BTC" | "USD" | "USDT")))
+    });
+    if canonical != body.as_ref() || !closed {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    paykit_record_call(&state, "POST", "/setup/status", &host, &parsed);
+    let guard = state.lock().expect("fake paykit lock");
+    if let Some(status) = guard.setup_status_failure {
+        return paykit_error(
+            StatusCode::from_u16(status).expect("valid fake status"),
+            "unavailable",
+        );
+    }
+    if let Some(body) = guard.setup_status_body.clone() {
+        return (StatusCode::OK, axum::Json(body)).into_response();
+    }
+    let creator = parsed["creator"].as_str().unwrap_or_default();
+    let seller = creator.strip_prefix("pubky").unwrap_or(creator);
+    let status = guard
+        .setup_statuses
+        .get(seller)
+        .cloned()
+        .unwrap_or_else(|| {
+            if guard.claimed.iter().any(|claimed| claimed == seller) {
+                "ready".to_string()
+            } else {
+                "setup_required".to_string()
+            }
+        });
+    (StatusCode::OK, axum::Json(json!({ "status": status }))).into_response()
+}
+
 async fn serve_paykit_health(
     axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
 ) -> axum::response::Response {
@@ -2289,19 +2391,34 @@ async fn serve_paykit_health(
         .into_response()
 }
 
-/// Verifies the `x-paykit-signature` header over the raw canonical body,
-/// exactly as paykit-server does. Returns the parsed body on success.
-fn paykit_verify_signed(headers: &axum::http::HeaderMap, body: &[u8]) -> Option<Value> {
+/// Verifies the `x-paykit-signature` header exactly as the API the double
+/// plays does: over the raw canonical body for the fork, over the request
+/// preimage (`paykit_signature_preimage`: method, path, raw body) for
+/// upstream. Returns the parsed body on success.
+fn paykit_verify_signed(
+    state: &Arc<Mutex<FakePaykitState>>,
+    method: &str,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Option<Value> {
     use ed25519_dalek::Verifier;
-    let signature = headers
-        .get("x-paykit-signature")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, value).ok()
-        })
-        .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())?;
+    let api = state.lock().expect("fake paykit lock").api;
+    let mut signatures = headers.get_all("x-paykit-signature").iter();
+    let encoded = signatures.next()?.to_str().ok()?;
+    if signatures.next().is_some() {
+        return None;
+    }
+    let signature =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded)
+            .ok()
+            .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())?;
+    let message = match api {
+        PaykitApi::Fork => body.to_vec(),
+        PaykitApi::Upstream => paykit_signature_preimage(method, path, body),
+    };
     paykit_test_verifying_key()
-        .verify(body, &ed25519_dalek::Signature::from_bytes(&signature))
+        .verify(&message, &ed25519_dalek::Signature::from_bytes(&signature))
         .ok()?;
     serde_json::from_slice::<Value>(body).ok()
 }
@@ -2354,7 +2471,9 @@ async fn serve_paykit_payment_request(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let host = header_host(&headers);
-    let Some(parsed) = paykit_verify_signed(&headers, &body) else {
+    let Some(parsed) =
+        paykit_verify_signed(&state, "POST", "/v0/payment-requests", &headers, &body)
+    else {
         return paykit_unauthorized();
     };
     paykit_record_call(&state, "POST", "/v0/payment-requests", &host, &parsed);
@@ -2582,10 +2701,10 @@ async fn serve_paykit_command(
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     let host = header_host(&headers);
-    let Some(parsed) = paykit_verify_signed(&headers, &body) else {
+    let path = format!("/v0/payment-requests/{invoice_id}/{command}");
+    let Some(parsed) = paykit_verify_signed(&state, "POST", &path, &headers, &body) else {
         return paykit_unauthorized();
     };
-    let path = format!("/v0/payment-requests/{invoice_id}/{command}");
     paykit_record_call(&state, "POST", &path, &host, &parsed);
     let gate = if command == "activate" {
         state
@@ -2755,10 +2874,10 @@ async fn serve_paykit_resolve(
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     let host = header_host(&headers);
-    let Some(parsed) = paykit_verify_signed(&headers, &body) else {
+    let path = format!("/v0/payment-requests/{invoice_id}/resolve");
+    let Some(parsed) = paykit_verify_signed(&state, "POST", &path, &headers, &body) else {
         return paykit_unauthorized();
     };
-    let path = format!("/v0/payment-requests/{invoice_id}/resolve");
     paykit_record_call(&state, "POST", &path, &host, &parsed);
     let scripted = {
         let mut guard = state.lock().expect("fake paykit lock");
@@ -2833,7 +2952,9 @@ async fn serve_paykit_status(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let host = header_host(&headers);
-    let Some(parsed) = paykit_verify_signed(&headers, &body) else {
+    let Some(parsed) =
+        paykit_verify_signed(&state, "POST", "/transactions/status", &headers, &body)
+    else {
         return paykit_unauthorized();
     };
     paykit_record_call(&state, "POST", "/transactions/status", &host, &parsed);
@@ -2885,12 +3006,20 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         rail_health_requests: 0,
         rail_health_status: 200,
         account_status: 200,
+        api: PaykitApi::Fork,
+        setup_statuses: HashMap::new(),
+        setup_status_failure: None,
+        setup_status_body: None,
     }));
     let router = Router::new()
         .route("/health/ready", axum::routing::get(serve_paykit_health))
         .route(
             "/v0/accounts/{creator}",
             axum::routing::get(serve_paykit_account),
+        )
+        .route(
+            "/setup/status",
+            axum::routing::post(serve_paykit_setup_status),
         )
         .route(
             "/v0/payment-requests",
@@ -3079,8 +3208,27 @@ pub async fn test_app_with_payments_config(
     pool: PgPool,
     config: Config,
 ) -> (TestApp, FakeStripe, FakePaykit, FakePaypalIpn, FakeShippo) {
+    test_app_with_payments_api(pool, config, PaykitApi::Fork).await
+}
+
+/// A payments-enabled app whose Paykit client and Paykit double both play
+/// the upstream API (request-preimage signatures, signed `/setup/status`).
+pub async fn test_app_with_upstream_paykit(pool: PgPool) -> (TestApp, FakePaykit) {
+    let (app, _stripe, paykit, _ipn, _shippo) =
+        test_app_with_payments_api(pool, Config::for_tests(), PaykitApi::Upstream).await;
+    (app, paykit)
+}
+
+async fn test_app_with_payments_api(
+    pool: PgPool,
+    config: Config,
+    api: PaykitApi,
+) -> (TestApp, FakeStripe, FakePaykit, FakePaypalIpn, FakeShippo) {
     let stripe = spawn_fake_stripe().await;
     let paykit = spawn_fake_paykit().await;
+    if api == PaykitApi::Upstream {
+        paykit.use_upstream_api();
+    }
     let ipn = spawn_fake_paypal_ipn().await;
     let shippo = spawn_fake_shippo().await;
     let runtime = Arc::new(PaymentsRuntime {
@@ -3089,7 +3237,8 @@ pub async fn test_app_with_payments_config(
         stripe: StripeClient::new(&stripe.base_url).expect("fake stripe client builds"),
         paykit: Some(
             PaykitClient::new(&paykit.base_url, TEST_PAYKIT_SIGNING_SEED)
-                .expect("fake paykit client builds"),
+                .expect("fake paykit client builds")
+                .with_api(api),
         ),
         paypal_ipn: PaypalIpnVerifier::new(&ipn.base_url).expect("fake ipn verifier builds"),
         shippo: ShippoClient::new(&shippo.base_url).expect("fake shippo client builds"),

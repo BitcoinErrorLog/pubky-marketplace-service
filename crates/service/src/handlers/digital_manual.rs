@@ -32,7 +32,9 @@ use crate::auth::Actor;
 use crate::clock::format_timestamp;
 use crate::digital::{email_aad, DigitalKeys};
 use crate::executor::insert_event;
-use crate::handlers::digital::{no_store, unavailable, DIGITAL_ENDED_ORDER_STATES};
+use crate::handlers::digital::{
+    no_store, payment_taken_back, unavailable, DIGITAL_ENDED_ORDER_STATES,
+};
 use crate::handlers::digital_orders::line_kind;
 use crate::handlers::{
     fetch_order_for_update, fetch_order_reviews, guard_order_action, insert_notification_intent,
@@ -489,6 +491,13 @@ pub async fn read_delivery_email_with_hook(
                 ErrorCode::InvalidState,
                 "The buyer's email appears once payment is confirmed.",
                 Some("not_paid"),
+            );
+        }
+        if let Some(taken_back) = payment_taken_back(&order) {
+            return read_error(
+                ErrorCode::InvalidState,
+                taken_back.message(),
+                Some(taken_back.reason()),
             );
         }
         if DIGITAL_ENDED_ORDER_STATES.contains(&order.state.as_str()) {

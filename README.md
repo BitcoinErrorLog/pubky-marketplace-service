@@ -97,7 +97,8 @@ Railway IaC `preserve()`):
 | `STRIPE_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing seller Stripe restricted keys at rest; setting it enables the `/v0` payment-methods surface |
 | `STRIPE_API_BASE` | `https://api.stripe.com` | Stripe API base URL (overridden only by tests) |
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
-| `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests; its pubky-formatted public key is paykit-server's `marketplace.trusted_public_key` |
+| `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests. Its pubky-formatted public key goes into paykit-server's `[signed_services] trusted_public_keys`, beside the Locks key, when `PAYKIT_SERVER_API=upstream`; on the fork (`fork`, the default) it is `marketplace.trusted_public_key`. See [Paykit server API](#paykit-server-api) |
+| `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` rc9 with the signed-services allowlist, #55). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
 | `PAYKIT_RAIL_STALE_SECONDS` | `60` | stale-out window for cached Paykit rail and seller claim availability; must be at least `PAYKIT_POLL_SECONDS` |
 | `DELIVERY_ASSUME_DAYS` | `14` | days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1) |
@@ -116,7 +117,12 @@ Railway IaC `preserve()`):
 | `SANDBOX_PAYMENTS_ENABLED` | `false` | accept `payment.sandbox_advance` at all; must stay `false` on any deployment handling real orders |
 | `PICKUP_DETAILS_ENCRYPTION_KEY` | unset | 32-byte hex key sealing local-pickup details and pinned payment snapshots at rest (XChaCha20-Poly1305); must differ from the Locks key material; pickup is OFF without it |
 | `PICKUP_DETAILS_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous pickup key for the dual-key read window during rotation; the re-seal worker migrates both sealed families to the current key |
-| `PRIV_DATA_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing per-user `/priv` data keys at rest (XChaCha20-Poly1305); must differ from the Locks, pickup and digital delivery keys; `GET /v1/me/priv-keys` answers `priv_keys_unavailable` without it, and the service refuses to boot while sealed rows exist without it; `POST /v1/me/priv-keys/release` also needs it (see [private data key custody](docs/priv-key-custody.md)) |
+| `DIGITAL_DELIVERY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing digital delivery at rest (XChaCha20-Poly1305): the seller's deliverable versions (file key, link or text), each order's pinned copy and the buyer's delivery email. It is the only switch: unset, digital delivery is OFF, `/health` reports `digital_delivery_available: false` and checkout refuses digital lines (`digital_delivery_unavailable`). Must differ from `LOCKS_BUNDLE_ENCRYPTION_KEY`, `LOCKS_LOOKUP_HMAC_KEY`, the pickup keys and `PRIV_DATA_KEY_ENCRYPTION_KEY` (checked at boot). The service refuses to boot while sealed digital rows exist and no configured key opens them, so keep a backup outside the host |
+| `DIGITAL_DELIVERY_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous digital delivery key for the dual-key read window during rotation; the re-seal worker moves all three sealed families to the current key. Keep it set until a sweep finds zero rows under it |
+| `DIGITAL_DELIVERY_MAX_BYTES` | `52428800` | largest digital file, in plaintext bytes (≥ 1); exposed as `/health.digital_delivery_max_bytes` so the Shop's picker enforces the same cap |
+| `BUYER_EMAIL_RETENTION_DAYS` | `30` | days the sealed delivery email of a paid "I'll email it" order is kept after the order ends (completed, cancelled, refunded or closed), before the purge worker deletes it (≥ 1) |
+| `BUYER_EMAIL_UNPAID_RETENTION_DAYS` | `7` | days the sealed delivery email of a cancelled or expired unpaid checkout is kept before the purge deletes it (≥ 1) |
+| `PRIV_DATA_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing per-user `/priv` data keys at rest (XChaCha20-Poly1305); must differ from the Locks, pickup and digital delivery keys; `GET /v1/me/priv-keys` answers `priv_keys_unavailable` without it, and the service refuses to boot while sealed rows exist without it |
 | `PRIV_DATA_KEY_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous priv data key sealing key for the dual-key read window during rotation; the re-seal worker moves every row to the current key. Keep it set until the pass reports zero rows under the previous key |
 | `PICKUP_DISPUTE_RETENTION_DAYS` | `30` | days a cancelled-after-payment order's pinned pickup snapshot is retained as the dispute exhibit when no refund evidence ever lands, before the ordinary terminal-order purge takes it (≥ 1) |
 
@@ -145,6 +151,40 @@ During deployment ordering, an older paykit-server response without
 `bitcoin_offer_available` is compatible: `electrum: "ready"` or
 `electrum: { "state": "ready" }` maps to `true`, and any other shape maps to
 `false`. When present, the field is authoritative.
+
+### Paykit server API
+
+`PAYKIT_SERVER_API` is the one switch between the fork and upstream
+paykit-server. It decides what the `x-paykit-signature` header signs and how
+seller readiness is read; everything else about the client is unchanged.
+
+| | `fork` (default) | `upstream` |
+| --- | --- | --- |
+| Signature covers | the canonical JSON body | `"paykit-http-signature-v1\0" + METHOD + "\0" + path + "\0" + raw body` (the path is the query-free request path, base-URL prefix included) |
+| Trusted key | `marketplace.trusted_public_key` | an entry of `[signed_services] trusted_public_keys` (non-empty allowlist, beside the Locks key) |
+| Seller readiness | public `GET /v0/accounts/{creator}` (`claimed`) | signed `POST /setup/status` with `{"asset":"BTC","creator":"pubky..."}` |
+
+Upstream readiness answers one of three states. Only exactly `ready` makes
+`bitcoin_available` true. `setup_required` means the seller has to set up
+Paykit: the public projection reports `bitcoin_available: false` for it, and
+the service never starts an authorization flow itself.
+`unavailable`, any non-2xx answer, a transport failure and any body outside
+the closed `{"status": ...}` contract are outages: the availability cache
+retries every `PAYKIT_POLL_SECONDS` and serves the last known value until
+`PAYKIT_RAIL_STALE_SECONDS`, then `false`. The public `bitcoin_available` and
+`bitcoin_offer_available` fields keep their meaning. The rail-wide
+`bitcoin_offer_available` gate is the public, unsigned `GET /health/ready` in
+both modes (upstream answers `status`, `postgres`, `electrum`,
+`paykit_delivery`, `outbox`; only `status: ready` with `electrum: ready` is
+true, and a 503 is an outage).
+
+Flipping the setting is a deployment step: register the service's public key
+in the upstream allowlist first, then set `PAYKIT_SERVER_API=upstream` and
+repoint `PAYKIT_SERVER_URL`; setting it back to `fork` (or unsetting it) and
+repointing is the rollback. Upstream does not serve the payment-request
+lifecycle routes (prepare, activate, void, resolve) yet, so with `upstream`
+a Bitcoin bind answers `paykit_unavailable` until those land. PayPal and
+Stripe are not affected.
 
 ### Address autocomplete proxy
 
@@ -755,10 +795,10 @@ splits one order per (seller, fulfillment) — several pickup lines from one
 seller share one pickup order; pickup orders charge no shipping and store no
 buyer address (a pickup-only checkout presenting one is rejected
 `INVALID_COMMAND`). Every order carries a required `fulfillment` column.
-Digital lines are N/A (§A8 7.1): the service has no digital item concept —
-every registered order is a shipped or pickup physical order, so there are
-no digital lines to keep outside the (seller, fulfillment) split key or the
-`fulfillment = 'shipping'` backfill.
+Digital lines (`fulfillment = 'digital'`) are a third split key: a cart with
+shipped, pickup and digital lines becomes one order per (seller, method), and
+a digital-only checkout takes no address and charges no shipping (see
+[Digital delivery](#digital-delivery)).
 
 The seller's pickup details (spot or address, instructions, availability
 windows with their IANA zone) live ONLY in the service, sealed
@@ -795,6 +835,75 @@ through approve's path, and are excluded whole (including any
 buyer-confirmed handover or a dispute-free auto-complete; the auto-complete
 sweep coalesces the handover instant for pickup orders, locking
 `FOR UPDATE OF orders`.
+
+## Digital delivery
+
+A listing offers digital delivery by listing `digital` among its
+`fulfillmentMethods`, alone or beside `shipping` and `pickup`; an auction is
+refused. After registering, the seller sets what buyers receive with
+`digital_delivery.set` (and removes it with `digital_delivery.clear`). Five
+kinds exist:
+
+| Kind | What the buyer gets | Where it lives |
+| --- | --- | --- |
+| `file` | A download, up to `DIGITAL_DELIVERY_MAX_BYTES` | AES-256-GCM ciphertext made in the seller's browser and stored on the seller's homeserver; the service reads it once at `set` to check its length and BLAKE3, then keeps only the sealed file key. It never decrypts a file |
+| `link` | A URL to open | Sealed in the service |
+| `text` | A text or licence key, the same for every buyer | Sealed in the service. A per-buyer key list is not supported and is refused |
+| `email` | The seller emails it after payment | The buyer's address, sealed, shown to the seller once paid |
+| `message` | The seller sends it in messages | Nothing is stored; the seller marks it delivered |
+
+Each `set` is a new version from a per-listing counter that survives `clear`,
+so a version never repeats. Checkout refuses a listing with no current
+deliverable (`digital_delivery_not_ready`) and asks for a delivery email only
+when the order has an `email` line.
+
+Payment confirmation is the one release step, so Bitcoin (Paykit) and PayPal
+behave alike: nothing is released or shown to the seller while a payment is
+pending. When the payment confirms, the receipt transaction pins each instant
+line (`file`, `link`, `text`): it re-seals the current version's payload under
+the order, so a later replacement or clear never changes what that buyer paid
+for. If the deliverable is gone by then, the order is not paid and is marked
+`refund_required`. A `sandbox_advance` confirmation never delivers.
+
+The buyer opens one line at a time with
+`GET /v1/orders/{id}/digital-delivery/{line_index}` (`Cache-Control:
+no-store`, buyer only, 30 reads per minute per buyer and 10 per order). The
+read re-checks entitlement and logs the access in the same transaction, and
+fails closed if the log write fails; the log is the delivery evidence the
+seller reads at `GET /v1/orders/{id}/digital-evidence`. The purchase keeps
+downloading while the order stands, including `completed`. For `email` and
+`message` lines the seller reads the address at
+`GET /v1/orders/{id}/delivery-email` and records the delivery with
+`fulfillment.deliver_digital` (`channel`: `email` or `message`); when every
+manual line is marked the order moves `paid` to `delivered`. A background
+worker deletes the sealed address after its retention (see
+`BUYER_EMAIL_RETENTION_DAYS`), and `/ready` reports `unavailable` if the purge
+falls behind.
+
+The entitlement ends, and reads are refused, when the order is `cancelled`,
+`refunded_external` or `closed` (`delivery_ended`). PayPal can also take the
+money back after delivery, so a verified PayPal notification withholds the
+purchase without waiting for a state change (the design's DD3):
+
+- A `Reversed` notification, full or partial, sets `payment_reversed_at` on
+  the order. While it is set, the buyer's download is refused
+  (`payment_reversed`) and the seller can no longer read the buyer's email.
+  A full reversal also moves the order to `refunded_external`. A
+  `Canceled_Reversal` that restores everything clears the flag and the order
+  and its downloads come back.
+- A partial `Refunded` notification keeps the order's state, records the
+  amount in `external_refund`, and withholds the purchase for good
+  (`payment_refunded`): a refund is final. A full refund ends the order.
+- Both participants are notified of each notification, and the order's
+  `payment_reversed_at` and `external_refund` fields are how the Shop shows it.
+  Details: [`docs/paypal-refund-ipn.md`](docs/paypal-refund-ipn.md).
+
+A digital order never enters the physical lifecycle: ship, delivery
+confirmation, return and offer commands are refused on it, and a seller's
+refund after delivery is recorded straight from `delivered` or `completed`
+(`refund.record_external`). A cancellation after the buyer opened an instant
+line keeps that line sold. `/health` reports `digital_delivery_available` and
+`digital_delivery_max_bytes`.
 
 ## Drops (ADR-0026)
 
