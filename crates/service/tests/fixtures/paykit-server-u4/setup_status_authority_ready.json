@@ -1,0 +1,18 @@
+{
+  "description": "No asset: a seller who completed Paykit setup in Bitkit. Authority only.",
+  "name": "setup_status_authority_ready",
+  "request": {
+    "body": "{\"creator\":\"pubkyxnj8u7jodw3wfdap53qfo9wf9ca4n84mukkg6q7wqwri47nsq44y\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "HXfq8MakAKkBv7RBU15xsUHleHtBbBYHFigxzDSd59HqMkEr_AOwaQcGdy78eJXuXeJpxR6UENdH5OzpBqoNAA"
+  },
+  "response": {
+    "body": "{\"status\":\"ready\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T18:26:54.836194787Z",
+  "server": "usdt_configured",
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
+}

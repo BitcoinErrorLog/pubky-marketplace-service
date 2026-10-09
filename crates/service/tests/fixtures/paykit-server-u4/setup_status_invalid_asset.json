@@ -2,17 +2,17 @@
   "description": "An asset outside BTC, USD and USDT: refused.",
   "name": "setup_status_invalid_asset",
   "request": {
-    "body": "{\"asset\":\"ETH\",\"creator\":\"pubkyirqapc3t8bxyuzu89mkewx73nz3u74etrpcx1rzb9be5wxwucsbo\"}",
+    "body": "{\"asset\":\"ETH\",\"creator\":\"pubkyxnj8u7jodw3wfdap53qfo9wf9ca4n84mukkg6q7wqwri47nsq44y\"}",
     "method": "POST",
     "path": "/setup/status",
-    "signature": "l2kj4rIFbt-P8Vr9NJJJQZW1VBnmEohZWSFie28g1c3-OxzSahpkICKsbU62Et0QegOFa2Rsz1gF27U8mN2ZDA"
+    "signature": "wr69FEfHoRtSE4Y3BE4m4hsW6n81qx45lWjGZNPNMJR0zLayNkN2h6QHO7i_uTPpo49L1BOGgTHjUpLSOj6HDQ"
   },
   "response": {
     "body": "{\"error\":{\"code\":\"invalid_request\",\"message\":\"request is invalid\"}}",
     "content_type": "application/json",
     "status": 400
   },
-  "sent_at": "2026-10-09T16:37:24.688308259Z",
+  "sent_at": "2026-10-09T18:26:59.027233072Z",
   "server": "usdt_configured",
-  "server_revision": "7326a3f9a035d79d8b6977b7c1a5fb742327ff37"
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
 }

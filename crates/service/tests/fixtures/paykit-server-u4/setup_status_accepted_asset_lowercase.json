@@ -1,0 +1,18 @@
+{
+  "description": "accepted_asset btc: values are case sensitive, refused.",
+  "name": "setup_status_accepted_asset_lowercase",
+  "request": {
+    "body": "{\"accepted_asset\":\"btc\",\"creator\":\"pubkyxnj8u7jodw3wfdap53qfo9wf9ca4n84mukkg6q7wqwri47nsq44y\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "j96GTbg8NsmEOQP7HyoTXQRA2CPuzMk6VEbonCSySRbxiItcUUXBYgj1i-CMFu8bdWsImZ57VCePcM6da9CoAQ"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"invalid_request\",\"message\":\"request is invalid\"}}",
+    "content_type": "application/json",
+    "status": 400
+  },
+  "sent_at": "2026-10-09T18:26:59.741931641Z",
+  "server": "usdt_configured",
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
+}

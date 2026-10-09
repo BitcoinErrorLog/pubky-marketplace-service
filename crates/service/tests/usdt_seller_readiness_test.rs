@@ -3,13 +3,15 @@
 //! `usdt_setup_action`, and the public config carries `usdt_available`. The
 //! readiness comes only from paykit-server's signed `POST /setup/status`, and
 //! every answer these tests replay is an exchange captured from a running
-//! paykit-server `v0.1.0-rc10` (`tests/fixtures/paykit-server-rc10/`). With
+//! paykit-server that has `accepted_asset` on `/setup/status`
+//! (`tests/fixtures/paykit-server-u4/`). USDT is asked as
+//! `{"accepted_asset":"USDT",...}`, never as the `asset` denomination. With
 //! the flag off none of it exists.
 
 mod common;
 
 use axum::http::StatusCode;
-use common::paykit_server_rc10 as rc10;
+use common::paykit_server_u4 as u4;
 use common::*;
 use marketplace_service::config::Config;
 use marketplace_service::payments::{
@@ -85,8 +87,8 @@ async fn get_public(app: &TestApp, seller: &str) -> Value {
 /// The seller's USDT answers: what paykit-server says for `asset: "USDT"`
 /// and for no asset.
 fn replay(paykit: &FakePaykit, seller: &str, usdt: &str, authority: &str) {
-    paykit.replay_setup_status(seller, Some("USDT"), &rc10::load(usdt));
-    paykit.replay_setup_status(seller, None, &rc10::load(authority));
+    paykit.replay_setup_status(seller, Some("accepted_asset:USDT"), &u4::load(usdt));
+    paykit.replay_setup_status(seller, None, &u4::load(authority));
 }
 
 fn usdt_fields(body: &Value) -> (Value, Value, Value) {
@@ -110,7 +112,7 @@ fn setup_status_calls(paykit: &FakePaykit) -> Vec<Value> {
 fn usdt_calls(paykit: &FakePaykit) -> usize {
     setup_status_calls(paykit)
         .iter()
-        .filter(|body| body["asset"] == json!("USDT"))
+        .filter(|body| body["accepted_asset"] == json!("USDT"))
         .count()
 }
 
@@ -119,9 +121,14 @@ fn usdt_calls(paykit: &FakePaykit) -> usize {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_capture_is_from_the_pinned_server_revision_and_a_closed_signed_body() {
-    for fixture in rc10::load_all() {
-        assert_eq!(fixture.server_revision, rc10::SERVER_REVISION);
+fn every_capture_is_from_a_pinned_server_revision_and_a_closed_signed_body() {
+    for fixture in u4::load_all() {
+        let expected = if fixture.name == "setup_status_accepted_asset_pre_u4" {
+            u4::PRE_U4_REVISION
+        } else {
+            u4::U4_REVISION
+        };
+        assert_eq!(fixture.server_revision, expected, "{}", fixture.name);
         assert_eq!(fixture.method, "POST");
         assert_eq!(fixture.path, "/setup/status");
         assert!(!fixture.signature.is_empty(), "{}", fixture.name);
@@ -142,18 +149,22 @@ async fn the_client_reads_every_captured_answer_as_the_service_contract_says(poo
         .expect("client builds")
         .with_api(PaykitApi::Upstream);
     let seller = "capture-seller";
-    for fixture in rc10::load_all() {
+    for fixture in u4::load_all() {
         // The fake answers with the captured status and body for this seller
-        // and the captured request's asset.
-        let asset = match fixture.asset().as_deref() {
-            Some("BTC") => Some(SetupAsset::Btc),
-            Some("USDT") => Some(SetupAsset::Usdt),
+        // and the captured request's readiness question. A capture whose
+        // request the client never sends (a refused asset value, an extra
+        // field) is skipped: the client cannot produce that body.
+        let question = fixture.question();
+        let asset = match question.as_deref() {
+            Some("asset:BTC") => Some(SetupAsset::Btc),
+            Some("accepted_asset:USDT") => Some(SetupAsset::Usdt),
             _ => None,
         };
-        if fixture.asset().is_some() && asset.is_none() {
+        let keys = fixture.request().as_object().expect("object").len();
+        if (question.is_some() && asset.is_none()) || keys > 1 + usize::from(asset.is_some()) {
             continue;
         }
-        paykit.replay_setup_status(seller, asset.map(SetupAsset::as_str), &fixture);
+        paykit.replay_setup_status(seller, question.as_deref(), &fixture);
         let read = client.upstream_setup_status(seller, asset).await;
         if fixture.status == 200 {
             let expected = match fixture.status_value().as_str() {
@@ -175,7 +186,9 @@ async fn the_client_reads_every_captured_answer_as_the_service_contract_says(poo
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn the_requests_are_the_closed_canonical_bodies_the_captures_show(pool: PgPool) {
+async fn the_usdt_question_is_accepted_asset_never_asset_in_the_closed_canonical_bodies_the_captures_show(
+    pool: PgPool,
+) {
     let (app, paykit) = upstream_app(pool).await;
     let seller = new_actor(&app).await;
     replay(
@@ -191,13 +204,13 @@ async fn the_requests_are_the_closed_canonical_bodies_the_captures_show(pool: Pg
     assert_eq!(
         setup_status_calls(&paykit),
         vec![
-            json!({ "asset": "USDT", "creator": creator }),
+            json!({ "accepted_asset": "USDT", "creator": creator }),
             json!({ "creator": creator }),
         ]
     );
     // The same field sets the captured requests carry.
     let captured_keys = |name: &str| -> Vec<String> {
-        rc10::load(name)
+        u4::load(name)
             .request()
             .as_object()
             .expect("object")
@@ -207,8 +220,9 @@ async fn the_requests_are_the_closed_canonical_bodies_the_captures_show(pool: Pg
     };
     assert_eq!(
         captured_keys("setup_status_usdt_dual"),
-        ["asset", "creator"]
+        ["accepted_asset", "creator"]
     );
+    assert_eq!(captured_keys("setup_status_btc_dual"), ["asset", "creator"]);
     assert_eq!(captured_keys("setup_status_authority_ready"), ["creator"]);
 }
 
@@ -395,8 +409,8 @@ async fn own_reads_are_never_served_from_the_availability_cache(pool: PgPool) {
     // clock advance, sees it.
     paykit.replay_setup_status(
         &seller.pubky,
-        Some("USDT"),
-        &rc10::load("setup_status_usdt_after_reconnect"),
+        Some("accepted_asset:USDT"),
+        &u4::load("setup_status_usdt_after_reconnect"),
     );
     let (_, second) = get_own(&app, &seller.token).await;
     assert_eq!(usdt_fields(&second).1, json!("ready"));
@@ -404,25 +418,80 @@ async fn own_reads_are_never_served_from_the_availability_cache(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn the_service_maps_rc10_literally_for_a_seller_who_declined_usdt(pool: PgPool) {
-    // paykit-server rc10 answers `ready` for `asset: "USDT"` for any ready
-    // seller on a deployment with `[usdt]` configured, including a Bitcoin
-    // account that declined the USDT address (captured:
-    // `setup_status_usdt_bitcoin_only`, and before and after a reconnect).
-    // The service reports the answer as it is; Paykit's own validation of the
-    // request against the seller's approval is the safety net.
+async fn a_seller_who_declined_usdt_is_told_to_reconnect_and_is_ready_after_it(pool: PgPool) {
+    // Captured on a `[usdt]` deployment: a Bitcoin-only seller who declined
+    // the USDT address is `setup_required` for `accepted_asset: "USDT"` (and
+    // before a reconnect), with the authority ready, so the action is
+    // `reconnect`. After a reconnect that adds the address the same question
+    // is `ready`.
     for fixture in [
         "setup_status_usdt_bitcoin_only",
         "setup_status_usdt_before_reconnect",
     ] {
-        let (body, _paykit) = own_usdt(
+        let (body, paykit) = own_usdt(
             pool.clone(),
             fixture,
             "setup_status_authority_ready_bitcoin_only",
         )
         .await;
-        assert_eq!(usdt_fields(&body).1, json!("ready"), "{fixture}");
+        assert_eq!(
+            usdt_fields(&body),
+            (json!(false), json!("setup_required"), json!("reconnect")),
+            "{fixture}"
+        );
+        assert_eq!(setup_status_calls(&paykit).len(), 2, "{fixture}");
     }
+    let (body, _paykit) = own_usdt(
+        pool,
+        "setup_status_usdt_after_reconnect",
+        "setup_status_authority_ready",
+    )
+    .await;
+    assert_eq!(
+        usdt_fields(&body),
+        (json!(false), json!("ready"), Value::Null)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_paykit_server_without_accepted_asset_fails_closed_to_unavailable(pool: PgPool) {
+    // Captured: a server that predates the field refuses the USDT body with
+    // `400 invalid_request`. That is a non-2xx answer: USDT is unavailable
+    // with no action, no authority lookup follows, and the seller is never
+    // offered USDT.
+    let (app, paykit) = upstream_app(pool).await;
+    let seller = new_actor(&app).await;
+    paykit.replay_setup_status(
+        &seller.pubky,
+        Some("accepted_asset:USDT"),
+        &u4::load("setup_status_accepted_asset_pre_u4"),
+    );
+    paykit.replay_setup_status(
+        &seller.pubky,
+        None,
+        &u4::load("setup_status_authority_ready"),
+    );
+    put(
+        &app,
+        &seller.token,
+        &with(rails(false), "usdt_enabled", json!(true)),
+    )
+    .await;
+    let (_, own) = get_own(&app, &seller.token).await;
+    assert_eq!(
+        usdt_fields(&own),
+        (json!(true), json!("unavailable"), Value::Null)
+    );
+    assert_eq!(
+        get_public(&app, &seller.pubky).await["usdt_available"],
+        json!(false)
+    );
+    assert!(
+        setup_status_calls(&paykit)
+            .iter()
+            .all(|body| body.get("accepted_asset").is_some()),
+        "the authority is never asked after an unanswered USDT question"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -654,20 +723,20 @@ async fn usdt_is_available_only_when_consented_and_ready(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_seller_without_a_usdt_setup_is_never_offered_usdt(pool: PgPool) {
     // The shape B7 describes: Bitcoin is ready, USDT is not (a Ring-only
-    // seller has no USDT address). Captured: USDT `setup_required` while the
-    // seller's authority and Bitcoin are ready.
+    // seller has no USDT address). Captured on a `[usdt]` deployment: USDT
+    // `setup_required` while the seller's authority and Bitcoin are ready.
     let (app, paykit) = upstream_app(pool).await;
     let seller = new_actor(&app).await;
     replay(
         &paykit,
         &seller.pubky,
-        "setup_status_usdt_without_usdt_config_bitcoin_wallet",
-        "setup_status_authority_without_usdt_config",
+        "setup_status_usdt_bitcoin_only",
+        "setup_status_authority_ready_bitcoin_only",
     );
     paykit.replay_setup_status(
         &seller.pubky,
-        Some("BTC"),
-        &rc10::load("setup_status_btc_without_usdt_config"),
+        Some("asset:BTC"),
+        &u4::load("setup_status_btc_bitcoin_only"),
     );
     put(
         &app,
@@ -692,8 +761,8 @@ async fn an_unavailable_status_is_not_offered_and_does_not_start_anything(pool: 
     .await;
     paykit.replay_setup_status(
         &seller.pubky,
-        Some("USDT"),
-        &rc10::load("setup_status_usdt_homeserver_down"),
+        Some("accepted_asset:USDT"),
+        &u4::load("setup_status_usdt_homeserver_down"),
     );
     let before = setup_status_calls(&paykit).len();
     assert_eq!(
@@ -705,12 +774,14 @@ async fn an_unavailable_status_is_not_offered_and_does_not_start_anything(pool: 
     assert_eq!(
         new_calls
             .iter()
-            .filter(|body| body["asset"] == json!("USDT"))
+            .filter(|body| body["accepted_asset"] == json!("USDT"))
             .count(),
         1
     );
     assert!(
-        new_calls.iter().all(|body| body.get("asset").is_some()),
+        new_calls
+            .iter()
+            .all(|body| body.get("asset").is_some() || body.get("accepted_asset").is_some()),
         "no authority-only lookup follows an unavailable USDT answer"
     );
 }
@@ -734,27 +805,27 @@ async fn readiness_is_cached_per_seller_and_asset(pool: PgPool) {
     .await;
 
     // The save asked once for the seller's own view; public reads use the cache.
-    let count = |asset: &str| {
+    let count = |field: &str, asset: &str| {
         setup_status_calls(&paykit)
             .iter()
-            .filter(|body| body["asset"] == json!(asset))
+            .filter(|body| body[field] == json!(asset))
             .count()
     };
-    let usdt_before = count("USDT");
+    let usdt_before = count("accepted_asset", "USDT");
     get_public(&app, &seller.pubky).await;
     get_public(&app, &seller.pubky).await;
     assert_eq!(
-        count("USDT") - usdt_before,
+        count("accepted_asset", "USDT") - usdt_before,
         1,
         "one USDT lookup for two reads inside the TTL"
     );
-    assert_eq!(count("BTC"), 1, "Bitcoin keeps its own entry");
+    assert_eq!(count("asset", "BTC"), 1, "Bitcoin keeps its own entry");
 
     // The seller leaves USDT; the public read follows after the TTL.
     paykit.replay_setup_status(
         &seller.pubky,
-        Some("USDT"),
-        &rc10::load("setup_status_usdt_without_usdt_config"),
+        Some("accepted_asset:USDT"),
+        &u4::load("setup_status_usdt_without_usdt_config"),
     );
     assert_eq!(
         get_public(&app, &seller.pubky).await["usdt_available"],
@@ -900,7 +971,7 @@ async fn without_a_paykit_client_usdt_is_unavailable(pool: PgPool) {
 #[test]
 fn the_fixture_list_matches_the_directory() {
     let mut on_disk: Vec<String> = std::fs::read_dir(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/paykit-server-rc10"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/paykit-server-u4"),
     )
     .expect("fixture directory")
     .filter_map(|entry| {
@@ -913,7 +984,7 @@ fn the_fixture_list_matches_the_directory() {
     })
     .collect();
     on_disk.sort_unstable();
-    let mut listed: Vec<String> = rc10::FIXTURE_NAMES
+    let mut listed: Vec<String> = u4::FIXTURE_NAMES
         .iter()
         .map(|name| name.to_string())
         .collect();

@@ -1116,8 +1116,11 @@ impl PaykitApi {
     }
 }
 
-/// The asset a seller's readiness is asked for (`asset` of the signed
-/// `POST /setup/status`). Also the second half of the availability cache key.
+/// The payment asset a seller's readiness is asked for, and the second half
+/// of the availability cache key. Bitcoin is asked as the `asset`
+/// denomination (`{"asset":"BTC",...}`, unchanged); USDT is asked as the
+/// `accepted_asset` payment asset (`{"accepted_asset":"USDT",...}`), which
+/// paykit-server answers from the seller's approved USDT address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SetupAsset {
     Btc,
@@ -1125,11 +1128,19 @@ pub enum SetupAsset {
 }
 
 impl SetupAsset {
-    /// The wire value paykit-server's closed `asset` field takes.
+    /// The asset's wire value.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Btc => "BTC",
             Self::Usdt => "USDT",
+        }
+    }
+
+    /// The closed `POST /setup/status` field the question is asked in.
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::Btc => "asset",
+            Self::Usdt => "accepted_asset",
         }
     }
 }
@@ -1338,16 +1349,21 @@ impl PaykitClient {
         }
     }
 
-    /// The signed `POST /setup/status` of `pubky/paykit-server` rc10, for one
-    /// creator. With an `asset` it answers whether the approved receiving
-    /// details can accept it; without one it answers whether the creator's
-    /// Paykit authority itself is usable. The body is closed
-    /// (`{"asset"?, "creator"}`) and so is the answer
+    /// The signed `POST /setup/status` of `pubky/paykit-server` (the
+    /// `accepted_asset` field needs the build that adds it), for one creator.
+    /// With an asset it answers whether the seller's approved receiving
+    /// details can accept it (`asset: "BTC"` for Bitcoin, `accepted_asset:
+    /// "USDT"` for USDT, see [`SetupAsset::field`]); without one it answers
+    /// whether the creator's Paykit authority itself is usable. The body is
+    /// closed (`{"accepted_asset"? | "asset"?, "creator"}`) and so is the
+    /// answer
     /// (`{"status": "ready" | "setup_required" | "unavailable"}`): a non-2xx
     /// answer, a transport failure and anything outside the contract are
     /// `Err(Unavailable)`. Nothing here ever starts a Paykit authorization
     /// flow: rc10 says callers "must not convert `unavailable` into a new
-    /// authorization flow".
+    /// authorization flow". A server that predates `accepted_asset` refuses
+    /// the USDT body with `400 invalid_request`, which is a non-2xx answer
+    /// and so fails closed as `Err(Unavailable)`: USDT is not offered.
     pub async fn upstream_setup_status(
         &self,
         seller_pubky: &str,
@@ -1356,7 +1372,7 @@ impl PaykitClient {
         let url = format!("{}/setup/status", self.base_url);
         let mut request = serde_json::json!({ "creator": pubky_app_key(seller_pubky) });
         if let Some(asset) = asset {
-            request["asset"] = serde_json::json!(asset.as_str());
+            request[asset.field()] = serde_json::json!(asset.as_str());
         }
         let (body, signature) = self.signed_body(&url, &request).map_err(|error| {
             tracing::error!(error = %error, "paykit setup status request could not be signed");

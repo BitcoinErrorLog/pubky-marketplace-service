@@ -1,15 +1,19 @@
-//! Exchanges captured from a running paykit-server at `pubky/paykit-server`
-//! `v0.1.0-rc10` (`tests/fixtures/paykit-server-rc10/`), all of
-//! `POST /setup/status`. Nothing in a fixture is written by hand:
-//! `capture/README.md` says how they were captured, and
+//! Exchanges captured from a running paykit-server that has `accepted_asset`
+//! on `POST /setup/status` (`tests/fixtures/paykit-server-u4/`):
+//! [pubky/paykit-server#70](https://github.com/pubky/paykit-server/pull/70)
+//! at `69222059`, three commits on `v0.1.0-rc11` (`662dca0`). Nothing in a fixture is written by
+//! hand: `capture/README.md` says how they were captured, and
 //! `capture/capture-harness.patch` is the harness.
 
 use serde_json::Value;
 
-pub const SERVER_REVISION: &str = "7326a3f9a035d79d8b6977b7c1a5fb742327ff37";
+/// The server the captures come from.
+pub const U4_REVISION: &str = "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)";
+/// A server without `accepted_asset`, for the one capture of how it refuses it.
+pub const PRE_U4_REVISION: &str = "662dca0619a9aa2962bcd677bd5ddd4563cd2784 (v0.1.0-rc11, no U4)";
 
-/// Every captured exchange, in capture order.
-pub const FIXTURE_NAMES: [&str; 20] = [
+/// Every captured exchange, in capture order (the pre-U4 refusal last).
+pub const FIXTURE_NAMES: [&str; 23] = [
     "setup_status_authority_ready",
     "setup_status_authority_ready_bitcoin_only",
     "setup_status_authority_never_set_up",
@@ -27,9 +31,12 @@ pub const FIXTURE_NAMES: [&str; 20] = [
     "setup_status_btc_without_usdt_config",
     "setup_status_invalid_asset",
     "setup_status_unknown_field",
+    "setup_status_accepted_asset_usd",
+    "setup_status_accepted_asset_lowercase",
     "setup_status_invalid_signature",
     "setup_status_authority_homeserver_down",
     "setup_status_usdt_homeserver_down",
+    "setup_status_accepted_asset_pre_u4",
 ];
 
 #[derive(Debug, Clone)]
@@ -47,7 +54,7 @@ pub struct Fixture {
 }
 
 fn directory() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/paykit-server-rc10")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/paykit-server-u4")
 }
 
 pub fn load(name: &str) -> Fixture {
@@ -83,10 +90,16 @@ impl Fixture {
         serde_json::from_str(&self.request_body).expect("request body is JSON")
     }
 
-    /// The `asset` the captured request asked about; `None` for the
+    /// The readiness question the captured request asked, as the fake
+    /// Paykit keys it (`asset:BTC`, `accepted_asset:USDT`); `None` for the
     /// authority-only body.
-    pub fn asset(&self) -> Option<String> {
-        self.request()["asset"].as_str().map(str::to_string)
+    pub fn question(&self) -> Option<String> {
+        let request = self.request();
+        ["asset", "accepted_asset"].into_iter().find_map(|field| {
+            request[field]
+                .as_str()
+                .map(|value| format!("{field}:{value}"))
+        })
     }
 
     /// The `status` of a 200 answer.

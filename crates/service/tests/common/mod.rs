@@ -5,7 +5,7 @@
 
 pub mod fx_feed;
 pub mod paykit_review;
-pub mod paykit_server_rc10;
+pub mod paykit_server_u4;
 
 use std::sync::Arc;
 
@@ -2047,7 +2047,8 @@ struct FakePaykitState {
     setup_status_failure: Option<u16>,
     /// Body served verbatim instead of the scripted status, when forced.
     setup_status_body: Option<Value>,
-    /// (Seller (bare z32), `asset` of the request) -> an exchange captured
+    /// (Seller (bare z32), the readiness question: `asset:BTC`,
+    /// `accepted_asset:USDT`, or `None` for the authority-only body) -> an exchange captured
     /// from paykit-server, replayed verbatim (status and body) for that
     /// seller and asset. Consulted before the per-seller scripted status.
     setup_replays: HashMap<(String, Option<String>), (u16, String)>,
@@ -2136,20 +2137,21 @@ impl FakePaykit {
     }
 
     /// Answers `POST /setup/status` for `seller_pubky` (bare z32) and the
-    /// request's `asset` (`None` for the authority-only body) with the
-    /// response of a captured paykit-server exchange, byte for byte.
+    /// request's readiness question (`asset:BTC`, `accepted_asset:USDT`, or
+    /// `None` for the authority-only body) with the response of a captured
+    /// paykit-server exchange, byte for byte.
     pub fn replay_setup_status(
         &self,
         seller_pubky: &str,
-        asset: Option<&str>,
-        fixture: &paykit_server_rc10::Fixture,
+        question: Option<&str>,
+        fixture: &paykit_server_u4::Fixture,
     ) {
         self.state
             .lock()
             .expect("fake paykit lock")
             .setup_replays
             .insert(
-                (seller_pubky.to_string(), asset.map(str::to_string)),
+                (seller_pubky.to_string(), question.map(str::to_string)),
                 (fixture.status, fixture.response_body.clone()),
             );
     }
@@ -2393,11 +2395,14 @@ async fn serve_paykit_setup_status(
     let closed = parsed.as_object().is_some_and(|object| {
         object
             .keys()
-            .all(|key| matches!(key.as_str(), "creator" | "asset"))
+            .all(|key| matches!(key.as_str(), "creator" | "asset" | "accepted_asset"))
             && object.get("creator").is_some_and(Value::is_string)
             && object
                 .get("asset")
                 .is_none_or(|asset| matches!(asset.as_str(), Some("BTC" | "USD" | "USDT")))
+            && object
+                .get("accepted_asset")
+                .is_none_or(|asset| matches!(asset.as_str(), Some("BTC" | "USDT")))
     });
     if canonical != body.as_ref() || !closed {
         return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
@@ -2415,11 +2420,13 @@ async fn serve_paykit_setup_status(
     }
     let creator = parsed["creator"].as_str().unwrap_or_default();
     let seller = creator.strip_prefix("pubky").unwrap_or(creator);
-    let asset = parsed.get("asset").and_then(Value::as_str);
-    if let Some((status, body)) = guard
-        .setup_replays
-        .get(&(seller.to_string(), asset.map(str::to_string)))
-    {
+    let question = ["asset", "accepted_asset"].into_iter().find_map(|field| {
+        parsed
+            .get(field)
+            .and_then(Value::as_str)
+            .map(|value| format!("{field}:{value}"))
+    });
+    if let Some((status, body)) = guard.setup_replays.get(&(seller.to_string(), question)) {
         return (
             StatusCode::from_u16(*status).expect("captured status"),
             [(axum::http::header::CONTENT_TYPE, "application/json")],

@@ -2,17 +2,17 @@
   "description": "No asset: a seller who completed Paykit setup with Bitcoin only and declined USDT.",
   "name": "setup_status_authority_ready_bitcoin_only",
   "request": {
-    "body": "{\"creator\":\"pubkywgpptagioueqkwt4yftfr55frsyqzncu9xzs5y7bw7jiie3u316y\"}",
+    "body": "{\"creator\":\"pubky9nbrh4fg1mcxhu9dggii46x7q5suzqcbpyuqubjnqc9s4eupxq5y\"}",
     "method": "POST",
     "path": "/setup/status",
-    "signature": "g3uYoFdlOPfiC9ma6sIk7GRXF2EoHAibWyMlhKcOgrZ7idUWji4pVhWSarhEiwVm4TTeQg8Lg16MKkjfcqVDDw"
+    "signature": "wCCpUM8S8hhelP3snY-h3Mz85w9cZ0CSJShUTGJNr37OLMVsehrlAcWO7KTr2Mq3-0Nx4mwSH95VSvy6OeUnBA"
   },
   "response": {
     "body": "{\"status\":\"ready\"}",
     "content_type": "application/json",
     "status": 200
   },
-  "sent_at": "2026-10-09T16:37:20.925945046Z",
+  "sent_at": "2026-10-09T18:26:55.106531314Z",
   "server": "usdt_configured",
-  "server_revision": "7326a3f9a035d79d8b6977b7c1a5fb742327ff37"
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
 }
