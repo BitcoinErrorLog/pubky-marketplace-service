@@ -733,20 +733,29 @@ async fn paypal_digital_order(
     order
 }
 
-async fn post_completed_ipn(app: &TestApp, order_id: &str) -> StatusCode {
+/// Posts the `tests/fixtures/paypal_ipn/{name}` IPN for `order_id`, with the
+/// given fields replaced.
+async fn post_ipn_fixture(
+    app: &TestApp,
+    name: &str,
+    order_id: &str,
+    overrides: &[(&str, &str)],
+) -> StatusCode {
     let path = format!(
-        "{}/tests/fixtures/paypal_ipn/completed.ipn",
+        "{}/tests/fixtures/paypal_ipn/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
-    let text = std::fs::read_to_string(&path).expect("completed.ipn fixture");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    for (name, value) in url::form_urlencoded::parse(text.trim_end().as_bytes()) {
+    for (field, value) in url::form_urlencoded::parse(text.trim_end().as_bytes()) {
         let value = if value == "{{ORDER_ID}}" {
             order_id.into()
+        } else if let Some((_, replacement)) = overrides.iter().find(|(key, _)| *key == field) {
+            (*replacement).into()
         } else {
             value
         };
-        serializer.append_pair(&name, &value);
+        serializer.append_pair(&field, &value);
     }
     let (status, _) = send_bytes(
         app.router.clone(),
@@ -756,6 +765,10 @@ async fn post_completed_ipn(app: &TestApp, order_id: &str) -> StatusCode {
     )
     .await;
     status
+}
+
+async fn post_completed_ipn(app: &TestApp, order_id: &str) -> StatusCode {
+    post_ipn_fixture(app, "completed.ipn", order_id, &[]).await
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -2023,4 +2036,177 @@ async fn record_epoch(conn: &mut sqlx::PgConnection, aggregate_id: &str) -> i64 
         .fetch_one(conn)
         .await
         .expect("record epoch")
+}
+
+/// A PayPal digital order delivered by `completed.ipn` (payment `txn_id`
+/// `7XP31449AB123456C`, the parent of every refund fixture).
+async fn paypal_delivered_order(app: &TestApp) -> (TestActor, TestActor, DigitalOrder) {
+    let seller = new_actor(app).await;
+    let buyer = new_actor(app).await;
+    let order = paypal_digital_order(app, &seller, &buyer).await;
+    assert_eq!(
+        post_completed_ipn(app, &order.order_id).await,
+        StatusCode::OK
+    );
+    assert_eq!(order_facts(app, &order.order_id).await.0, "delivered");
+    let (status, _, body) = read_delivery(app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lines"][0]["text"], json!(TEXT_V1));
+    (seller, buyer, order)
+}
+
+async fn buyer_order_view(app: &TestApp, buyer: &TestActor, order_id: &str) -> Value {
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/orders/{order_id}"),
+        Some(&buyer.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// The buyer's read is refused with `reason`, and nothing is released or
+/// logged.
+async fn assert_download_withheld(app: &TestApp, buyer: &TestActor, order_id: &str, reason: &str) {
+    let opens = access_rows(app, order_id).await;
+    let (status, cache, body) = read_delivery(app, &buyer.token, order_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reason}: {body}");
+    assert_eq!(cache, "no-store");
+    assert_eq!(body["error"]["reason"], json!(reason), "{body}");
+    assert!(!body.to_string().contains(TEXT_V1), "no payload: {body}");
+    assert_eq!(access_rows(app, order_id).await, opens, "no access logged");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn paypal_full_reversal_revokes_digital_access(pool: PgPool) {
+    let (app, _paykit) = paykit_app(pool).await;
+    let (seller, buyer, order) = paypal_delivered_order(&app).await;
+    let id = order.order_id.as_str();
+
+    // A chargeback for the whole payment moves the order to refunded_external
+    // and flags the reversal; the buyer is told the payment was reversed.
+    assert_eq!(
+        post_ipn_fixture(&app, "reversal-full.ipn", id, &[]).await,
+        StatusCode::OK
+    );
+    assert_eq!(order_facts(&app, id).await.0, "refunded_external");
+    let view = buyer_order_view(&app, &buyer, id).await;
+    assert!(view["payment_reversed_at"].is_string(), "{view}");
+    assert_download_withheld(&app, &buyer, id, "payment_reversed").await;
+
+    // PayPal cancels the reversal: the order and the purchase come back.
+    assert_eq!(
+        post_ipn_fixture(&app, "canceled-reversal.ipn", id, &[]).await,
+        StatusCode::OK
+    );
+    assert_eq!(order_facts(&app, id).await.0, "delivered");
+    let view = buyer_order_view(&app, &buyer, id).await;
+    assert_eq!(view["payment_reversed_at"], Value::Null, "{view}");
+    let (status, _, body) = read_delivery(&app, &buyer.token, id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lines"][0]["text"], json!(TEXT_V1));
+
+    // The seller is told on both events (refund recorded, reversal cancelled).
+    for kind in [
+        "notification.refund_recorded",
+        "notification.payment_reversal_cancelled",
+    ] {
+        let told: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM outbox WHERE kind = $1 \
+             AND payload->>'aggregate_id' = 'order:' || $2 AND payload->>'recipient_pubky' = $3",
+        )
+        .bind(kind)
+        .bind(id)
+        .bind(&seller.pubky)
+        .fetch_one(&app.pool)
+        .await
+        .expect("notification");
+        assert_eq!(told, 1, "{kind}");
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn paypal_partial_reversal_revokes_digital_access(pool: PgPool) {
+    let (app, _paykit) = paykit_app(pool).await;
+    let (_seller, buyer, order) = paypal_delivered_order(&app).await;
+    let id = order.order_id.as_str();
+
+    // A partial reversal keeps the order's state, so only the explicit
+    // reversal check withholds the purchase.
+    assert_eq!(
+        post_ipn_fixture(
+            &app,
+            "reversal-full.ipn",
+            id,
+            &[("mc_gross", "-40.00"), ("txn_id", "5MC93249NP7742999")]
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(order_facts(&app, id).await.0, "delivered");
+    let view = buyer_order_view(&app, &buyer, id).await;
+    assert!(view["payment_reversed_at"].is_string(), "{view}");
+    assert_eq!(view["external_refund"]["amount_minor"], json!(4_000));
+    assert_download_withheld(&app, &buyer, id, "payment_reversed").await;
+
+    // The reversal is restored in full: the purchase downloads again.
+    assert_eq!(
+        post_ipn_fixture(
+            &app,
+            "canceled-reversal.ipn",
+            id,
+            &[("mc_gross", "40.00"), ("txn_id", "6ND04350PQ8853999")]
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(order_facts(&app, id).await.0, "delivered");
+    let view = buyer_order_view(&app, &buyer, id).await;
+    assert_eq!(view["payment_reversed_at"], Value::Null, "{view}");
+    assert_eq!(view["external_refund"], Value::Null, "{view}");
+    let (status, _, body) = read_delivery(&app, &buyer.token, id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn paypal_partial_refund_revokes_digital_access(pool: PgPool) {
+    let (app, _paykit) = paykit_app(pool).await;
+    let (_seller, buyer, order) = paypal_delivered_order(&app).await;
+    let id = order.order_id.as_str();
+
+    // A refund is final: the order keeps its state and the purchase stays
+    // withheld, with the refund (not a reversal) as the reason.
+    assert_eq!(
+        post_ipn_fixture(&app, "refund-partial-1.ipn", id, &[]).await,
+        StatusCode::OK
+    );
+    assert_eq!(order_facts(&app, id).await.0, "delivered");
+    let view = buyer_order_view(&app, &buyer, id).await;
+    assert_eq!(view["payment_reversed_at"], Value::Null, "{view}");
+    assert_eq!(view["external_refund"]["amount_minor"], json!(4_000));
+    assert_download_withheld(&app, &buyer, id, "payment_refunded").await;
+
+    // The rest of the payment comes back: the order ends, as before.
+    assert_eq!(
+        post_ipn_fixture(&app, "refund-partial-2.ipn", id, &[]).await,
+        StatusCode::OK
+    );
+    assert_eq!(order_facts(&app, id).await.0, "refunded_external");
+    assert_download_withheld(&app, &buyer, id, "delivery_ended").await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn paypal_full_refund_ends_digital_access(pool: PgPool) {
+    let (app, _paykit) = paykit_app(pool).await;
+    let (_seller, buyer, order) = paypal_delivered_order(&app).await;
+    let id = order.order_id.as_str();
+    assert_eq!(
+        post_ipn_fixture(&app, "refund-full.ipn", id, &[]).await,
+        StatusCode::OK
+    );
+    assert_eq!(order_facts(&app, id).await.0, "refunded_external");
+    assert_download_withheld(&app, &buyer, id, "delivery_ended").await;
 }

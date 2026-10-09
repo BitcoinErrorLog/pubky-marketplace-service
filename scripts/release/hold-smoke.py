@@ -16,7 +16,17 @@ listing variant it resolved. Hold semantics are Option B:
   (b) pickup-only (no delivery_address);
   (c) two unheld checkout.create 200s, then bind exclusivity (first
       POST /v0/orders/{id}/payment-method holds; loser 409 HOLDING_COPY);
-  (d) hold TTL equals live FIAT_PAYMENT_WINDOW_SECONDS (exact-key read).
+  (d) hold TTL equals live FIAT_PAYMENT_WINDOW_SECONDS (exact-key read);
+  (e) one digital case per delivery kind (file, link, text, email, message)
+      on a staging listing that already has that delivery set: the digital
+      checkout (no address, `delivery_email` only for the email kind), the
+      bind hold on the listing's stock, nothing released or logged while the
+      payment is pending (buyer download and the email read answer
+      `not_paid`), and the cancel that releases the hold. Staging cannot
+      confirm a real payment, so the confirmed-payment release is covered by
+      the service's integration tests (`digital_orders_test`,
+      `digital_manual_test`), not here. Select kinds with `--digital-kinds`
+      (default all five; an empty value runs none).
 
 Any HTTP 4xx other than the expected bind 409 is STOP. Never production.
 Every created order is cancelled and verified cancelled at the end.
@@ -130,6 +140,12 @@ LINE_KEYS = {"listing_aggregate_id", "expected_revision", "quantity", "variant_i
 # options, which the smoke listings do not.
 SHOP_VARIANT_ID = "variant_1"
 
+DIGITAL_KINDS = ("file", "link", "text", "email", "message")
+# The address the email-kind case checks out with. The service seals it and
+# the unpaid-checkout purge deletes it after BUYER_EMAIL_UNPAID_RETENTION_DAYS.
+DIGITAL_SMOKE_EMAIL = "hold-smoke.digital@example.com"
+DIGITAL_PAYLOAD_KEYS = {"lines", "guarantee_policy_version"}
+
 
 def refuse_production(url: str, project: str) -> None:
     lowered = url.lower()
@@ -162,6 +178,7 @@ def checkout_body(
     *,
     fulfillment: str,
     address: dict[str, str] | None,
+    delivery_email: str | None = None,
 ) -> dict[str, Any]:
     """Shop v0.6.25 checkout.create after toSnakeCaseWire."""
     line: dict[str, Any] = {
@@ -180,7 +197,11 @@ def checkout_body(
             raise RuntimeError("shipping checkout requires delivery_address")
         payload["delivery_address"] = dict(address)
     elif address is not None:
-        raise RuntimeError("pickup-only checkout must omit delivery_address")
+        raise RuntimeError(f"{fulfillment} checkout must omit delivery_address")
+    if delivery_email is not None:
+        if fulfillment != "digital":
+            raise RuntimeError("delivery_email rides only a digital checkout")
+        payload["delivery_email"] = delivery_email
     return {
         "version": 1,
         "command_id": command_id,
@@ -231,6 +252,66 @@ def assert_shape(body: dict[str, Any], *, shipping: bool) -> None:
     dumped = json.dumps(body)
     if '"region": "NY"' in dumped:
         raise RuntimeError("hard-coded NY region is the class that hid the 422")
+
+
+def assert_digital_shape(body: dict[str, Any], *, kind: str) -> None:
+    """A digital checkout: no address; `delivery_email` exactly for the email kind."""
+    missing = ENVELOPE_KEYS - body.keys()
+    extra = body.keys() - ENVELOPE_KEYS
+    if missing or extra:
+        raise RuntimeError(f"envelope keys mismatch missing={missing} extra={extra}")
+    if body["kind"] != "checkout.create":
+        raise RuntimeError(f"kind {body['kind']!r}")
+    payload = body["payload"]
+    expected = DIGITAL_PAYLOAD_KEYS | ({"delivery_email"} if kind == "email" else set())
+    if set(payload) != expected:
+        raise RuntimeError(f"digital {kind} payload keys {set(payload)} != {expected}")
+    line = payload["lines"][0]
+    if set(line) != LINE_KEYS:
+        raise RuntimeError(f"line keys {set(line)} != {LINE_KEYS}")
+    if line["fulfillment"] != "digital":
+        raise RuntimeError("digital line fulfillment")
+
+
+def digital_listing_query(kind: str, exclude: set[str]) -> str:
+    """Staging listings that sell `kind` and already have that delivery set.
+
+    `digital_delivery_kind` is written only by `digital_delivery.set`, so a
+    row carrying it has a current deliverable. Stock may be a number of
+    copies or the unlimited cap; the case checks the hold against the stock
+    it finds. `kind` comes from DIGITAL_KINDS only.
+    """
+    if kind not in DIGITAL_KINDS:
+        raise RuntimeError(f"unknown digital kind {kind!r}")
+    excluded = ""
+    if exclude:
+        ids = ",".join(f"'{quote(item)}'" for item in sorted(exclude))
+        excluded = f"AND l.aggregate_id NOT IN ({ids}) "
+    return (
+        "SELECT l.aggregate_id || '|' || l.seller_pubky || '|' || l.server_revision::text "
+        "|| '|' || l.available_quantity::text || '|' || l.fulfillment_methods::text "
+        "|| '|' || CASE "
+        "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 'paypal' "
+        "WHEN c.stripe_payment_link IS NOT NULL AND btrim(c.stripe_payment_link) <> '' THEN 'stripe' "
+        "ELSE '' END "
+        "FROM listings l "
+        "LEFT JOIN seller_payment_configs c ON c.seller_pubky = l.seller_pubky "
+        "WHERE l.sale_format='fixed_price' AND l.state='available' "
+        "AND l.available_quantity>=1 AND l.reserved_quantity=0 "
+        "AND l.fulfillment_methods::text LIKE '%digital%' "
+        f"AND l.digital_delivery_kind='{kind}' "
+        "AND (c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' "
+        "OR c.stripe_payment_link IS NOT NULL AND btrim(c.stripe_payment_link) <> '') "
+        f"{excluded}"
+        "ORDER BY l.updated_at DESC NULLS LAST LIMIT 5;"
+    )
+
+
+def refusal_reason(body: dict | str) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    return error.get("reason") if isinstance(error, dict) else None
 
 
 def self_check() -> None:
@@ -284,6 +365,41 @@ def self_check() -> None:
         raise RuntimeError("exact-key 600")
     if parse_fiat_window("900") != 900:
         raise RuntimeError("exact-key 900")
+    digital_listing = {**listing, "fulfillment_methods": "{digital}"}
+    for kind in DIGITAL_KINDS:
+        digital = checkout_body(
+            digital_listing,
+            str(uuid.uuid4()),
+            fulfillment="digital",
+            address=None,
+            delivery_email=DIGITAL_SMOKE_EMAIL if kind == "email" else None,
+        )
+        assert_digital_shape(digital, kind=kind)
+        if ("delivery_email" in digital["payload"]) != (kind == "email"):
+            raise RuntimeError(f"delivery_email must ride only the email kind ({kind})")
+        if kind not in digital_listing_query(kind, {"listing:a"}):
+            raise RuntimeError(f"digital listing query misses {kind}")
+    for bad in (
+        lambda: checkout_body(
+            digital_listing, str(uuid.uuid4()), fulfillment="digital", address=SHIPPING_ADDRESSES["ca_iso_suffix"]
+        ),
+        lambda: checkout_body(
+            listing, str(uuid.uuid4()), fulfillment="shipping",
+            address=SHIPPING_ADDRESSES["ca_iso_suffix"], delivery_email=DIGITAL_SMOKE_EMAIL,
+        ),
+        lambda: digital_listing_query("file' OR '1'='1", set()),
+    ):
+        try:
+            bad()
+        except RuntimeError:
+            continue
+        raise RuntimeError("an invalid digital payload or kind was accepted")
+    if refusal_reason({"ok": False, "error": {"reason": "not_paid"}}) != "not_paid":
+        raise RuntimeError("refusal reason parse")
+    if parse_digital_kinds("file, email") != ("file", "email") or parse_digital_kinds("") != ():
+        raise RuntimeError("digital kinds parse")
+    if parse_digital_kinds("all") != DIGITAL_KINDS:
+        raise RuntimeError("digital kinds default")
     fixture_path = Path(__file__).with_name(FIXTURE_NAME)
     fixture = json.loads(fixture_path.read_text())
     if fixture["captured_from"]["shop_tag"] != SHOP_TAG:
@@ -413,6 +529,17 @@ def railway_ssh(argv: list[str]) -> str:
         )
         raise RuntimeError(f"ssh failed rc={result.returncode} err={err[:400]!r} out={filtered!r}")
     return "\n".join(filtered)
+
+
+def parse_digital_kinds(raw: str) -> tuple[str, ...]:
+    """`--digital-kinds`: `all`, an empty value (none), or a comma list of kinds."""
+    if raw.strip() == "all":
+        return DIGITAL_KINDS
+    kinds = tuple(item.strip() for item in raw.split(",") if item.strip())
+    unknown = [item for item in kinds if item not in DIGITAL_KINDS]
+    if unknown:
+        raise SystemExit(f"HOLD_SMOKE=STOP unknown digital kinds {unknown}; choose from {list(DIGITAL_KINDS)}")
+    return tuple(dict.fromkeys(kinds))
 
 
 def parse_fiat_window(raw: str) -> int:
@@ -692,8 +819,68 @@ def refresh_listing(aggregate_id: str) -> dict[str, Any]:
     return rows[0]
 
 
+def listing_stock(aggregate_id: str) -> tuple[int, int]:
+    """(available, reserved) of a listing. A bind hold moves one copy from the
+    first to the second; a released hold moves it back."""
+    token = sql_scalar(
+        sql(
+            "SELECT 'stock=' || available_quantity::text || ',' || reserved_quantity::text "
+            f"FROM listings WHERE aggregate_id='{quote(aggregate_id)}';"
+        )
+    )
+    if not token.startswith("stock="):
+        raise RuntimeError(f"stock marker missing {token!r}")
+    available, reserved = token[len("stock=") :].split(",")
+    return int(available), int(reserved)
+
+
+def digital_order_facts(order_id: str) -> dict[str, Any]:
+    """What the unpaid digital order stored: its fulfillment, the delivery kind
+    its line snapshotted, whether it carries an address or a receipt, and how
+    many pins, access rows and sealed delivery emails exist for it."""
+    token = sql_scalar(
+        sql(
+            "SELECT 'fact=' || o.fulfillment || '|' || coalesce(o.lines->0->>'digital_kind','') "
+            "|| '|' || (o.delivery_address IS NULL)::text || '|' || (o.receipt_id IS NULL)::text "
+            f"|| '|' || (SELECT count(*) FROM order_digital_pins WHERE order_id=o.id)::text "
+            f"|| '|' || (SELECT count(*) FROM order_digital_access WHERE order_id=o.id)::text "
+            f"|| '|' || (SELECT count(*) FROM order_delivery_emails WHERE order_id=o.id)::text "
+            f"FROM orders o WHERE o.id='{quote(order_id)}'::uuid;"
+        )
+    )
+    if not token.startswith("fact="):
+        raise RuntimeError(f"order facts marker missing {token!r}")
+    cols = token[len("fact=") :].split("|")
+    if len(cols) != 7:
+        raise RuntimeError(f"order facts unparseable {token!r}")
+    return {
+        "fulfillment": cols[0],
+        "digital_kind": cols[1],
+        "no_address": cols[2] == "true",
+        "no_receipt": cols[3] == "true",
+        "pins": int(cols[4]),
+        "access_rows": int(cols[5]),
+        "email_rows": int(cols[6]),
+    }
+
+
+def pick_digital_listing(kind: str, exclude: set[str]) -> dict[str, Any]:
+    raw = sql(digital_listing_query(kind, exclude))
+    rows = parse_listing_rows(raw)
+    if not rows:
+        raise RuntimeError(
+            f"no available staging listing with {kind} delivery set and a PayPal or Stripe rail; "
+            f"publish one on staging (sell with Digital delivery, then set {kind} on the edit page) "
+            f"or run with --digital-kinds without {kind}\n{raw!r}"
+        )
+    listing = rows[0]
+    if "digital" not in listing["fulfillment_methods"]:
+        raise RuntimeError(f"picked listing is not digital: {listing['fulfillment_methods']!r}")
+    return listing
+
+
 class Smoke:
-    def __init__(self) -> None:
+    def __init__(self, digital_kinds: tuple[str, ...] = DIGITAL_KINDS) -> None:
         self.base = os.environ["MARKETPLACE_URL"].rstrip("/")
         self.project = os.environ["RAILWAY_PROJECT_ID"]
         refuse_production(self.base, self.project)
@@ -705,6 +892,7 @@ class Smoke:
         self.created_orders: list[dict[str, Any]] = []
         self.cases: list[dict[str, Any]] = []
         self.fiat_window: int | None = None
+        self.digital_kinds = digital_kinds
 
     def load_fiat_window(self) -> int:
         if self.fiat_window is None:
@@ -938,6 +1126,147 @@ class Smoke:
             "listing_qty_after": listing_after["available_quantity"],
         }
 
+    def refused_read(
+        self, token: str, path: str, *, reason: str, case: str, status_expected: int = 409
+    ) -> dict[str, Any]:
+        status, body = api(self.base, "GET", path, token)
+        stop_on_unexpected_4xx(status, body, allowed={status_expected}, case=case)
+        if status != status_expected or (reason and refusal_reason(body) != reason):
+            raise RuntimeError(
+                f"{case}: expected {status_expected} {reason!r}, got {status} {refusal_reason(body)!r}"
+            )
+        return {"http": status, "reason": refusal_reason(body)}
+
+    def digital_case(self, kind: str, listing: dict[str, Any]) -> dict[str, Any]:
+        """Hold and release for one digital delivery kind on an unpaid order.
+
+        Checkout takes no hold; the bind takes it and the cancel gives it back.
+        At every point nothing is released: the buyer's download and the
+        seller's read of the buyer's email answer `not_paid`, and no pin,
+        access row or receipt exists.
+        """
+        case = f"digital_{kind}"
+        method = listing.get("bind_method") or ""
+        if method not in {"paypal", "stripe"}:
+            raise RuntimeError(f"{case}: listing has no paypal/stripe bind method {listing!r}")
+        window = self.load_fiat_window()
+        aggregate_id = listing["aggregate_id"]
+        stock_before = listing_stock(aggregate_id)
+        available, reserved = stock_before
+        buyer = z32_pubky()
+        if buyer == listing["seller_pubky"]:
+            raise RuntimeError("buyer collides with seller")
+        token, sid = insert_session(buyer)
+        self.sessions.append(sid)
+        seller_token = None
+        if kind == "email":
+            seller_token, seller_sid = insert_session(listing["seller_pubky"])
+            self.sessions.append(seller_sid)
+        email = DIGITAL_SMOKE_EMAIL if kind == "email" else None
+        body = checkout_body(
+            listing, str(uuid.uuid4()), fulfillment="digital", address=None, delivery_email=email
+        )
+        assert_digital_shape(body, kind=kind)
+        status, resp = self.command(token, body, allowed={200}, case=f"{case}.create")
+        if not (isinstance(resp, dict) and resp.get("ok") is True):
+            raise RuntimeError(f"{case}: not ok {status} {resp!r}")
+        orders = resp["result"]["orders"]  # type: ignore[index]
+        if len(orders) != 1:
+            raise RuntimeError(f"{case}: a digital-only cart must be one order, got {len(orders)}")
+        order_id = orders[0]["id"]
+        self.created_orders.append({"id": order_id, "token": token, "case": case})
+        hold = self.order_hold(order_id)
+        if hold["stock_held"] or hold["hold_source"]:
+            raise RuntimeError(f"{case}: checkout must not hold {hold!r}")
+        if listing_stock(aggregate_id) != stock_before:
+            raise RuntimeError(f"{case}: checkout moved the listing's stock")
+        facts = digital_order_facts(order_id)
+        expected_facts = {
+            "fulfillment": "digital",
+            "digital_kind": kind,
+            "no_address": True,
+            "no_receipt": True,
+            "pins": 0,
+            "access_rows": 0,
+            "email_rows": 1 if kind == "email" else 0,
+        }
+        if facts != expected_facts:
+            raise RuntimeError(f"{case}: order facts {facts!r} != {expected_facts!r}")
+
+        download = f"/v1/orders/{order_id}/digital-delivery/0"
+        email_path = f"/v1/orders/{order_id}/delivery-email"
+
+        def nothing_released(stage: str) -> dict[str, Any]:
+            reads = {
+                "download": self.refused_read(
+                    token, download, reason="not_paid", case=f"{case}.{stage}.download"
+                )
+            }
+            if kind == "email":
+                assert seller_token is not None
+                reads["seller_email"] = self.refused_read(
+                    seller_token, email_path, reason="not_paid", case=f"{case}.{stage}.seller_email"
+                )
+                status_b, own = api(self.base, "GET", email_path, token)
+                stop_on_unexpected_4xx(status_b, own, allowed={200}, case=f"{case}.{stage}.buyer_email")
+                if not (isinstance(own, dict) and own.get("delivery_email") == email):
+                    raise RuntimeError(f"{case}.{stage}: the buyer could not read their own address")
+                reads["buyer_email"] = {"http": status_b}
+            else:
+                reads["buyer_email"] = self.refused_read(
+                    token, email_path, reason="", case=f"{case}.{stage}.buyer_email", status_expected=404
+                )
+            after = digital_order_facts(order_id)
+            if after["pins"] or after["access_rows"] or not after["no_receipt"]:
+                raise RuntimeError(f"{case}.{stage}: something was released {after!r}")
+            return reads
+
+        pending_reads = nothing_released("pending")
+        bind_status, bind_resp = self.bind_payment(token, order_id, method, case=f"{case}.bind")
+        if bind_status != 200:
+            raise RuntimeError(f"{case}: bind http {bind_status} {bind_resp!r}")
+        held = self.order_hold(order_id)
+        if not held["stock_held"] or held["hold_source"] != "bind":
+            raise RuntimeError(f"{case}: hold after bind {held!r}")
+        ttl = float(
+            sql_scalar(
+                sql(
+                    "SELECT extract(epoch from (hold_expires_at - now())) "
+                    f"FROM orders WHERE id='{quote(order_id)}'::uuid;"
+                )
+            )
+        )
+        if not ttl_matches_window(ttl, window):
+            raise RuntimeError(f"{case}: ttl {ttl} window={window}")
+        stock_held = listing_stock(aggregate_id)
+        if stock_held != (available - 1, reserved + 1):
+            raise RuntimeError(f"{case}: stock during the hold {stock_held} from {stock_before}")
+        held_reads = nothing_released("held")
+
+        cancel = self.cancel_order(token, order_id, f"hold-smoke {case} release")
+        stock_after = listing_stock(aggregate_id)
+        if stock_after != stock_before:
+            raise RuntimeError(f"{case}: stock after cancel {stock_after} != {stock_before}")
+        cancelled_reads = nothing_released("cancelled")
+        return {
+            "case": case,
+            "listing": aggregate_id,
+            "kind": kind,
+            "bind_method": method,
+            "fiat_window_seconds": window,
+            "order_id": order_id,
+            "order_facts": facts,
+            "pending_reads": pending_reads,
+            "hold": held,
+            "ttl_seconds": ttl,
+            "stock_before": stock_before,
+            "stock_during_hold": stock_held,
+            "stock_after_cancel": stock_after,
+            "held_reads": held_reads,
+            "cancelled_reads": cancelled_reads,
+            "cancel": cancel,
+        }
+
     def verify_all_cancelled(self) -> list[dict[str, Any]]:
         verified = []
         for row in self.created_orders:
@@ -1004,6 +1333,11 @@ class Smoke:
                     expected_stored_region=EXPECTED_STORED_REGION["pt_empty_region"],
                 )
             )
+            used = {shipping["aggregate_id"], pickup["aggregate_id"]}
+            for kind in self.digital_kinds:
+                listing = pick_digital_listing(kind, used)
+                used.add(listing["aggregate_id"])
+                self.cases.append(self.digital_case(kind, listing))
             verified = self.verify_all_cancelled()
             summary = {
                 "shop_tag": SHOP_TAG,
@@ -1012,6 +1346,7 @@ class Smoke:
                 "railway_project": self.project,
                 "fiat_window_seconds": self.fiat_window,
                 "pickup_methods_retargeted": pickup_restore is not None,
+                "digital_kinds": list(self.digital_kinds),
                 "cases": self.cases,
                 "orders_verified_cancelled": verified,
             }
@@ -1053,7 +1388,14 @@ class Smoke:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Staging hold-smoke (never production).")
     parser.add_argument("--self-check", action="store_true", help="Validate payload shape without hitting staging.")
+    parser.add_argument(
+        "--digital-kinds",
+        default="all",
+        help="Digital delivery kinds to smoke: all (default), or a comma list of "
+        f"{', '.join(DIGITAL_KINDS)}; an empty value runs none.",
+    )
     args = parser.parse_args()
+    digital_kinds = parse_digital_kinds(args.digital_kinds)
     if args.self_check:
         self_check()
         return
@@ -1062,7 +1404,7 @@ def main() -> None:
             raise SystemExit(f"HOLD_SMOKE=STOP missing {required}")
     os.environ.setdefault("RAILWAY_ENVIRONMENT", STAGING_ENVIRONMENT)
     os.environ.setdefault("RAILWAY_DATABASE_SERVICE", "Postgres")
-    Smoke().run()
+    Smoke(digital_kinds).run()
 
 
 if __name__ == "__main__":

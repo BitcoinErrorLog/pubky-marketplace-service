@@ -117,6 +117,11 @@ Railway IaC `preserve()`):
 | `SANDBOX_PAYMENTS_ENABLED` | `false` | accept `payment.sandbox_advance` at all; must stay `false` on any deployment handling real orders |
 | `PICKUP_DETAILS_ENCRYPTION_KEY` | unset | 32-byte hex key sealing local-pickup details and pinned payment snapshots at rest (XChaCha20-Poly1305); must differ from the Locks key material; pickup is OFF without it |
 | `PICKUP_DETAILS_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous pickup key for the dual-key read window during rotation; the re-seal worker migrates both sealed families to the current key |
+| `DIGITAL_DELIVERY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing digital delivery at rest (XChaCha20-Poly1305): the seller's deliverable versions (file key, link or text), each order's pinned copy and the buyer's delivery email. It is the only switch: unset, digital delivery is OFF, `/health` reports `digital_delivery_available: false` and checkout refuses digital lines (`digital_delivery_unavailable`). Must differ from `LOCKS_BUNDLE_ENCRYPTION_KEY`, `LOCKS_LOOKUP_HMAC_KEY`, the pickup keys and `PRIV_DATA_KEY_ENCRYPTION_KEY` (checked at boot). The service refuses to boot while sealed digital rows exist and no configured key opens them, so keep a backup outside the host |
+| `DIGITAL_DELIVERY_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous digital delivery key for the dual-key read window during rotation; the re-seal worker moves all three sealed families to the current key. Keep it set until a sweep finds zero rows under it |
+| `DIGITAL_DELIVERY_MAX_BYTES` | `52428800` | largest digital file, in plaintext bytes (≥ 1); exposed as `/health.digital_delivery_max_bytes` so the Shop's picker enforces the same cap |
+| `BUYER_EMAIL_RETENTION_DAYS` | `30` | days the sealed delivery email of a paid "I'll email it" order is kept after the order ends (completed, cancelled, refunded or closed), before the purge worker deletes it (≥ 1) |
+| `BUYER_EMAIL_UNPAID_RETENTION_DAYS` | `7` | days the sealed delivery email of a cancelled or expired unpaid checkout is kept before the purge deletes it (≥ 1) |
 | `PRIV_DATA_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing per-user `/priv` data keys at rest (XChaCha20-Poly1305); must differ from the Locks, pickup and digital delivery keys; `GET /v1/me/priv-keys` answers `priv_keys_unavailable` without it, and the service refuses to boot while sealed rows exist without it |
 | `PRIV_DATA_KEY_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous priv data key sealing key for the dual-key read window during rotation; the re-seal worker moves every row to the current key. Keep it set until the pass reports zero rows under the previous key |
 | `PICKUP_DISPUTE_RETENTION_DAYS` | `30` | days a cancelled-after-payment order's pinned pickup snapshot is retained as the dispute exhibit when no refund evidence ever lands, before the ordinary terminal-order purge takes it (≥ 1) |
@@ -790,10 +795,10 @@ splits one order per (seller, fulfillment) — several pickup lines from one
 seller share one pickup order; pickup orders charge no shipping and store no
 buyer address (a pickup-only checkout presenting one is rejected
 `INVALID_COMMAND`). Every order carries a required `fulfillment` column.
-Digital lines are N/A (§A8 7.1): the service has no digital item concept —
-every registered order is a shipped or pickup physical order, so there are
-no digital lines to keep outside the (seller, fulfillment) split key or the
-`fulfillment = 'shipping'` backfill.
+Digital lines (`fulfillment = 'digital'`) are a third split key: a cart with
+shipped, pickup and digital lines becomes one order per (seller, method), and
+a digital-only checkout takes no address and charges no shipping (see
+[Digital delivery](#digital-delivery)).
 
 The seller's pickup details (spot or address, instructions, availability
 windows with their IANA zone) live ONLY in the service, sealed
@@ -830,6 +835,75 @@ through approve's path, and are excluded whole (including any
 buyer-confirmed handover or a dispute-free auto-complete; the auto-complete
 sweep coalesces the handover instant for pickup orders, locking
 `FOR UPDATE OF orders`.
+
+## Digital delivery
+
+A listing offers digital delivery by listing `digital` among its
+`fulfillmentMethods`, alone or beside `shipping` and `pickup`; an auction is
+refused. After registering, the seller sets what buyers receive with
+`digital_delivery.set` (and removes it with `digital_delivery.clear`). Five
+kinds exist:
+
+| Kind | What the buyer gets | Where it lives |
+| --- | --- | --- |
+| `file` | A download, up to `DIGITAL_DELIVERY_MAX_BYTES` | AES-256-GCM ciphertext made in the seller's browser and stored on the seller's homeserver; the service reads it once at `set` to check its length and BLAKE3, then keeps only the sealed file key. It never decrypts a file |
+| `link` | A URL to open | Sealed in the service |
+| `text` | A text or licence key, the same for every buyer | Sealed in the service. A per-buyer key list is not supported and is refused |
+| `email` | The seller emails it after payment | The buyer's address, sealed, shown to the seller once paid |
+| `message` | The seller sends it in messages | Nothing is stored; the seller marks it delivered |
+
+Each `set` is a new version from a per-listing counter that survives `clear`,
+so a version never repeats. Checkout refuses a listing with no current
+deliverable (`digital_delivery_not_ready`) and asks for a delivery email only
+when the order has an `email` line.
+
+Payment confirmation is the one release step, so Bitcoin (Paykit) and PayPal
+behave alike: nothing is released or shown to the seller while a payment is
+pending. When the payment confirms, the receipt transaction pins each instant
+line (`file`, `link`, `text`): it re-seals the current version's payload under
+the order, so a later replacement or clear never changes what that buyer paid
+for. If the deliverable is gone by then, the order is not paid and is marked
+`refund_required`. A `sandbox_advance` confirmation never delivers.
+
+The buyer opens one line at a time with
+`GET /v1/orders/{id}/digital-delivery/{line_index}` (`Cache-Control:
+no-store`, buyer only, 30 reads per minute per buyer and 10 per order). The
+read re-checks entitlement and logs the access in the same transaction, and
+fails closed if the log write fails; the log is the delivery evidence the
+seller reads at `GET /v1/orders/{id}/digital-evidence`. The purchase keeps
+downloading while the order stands, including `completed`. For `email` and
+`message` lines the seller reads the address at
+`GET /v1/orders/{id}/delivery-email` and records the delivery with
+`fulfillment.deliver_digital` (`channel`: `email` or `message`); when every
+manual line is marked the order moves `paid` to `delivered`. A background
+worker deletes the sealed address after its retention (see
+`BUYER_EMAIL_RETENTION_DAYS`), and `/ready` reports `unavailable` if the purge
+falls behind.
+
+The entitlement ends, and reads are refused, when the order is `cancelled`,
+`refunded_external` or `closed` (`delivery_ended`). PayPal can also take the
+money back after delivery, so a verified PayPal notification withholds the
+purchase without waiting for a state change (the design's DD3):
+
+- A `Reversed` notification, full or partial, sets `payment_reversed_at` on
+  the order. While it is set, the buyer's download is refused
+  (`payment_reversed`) and the seller can no longer read the buyer's email.
+  A full reversal also moves the order to `refunded_external`. A
+  `Canceled_Reversal` that restores everything clears the flag and the order
+  and its downloads come back.
+- A partial `Refunded` notification keeps the order's state, records the
+  amount in `external_refund`, and withholds the purchase for good
+  (`payment_refunded`): a refund is final. A full refund ends the order.
+- Both participants are notified of each notification, and the order's
+  `payment_reversed_at` and `external_refund` fields are how the Shop shows it.
+  Details: [`docs/paypal-refund-ipn.md`](docs/paypal-refund-ipn.md).
+
+A digital order never enters the physical lifecycle: ship, delivery
+confirmation, return and offer commands are refused on it, and a seller's
+refund after delivery is recorded straight from `delivered` or `completed`
+(`refund.record_external`). A cancellation after the buyer opened an instant
+line keeps that line sold. `/health` reports `digital_delivery_available` and
+`digital_delivery_max_bytes`.
 
 ## Drops (ADR-0026)
 

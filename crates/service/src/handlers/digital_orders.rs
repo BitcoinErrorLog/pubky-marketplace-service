@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::auth::Actor;
 use crate::clock::format_timestamp;
 use crate::digital::{pin_aad, version_aad, DigitalKeys};
-use crate::handlers::digital::{no_store, DIGITAL_ENDED_ORDER_STATES};
+use crate::handlers::digital::{no_store, payment_taken_back, DIGITAL_ENDED_ORDER_STATES};
 use crate::model::OrderRow;
 use crate::AppState;
 
@@ -392,6 +392,13 @@ pub async fn get_order_digital_delivery(
             ErrorCode::InvalidState,
             "The purchase is available once payment is confirmed.",
             Some("not_paid"),
+        );
+    }
+    if let Some(taken_back) = payment_taken_back(&order) {
+        return read_error(
+            ErrorCode::InvalidState,
+            taken_back.message(),
+            Some(taken_back.reason()),
         );
     }
     if DIGITAL_ENDED_ORDER_STATES.contains(&order.state.as_str()) {

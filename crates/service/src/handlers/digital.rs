@@ -30,7 +30,7 @@ use crate::digital::{version_aad, DigitalKeys};
 use crate::executor::insert_event;
 use crate::handlers::{fetch_listing, fetch_listing_for_update};
 use crate::homeserver::{DeliverableFetchOutcome, HomeserverListingClient};
-use crate::model::ListingRow;
+use crate::model::{ListingRow, OrderRow};
 use crate::refusal_audit::RefusalKind;
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 use crate::AppState;
@@ -38,6 +38,54 @@ use crate::AppState;
 /// Order states in which a digital entitlement has ended. `completed` is
 /// deliberately absent: a completed digital order still downloads (§3.4).
 pub const DIGITAL_ENDED_ORDER_STATES: [&str; 3] = ["cancelled", "refunded_external", "closed"];
+
+pub const REASON_PAYMENT_REVERSED: &str = "payment_reversed";
+pub const REASON_PAYMENT_REFUNDED: &str = "payment_refunded";
+
+/// Why PayPal taking money back withholds a digital order's purchase, if it
+/// does (digital delivery design DD3). A reversal outstanding at PayPal
+/// (`payment_reversed_at`, set by a full or partial `Reversed` IPN and
+/// cleared once `Canceled_Reversal` restores all of it) withholds the
+/// purchase in every state. An `external_refund` on an order that has not
+/// ended is a PayPal refund, full or partial, applied from an IPN (a seller
+/// or review record always ends the order); a refund is final, so it
+/// withholds the purchase for good. A full refund or reversal that moved the
+/// order to `refunded_external` is the ended state, which already withholds it.
+pub fn payment_taken_back(order: &OrderRow) -> Option<TakenBack> {
+    if order.payment_reversed_at.is_some() {
+        Some(TakenBack::Reversed)
+    } else if order.external_refund.is_some()
+        && !DIGITAL_ENDED_ORDER_STATES.contains(&order.state.as_str())
+    {
+        Some(TakenBack::Refunded)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakenBack {
+    Reversed,
+    Refunded,
+}
+
+impl TakenBack {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Reversed => REASON_PAYMENT_REVERSED,
+            Self::Refunded => REASON_PAYMENT_REFUNDED,
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Reversed => "The payment was reversed, so the purchase is no longer available.",
+            Self::Refunded => {
+                "PayPal refunded this payment, so the purchase is no longer available."
+            }
+        }
+    }
+}
 
 pub const REASON_UNAVAILABLE: &str = "digital_delivery_unavailable";
 pub const REASON_IN_USE: &str = "digital_delivery_in_use";
