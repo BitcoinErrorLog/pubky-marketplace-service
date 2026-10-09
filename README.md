@@ -99,6 +99,8 @@ Railway IaC `preserve()`):
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests. Its pubky-formatted public key goes into paykit-server's `[signed_services] trusted_public_keys`, beside the Locks key, when `PAYKIT_SERVER_API=upstream`; on the fork (`fork`, the default) it is `marketplace.trusted_public_key`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` rc9 with the signed-services allowlist, #55). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
+| `USDT_PAYMENTS_ENABLED` | `false` | the USDT feature flag (`true`/`1` or `false`/`0`). On, `/health` reports `usdt_payments.available` and the `usdt` bind method exists; off, neither does and every Bitcoin, PayPal and Stripe response is unchanged. See [USDT payments](#usdt-payments-flagged-default-off) |
+| `PAYKIT_MARKETPLACE_ASSETS` | `BTC` | the assets the deployed paykit-server's Marketplace prepare accepts: comma-separated `BTC` (required) and `USDT`. `USDT` is accepted only with `PAYKIT_SERVER_API=upstream`, and only once the deployed contract carries it |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
 | `PAYKIT_RAIL_STALE_SECONDS` | `60` | stale-out window for cached Paykit rail and seller claim availability; must be at least `PAYKIT_POLL_SECONDS` |
 | `DELIVERY_ASSUME_DAYS` | `14` | days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1) |
@@ -239,6 +241,43 @@ same operation would replay the late commit, which the fixtures and tests pin.
 The contract tests replay exchanges captured from a real paykit-server at
 `f9079d5` (`crates/service/tests/fixtures/paykit-server-66/`; its
 `capture/README.md` says how they were captured).
+
+### USDT payments (flagged, default off)
+
+The service can carry USDT (USDT0 on Arbitrum One) as a payment method beside
+Bitcoin and PayPal. It is built behind `USDT_PAYMENTS_ENABLED`, default off.
+This slice is the asset model and the flag; readiness, status and finality,
+the Paykit bind and refunds are separate slices.
+
+- **Model.** `orders.payment_method` stays the buyer-facing label and gains
+  `usdt`. What the buyer sends and where it settles live in
+  `orders.payment_asset`, `payment_network`, `payment_amount_minor`,
+  `payment_exponent` and `payment_quote_basis` (migration 0053), all NULL
+  unless the order is paid in USDT. They are distinct from
+  `orders.paykit_asset`, which is what a Paykit request is *denominated* in.
+  The order's `currency` and `total_minor` stay the price of record.
+  Canonical option ids are `{method}.{asset}.{network}`:
+  `paykit.btc.bitcoin`, `paykit.usdt.arbitrum-one`, `paypal.fiat`,
+  `stripe.fiat` (`payment_attempt::PaymentOption`).
+- **Quote.** USDT is offered only on `USD/2` orders, at exact parity:
+  `usdt_millionths = total_cents x 10_000`, no rate source and no rounding
+  (`PaymentTerms::usdt_at_parity`). Listings are never priced in USDT.
+- **Projection.** An order that carries terms adds `payment_asset`,
+  `payment_network`, `payment_amount_minor`, `payment_exponent` and
+  `payment_quote_basis` to its order projection (participants, list and
+  single). Every other order's projection is byte-identical to a build
+  without them. The terms are shown whatever the flag says: it gates new
+  offers, never an order that already exists.
+- **Flag.** On, `GET /health` gains `"usdt_payments": {"available": true}`
+  and `POST /v0/orders/{id}/payment-method` accepts `{"method":"usdt"}`.
+  Off, the key is absent and `usdt` is an `invalid_method` with today's
+  message. The Shop shows USDT only when its own flag is on and `/health`
+  reports it.
+- **Bind.** Until the upstream Marketplace prepare can carry a USDT request,
+  every `usdt` bind is refused with `usdt_unavailable` and leaves the order
+  untouched (unbound, unheld, no attempt spent). The log says which
+  prerequisite is missing: not the upstream API, USDT absent from
+  `PAYKIT_MARKETPLACE_ASSETS`, or the Bitcoin-only prepare body.
 
 ### Address autocomplete proxy
 

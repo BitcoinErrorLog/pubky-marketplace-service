@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use axum::http::HeaderValue;
 use url::Url;
 
+use crate::payment_attempt::MarketplaceAssets;
+use crate::payments::{PaykitApi, ENV_PAYKIT_SERVER_API};
 use crate::refusal_audit::AuditKeys;
 
 /// Default PayPal Website Payments Standard checkout (`_xclick`).
@@ -190,6 +192,16 @@ pub struct Config {
     /// live `www.paypal.com`; `www.sandbox.paypal.com` is the only other
     /// allowed host.
     pub paypal_checkout_url: String,
+    /// The USDT feature flag (`USDT_PAYMENTS_ENABLED`, default false).
+    /// It gates new offers only: `/health.usdt_payments`, the `usdt` bind
+    /// method and, in later slices, the seller toggle and readiness
+    /// lookups. It never gates polling, settlement, review or refunds of an
+    /// order that already carries USDT terms.
+    pub usdt_payments_enabled: bool,
+    /// The assets the deployed paykit-server's Marketplace prepare accepts
+    /// (`PAYKIT_MARKETPLACE_ASSETS`, default `BTC`). `USDT` is allowed only
+    /// with `PAYKIT_SERVER_API=upstream`.
+    pub paykit_marketplace_assets: MarketplaceAssets,
 }
 
 impl Config {
@@ -338,6 +350,17 @@ impl Config {
         let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
         let paypal_checkout_url =
             parse_paypal_checkout_url(std::env::var("PAYPAL_CHECKOUT_URL").ok().as_deref())?;
+        let usdt_payments_enabled = env_bool("USDT_PAYMENTS_ENABLED", false)?;
+        // A malformed selector is the payments runtime's error to report;
+        // here it only means "not upstream", so `USDT` is refused.
+        let paykit_api = std::env::var(ENV_PAYKIT_SERVER_API)
+            .ok()
+            .and_then(|value| PaykitApi::parse(&value).ok())
+            .unwrap_or_default();
+        let paykit_marketplace_assets = MarketplaceAssets::parse(
+            std::env::var("PAYKIT_MARKETPLACE_ASSETS").ok().as_deref(),
+            paykit_api,
+        )?;
         Ok(Self {
             bind_addr,
             database_url,
@@ -387,6 +410,8 @@ impl Config {
             locks_snapshot_retention_days,
             fx_feed_url,
             paypal_checkout_url,
+            usdt_payments_enabled,
+            paykit_marketplace_assets,
         })
     }
 
@@ -448,6 +473,8 @@ impl Config {
             locks_snapshot_retention_days: 90,
             fx_feed_url: crate::fx::FX_URL.to_string(),
             paypal_checkout_url: DEFAULT_PAYPAL_CHECKOUT_URL.to_string(),
+            usdt_payments_enabled: false,
+            paykit_marketplace_assets: MarketplaceAssets::BTC_ONLY,
         }
     }
 }
@@ -653,6 +680,7 @@ mod tests {
         validate_postgres_url, Config, AUTOMATION_RATE_LIMIT_MAX_TOKENS,
         DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS, DEFAULT_PAYPAL_CHECKOUT_URL,
     };
+    use crate::payment_attempt::MarketplaceAssets;
 
     /// Serializes the environment-mutating test (env is process-global).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -943,6 +971,151 @@ mod tests {
                 None => std::env::remove_var(name),
             }
         }
+    }
+
+    /// Sets environment variables for one test and restores them on drop,
+    /// including when an assertion panics.
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let previous = vars
+                .iter()
+                .map(|(name, _)| (*name, std::env::var(name).ok()))
+                .collect();
+            for (name, value) in vars {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// `Config::from_env` with the required settings, plus `extra`.
+    fn from_env_with(extra: &[(&'static str, Option<&str>)]) -> anyhow::Result<Config> {
+        let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
+        let mut vars: Vec<(&'static str, Option<&str>)> = vec![
+            ("DATABASE_URL", Some("postgres://example.invalid/test")),
+            (
+                "REFUSAL_AUDIT_DATABASE_URL",
+                Some("postgres://marketplace_refusal_audit_writer_login@audit.example/refusal"),
+            ),
+            (
+                "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
+                Some("postgres://marketplace_refusal_audit_retention@audit.example/refusal"),
+            ),
+            ("REFUSAL_AUDIT_HMAC_ROOT_B64", Some(root.as_str())),
+            ("REFUSAL_AUDIT_HMAC_KEY_EPOCH", Some("1")),
+            ("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64", None),
+            ("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH", None),
+            ("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", Some("true")),
+            ("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", Some("true")),
+            ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", Some("true")),
+            ("USDT_PAYMENTS_ENABLED", None),
+            ("PAYKIT_MARKETPLACE_ASSETS", None),
+            ("PAYKIT_SERVER_API", None),
+        ];
+        vars.extend_from_slice(extra);
+        let _guard = EnvGuard::set(&vars);
+        Config::from_env()
+    }
+
+    #[test]
+    fn usdt_is_off_and_bitcoin_only_unless_configured() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config = from_env_with(&[]).expect("defaults parse");
+        assert!(!config.usdt_payments_enabled);
+        assert_eq!(
+            config.paykit_marketplace_assets,
+            MarketplaceAssets::BTC_ONLY
+        );
+        let test_config = Config::for_tests();
+        assert!(!test_config.usdt_payments_enabled);
+        assert_eq!(
+            test_config.paykit_marketplace_assets,
+            MarketplaceAssets::BTC_ONLY
+        );
+    }
+
+    #[test]
+    fn the_usdt_flag_is_a_strict_boolean() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        for (value, expected) in [("true", true), ("1", true), ("false", false), ("0", false)] {
+            let config = from_env_with(&[("USDT_PAYMENTS_ENABLED", Some(value))])
+                .unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!(config.usdt_payments_enabled, expected, "{value}");
+        }
+        for value in ["yes", "TRUE", "on", "2", ""] {
+            let refused =
+                from_env_with(&[("USDT_PAYMENTS_ENABLED", Some(value))]).expect_err(value);
+            assert!(
+                refused.to_string().contains("USDT_PAYMENTS_ENABLED"),
+                "{value:?}: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_flag_alone_does_not_advertise_usdt_to_the_paykit_contract() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config = from_env_with(&[("USDT_PAYMENTS_ENABLED", Some("true"))]).expect("parses");
+        assert!(config.usdt_payments_enabled);
+        assert!(!config.paykit_marketplace_assets.includes_usdt());
+    }
+
+    #[test]
+    fn marketplace_assets_follow_the_paykit_api_selector() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config = from_env_with(&[
+            ("PAYKIT_SERVER_API", Some("upstream")),
+            ("PAYKIT_MARKETPLACE_ASSETS", Some("BTC,USDT")),
+        ])
+        .expect("upstream lists USDT");
+        assert!(config.paykit_marketplace_assets.includes_usdt());
+        for api in [None, Some("fork"), Some("not-an-api")] {
+            let refused = from_env_with(&[
+                ("PAYKIT_SERVER_API", api),
+                ("PAYKIT_MARKETPLACE_ASSETS", Some("BTC,USDT")),
+            ])
+            .expect_err("USDT needs upstream");
+            assert!(
+                refused.to_string().contains("PAYKIT_MARKETPLACE_ASSETS"),
+                "{api:?}: {refused}"
+            );
+        }
+        let refused = from_env_with(&[
+            ("PAYKIT_SERVER_API", Some("upstream")),
+            ("PAYKIT_MARKETPLACE_ASSETS", Some("USDT")),
+        ])
+        .expect_err("BTC is required");
+        assert!(
+            refused.to_string().contains("must include BTC"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_api_selector_is_not_this_modules_error() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config = from_env_with(&[("PAYKIT_SERVER_API", Some("not-an-api"))])
+            .expect("the payments runtime owns that error");
+        assert_eq!(
+            config.paykit_marketplace_assets,
+            MarketplaceAssets::BTC_ONLY
+        );
     }
 
     #[test]

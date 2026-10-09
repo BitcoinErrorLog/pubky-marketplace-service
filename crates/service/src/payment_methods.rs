@@ -48,11 +48,13 @@ use crate::handlers::{
 };
 use crate::model::{OrderRow, PaymentRow};
 use crate::payment_attempt::{
-    operation_id, payment_reference, payment_window_seconds, AttemptIdentity, PaymentAsset,
+    operation_id, payment_reference, payment_window_seconds, AttemptIdentity, MarketplaceAssets,
+    PaymentAsset, PaymentOption,
 };
 use crate::payments::{
     attempt_reference, validate_paypal_email, validate_stripe_payment_link,
-    validate_stripe_restricted_key, PaykitApi, PaykitRequestError, PaymentsRuntime, StripeError,
+    validate_stripe_restricted_key, PaykitApi, PaykitClient, PaykitRequestError, PaymentsRuntime,
+    StripeError,
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
@@ -502,6 +504,45 @@ fn bitcoin_amount_sats(order: &OrderRow) -> Option<u64> {
         .filter(|sats| *sats > 0)
 }
 
+/// Why a USDT bind cannot proceed on this deployment, for the operator's
+/// log; the buyer always sees the same `usdt_unavailable` refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsdtUnavailableCause {
+    /// Paykit is unset or the fork, which has no USDT.
+    PaykitNotUpstream,
+    /// `PAYKIT_MARKETPLACE_ASSETS` does not list USDT.
+    AssetNotAdvertised,
+    /// The upstream Marketplace prepare body is Bitcoin-only
+    /// (`amount_sats`), so it cannot carry a USDT request yet.
+    PrepareBitcoinOnly,
+}
+
+fn usdt_unavailable_cause(
+    paykit_api: Option<PaykitApi>,
+    assets: MarketplaceAssets,
+) -> UsdtUnavailableCause {
+    if paykit_api != Some(PaykitApi::Upstream) {
+        UsdtUnavailableCause::PaykitNotUpstream
+    } else if !assets.includes_usdt() {
+        UsdtUnavailableCause::AssetNotAdvertised
+    } else {
+        UsdtUnavailableCause::PrepareBitcoinOnly
+    }
+}
+
+/// The refusal of a `usdt` bind while the flag is on. The model, the flag
+/// and the columns exist, but the upstream prepare cannot carry USDT, so
+/// every USDT bind is refused until it can.
+fn usdt_unavailable(state: &AppState, paykit_api: Option<PaykitApi>) -> Response {
+    let cause = usdt_unavailable_cause(paykit_api, state.config.paykit_marketplace_assets);
+    tracing::info!(cause = ?cause, "usdt bind refused");
+    method_error(
+        ErrorCode::UpstreamUnavailable,
+        "usdt_unavailable",
+        "USDT payments are not available right now. Choose another payment method.",
+    )
+}
+
 fn fx_error_response(error: crate::fx::FxError) -> Response {
     let (reason, message) = match error {
         crate::fx::FxError::MissingReference => (
@@ -549,12 +590,22 @@ pub async fn bind_payment_method(
         Err(response) => return *response,
     };
     let method = body.method.as_str();
-    if !matches!(method, "bitcoin" | "stripe" | "paypal") {
+    let usdt_enabled = state.config.usdt_payments_enabled;
+    let Some(option) = PaymentOption::from_method(method)
+        .filter(|option| usdt_enabled || !option.requires_usdt_flag())
+    else {
         return method_error(
             ErrorCode::InvalidCommand,
             "invalid_method",
-            "The payment method must be bitcoin, stripe, or paypal.",
+            if usdt_enabled {
+                "The payment method must be bitcoin, usdt, stripe, or paypal."
+            } else {
+                "The payment method must be bitcoin, stripe, or paypal."
+            },
         );
+    };
+    if option == PaymentOption::PaykitUsdtArbitrumOne {
+        return usdt_unavailable(&state, payments.paykit.as_ref().map(PaykitClient::api));
     }
     let now = state.clock.now();
     // A bitcoin bind spends its attempt number in a committed statement of
@@ -2219,4 +2270,34 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     StatusCode::OK.into_response()
+}
+
+#[cfg(test)]
+mod usdt_bind_tests {
+    use super::*;
+
+    #[test]
+    fn a_usdt_bind_is_logged_with_the_first_missing_deployment_prerequisite() {
+        let btc_only = MarketplaceAssets::BTC_ONLY;
+        let btc_and_usdt = MarketplaceAssets::parse(Some("BTC,USDT"), PaykitApi::Upstream)
+            .expect("upstream lists USDT");
+        for api in [None, Some(PaykitApi::Fork)] {
+            assert_eq!(
+                usdt_unavailable_cause(api, btc_only),
+                UsdtUnavailableCause::PaykitNotUpstream
+            );
+            assert_eq!(
+                usdt_unavailable_cause(api, btc_and_usdt),
+                UsdtUnavailableCause::PaykitNotUpstream
+            );
+        }
+        assert_eq!(
+            usdt_unavailable_cause(Some(PaykitApi::Upstream), btc_only),
+            UsdtUnavailableCause::AssetNotAdvertised
+        );
+        assert_eq!(
+            usdt_unavailable_cause(Some(PaykitApi::Upstream), btc_and_usdt),
+            UsdtUnavailableCause::PrepareBitcoinOnly
+        );
+    }
 }

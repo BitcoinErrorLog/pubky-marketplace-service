@@ -107,3 +107,14 @@ one `NOT VALID` CHECK that keeps them all-or-nothing and the window positive.
 No default, no rewrite, no index; it sets `lock_timeout` like 0050. A binary
 from before it lists its `orders` columns and ignores them. `paykit_asset` has
 no CHECK on purpose: a later asset is a new value, not a migration.
+
+0053 (payment assets) widens `orders.payment_method` to `usdt`, adds five
+nullable `orders` columns for what the buyer sends (`payment_asset`,
+`payment_network`, `payment_amount_minor`, `payment_exponent`,
+`payment_quote_basis`), and creates `seller_accepted_payment_options` with its
+primary key. The two `orders` CHECKs (the method list; the five columns all
+set or all NULL with a positive amount) are `NOT VALID`: new and updated rows
+are checked, no table scan runs under the lock. No default, no rewrite, no
+index on an existing table; it sets `lock_timeout` like 0050. A binary from
+before it lists its `orders` columns and ignores them. The asset, network and
+quote basis have no CHECK on purpose: a later value is not a migration.

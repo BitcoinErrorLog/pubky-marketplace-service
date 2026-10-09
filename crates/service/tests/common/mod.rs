@@ -3228,6 +3228,17 @@ pub async fn test_app_with_upstream_paykit(pool: PgPool) -> (TestApp, FakePaykit
     (app, paykit)
 }
 
+/// A payments-enabled app on the given Paykit API with a caller-supplied
+/// config, for tests that turn a flag or a Paykit asset list on.
+pub async fn test_app_with_paykit_api_config(
+    pool: PgPool,
+    config: Config,
+    api: PaykitApi,
+) -> (TestApp, FakePaykit) {
+    let (app, _stripe, paykit, _ipn, _shippo) = test_app_with_payments_api(pool, config, api).await;
+    (app, paykit)
+}
+
 async fn test_app_with_payments_api(
     pool: PgPool,
     config: Config,
