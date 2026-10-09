@@ -41,6 +41,7 @@ pub mod payments;
 pub mod pickup;
 pub mod priv_keys;
 pub mod queries;
+pub mod refund_destination;
 pub mod refusal_audit;
 pub mod refusal_audit_admin;
 pub mod reserve_secrecy;
