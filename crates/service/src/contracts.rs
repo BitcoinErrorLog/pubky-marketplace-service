@@ -28,6 +28,7 @@ pub enum ReviewReason {
     NotInManualReview,
     StockUnavailable,
     RefundRequired,
+    RefundDestinationRequired,
 }
 
 impl ReviewReason {
@@ -49,6 +50,7 @@ impl ReviewReason {
             Self::NotInManualReview => "not_in_manual_review",
             Self::StockUnavailable => "stock_unavailable",
             Self::RefundRequired => "refund_required",
+            Self::RefundDestinationRequired => "refund_destination_required",
         }
     }
 
@@ -70,6 +72,7 @@ impl ReviewReason {
             Self::NotInManualReview,
             Self::StockUnavailable,
             Self::RefundRequired,
+            Self::RefundDestinationRequired,
         ]
     }
 
@@ -97,6 +100,7 @@ impl ReviewReason {
                 Self::ResolutionNotApplicable,
                 Self::StockUnavailable,
                 Self::RefundRequired,
+                Self::RefundDestinationRequired,
             ],
             _ => &[],
         }
