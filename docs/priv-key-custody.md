@@ -30,7 +30,7 @@ key read: the session's grant must cover `/priv/pubky.app/` with read and write.
 In one transaction under a per-owner advisory lock, the service checks that the
 request names exactly the key ids it holds for the owner, deletes every
 `user_priv_keys` row of the owner, and inserts a row into
-`user_priv_key_custody_releases` (migration 0054). The row holds no key
+`user_priv_key_custody_releases` (migration 0055). The row holds no key
 material. It is why a later `GET` answers `custody_released` and why the
 service never creates a replacement key for that owner: a new key would orphan
 the records the wrapped keys protect.
@@ -57,7 +57,7 @@ the records the wrapped keys protect.
   `released priv data key custody to the owner` carries the actor prefix and
   the number of keys, never a key.
 - **Roll forward, never back, once a release has happened.** A binary that
-  predates 0054 does not know the tombstone and would create a new key for a
+  predates 0055 does not know the tombstone and would create a new key for a
   released owner, a key none of that user's records use.
 - Deploying the service first is safe: the Shop does not call the release
   endpoint until its own scoped-keys switch is on.
