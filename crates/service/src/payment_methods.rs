@@ -988,7 +988,10 @@ pub async fn bind_payment_method(
                 derived_address_fingerprint,
             } => {
                 if total_sats != amount_sats + nonce_sats {
-                    tracing::error!(order_id = %order.id, "ALERT paykit phase 1 total mismatch");
+                    tracing::error!(
+                        order_id = %order.id,
+                        "ALERT paykit phase 1 total_sats != amount_sats + nonce_sats"
+                    );
                     let _ = tx.rollback().await;
                     return method_error(
                         ErrorCode::InvalidState,
@@ -997,7 +1000,10 @@ pub async fn bind_payment_method(
                     );
                 }
                 if echoed_expires_at.timestamp() != expires_at.timestamp() {
-                    tracing::error!(order_id = %order.id, "ALERT paykit phase 1 expiry mismatch");
+                    tracing::error!(
+                        order_id = %order.id,
+                        "ALERT paykit phase 1 expires_at != the hold deadline"
+                    );
                     let target = PaykitLifecycleTarget::Fork {
                         endpoint: paykit.base_url().to_string(),
                         stack_id: stack_id.clone(),
@@ -1084,6 +1090,24 @@ pub async fn bind_payment_method(
         // phase 2 durable. Any failure below rolls the whole bind back; the
         // courtesy void after the error return is best-effort (paykit's
         // 15-minute reaper is the guarantee).
+        let activation_payload = match &target {
+            PaykitLifecycleTarget::Fork { endpoint, stack_id } => json!({
+                "invoice_id": invoice_id,
+                "order_id": order.id,
+                "paykit_api": paykit.api().as_str(),
+                "stack_id": stack_id,
+                "stack_endpoint": endpoint,
+                "total_sats": total_sats,
+                "activation_attempt": 0,
+            }),
+            PaykitLifecycleTarget::Upstream { .. } => json!({
+                "invoice_id": invoice_id,
+                "order_id": order.id,
+                "paykit_api": paykit.api().as_str(),
+                "total_sats": total_sats,
+                "activation_attempt": 0,
+            }),
+        };
         let persisted = async {
             sqlx::query(
                 "UPDATE orders SET paykit_invoice_id = $2, paykit_api = $19, paykit_stack_id = $3, \
@@ -1176,13 +1200,7 @@ pub async fn bind_payment_method(
                  VALUES ($1, 'paykit.activate', $2, $3)",
             )
             .bind(event_id)
-            .bind(json!({
-                "invoice_id": invoice_id,
-                "order_id": order.id,
-                "paykit_api": paykit.api().as_str(),
-                "total_sats": total_sats,
-                "activation_attempt": 0,
-            }))
+            .bind(activation_payload)
             .bind(now)
             .execute(&mut *tx)
             .await?;

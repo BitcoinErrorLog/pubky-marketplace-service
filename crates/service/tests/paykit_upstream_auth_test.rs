@@ -427,6 +427,30 @@ async fn durable_target_not_current_config_selects_lifecycle_signature_framing()
         )
         .await
         .expect("durable upstream resolve keeps preimage signing");
+    let prepared_to_void = upstream_client(&upstream_server)
+        .create_payment_request(
+            SELLER,
+            "w3g1m3s5rbuyer1111111111111111111111111111111111111111",
+            uuid::Uuid::new_v4(),
+            1,
+            42_000,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            3_600,
+        )
+        .await
+        .expect("second upstream prepare accepted");
+    let PaykitPrepared::Upstream {
+        invoice_id: upstream_void_invoice,
+        ..
+    } = prepared_to_void
+    else {
+        panic!("upstream response")
+    };
+    let upstream_voided = rollback_client
+        .void_payment_request(&upstream_target, upstream_void_invoice, "fork-only reason")
+        .await
+        .expect("durable upstream void keeps preimage signing after rollback");
+    assert_eq!(upstream_voided.state, "voided");
 
     let fork_server = spawn_fake_paykit().await;
     let prepared = PaykitClient::new(&fork_server.base_url, TEST_PAYKIT_SIGNING_SEED)
@@ -462,6 +486,36 @@ async fn durable_target_not_current_config_selects_lifecycle_signature_framing()
         .activate_payment_request(&fork_target, invoice_id, total_sats, 1)
         .await
         .expect("durable fork target keeps body-only signing after cutover");
+    let prepared_to_void = PaykitClient::new(&fork_server.base_url, TEST_PAYKIT_SIGNING_SEED)
+        .expect("fork client")
+        .create_payment_request(
+            SELLER,
+            "w3g1m3s5rbuyer1111111111111111111111111111111111111111",
+            uuid::Uuid::new_v4(),
+            1,
+            42_000,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            3_600,
+        )
+        .await
+        .expect("second fork prepare accepted");
+    let PaykitPrepared::Fork {
+        invoice_id: fork_void_invoice,
+        stack_id: fork_void_stack_id,
+        ..
+    } = prepared_to_void
+    else {
+        panic!("fork response")
+    };
+    let fork_void_target = PaykitLifecycleTarget::Fork {
+        endpoint: fork_server.base_url.clone(),
+        stack_id: fork_void_stack_id,
+    };
+    let fork_voided = cutover_client
+        .void_payment_request(&fork_void_target, fork_void_invoice, "order_cancelled")
+        .await
+        .expect("durable fork void keeps body-only signing after cutover");
+    assert_eq!(fork_voided.state, "void_cancelled");
 }
 
 #[tokio::test]

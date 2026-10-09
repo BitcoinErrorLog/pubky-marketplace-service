@@ -1608,7 +1608,11 @@ impl PaykitClient {
                 .json::<PaykitVoided>()
                 .await
                 .map_err(|_| PaykitCommandError::Unavailable)?;
-            return if body.invoice_id == invoice_id && body.state == "voided" {
+            let accepted_state = match target {
+                PaykitLifecycleTarget::Fork { .. } => body.state.starts_with("void_"),
+                PaykitLifecycleTarget::Upstream { .. } => body.state == "voided",
+            };
+            return if body.invoice_id == invoice_id && accepted_state {
                 Ok(body)
             } else {
                 Err(PaykitCommandError::Unavailable)
