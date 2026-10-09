@@ -223,6 +223,54 @@ the Paykit bind and refunds are separate slices.
   prerequisite is missing: not the upstream API, USDT absent from
   `PAYKIT_MARKETPLACE_ASSETS`, or the Bitcoin-only prepare body.
 
+### USDT refund destination
+
+A USDT payment is refunded by the seller from their own wallet (a normal USDT
+send in Bitkit): the service never holds or moves funds, and Paykit has no
+refunds. The seller needs an address to send to, and the address a payment came
+from is not assumed to take a refund (the buyer may have paid from an
+exchange). So the buyer confirms one on the order. This applies to orders paid
+with the `usdt` method only; every other order is unchanged. It is not gated by
+`USDT_PAYMENTS_ENABLED`: an order that already exists can always be refunded.
+
+- **`refund.confirm_destination`** (buyer of the order). Payload
+  `{"order_id": "<uuid>", "address": "0x<40 hex>"}`, closed (no other field).
+  The address is `0x` and 40 hex digits; a mixed-case address must match its
+  EIP-55 checksum, while an all-lower or all-upper one carries none and is
+  accepted. Surrounding whitespace is trimmed and the address is stored as
+  entered. The order needs `payment_method = 'usdt'` and a payment that is
+  received (`confirmed`) or in manual review. The buyer may replace the address
+  until a refund is recorded; every confirmation advances the order revision,
+  appends the event `refund.destination_confirmed` and sends the seller the
+  `refund_destination_confirmed` notification. There is no way to ask for "the
+  address I paid from": paykit-server does not expose the payer address, so the
+  only source is `buyer_entered`.
+- **Projection.** A USDT order projects `refund_destination` to its
+  participants on `GET /v1/orders` and `GET /v1/orders/{id}`, and on the
+  `refund.confirm_destination` result: `null` until the buyer confirms, then
+  `{"address", "network": "arbitrum-one", "asset": "USDT", "source":
+  "buyer_entered", "confirmed_at"}`. Orders of any other method have no
+  `refund_destination` key. It is never in a public projection or a log. The
+  USDT amount is the order's `payment_amount_minor` (millionths).
+- **Recording the refund.** On a USDT order `refund.record_external` and the
+  manual-review `refunded` resolution (`POST /v0/orders/{id}/bitcoin/resolve`)
+  need the buyer's confirmed address (`refund_destination_required`, 409) and a
+  reference that is the Arbitrum transaction hash, `0x` and 64 lower-case hex
+  digits (`invalid_refund_reference`, 422). The resolution reference cap is 64
+  printable characters for a Bitcoin order and unchanged; a USDT order takes the
+  66-character hash instead. The address is copied into `external_refund` as
+  `destination_address`, so a later change cannot rewrite the record. A
+  manual-review USDT refund records the quoted USDT amount in order units
+  (cents for a USD order).
+- **What it does not do.** It never verifies the refund on Arbitrum, so the
+  record is what the seller said they did. A `refunded` resolution toward Paykit
+  is an annotation only (it does not verify or execute a refund).
+- **Refusals** (closed `error.reason` tokens): `invalid_refund_destination`
+  (422), `refund_destination_required` (409) and `invalid_refund_reference`
+  (422). A wrong sender, order method or payment state is a plain
+  `UNAUTHORIZED` or `INVALID_STATE`.
+- **Storage.** `order_refund_destinations` (migration 0054), one row per order.
+
 ### Address autocomplete proxy
 
 `POST /v0/address/suggest` with `{"q": "42 Union Street New Bedford", "country": "US"}`
@@ -614,6 +662,7 @@ compare it.
 | `return.approve` | CAS 409 vs order `revision` | `returns.rs:171` |
 | `return.receive` | CAS 409 vs order `revision` | `returns.rs:171` |
 | `refund.record_external` | CAS 409 vs order `revision` | `returns.rs:251` |
+| `refund.confirm_destination` | CAS 409 vs order `revision` | `refund_destination.rs:27` |
 | `review.create` | CAS 409 vs order `revision` | `reviews.rs:54` |
 | `review.update` | CAS 409 vs order `revision` | `reviews.rs:304` |
 | `attestation.set_band_consent` | CAS 409 vs stored consent revision (`0` on first write) | `attestation.rs:47` |
@@ -634,6 +683,7 @@ actor may sync), `drop.sync` (convergent; any actor may sync),
 `pickup_details.clear`, `fulfillment.mark_ready`,
 `fulfillment.confirm_pickup` (see Local pickup), `return.request`,
 `return.approve`, `return.receive`, `refund.record_external`,
+`refund.confirm_destination` (see USDT refund destination),
 `review.create`, `review.update` (this service only), and
 `attestation.set_band_consent`.
 Server-driven transitions (reservation expiry, offer expiry, auction close
