@@ -3363,7 +3363,8 @@ pub async fn test_app_with_live_paykit(pool: PgPool, paykit_base_url: &str) -> T
         stripe: StripeClient::new(&stripe.base_url).expect("fake stripe client builds"),
         paykit: Some(
             PaykitClient::new(paykit_base_url, TEST_PAYKIT_SIGNING_SEED)
-                .expect("live paykit client builds"),
+                .expect("live paykit client builds")
+                .with_api(PaykitApi::Upstream),
         ),
         paypal_ipn: PaypalIpnVerifier::new(&ipn.base_url).expect("fake ipn verifier builds"),
         shippo: ShippoClient::new(&shippo.base_url).expect("fake shippo client builds"),

@@ -1,34 +1,41 @@
-//! Bitcoin binds against a live paykit-server: the marketplace bind handler,
-//! activation worker, and signed client talk HTTP to the production
-//! paykit-server composition (real Postgres, ephemeral pubky testnet), not
-//! to the in-repo double.
+//! Cross-process acceptance against upstream paykit-server production routes,
+//! PostgreSQL stores, workers, ephemeral Pubky testnet, and real SDK delivery.
 //!
-//! Start the server with paykit-server's `marketplace_live_harness`
-//! (`paykit-server-e2e/tests/marketplace_live_harness.rs`), trusting
-//! [`TEST_PAYKIT_SIGNING_SEED`], then run these tests with
-//! `PAYKIT_LIVE_HANDOFF=<handoff file> cargo test -p marketplace-service
-//! --test paykit_live_test -- --ignored --test-threads=1`.
+//! Start `paykit-server-e2e`'s ignored `marketplace_live_harness`, then run:
+//!
+//! `PAYKIT_LIVE_HANDOFF=<handoff> cargo test -p marketplace-service \
+//!   --test paykit_live_test -- --ignored --test-threads=1`
 
 mod common;
 
+use std::{path::PathBuf, time::Duration};
+
 use axum::http::StatusCode;
 use common::*;
-use marketplace_service::clock::Clock;
-use marketplace_service::payments::PaykitLifecycleTarget;
-use marketplace_service::workers::drain_outbox;
+use marketplace_service::{clock::Clock, payments::PaykitPrepared, workers::drain_outbox};
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
 struct LiveHarness {
     base_url: String,
+    paykit_database_url: String,
     creator_secret_hex: String,
     reader_secret_hex: String,
+    stop: PathBuf,
+}
+
+impl Drop for LiveHarness {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.stop, b"stop");
+    }
 }
 
 fn live_harness() -> LiveHarness {
-    let path = std::env::var("PAYKIT_LIVE_HANDOFF")
-        .expect("PAYKIT_LIVE_HANDOFF names the paykit-server harness handoff file");
+    let path = PathBuf::from(
+        std::env::var("PAYKIT_LIVE_HANDOFF")
+            .expect("PAYKIT_LIVE_HANDOFF names the Paykit harness handoff file"),
+    );
     let handoff: Value =
         serde_json::from_slice(&std::fs::read(&path).expect("handoff file is readable"))
             .expect("handoff is JSON");
@@ -40,16 +47,24 @@ fn live_harness() -> LiveHarness {
     };
     LiveHarness {
         base_url: field("base_url"),
+        paykit_database_url: field("paykit_database_url"),
         creator_secret_hex: field("creator_secret_hex"),
         reader_secret_hex: field("reader_secret_hex"),
+        stop: PathBuf::from(format!("{}.stop", path.display())),
     }
 }
 
-/// The harness creator is the seller (claimed on paykit-server) and the
-/// harness reader is the buyer (its Paykit receiver marker is published).
-async fn live_parties(pool: PgPool) -> (TestApp, TestActor, TestActor) {
-    let harness = live_harness();
+async fn live_parties(pool: PgPool, harness: &LiveHarness) -> (TestApp, TestActor, TestActor) {
     let app = test_app_with_live_paykit(pool, &harness.base_url).await;
+    assert_eq!(
+        app.state
+            .payments
+            .as_ref()
+            .and_then(|payments| payments.paykit.as_ref())
+            .expect("Paykit client configured")
+            .api(),
+        marketplace_service::payments::PaykitApi::Upstream
+    );
     let seller = actor_from_secret(&app, &harness.creator_secret_hex).await;
     let buyer = actor_from_secret(&app, &harness.reader_secret_hex).await;
     let (status, body) = send(
@@ -64,7 +79,7 @@ async fn live_parties(pool: PgPool) -> (TestApp, TestActor, TestActor) {
     (app, seller, buyer)
 }
 
-async fn create_sat_order(app: &TestApp, seller: &TestActor, buyer: &TestActor) -> String {
+async fn create_sat_order(app: &TestApp, seller: &TestActor, buyer: &TestActor) -> Uuid {
     let listing_id = format!("sat_{}", Uuid::new_v4().simple());
     let command_number = (Uuid::new_v4().as_u128() % 1_000_000_000_000) as u64;
     let mut register = register_listing_command(&seller.pubky, &listing_id, 1, command_number);
@@ -78,13 +93,15 @@ async fn create_sat_order(app: &TestApp, seller: &TestActor, buyer: &TestActor) 
     checkout["payload"]["lines"][0]["expected_revision"] = json!(1);
     let (status, body) = execute(app, &buyer.token, &checkout).await;
     assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
-    body["result"]["orders"][0]["id"]
-        .as_str()
-        .expect("order id present")
-        .to_string()
+    Uuid::parse_str(
+        body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id present"),
+    )
+    .unwrap()
 }
 
-async fn bind_bitcoin(app: &TestApp, token: &str, order_id: &str) -> (StatusCode, Value) {
+async fn bind_bitcoin(app: &TestApp, token: &str, order_id: Uuid) -> (StatusCode, Value) {
     send(
         app.router.clone(),
         "POST",
@@ -96,21 +113,23 @@ async fn bind_bitcoin(app: &TestApp, token: &str, order_id: &str) -> (StatusCode
 }
 
 #[derive(sqlx::FromRow)]
-struct PaykitPin {
+struct MarketplacePin {
     payment_method: Option<String>,
     paykit_invoice_id: Option<Uuid>,
+    paykit_api: Option<String>,
     paykit_stack_id: Option<String>,
     paykit_stack_endpoint: Option<String>,
     paykit_activation_state: Option<String>,
-    paykit_request_reference: Option<String>,
+    paykit_total_sats: Option<i64>,
 }
 
-async fn paykit_pin(pool: &PgPool, order_id: &str) -> PaykitPin {
+async fn marketplace_pin(pool: &PgPool, order_id: Uuid) -> MarketplacePin {
     sqlx::query_as(
-        "SELECT payment_method, paykit_invoice_id, paykit_stack_id, paykit_stack_endpoint, \
-         paykit_activation_state, paykit_request_reference FROM orders WHERE id = $1",
+        "SELECT payment_method, paykit_invoice_id, paykit_api, paykit_stack_id, \
+         paykit_stack_endpoint, paykit_activation_state, paykit_total_sats \
+         FROM orders WHERE id = $1",
     )
-    .bind(Uuid::parse_str(order_id).expect("order id is a uuid"))
+    .bind(order_id)
     .fetch_one(pool)
     .await
     .expect("order row exists")
@@ -121,107 +140,143 @@ fn live_client(app: &TestApp) -> &marketplace_service::payments::PaykitClient {
         .payments
         .as_ref()
         .and_then(|payments| payments.paykit.as_ref())
-        .expect("paykit client configured")
+        .expect("Paykit client configured")
 }
 
-// Paykit finalizes a prepared invoice before the marketplace activates it
-// (its prepare reaper, or any void that lands first). The activation worker
-// sees the terminal refusal and releases the bind; the buyer pays again.
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-#[ignore = "needs a live paykit-server (PAYKIT_LIVE_HANDOFF)"]
-async fn live_a_rebind_after_a_void_prepares_a_new_invoice(pool: PgPool) {
-    let (app, seller, buyer) = live_parties(pool.clone()).await;
-    let order_id = create_sat_order(&app, &seller, &buyer).await;
-
-    let (status, body) = bind_bitcoin(&app, &buyer.token, &order_id).await;
-    assert_eq!(status, StatusCode::OK, "first bind failed: {body}");
-    let first = paykit_pin(&pool, &order_id).await;
-    let first_invoice = first.paykit_invoice_id.expect("first invoice pinned");
-    let target = PaykitLifecycleTarget::Fork {
-        endpoint: first.paykit_stack_endpoint.clone().expect("endpoint"),
-        stack_id: first.paykit_stack_id.clone().expect("stack id"),
-    };
-    let voided = live_client(&app)
-        .void_payment_request(&target, first_invoice, "marketplace_bind_rolled_back")
+async fn wait_for_paykit_states(pool: &PgPool) -> Vec<(Uuid, String)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let rows = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, state FROM marketplace_payment_preparations ORDER BY prepared_at",
+        )
+        .fetch_all(pool)
         .await
-        .expect("paykit voids the prepared invoice");
-    assert_eq!(voided.state, "void_cancelled");
-
-    drain_outbox(&app.pool, Some(live_client(&app)), app.clock.now(), 30)
-        .await
-        .expect("drain runs");
-    let released = paykit_pin(&pool, &order_id).await;
-    assert_eq!(released.paykit_activation_state.as_deref(), Some("voided"));
-    assert_eq!(released.payment_method, None, "the bind is released");
-
-    let (status, body) = bind_bitcoin(&app, &buyer.token, &order_id).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the buyer's second bind must prepare a new invoice: {body}"
-    );
-    let second = paykit_pin(&pool, &order_id).await;
-    assert_ne!(second.paykit_invoice_id, Some(first_invoice));
-    assert_ne!(
-        second.paykit_request_reference, first.paykit_request_reference,
-        "each attempt carries its own Paykit reference"
-    );
-    assert_eq!(second.paykit_activation_state.as_deref(), Some("preparing"));
-
-    drain_outbox(&app.pool, Some(live_client(&app)), app.clock.now(), 30)
-        .await
-        .expect("drain runs");
-    let activated = paykit_pin(&pool, &order_id).await;
-    assert_eq!(activated.paykit_activation_state.as_deref(), Some("active"));
-}
-
-// Phase 1 succeeds at paykit, the bind transaction then rolls back, and the
-// courtesy void cancels the prepared invoice. The buyer's retry must not
-// replay the voided attempt's identity.
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-#[ignore = "needs a live paykit-server (PAYKIT_LIVE_HANDOFF)"]
-async fn live_a_retry_after_a_rolled_back_bind_prepares_a_new_invoice(pool: PgPool) {
-    install_log_capture();
-    let (app, seller, buyer) = live_parties(pool.clone()).await;
-    let order_id = create_sat_order(&app, &seller, &buyer).await;
-
-    fail_activation_intent_inserts(&pool).await;
-    let (status, body) = bind_bitcoin(&app, &buyer.token, &order_id).await;
-    assert_eq!(
-        status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "the injected failure rolls the bind back: {body}"
-    );
-    restore_activation_intent_inserts(&pool).await;
-    assert_eq!(paykit_pin(&pool, &order_id).await.payment_method, None);
-    let mut delivered = false;
-    for _ in 0..100 {
-        if captured_logs().contains("courtesy void delivered") {
-            delivered = true;
-            break;
+        .unwrap();
+        if rows.len() == 2
+            && rows.iter().any(|(_, state)| state == "active")
+            && rows.iter().any(|(_, state)| state == "voided")
+        {
+            return rows;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Paykit lifecycle did not reach one active and one voided row: {rows:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(delivered, "the courtesy void reached paykit-server");
+}
 
-    let (status, body) = bind_bitcoin(&app, &buyer.token, &order_id).await;
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+#[ignore = "needs protocol-real upstream Paykit harness (PAYKIT_LIVE_HANDOFF)"]
+async fn upstream_live_commit_activate_replay_and_rollback_void(pool: PgPool) {
+    let harness = live_harness();
+    let paykit_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&harness.paykit_database_url)
+        .await
+        .expect("Paykit disposable DB is reachable");
+    let (app, seller, buyer) = live_parties(pool.clone(), &harness).await;
+
+    let committed_order = create_sat_order(&app, &seller, &buyer).await;
+    let (status, body) = bind_bitcoin(&app, &buyer.token, committed_order).await;
+    assert_eq!(status, StatusCode::OK, "upstream bind failed: {body}");
+    let committed = marketplace_pin(&pool, committed_order).await;
+    let committed_invoice = committed.paykit_invoice_id.expect("invoice durably bound");
+    assert_eq!(committed.payment_method.as_deref(), Some("bitcoin"));
+    assert_eq!(committed.paykit_api.as_deref(), Some("upstream"));
+    assert_eq!(committed.paykit_stack_id, None, "upstream has no stack_id");
     assert_eq!(
-        status,
-        StatusCode::OK,
-        "the retry must prepare a new invoice: {body}"
+        committed.paykit_stack_endpoint, None,
+        "upstream has one configured endpoint, not a durable fork pin"
     );
-    let bound = paykit_pin(&pool, &order_id).await;
-    assert_eq!(bound.payment_method.as_deref(), Some("bitcoin"));
-    assert_eq!(bound.paykit_activation_state.as_deref(), Some("preparing"));
+    assert_eq!(
+        committed.paykit_activation_state.as_deref(),
+        Some("preparing")
+    );
+
+    // Emulate a lost prepare response: exact signed retry must replay one invoice
+    // without allocating another address or creating publication work.
+    let replay = live_client(&app)
+        .create_payment_request(
+            &seller.pubky,
+            &buyer.pubky,
+            committed_order,
+            1,
+            u64::try_from(committed.paykit_total_sats.unwrap()).unwrap(),
+            app.clock.now() + chrono::Duration::hours(1),
+            app.state.config.bitcoin_payment_window_seconds,
+        )
+        .await
+        .expect("exact prepare replay succeeds");
+    assert!(matches!(
+        replay,
+        PaykitPrepared::Upstream { invoice_id, .. } if invoice_id == committed_invoice
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(&paykit_pool)
+            .await
+            .unwrap(),
+        1
+    );
 
     drain_outbox(&app.pool, Some(live_client(&app)), app.clock.now(), 30)
         .await
-        .expect("drain runs");
+        .expect("Marketplace activates durable bind");
     assert_eq!(
-        paykit_pin(&pool, &order_id)
+        marketplace_pin(&pool, committed_order)
             .await
             .paykit_activation_state
             .as_deref(),
         Some("active")
     );
+
+    let rolled_back_order = create_sat_order(&app, &seller, &buyer).await;
+    fail_activation_intent_inserts(&pool).await;
+    let (status, body) = bind_bitcoin(&app, &buyer.token, rolled_back_order).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "injected Marketplace transaction rollback expected: {body}"
+    );
+    restore_activation_intent_inserts(&pool).await;
+    let rolled_back = marketplace_pin(&pool, rolled_back_order).await;
+    assert_eq!(rolled_back.payment_method, None);
+    assert_eq!(rolled_back.paykit_invoice_id, None);
+
+    let paykit_states = wait_for_paykit_states(&paykit_pool).await;
+    assert!(paykit_states
+        .iter()
+        .any(|(id, state)| *id == committed_invoice && state == "active"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let row: (i64, i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(DISTINCT sdk_event_id), count(DISTINCT sdk_payment_request_id) \
+             FROM outbox WHERE intent_kind = 'payment_request_proposal' AND status = 'delivered'",
+        )
+        .fetch_one(&paykit_pool)
+        .await
+        .unwrap();
+        if row == (1, 1, 1) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected one delivered SDK proposal/outbox identity, got {row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM outbox WHERE intent_kind = 'payment_request_proposal'",
+        )
+        .fetch_one(&paykit_pool)
+        .await
+        .unwrap(),
+        1,
+        "rolled-back Marketplace bind was voided without publication"
+    );
+
+    paykit_pool.close().await;
+    drop(harness);
 }
