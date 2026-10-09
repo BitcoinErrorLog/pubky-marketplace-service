@@ -11,7 +11,7 @@
 -- `key_count` is how many keys the release dropped, for the operator's log
 -- and for counting released owners. Additive and rerunnable. There is NO DOWN
 -- migration; rolling back the service leaves these rows in place, and a
--- service that predates 0052 would create a new key for a released owner, so
+-- service that predates 0054 would create a new key for a released owner, so
 -- roll forward rather than back once any release has happened.
 
 CREATE TABLE IF NOT EXISTS user_priv_key_custody_releases (

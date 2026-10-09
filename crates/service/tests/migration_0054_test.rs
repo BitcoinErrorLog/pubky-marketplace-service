@@ -15,17 +15,17 @@ async fn insert(pool: &PgPool, owner: &str, key_count: i32) -> Result<(), sqlx::
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn migration_0052_creates_the_release_table_and_is_rerunnable(pool: PgPool) {
+async fn migration_0054_creates_the_release_table_and_is_rerunnable(pool: PgPool) {
     insert(&pool, OWNER, 1)
         .await
         .expect("a well-formed row inserts");
 
     sqlx::raw_sql(include_str!(
-        "../migrations/0052_user_priv_key_custody_releases.sql"
+        "../migrations/0054_user_priv_key_custody_releases.sql"
     ))
     .execute(&pool)
     .await
-    .expect("0052 must be directly rerunnable");
+    .expect("0054 must be directly rerunnable");
     let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_priv_key_custody_releases")
         .fetch_one(&pool)
         .await

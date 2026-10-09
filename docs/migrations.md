@@ -100,8 +100,8 @@ primary key. It builds no index on an existing table and sets
 `lock_timeout` like 0050. No index serves the follower's revival read (live
 listings with `revived_from_cursor` set); it filters the live listings.
 
-0052 (priv data key custody releases) creates `user_priv_key_custody_releases`
+0054 (priv data key custody releases) creates `user_priv_key_custody_releases`
 with its primary key and a key-count check. It builds no index on an existing
 table and takes no lock on one. Roll forward rather than back once any row
-exists: a binary that predates 0052 would create a new data key for a released
+exists: a binary that predates 0054 would create a new data key for a released
 owner (see [private data key custody](priv-key-custody.md)).
