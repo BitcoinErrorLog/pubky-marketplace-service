@@ -12,7 +12,11 @@ use std::{path::PathBuf, time::Duration};
 
 use axum::http::StatusCode;
 use common::*;
-use marketplace_service::{clock::Clock, payments::PaykitPrepared, workers::drain_outbox};
+use marketplace_service::{
+    clock::Clock,
+    payments::PaykitPrepared,
+    workers::{drain_outbox, verify_due_paykit_payments},
+};
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
@@ -114,6 +118,7 @@ async fn bind_bitcoin(app: &TestApp, token: &str, order_id: Uuid) -> (StatusCode
 
 #[derive(sqlx::FromRow)]
 struct MarketplacePin {
+    seller_pubky: String,
     payment_method: Option<String>,
     paykit_invoice_id: Option<Uuid>,
     paykit_api: Option<String>,
@@ -121,12 +126,15 @@ struct MarketplacePin {
     paykit_stack_endpoint: Option<String>,
     paykit_activation_state: Option<String>,
     paykit_total_sats: Option<i64>,
+    paykit_delivery_state: Option<String>,
+    paykit_last_checked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 async fn marketplace_pin(pool: &PgPool, order_id: Uuid) -> MarketplacePin {
     sqlx::query_as(
-        "SELECT payment_method, paykit_invoice_id, paykit_api, paykit_stack_id, \
+        "SELECT seller_pubky, payment_method, paykit_invoice_id, paykit_api, paykit_stack_id, \
          paykit_stack_endpoint, paykit_activation_state, paykit_total_sats \
+         , paykit_delivery_state, paykit_last_checked_at \
          FROM orders WHERE id = $1",
     )
     .bind(order_id)
@@ -183,6 +191,7 @@ async fn upstream_live_commit_activate_replay_and_rollback_void(pool: PgPool) {
     let committed = marketplace_pin(&pool, committed_order).await;
     let committed_invoice = committed.paykit_invoice_id.expect("invoice durably bound");
     assert_eq!(committed.payment_method.as_deref(), Some("bitcoin"));
+    assert_eq!(committed.seller_pubky, seller.pubky);
     assert_eq!(committed.paykit_api.as_deref(), Some("upstream"));
     assert_eq!(committed.paykit_stack_id, None, "upstream has no stack_id");
     assert_eq!(
@@ -275,6 +284,41 @@ async fn upstream_live_commit_activate_replay_and_rollback_void(pool: PgPool) {
         .unwrap(),
         1,
         "rolled-back Marketplace bind was voided without publication"
+    );
+
+    // Exercise the production consumer against the production signed status
+    // route. A response can only project this invoice when both durable
+    // identities are correct; the closed DTO then maps delivered + no chain
+    // observation to an undetected outcome without advancing payment state.
+    assert_eq!(
+        verify_due_paykit_payments(
+            &app.state,
+            live_client(&app),
+            app.clock.now() + chrono::Duration::seconds(1),
+        )
+        .await
+        .expect("Marketplace worker polls signed upstream status"),
+        0
+    );
+    let observed = marketplace_pin(&pool, committed_order).await;
+    assert_eq!(observed.seller_pubky, seller.pubky);
+    assert_eq!(observed.paykit_invoice_id, Some(committed_invoice));
+    assert_eq!(observed.paykit_api.as_deref(), Some("upstream"));
+    assert_eq!(observed.paykit_stack_id, None);
+    assert_eq!(observed.paykit_stack_endpoint, None);
+    assert_eq!(observed.paykit_delivery_state.as_deref(), Some("delivered"));
+    assert!(
+        observed.paykit_last_checked_at.is_some(),
+        "production worker claimed and projected signed status"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM payments WHERE order_id = $1")
+            .bind(committed_order)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "awaiting_entitlement",
+        "no Bitcoin observation must not advance Marketplace payment"
     );
 
     paykit_pool.close().await;

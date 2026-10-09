@@ -1774,7 +1774,10 @@ impl PaykitClient {
     }
 
     /// Reads one Marketplace invoice through the dedicated signed status
-    /// endpoint. Producer fixture: paykit-server 0131f159, tree 012a304e.
+    /// endpoint. Producer fixture: paykit-server
+    /// `cce84b127febdc0411cd709df2b7cc913f6c4726`, tree
+    /// `faa5a49144fc27667360d15f6a0a306e58188c18` (composed reviewed typed
+    /// lifecycle, status, and live-harness commits).
     pub async fn marketplace_payment_status(
         &self,
         seller_pubky: &str,
