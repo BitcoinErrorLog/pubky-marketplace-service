@@ -795,6 +795,31 @@ pub enum PaykitStatusOutcome {
     Unavailable,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceBitcoinStatus {
+    txid: String,
+    observed_sats: u64,
+    confirmations: u32,
+    amount_matched: bool,
+    paid_on_time: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceStatusBody {
+    invoice_id: uuid::Uuid,
+    state: String,
+    proposal_delivery_state: String,
+    request_state: Option<String>,
+    payment_state: Option<String>,
+    activated_at: Option<chrono::DateTime<chrono::Utc>>,
+    payment_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    bitcoin: Option<MarketplaceBitcoinStatus>,
+    outcome: Option<String>,
+    resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Reads upstream paykit-server's `/transactions/status` body, which is
 /// exactly `{status, confirmations, amount_matched}`. `None` means the bytes
 /// are not that shape, and the caller fails closed as before.
@@ -1748,6 +1773,130 @@ impl PaykitClient {
         Ok(body["stack_id"].as_str().map(str::to_owned))
     }
 
+    /// Reads one Marketplace invoice through the dedicated signed status
+    /// endpoint. Producer fixture: paykit-server 0131f159, tree 012a304e.
+    pub async fn marketplace_payment_status(
+        &self,
+        seller_pubky: &str,
+        invoice_id: uuid::Uuid,
+        expected_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> (PaykitStatusOutcome, Option<PaykitDeliveryState>) {
+        let response = self
+            .post_signed_to(
+                PaykitApi::Upstream,
+                &self.base_url,
+                "/marketplace/payment-requests/status",
+                serde_json::json!({
+                    "creator": pubky_app_key(seller_pubky),
+                    "invoice_id": invoice_id,
+                }),
+            )
+            .await;
+        let Ok(response) = response else {
+            return (PaykitStatusOutcome::Unavailable, None);
+        };
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return (PaykitStatusOutcome::NotFound, None);
+        }
+        if !response.status().is_success() {
+            return (PaykitStatusOutcome::Unavailable, None);
+        }
+        let Ok(body) = response.json::<MarketplaceStatusBody>().await else {
+            return (PaykitStatusOutcome::Unavailable, None);
+        };
+        if body.invoice_id != invoice_id
+            || !matches!(body.state.as_str(), "prepared" | "active" | "voided")
+            || !body.request_state.as_deref().is_none_or(|state| {
+                matches!(
+                    state,
+                    "proposed"
+                        | "proposal_expired"
+                        | "accepted"
+                        | "rejected"
+                        | "canceled"
+                        | "proof_submitted"
+                        | "active_recurring"
+                )
+            })
+            || !body.payment_state.as_deref().is_none_or(|state| {
+                matches!(state, "undetected" | "detected" | "confirmed" | "expired")
+            })
+            || !body
+                .outcome
+                .as_deref()
+                .is_none_or(|value| matches!(value, "paid_manually" | "refunded" | "abandoned"))
+            || body.outcome.is_some() != body.resolved_at.is_some()
+        {
+            return (PaykitStatusOutcome::Unavailable, None);
+        }
+        let delivery = match body.proposal_delivery_state.as_str() {
+            "unpublished" => None,
+            "pending" => Some(PaykitDeliveryState::Pending),
+            "delivered" => Some(PaykitDeliveryState::Delivered),
+            "failed" => Some(PaykitDeliveryState::Failed),
+            _ => return (PaykitStatusOutcome::Unavailable, None),
+        };
+        if body.state != "active"
+            || body.activated_at.is_none()
+            || body.payment_deadline.is_none()
+            || body.payment_deadline != expected_deadline
+            || delivery.is_none()
+        {
+            return if matches!(body.state.as_str(), "prepared" | "voided")
+                && body.proposal_delivery_state == "unpublished"
+                && body.request_state.is_none()
+                && body.payment_state.is_none()
+                && body.activated_at.is_none()
+                && body.payment_deadline.is_none()
+                && body.bitcoin.is_none()
+            {
+                (PaykitStatusOutcome::Undetected, None)
+            } else {
+                (PaykitStatusOutcome::Unavailable, None)
+            };
+        }
+        let safe_request = matches!(
+            body.request_state.as_deref(),
+            Some("accepted" | "proof_submitted" | "active_recurring")
+        );
+        let Some(bitcoin) = body.bitcoin else {
+            return match body.payment_state.as_deref() {
+                Some("undetected" | "expired") => (PaykitStatusOutcome::Undetected, delivery),
+                _ => (PaykitStatusOutcome::Unavailable, delivery),
+            };
+        };
+        let facts = PaykitStatusFacts {
+            allocation_mode: "exclusive".to_string(),
+            late_settlement: !bitcoin.paid_on_time
+                || !safe_request
+                || body.payment_state.as_deref() == Some("expired"),
+            observation: PaykitObservation {
+                txid: Some(bitcoin.txid),
+                observed_sats: Some(bitcoin.observed_sats),
+                confirmations: Some(bitcoin.confirmations),
+            },
+        };
+        let outcome = if bitcoin.amount_matched
+            && (!safe_request || body.payment_state.as_deref() == Some("expired"))
+        {
+            PaykitStatusOutcome::Confirmed {
+                amount_matched: true,
+                facts,
+            }
+        } else {
+            match body.payment_state.as_deref() {
+                Some("confirmed") => PaykitStatusOutcome::Confirmed {
+                    amount_matched: bitcoin.amount_matched,
+                    facts,
+                },
+                Some("detected") => PaykitStatusOutcome::Detected { facts },
+                Some("undetected" | "expired") => PaykitStatusOutcome::Undetected,
+                _ => PaykitStatusOutcome::Unavailable,
+            }
+        };
+        (outcome, delivery)
+    }
+
     /// Polls the payment status for one order reference against the strict
     /// `paykit.bitcoin_status/v2` contract (W1.14): a missing/wrong
     /// `contract_version`, a missing/unknown `allocation_mode`, an unknown
@@ -1991,6 +2140,21 @@ pub trait PaykitStatusSource: Send + Sync + 'static {
     {
         Box::pin(async move { (self.status(seller_pubky, reference).await, None) })
     }
+
+    /// Polls using identity persisted with one invoice. Implementations that
+    /// only support the fork keep using the reference route.
+    fn status_for<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        reference: &'a str,
+        api: PaykitApi,
+        invoice_id: uuid::Uuid,
+        expected_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Pin<Box<dyn Future<Output = (PaykitStatusOutcome, Option<PaykitDeliveryState>)> + Send + 'a>>
+    {
+        let _ = (api, invoice_id, expected_deadline);
+        self.status_with_delivery(seller_pubky, reference)
+    }
 }
 
 impl PaykitStatusSource for PaykitClient {
@@ -2009,6 +2173,25 @@ impl PaykitStatusSource for PaykitClient {
     ) -> Pin<Box<dyn Future<Output = (PaykitStatusOutcome, Option<PaykitDeliveryState>)> + Send + 'a>>
     {
         Box::pin(self.payment_status_with_delivery(seller_pubky, reference))
+    }
+
+    fn status_for<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        reference: &'a str,
+        api: PaykitApi,
+        invoice_id: uuid::Uuid,
+        expected_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Pin<Box<dyn Future<Output = (PaykitStatusOutcome, Option<PaykitDeliveryState>)> + Send + 'a>>
+    {
+        match api {
+            PaykitApi::Fork => self.status_with_delivery(seller_pubky, reference),
+            PaykitApi::Upstream => Box::pin(self.marketplace_payment_status(
+                seller_pubky,
+                invoice_id,
+                expected_deadline,
+            )),
+        }
     }
 }
 

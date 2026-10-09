@@ -39,7 +39,7 @@ use crate::bitcoin_review::{apply_late_money, observation_json};
 use crate::handlers::fetch_order_for_update;
 use crate::model::PaymentRow;
 use crate::payments::{
-    legacy_order_reference, PaykitObservation, PaykitStatusOutcome, PaykitStatusSource,
+    legacy_order_reference, PaykitApi, PaykitObservation, PaykitStatusOutcome, PaykitStatusSource,
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
@@ -212,14 +212,21 @@ async fn apply_attempt_status(
     attempt: &WatchedAttempt,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    if attempt.paykit_api == "upstream" {
-        // Provider has no Marketplace status identity yet. Keep attempt
-        // durable and never send its UUID to the Locks bundle-status route.
-        return Ok(false);
-    }
+    let api = match attempt.paykit_api.as_str() {
+        "fork" => PaykitApi::Fork,
+        "upstream" => PaykitApi::Upstream,
+        _ => return Ok(false),
+    };
     match source
-        .status(&attempt.seller_pubky, &attempt.reference())
+        .status_for(
+            &attempt.seller_pubky,
+            &attempt.reference(),
+            api,
+            attempt.invoice_id,
+            attempt.expires_at,
+        )
         .await
+        .0
     {
         PaykitStatusOutcome::Confirmed {
             amount_matched,

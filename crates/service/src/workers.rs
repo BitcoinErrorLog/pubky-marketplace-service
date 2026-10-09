@@ -1759,8 +1759,11 @@ struct ClaimedPaykitOrder {
     payment_id: Uuid,
     buyer_pubky: String,
     seller_pubky: String,
+    paykit_invoice_id: Uuid,
+    paykit_api: String,
     paykit_request_reference: String,
     paykit_request_state: String,
+    paykit_expires_at: Option<DateTime<Utc>>,
     paykit_allocation_mode: Option<String>,
     paykit_stack_id: Option<String>,
     paykit_stack_endpoint: Option<String>,
@@ -1797,8 +1800,8 @@ async fn claim_due_paykit_orders(
              AND (o.paykit_last_checked_at IS NULL OR o.paykit_last_checked_at <= $2) \
              ORDER BY o.paykit_last_checked_at ASC NULLS FIRST LIMIT $3 \
              FOR UPDATE OF o SKIP LOCKED\
-         ) RETURNING id, payment_id, buyer_pubky, seller_pubky, \
-         paykit_request_reference, paykit_request_state, paykit_allocation_mode, \
+         ) RETURNING id, payment_id, buyer_pubky, seller_pubky, paykit_invoice_id, paykit_api, \
+         paykit_request_reference, paykit_request_state, paykit_expires_at, paykit_allocation_mode, \
          paykit_stack_id, paykit_stack_endpoint",
     )
     .bind(now)
@@ -1845,8 +1848,11 @@ async fn apply_confirmed_paykit_payment(
     now: DateTime<Utc>,
     late_settlement: bool,
 ) -> anyhow::Result<bool> {
-    let resolution_pins_present =
-        row.paykit_stack_id.is_some() && row.paykit_stack_endpoint.is_some();
+    let resolution_pins_present = match row.paykit_api.as_str() {
+        "fork" => row.paykit_stack_id.is_some() && row.paykit_stack_endpoint.is_some(),
+        "upstream" => row.paykit_stack_id.is_none() && row.paykit_stack_endpoint.is_none(),
+        _ => false,
+    };
     let mut tx = pool.begin().await?;
     let payment: Option<PaymentRow> = sqlx::query_as(&format!(
         "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1 FOR UPDATE"
@@ -2575,8 +2581,19 @@ async fn apply_paykit_status_outcome(
     row: &ClaimedPaykitOrder,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
+    let api = match row.paykit_api.as_str() {
+        "fork" => crate::payments::PaykitApi::Fork,
+        "upstream" => crate::payments::PaykitApi::Upstream,
+        _ => return Ok(false),
+    };
     let (outcome, delivery) = source
-        .status_with_delivery(&row.seller_pubky, &row.paykit_request_reference)
+        .status_for(
+            &row.seller_pubky,
+            &row.paykit_request_reference,
+            api,
+            row.paykit_invoice_id,
+            row.paykit_expires_at,
+        )
         .await;
     if let Some(delivery) = delivery {
         record_paykit_delivery(&state.pool, row, delivery).await?;

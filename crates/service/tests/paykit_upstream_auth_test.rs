@@ -12,7 +12,9 @@ mod common;
 
 use axum::http::StatusCode;
 use base64::Engine;
-use common::paykit_review::{create_sat_order, enable_bitcoin as enable_bitcoin_for_review};
+use common::paykit_review::{
+    create_sat_order, enable_bitcoin as enable_bitcoin_for_review, poll_now,
+};
 use common::*;
 use ed25519_dalek::{Signer, SigningKey, Verifier};
 use marketplace_service::clock::Clock;
@@ -49,6 +51,31 @@ const UPSTREAM_BODY: &str =
 const UPSTREAM_PREIMAGE_HEX: &str = "7061796b69742d687474702d7369676e61747572652d763100504f5354002f73657475702f737461747573007b2263726561746f72223a227075626b79746b7271387a6d77623861336d396b313563737533713137716d6667716e703964736b6272673975713172796470797870377179227d";
 const UPSTREAM_SIGNATURE: &str =
     "uGwZVTdCxIRugXQo2gui7dAz7Ude3mobvcretytsMx55Iyr3rCzLEm-rwpfJcphCTPOj6VAzD4sNMr2wT60OAw";
+const STATUS_INVOICE: uuid::Uuid = uuid::Uuid::from_u128(0x4c6e66c7_8a8b_4d54_b97b_340cedb3e1d0);
+const STATUS_BODY: &str = r#"{"creator":"pubkygy1wnkhfwezwdnawnur1bc3kw1x3jf5ggjj3cm37e31i5ntq3pco","invoice_id":"4c6e66c7-8a8b-4d54-b97b-340cedb3e1d0"}"#;
+const STATUS_SIGNATURE: &str =
+    "wis1mgbBnXe1u13cnM9-CUbS4EoT2q39_SlAnyQUgErHnQflpbEwyoM6AkP6wlD5sN-rQx14BVw7CUGSaznUAQ";
+
+fn producer_status_fixture() -> Value {
+    json!({
+        "activated_at": "1970-01-01T00:00:00Z",
+        "bitcoin": {
+            "amount_matched": true,
+            "confirmations": 3,
+            "observed_sats": 50_000,
+            "paid_on_time": true,
+            "txid": "0000000000000000000000000000000000000000000000000000000000000001"
+        },
+        "invoice_id": STATUS_INVOICE,
+        "outcome": "paid_manually",
+        "payment_deadline": "1970-01-02T00:00:00Z",
+        "payment_state": "confirmed",
+        "proposal_delivery_state": "delivered",
+        "request_state": "accepted",
+        "resolved_at": "1970-01-01T02:00:00Z",
+        "state": "active"
+    })
+}
 
 fn upstream_client(paykit: &FakePaykit) -> PaykitClient {
     PaykitClient::new(&paykit.base_url, TEST_PAYKIT_SIGNING_SEED)
@@ -259,6 +286,138 @@ async fn upstream_signs_every_request_with_the_preimage() {
         paykit.calls().is_empty(),
         "a Marketplace UUID is never guessed to be a Locks bundle_id"
     );
+}
+
+#[tokio::test]
+async fn marketplace_status_matches_reviewed_producer_fixture_and_signature_bytes() {
+    let preimage = paykit_signature_preimage(
+        "POST",
+        "/marketplace/payment-requests/status",
+        STATUS_BODY.as_bytes(),
+    );
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(SigningKey::from_bytes(&[7; 32]).sign(&preimage).to_bytes());
+    assert_eq!(signature, STATUS_SIGNATURE);
+
+    let paykit = upstream_paykit().await;
+    paykit.set_marketplace_status(STATUS_INVOICE, producer_status_fixture());
+    let client = upstream_client(&paykit);
+
+    let (outcome, delivery) = client
+        .marketplace_payment_status(
+            SELLER,
+            STATUS_INVOICE,
+            Some("1970-01-02T00:00:00Z".parse().unwrap()),
+        )
+        .await;
+    assert_eq!(
+        delivery,
+        Some(marketplace_service::payments::PaykitDeliveryState::Delivered)
+    );
+    assert!(matches!(
+        outcome,
+        PaykitStatusOutcome::Confirmed {
+            amount_matched: true,
+            facts
+        } if facts.allocation_mode == "exclusive"
+            && !facts.late_settlement
+            && facts.observation.txid.as_deref()
+                == Some("0000000000000000000000000000000000000000000000000000000000000001")
+            && facts.observation.observed_sats == Some(50_000)
+            && facts.observation.confirmations == Some(3)
+    ));
+
+    let call = paykit.calls().pop().expect("one status call");
+    assert_eq!(call.method, "POST");
+    assert_eq!(call.path, "/marketplace/payment-requests/status");
+    assert_eq!(serde_json::to_string(&call.body).unwrap(), STATUS_BODY);
+    assert_eq!(
+        call.body,
+        json!({"creator": format!("pubky{SELLER}"), "invoice_id": STATUS_INVOICE})
+    );
+}
+
+#[tokio::test]
+async fn marketplace_status_fails_closed_on_schema_identity_deadline_and_service_errors() {
+    let deadline = Some("1970-01-02T00:00:00Z".parse().unwrap());
+    for malformed in [
+        {
+            let mut value = producer_status_fixture();
+            value["extra"] = json!(true);
+            value
+        },
+        {
+            let mut value = producer_status_fixture();
+            value["invoice_id"] = json!(uuid::Uuid::new_v4());
+            value
+        },
+        {
+            let mut value = producer_status_fixture();
+            value["payment_deadline"] = json!("1970-01-03T00:00:00Z");
+            value
+        },
+        {
+            let mut value = producer_status_fixture();
+            value["request_state"] = json!("unknown");
+            value
+        },
+        {
+            let mut value = producer_status_fixture();
+            value["proposal_delivery_state"] = json!("retrying");
+            value
+        },
+    ] {
+        let paykit = upstream_paykit().await;
+        paykit.set_marketplace_status(STATUS_INVOICE, malformed);
+        assert_eq!(
+            upstream_client(&paykit)
+                .marketplace_payment_status(SELLER, STATUS_INVOICE, deadline)
+                .await
+                .0,
+            PaykitStatusOutcome::Unavailable
+        );
+    }
+
+    for (status, code) in [(409, "conflict"), (503, "unavailable")] {
+        let paykit = upstream_paykit().await;
+        paykit.fail_marketplace_status_with(status, code);
+        assert_eq!(
+            upstream_client(&paykit)
+                .marketplace_payment_status(SELLER, STATUS_INVOICE, deadline)
+                .await,
+            (PaykitStatusOutcome::Unavailable, None)
+        );
+    }
+}
+
+#[tokio::test]
+async fn marketplace_status_routes_late_or_terminal_matching_money_as_late_evidence() {
+    let deadline = Some("1970-01-02T00:00:00Z".parse().unwrap());
+    for mutate in ["late", "expired", "rejected"] {
+        let paykit = upstream_paykit().await;
+        let mut fixture = producer_status_fixture();
+        match mutate {
+            "late" => fixture["bitcoin"]["paid_on_time"] = json!(false),
+            "expired" => fixture["payment_state"] = json!("expired"),
+            "rejected" => fixture["request_state"] = json!("rejected"),
+            _ => unreachable!(),
+        }
+        paykit.set_marketplace_status(STATUS_INVOICE, fixture);
+        let outcome = upstream_client(&paykit)
+            .marketplace_payment_status(SELLER, STATUS_INVOICE, deadline)
+            .await
+            .0;
+        assert!(
+            matches!(
+                &outcome,
+                PaykitStatusOutcome::Confirmed {
+                    amount_matched: true,
+                    facts
+                } if facts.late_settlement
+            ),
+            "{mutate}: {outcome:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -656,6 +815,64 @@ async fn upstream_bind_persists_api_and_recovers_activation_after_config_rollbac
     assert_eq!(
         paykit.resolution(invoice_id).map(|value| value.0),
         Some("paid_manually".to_string())
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_worker_polls_durable_invoice_identity_and_confirms_on_time_payment(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin_for_review(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    let order_id = uuid::Uuid::parse_str(&order.order_id).unwrap();
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{order_id}/payment-method"),
+        Some(&buyer.token),
+        &json!({"method":"bitcoin"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    drain_outbox(&pool, client, app.clock.now(), 30)
+        .await
+        .unwrap();
+    let (invoice_id, deadline): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT paykit_invoice_id, paykit_expires_at FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut fixture = producer_status_fixture();
+    fixture["invoice_id"] = json!(invoice_id);
+    fixture["payment_deadline"] = json!(deadline.to_rfc3339());
+    fixture["bitcoin"]["confirmations"] = json!(6);
+    paykit.set_marketplace_status(invoice_id, fixture);
+
+    assert_eq!(poll_now(&app, app.clock.now()).await, 1);
+    let state: String = sqlx::query_scalar("SELECT state FROM payments WHERE order_id = $1")
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "confirmed");
+    let status_call = paykit
+        .calls()
+        .into_iter()
+        .find(|call| call.path == "/marketplace/payment-requests/status")
+        .expect("status called");
+    assert_eq!(
+        status_call.body,
+        json!({
+            "creator": format!("pubky{}", seller.pubky),
+            "invoice_id": invoice_id,
+        })
     );
 }
 

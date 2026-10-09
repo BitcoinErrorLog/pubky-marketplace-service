@@ -2024,6 +2024,9 @@ struct FakePaykitState {
     /// Scripted transaction-status bodies by bundle id (the strict
     /// `paykit.bitcoin_status/v2` shape the real client consumes).
     status_bodies: HashMap<String, Value>,
+    /// Exact Marketplace status bodies by server-issued invoice id.
+    marketplace_status_bodies: HashMap<uuid::Uuid, Value>,
+    marketplace_status_failure: Option<(u16, String)>,
     /// Status every transaction-status call answers with, when forced.
     status_failure: Option<u16>,
     calls: Vec<FakePaykitCall>,
@@ -2283,6 +2286,21 @@ impl FakePaykit {
             .expect("fake paykit lock")
             .status_bodies
             .insert(bundle_id.to_string(), body);
+    }
+
+    pub fn set_marketplace_status(&self, invoice_id: uuid::Uuid, body: Value) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .marketplace_status_bodies
+            .insert(invoice_id, body);
+    }
+
+    pub fn fail_marketplace_status_with(&self, status: u16, code: &str) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .marketplace_status_failure = Some((status, code.to_string()));
     }
 
     /// Force every transaction-status call to answer `status` (e.g. 503).
@@ -3182,6 +3200,43 @@ async fn serve_paykit_status(
     }
 }
 
+async fn serve_marketplace_status(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    const PATH: &str = "/marketplace/payment-requests/status";
+    let host = header_host(&headers);
+    let Some(parsed) = paykit_verify_signed(&state, "POST", PATH, &headers, &body) else {
+        return paykit_unauthorized();
+    };
+    let Some(object) = parsed.as_object() else {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    if object.len() != 2 || !object.contains_key("creator") || !object.contains_key("invoice_id") {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let Some(invoice_id) = parsed["invoice_id"]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+    else {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    paykit_record_call(&state, "POST", PATH, &host, &parsed);
+    let response = {
+        let guard = state.lock().expect("fake paykit lock");
+        if let Some((status, code)) = &guard.marketplace_status_failure {
+            return paykit_error(StatusCode::from_u16(*status).unwrap(), code);
+        }
+        guard.marketplace_status_bodies.get(&invoice_id).cloned()
+    };
+    match response {
+        Some(response) => (StatusCode::OK, axum::Json(response)).into_response(),
+        None => paykit_error(StatusCode::NOT_FOUND, "not_found"),
+    }
+}
+
 pub async fn spawn_fake_paykit() -> FakePaykit {
     let stack_id = format!("test-stack:{}", uuid::Uuid::new_v4());
     let state = Arc::new(Mutex::new(FakePaykitState {
@@ -3203,6 +3258,8 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         activate_gates: HashMap::new(),
         resolutions: HashMap::new(),
         status_bodies: HashMap::new(),
+        marketplace_status_bodies: HashMap::new(),
+        marketplace_status_failure: None,
         status_failure: None,
         calls: Vec::new(),
         rail_health: json!({
@@ -3259,6 +3316,10 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         .route(
             "/marketplace/payment-requests/resolve",
             axum::routing::post(serve_upstream_resolve),
+        )
+        .route(
+            "/marketplace/payment-requests/status",
+            axum::routing::post(serve_marketplace_status),
         )
         .route(
             "/transactions/status",
