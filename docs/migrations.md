@@ -110,3 +110,12 @@ are checked, no table scan runs under the lock. No default, no rewrite, no
 index on an existing table; it sets `lock_timeout` like 0050. A binary from
 before it lists its `orders` columns and ignores them. The asset, network and
 quote basis have no CHECK on purpose: a later value is not a migration.
+
+0054 (refund destinations) creates `order_refund_destinations` with its
+primary key and a foreign key to `orders`, and appends one refusal-audit
+command kind (`confirm_refund_destination`, 39). The table holds the
+Arbitrum One address a buyer confirmed for a USDT refund, one row per order.
+Its CHECKs fix the asset (`USDT`), the network (`arbitrum-one`), the address
+shape and the source (`buyer_entered`); a later source is a widened CHECK in
+a later migration. It builds no index on an existing table and sets
+`lock_timeout` like 0050.
