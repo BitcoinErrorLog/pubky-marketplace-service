@@ -220,17 +220,24 @@ its hold:
 
 | paykit-server | bind answer |
 | --- | --- |
-| `409 conflict` (a changed binding: a bug here, alerted) | `paykit_rejected` |
-| `400 invalid_request` (also a seller with no Bitcoin receiving details) | `paykit_rejected` |
-| `409 creator_session_invalid` | `seller_account_unclaimed` |
+| `409 operation_conflict` (a changed binding: a bug here, alerted) | `paykit_rejected` |
+| `400 invalid_request` (malformed request or over-cap window) | `paykit_rejected` |
+| `409 creator_session_invalid`, `503 seller_setup_pending` (the seller has no Bitcoin receiving details) | `seller_account_unclaimed`, the outcome the fork gives a seller without a claimed account |
 | `409 reader_not_payable` | `buyer_paykit_wallet_required` |
 | `503 reader_setup_pending` | `buyer_paykit_wallet_setup_needed` |
 | `401 invalid_signature` (the key is not in `trusted_public_keys`; alerted) | `paykit_unavailable` |
-| `503 creator_session_unavailable`, `dependency_unavailable`, `dependency_timeout`, `reader_registry_unavailable`; `502 reader_registry_malformed`; `429 rate_limited`; anything else | `paykit_unavailable` |
+| `503 creator_session_unavailable`, `dependency_unavailable`, `dependency_timeout`, `reader_registry_unavailable`; `502 reader_registry_malformed`; `429 rate_limited`; anything else (including the retired `409 conflict`) | `paykit_unavailable` |
 | a `200` that is not the closed answer, or whose `total_sats` is not the amount | `paykit_rejected`, `paykit_total_inconsistent` |
 
+`dependency_timeout` means the request outlived paykit-server's 15-second
+deadline and the preparation may still have committed. That is harmless: it is
+unpublished and lapses at its activation deadline. The service does not retry
+the attempt (its client also gives up at 10 seconds); the buyer's next bind
+reserves the next attempt and prepares a new operation. An exact retry of the
+same operation would replay the late commit, which the fixtures and tests pin.
+
 The contract tests replay exchanges captured from a real paykit-server at
-`3eff693` (`crates/service/tests/fixtures/paykit-server-66/`; its
+`f9079d5` (`crates/service/tests/fixtures/paykit-server-66/`; its
 `capture/README.md` says how they were captured).
 
 ### Address autocomplete proxy
