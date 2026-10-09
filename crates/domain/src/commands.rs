@@ -88,6 +88,7 @@ pub enum CommandPayload {
     ApproveReturn(OrderActionPayload),
     ReceiveReturn(OrderActionPayload),
     RecordExternalRefund(RecordExternalRefundPayload),
+    ConfirmRefundDestination(ConfirmRefundDestinationPayload),
     CreateReview(ReviewTermsPayload),
     UpdateReview(ReviewTermsPayload),
     SetBandConsent(SetBandConsentPayload),
@@ -130,6 +131,7 @@ impl Command {
             CommandPayload::ApproveReturn(_) => "return.approve",
             CommandPayload::ReceiveReturn(_) => "return.receive",
             CommandPayload::RecordExternalRefund(_) => "refund.record_external",
+            CommandPayload::ConfirmRefundDestination(_) => "refund.confirm_destination",
             CommandPayload::CreateReview(_) => "review.create",
             CommandPayload::UpdateReview(_) => "review.update",
             CommandPayload::SetBandConsent(_) => "attestation.set_band_consent",
@@ -175,6 +177,7 @@ impl Command {
             | CommandPayload::ConfirmPickup(p) => serde_json::to_value(p),
             CommandPayload::RequestReturn(p) => serde_json::to_value(p),
             CommandPayload::RecordExternalRefund(p) => serde_json::to_value(p),
+            CommandPayload::ConfirmRefundDestination(p) => serde_json::to_value(p),
             CommandPayload::CreateReview(p) | CommandPayload::UpdateReview(p) => {
                 serde_json::to_value(p)
             }
@@ -1006,6 +1009,17 @@ pub struct RecordExternalRefundPayload {
     pub transaction_id: String,
 }
 
+/// `refund.confirm_destination` (buyer, own USDT order only): the Arbitrum
+/// One USDT address the seller refunds to. The service validates the shape
+/// and the EIP-55 checksum; the payload carries no source, because the
+/// buyer-entered address is the only source there is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmRefundDestinationPayload {
+    pub order_id: Uuid,
+    pub address: String,
+}
+
 /// Review terms shared by `review.create` and `review.update` (the update
 /// command is this service only; the prototype had no review editing).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1188,6 +1202,9 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         "return.receive" => parse_payload(&envelope.payload).map(CommandPayload::ReceiveReturn)?,
         "refund.record_external" => {
             parse_payload(&envelope.payload).and_then(validate_record_external_refund)?
+        }
+        "refund.confirm_destination" => {
+            parse_payload(&envelope.payload).and_then(validate_confirm_refund_destination)?
         }
         "review.create" => parse_payload(&envelope.payload)
             .and_then(|payload| validate_review_terms(payload, CommandPayload::CreateReview))?,
@@ -1794,6 +1811,28 @@ fn validate_record_external_refund(
     );
     if issues.is_empty() {
         Ok(CommandPayload::RecordExternalRefund(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+/// The longest address text accepted before the service judges its shape,
+/// so a hostile payload is refused cheaply: a refund address is 42 characters.
+const REFUND_ADDRESS_MAX_CHARS: usize = 100;
+
+fn validate_confirm_refund_destination(
+    mut payload: ConfirmRefundDestinationPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed(
+        "payload.address",
+        &mut payload.address,
+        1,
+        REFUND_ADDRESS_MAX_CHARS,
+        &mut issues,
+    );
+    if issues.is_empty() {
+        Ok(CommandPayload::ConfirmRefundDestination(payload))
     } else {
         Err(issues)
     }
@@ -2628,6 +2667,10 @@ mod tests {
                 json!({ "order_id": order_id, "amount_minor": 14_796, "transaction_id": "bitcoin-tx-evidence-123" }),
             ),
             (
+                "refund.confirm_destination",
+                json!({ "order_id": order_id, "address": "0x52908400098527886E0F7030069857D2E4169EE7" }),
+            ),
+            (
                 "review.create",
                 json!({ "order_id": order_id, "rating": 5, "text": "Accurate and fast." }),
             ),
@@ -2657,6 +2700,33 @@ mod tests {
         );
         let issues = parse_command(&zero_rating).expect_err("rating 0 invalid");
         assert!(issues.iter().any(|i| i.path == "payload.rating"));
+    }
+
+    #[test]
+    fn refund_destination_payload_is_closed_and_trimmed() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let padded = order_command_json(
+            "refund.confirm_destination",
+            json!({ "order_id": order_id, "address": "  0xd8da6bf26964af9d7eed9e03e53415d37aa96045  " }),
+        );
+        let command = parse_command(&padded).expect("padded address parses");
+        let CommandPayload::ConfirmRefundDestination(payload) = command.payload else {
+            panic!("wrong payload");
+        };
+        assert_eq!(
+            payload.address,
+            "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+        );
+
+        for payload in [
+            json!({ "order_id": order_id, "address": "" }),
+            json!({ "order_id": order_id, "address": "0x".to_string() + &"a".repeat(120) }),
+            json!({ "order_id": order_id }),
+            json!({ "order_id": order_id, "address": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045", "source": "payment_address" }),
+        ] {
+            let command = order_command_json("refund.confirm_destination", payload);
+            assert!(parse_command(&command).is_err());
+        }
     }
 
     const TEST_BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";

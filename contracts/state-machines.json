@@ -827,6 +827,7 @@
         "return.approve",
         "return.receive",
         "refund.record_external",
+        "refund.confirm_destination",
         "review.create",
         "review.update"
       ],

@@ -479,6 +479,7 @@ pub fn order_machine() -> AggregateMachine {
             "return.approve",
             "return.receive",
             "refund.record_external",
+            "refund.confirm_destination",
             "review.create",
             "review.update",
         ],
@@ -1062,7 +1063,11 @@ mod tests {
         // Digital orders never need a return edge of their own.
         assert!(!can_transition(&machine, "paid", "return_requested"));
         // Change email moves no state, so only the catalog names it.
-        for command in ["fulfillment.deliver_digital", "order.set_delivery_email"] {
+        for command in [
+            "fulfillment.deliver_digital",
+            "order.set_delivery_email",
+            "refund.confirm_destination",
+        ] {
             assert!(machine.commands.contains(&command), "{command}");
         }
     }

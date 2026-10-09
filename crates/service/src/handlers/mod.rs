@@ -13,6 +13,7 @@ pub mod offer_checkout;
 pub mod offers;
 pub mod payment;
 pub mod pickup;
+pub mod refund_destination;
 pub mod register_listing;
 pub mod reserve_inventory;
 pub mod returns;
