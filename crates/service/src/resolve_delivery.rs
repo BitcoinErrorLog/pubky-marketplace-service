@@ -33,7 +33,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::payments::{PaykitClient, PaykitResolveResponse};
+use crate::payments::{PaykitClient, PaykitLifecycleTarget, PaykitResolveResponse};
 use crate::AppState;
 
 /// The pinned-endpoint readiness cache TTL (the same 15 s the
@@ -110,8 +110,10 @@ struct ClaimedResolveRow {
     invoice_id: Uuid,
     resolution: String,
     resolved_at: DateTime<Utc>,
-    stack_id: String,
-    stack_endpoint: String,
+    paykit_api: String,
+    creator_pubky: Option<String>,
+    stack_id: Option<String>,
+    stack_endpoint: Option<String>,
     attempt_count: i32,
     delivery_deadline: DateTime<Utc>,
     auth_alerted: bool,
@@ -129,8 +131,8 @@ async fn claim_due_resolve_rows(
              WHERE delivery_state = 'queued' AND next_attempt_at <= $1 \
              AND (lease_until IS NULL OR lease_until <= $1) \
              ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED\
-         ) RETURNING id, order_id, invoice_id, resolution, resolved_at, stack_id, \
-         stack_endpoint, attempt_count, delivery_deadline, auth_alerted",
+         ) RETURNING id, order_id, invoice_id, resolution, resolved_at, paykit_api, \
+         creator_pubky, stack_id, stack_endpoint, attempt_count, delivery_deadline, auth_alerted",
     )
     .bind(now)
     .bind(now + chrono::Duration::seconds(lease_seconds))
@@ -267,22 +269,27 @@ async fn pin_check(
     row: &ClaimedResolveRow,
     now: DateTime<Utc>,
 ) -> Result<bool, ()> {
-    let reported = match state.resolve_pin_cache.get(&row.stack_endpoint, now) {
+    let (Some(stack_endpoint), Some(stack_id)) =
+        (row.stack_endpoint.as_deref(), row.stack_id.as_deref())
+    else {
+        return Ok(false);
+    };
+    let reported = match state.resolve_pin_cache.get(stack_endpoint, now) {
         Some(cached) => cached,
         None => {
-            let fetched = paykit.stack_identity_at(&row.stack_endpoint).await;
+            let fetched = paykit.stack_identity_at(stack_endpoint).await;
             match fetched {
                 Ok(stack_id) => {
                     state
                         .resolve_pin_cache
-                        .put(&row.stack_endpoint, stack_id.clone(), now);
+                        .put(stack_endpoint, stack_id.clone(), now);
                     stack_id
                 }
                 Err(_) => return Err(()),
             }
         }
     };
-    Ok(reported.as_deref() == Some(row.stack_id.as_str()))
+    Ok(reported.as_deref() == Some(stack_id))
 }
 
 /// Delivers one claimed row. Returns true when the row reached a finished
@@ -309,29 +316,51 @@ async fn deliver_one_resolve_row(
     }
     // The local half of the pin: compare before sending, never send on a
     // mismatch.
-    match pin_check(state, paykit, row, now).await {
-        Ok(true) => {}
-        Ok(false) => {
-            stamp_terminal(pool, row, "stack_pin_mismatch", None, now).await?;
+    match row.paykit_api.as_str() {
+        "fork" => match pin_check(state, paykit, row, now).await {
+            Ok(true) => {}
+            Ok(false) => {
+                stamp_terminal(pool, row, "stack_pin_mismatch", None, now).await?;
+                return Ok(true);
+            }
+            Err(()) => {
+                tracing::warn!(
+                    row_id = row.id,
+                    "the pinned endpoint is unreachable for the readiness read; retrying"
+                );
+                return schedule_retry(pool, row, None, now).await;
+            }
+        },
+        "upstream" => {}
+        _ => {
+            stamp_terminal(
+                pool,
+                row,
+                "unmapped_resolve_error",
+                Some("invalid paykit_api".into()),
+                now,
+            )
+            .await?;
             return Ok(true);
-        }
-        Err(()) => {
-            tracing::warn!(
-                row_id = row.id,
-                "the pinned endpoint is unreachable for the readiness read; retrying"
-            );
-            return schedule_retry(pool, row, None, now).await;
         }
     }
 
+    let target = match row.paykit_api.as_str() {
+        "fork" => PaykitLifecycleTarget::Fork {
+            endpoint: row.stack_endpoint.clone().expect("validated fork endpoint"),
+            stack_id: row.stack_id.clone().expect("validated fork stack id"),
+        },
+        "upstream" => PaykitLifecycleTarget::Upstream {
+            creator: row
+                .creator_pubky
+                .clone()
+                .expect("constrained upstream creator"),
+        },
+        _ => unreachable!(),
+    };
+
     let outcome = paykit
-        .resolve_payment_request(
-            &row.stack_endpoint,
-            row.invoice_id,
-            &row.stack_id,
-            &row.resolution,
-            row.resolved_at,
-        )
+        .resolve_payment_request(&target, row.invoice_id, &row.resolution, row.resolved_at)
         .await;
     let response = match outcome {
         Ok(response) => response,
@@ -366,7 +395,7 @@ async fn classify_response(
     // a contract violation — fail visible, not a success.
     if response.status.is_success() {
         return match response.resolved {
-            Some(resolved) if resolved.resolution == row.resolution => {
+            Some(resolved) if resolved.outcome == row.resolution => {
                 stamp_delivered(pool, row.id, now).await?;
                 tracing::info!(
                     row_id = row.id,
@@ -383,7 +412,7 @@ async fn classify_response(
                     "unmapped_resolve_error",
                     Some(format!(
                         "status={status} resolution_mismatch:{}",
-                        resolved.resolution
+                        resolved.outcome
                     )),
                     now,
                 )

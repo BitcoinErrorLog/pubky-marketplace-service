@@ -14,6 +14,7 @@ mod common;
 use axum::http::StatusCode;
 use common::*;
 use marketplace_service::clock::Clock;
+use marketplace_service::payments::PaykitLifecycleTarget;
 use marketplace_service::workers::drain_outbox;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -136,13 +137,12 @@ async fn live_a_rebind_after_a_void_prepares_a_new_invoice(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "first bind failed: {body}");
     let first = paykit_pin(&pool, &order_id).await;
     let first_invoice = first.paykit_invoice_id.expect("first invoice pinned");
+    let target = PaykitLifecycleTarget::Fork {
+        endpoint: first.paykit_stack_endpoint.clone().expect("endpoint"),
+        stack_id: first.paykit_stack_id.clone().expect("stack id"),
+    };
     let voided = live_client(&app)
-        .void_payment_request(
-            first.paykit_stack_endpoint.as_deref().expect("endpoint"),
-            first_invoice,
-            first.paykit_stack_id.as_deref().expect("stack id"),
-            "marketplace_bind_rolled_back",
-        )
+        .void_payment_request(&target, first_invoice, "marketplace_bind_rolled_back")
         .await
         .expect("paykit voids the prepared invoice");
     assert_eq!(voided.state, "void_cancelled");

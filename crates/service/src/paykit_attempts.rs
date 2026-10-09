@@ -64,20 +64,22 @@ pub(crate) async fn record_released_attempt(
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO paykit_superseded_attempts (order_id, invoice_id, reference, stack_id, \
+        "INSERT INTO paykit_superseded_attempts (order_id, invoice_id, reference, paykit_api, stack_id, \
          stack_endpoint, total_sats, expires_at, prepare_expires_at, allocation_mode, \
          address_fingerprint, bitcoin_quote_rate, bitcoin_quote_source, \
          bitcoin_quote_fetched_at, bitcoin_quoted_sats, bitcoin_quote_expires_at, \
          bitcoin_quote_currency, bitcoin_quote_exponent, bitcoin_quote_spread_bps, \
          released_at) \
-         SELECT id, paykit_invoice_id, paykit_request_reference, paykit_stack_id, \
+         SELECT id, paykit_invoice_id, paykit_request_reference, paykit_api, paykit_stack_id, \
          paykit_stack_endpoint, paykit_total_sats, paykit_expires_at, \
          paykit_prepare_expires_at, paykit_allocation_mode, paykit_address_fingerprint, \
          bitcoin_quote_rate, bitcoin_quote_source, bitcoin_quote_fetched_at, \
          bitcoin_quoted_sats, bitcoin_quote_expires_at, bitcoin_quote_currency, \
          bitcoin_quote_exponent, bitcoin_quote_spread_bps, $2 FROM orders \
-         WHERE id = $1 AND paykit_invoice_id IS NOT NULL AND paykit_stack_id IS NOT NULL \
-         AND paykit_stack_endpoint IS NOT NULL AND paykit_total_sats > 0 \
+         WHERE id = $1 AND paykit_invoice_id IS NOT NULL AND paykit_api IS NOT NULL \
+         AND paykit_total_sats > 0 \
+         AND ((paykit_api = 'fork' AND paykit_stack_id IS NOT NULL AND paykit_stack_endpoint IS NOT NULL) \
+              OR (paykit_api = 'upstream' AND paykit_stack_id IS NULL AND paykit_stack_endpoint IS NULL)) \
          ON CONFLICT (order_id, invoice_id) DO NOTHING",
     )
     .bind(order_id)
@@ -92,6 +94,7 @@ struct WatchedAttempt {
     order_id: Uuid,
     invoice_id: Uuid,
     reference: Option<String>,
+    paykit_api: String,
     expires_at: Option<DateTime<Utc>>,
     released_at: DateTime<Utc>,
     detected_at: Option<DateTime<Utc>>,
@@ -136,9 +139,9 @@ async fn claim_due_attempts(
                  make_interval(secs => $4::double precision)) \
              FROM due \
              WHERE h.order_id = due.order_id AND h.invoice_id = due.invoice_id \
-             RETURNING h.order_id, h.invoice_id, h.reference, h.expires_at, h.released_at, \
+             RETURNING h.order_id, h.invoice_id, h.reference, h.paykit_api, h.expires_at, h.released_at, \
              h.detected_at\
-         ) SELECT c.order_id, c.invoice_id, c.reference, c.expires_at, c.released_at, \
+         ) SELECT c.order_id, c.invoice_id, c.reference, c.paykit_api, c.expires_at, c.released_at, \
            c.detected_at, o.seller_pubky \
            FROM claimed c JOIN orders o ON o.id = c.order_id",
     )
@@ -209,6 +212,11 @@ async fn apply_attempt_status(
     attempt: &WatchedAttempt,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
+    if attempt.paykit_api == "upstream" {
+        // Provider has no Marketplace status identity yet. Keep attempt
+        // durable and never send its UUID to the Locks bundle-status route.
+        return Ok(false);
+    }
     match source
         .status(&attempt.seller_pubky, &attempt.reference())
         .await
@@ -278,6 +286,7 @@ async fn apply_attempt_status(
 struct ReleasedPins {
     state: String,
     reference: Option<String>,
+    paykit_api: String,
     stack_id: String,
     stack_endpoint: String,
     total_sats: i64,
@@ -324,7 +333,7 @@ async fn route_released_settlement(
         anyhow::bail!("released paykit attempt names a missing order");
     };
     let pins: Option<ReleasedPins> = sqlx::query_as(
-        "SELECT state, reference, stack_id, stack_endpoint, total_sats, expires_at, \
+        "SELECT state, reference, paykit_api, stack_id, stack_endpoint, total_sats, expires_at, \
          prepare_expires_at, allocation_mode, address_fingerprint, bitcoin_quote_rate, \
          bitcoin_quote_source, bitcoin_quote_fetched_at, bitcoin_quoted_sats, \
          bitcoin_quote_expires_at, bitcoin_quote_currency, bitcoin_quote_exponent, \
@@ -393,7 +402,7 @@ async fn route_released_settlement(
         }
     }
     sqlx::query(
-        "UPDATE orders SET payment_method = 'bitcoin', paykit_invoice_id = $2, \
+        "UPDATE orders SET payment_method = 'bitcoin', paykit_invoice_id = $2, paykit_api = $22, \
          paykit_request_reference = $3, paykit_stack_id = $4, paykit_stack_endpoint = $5, \
          paykit_total_sats = $6, paykit_expires_at = $7, paykit_prepare_expires_at = $8, \
          paykit_allocation_mode = $9, paykit_address_fingerprint = $10, \
@@ -427,6 +436,7 @@ async fn route_released_settlement(
     .bind(&frozen)
     .bind(observation.observed_sats.map(i64::try_from).transpose()?)
     .bind(now)
+    .bind(&pins.paykit_api)
     .execute(&mut *tx)
     .await?;
     sqlx::query(

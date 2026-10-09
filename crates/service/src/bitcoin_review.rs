@@ -587,20 +587,27 @@ async fn enqueue_resolve_row(
     resolution: &str,
     now: DateTime<Utc>,
 ) -> Result<(), ResolutionFailure> {
-    let (Some(invoice_id), Some(stack_id), Some(endpoint)) = (
-        order.paykit_invoice_id,
-        order.paykit_stack_id.clone(),
-        order.paykit_stack_endpoint.clone(),
-    ) else {
+    let Some(invoice_id) = order.paykit_invoice_id else {
         // Scope was validated by the caller (pin presence is a
         // precondition); reaching here is an invariant violation.
         return Err(ResolutionFailure::MissingPin);
     };
+    let (stack_id, endpoint, creator) = match order.paykit_api.as_deref() {
+        Some("fork") => match (
+            order.paykit_stack_id.clone(),
+            order.paykit_stack_endpoint.clone(),
+        ) {
+            (Some(stack_id), Some(endpoint)) => (Some(stack_id), Some(endpoint), None),
+            _ => return Err(ResolutionFailure::MissingPin),
+        },
+        Some("upstream") => (None, None, Some(order.seller_pubky.clone())),
+        _ => return Err(ResolutionFailure::MissingPin),
+    };
     sqlx::query(
         "INSERT INTO paykit_resolve_outbox (order_id, payment_id, event_id, invoice_id, \
-         resolution, resolved_at, stack_id, stack_endpoint, next_attempt_at, delivery_deadline, \
-         created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)",
+         resolution, resolved_at, paykit_api, creator_pubky, stack_id, stack_endpoint, \
+         next_attempt_at, delivery_deadline, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)",
     )
     .bind(order.id)
     .bind(payment_id)
@@ -608,6 +615,8 @@ async fn enqueue_resolve_row(
     .bind(invoice_id)
     .bind(resolution)
     .bind(now)
+    .bind(order.paykit_api.as_deref())
+    .bind(creator)
     .bind(stack_id)
     .bind(endpoint)
     .bind(now)
@@ -793,8 +802,16 @@ pub async fn resolve_bitcoin_payment(
         );
     }
     let pins_present = order.paykit_request_reference.is_some()
-        && order.paykit_stack_id.is_some()
-        && order.paykit_stack_endpoint.is_some();
+        && order.paykit_invoice_id.is_some()
+        && match order.paykit_api.as_deref() {
+            Some("fork") => {
+                order.paykit_stack_id.is_some() && order.paykit_stack_endpoint.is_some()
+            }
+            Some("upstream") => {
+                order.paykit_stack_id.is_none() && order.paykit_stack_endpoint.is_none()
+            }
+            _ => false,
+        };
     if !pins_present {
         return audited_resolve_refusal(
             &state,
@@ -2002,7 +2019,10 @@ pub async fn watch_manual_reviews(
          WHERE p.adapter = 'paykit' AND o.payment_method = 'bitcoin' \
          AND p.state = 'manual_review' AND p.resolution_outcome IS NULL \
          AND o.paykit_request_reference IS NOT NULL \
-         AND o.paykit_stack_id IS NOT NULL AND o.paykit_stack_endpoint IS NOT NULL \
+         AND ((o.paykit_api = 'fork' AND o.paykit_stack_id IS NOT NULL \
+               AND o.paykit_stack_endpoint IS NOT NULL) \
+              OR (o.paykit_api = 'upstream' AND o.paykit_invoice_id IS NOT NULL \
+                  AND o.paykit_stack_id IS NULL AND o.paykit_stack_endpoint IS NULL)) \
          ORDER BY p.manual_review_entered_at LIMIT 100",
     )
     .fetch_all(pool)

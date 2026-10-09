@@ -58,7 +58,10 @@ use crate::handlers::payment::confirm_order;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
 use crate::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
 use crate::model::{ListingRow, PaymentRow};
-use crate::payments::{PaykitClient, PaykitCommandError, PaykitStatusOutcome, PaykitStatusSource};
+use crate::payments::{
+    PaykitClient, PaykitCommandError, PaykitLifecycleTarget, PaykitStatusOutcome,
+    PaykitStatusSource,
+};
 use crate::queries::PAYMENT_COLUMNS;
 use crate::{expiry, fx, AppState};
 
@@ -917,7 +920,7 @@ async fn deliver_paykit_activation(
     let payload = parse_activate_payload(row)?;
     // Read the order's persisted pin under its row lock; count this try by
     // incrementing the attempt in the payload before the call.
-    let (endpoint, stack_id, total_sats, attempt) = {
+    let (target, total_sats, attempt) = {
         let mut tx = pool.begin().await?;
         let Some(order) = fetch_order_for_update(&mut tx, payload.order_id).await? else {
             anyhow::bail!(
@@ -939,16 +942,24 @@ async fn deliver_paykit_activation(
             // An order that left `pending_payment` with its request still
             // `preparing` (a cancel from before cancel voided the request):
             // never publish it — void instead.
-            let pin = match (
-                order.paykit_invoice_id,
-                order.paykit_stack_id.clone(),
-                order.paykit_stack_endpoint.clone(),
-            ) {
-                (Some(invoice_id), Some(stack_id), Some(stack_endpoint)) => {
-                    Some(crate::handlers::cancellation::PaykitVoidPin {
+            let pin = match (order.paykit_invoice_id, order.paykit_api.as_deref()) {
+                (Some(invoice_id), Some("fork")) => match (
+                    order.paykit_stack_id.clone(),
+                    order.paykit_stack_endpoint.clone(),
+                ) {
+                    (Some(stack_id), Some(stack_endpoint)) => {
+                        Some(crate::handlers::cancellation::PaykitVoidPin::Fork {
+                            invoice_id,
+                            stack_id,
+                            stack_endpoint,
+                        })
+                    }
+                    _ => None,
+                },
+                (Some(invoice_id), Some("upstream")) => {
+                    Some(crate::handlers::cancellation::PaykitVoidPin::Upstream {
                         invoice_id,
-                        stack_id,
-                        stack_endpoint,
+                        creator: order.seller_pubky.clone(),
                     })
                 }
                 _ => None,
@@ -987,46 +998,50 @@ async fn deliver_paykit_activation(
         .bind(serde_json::json!(attempt))
         .execute(&mut *tx)
         .await?;
-        let pin = (
-            order.paykit_stack_endpoint.clone(),
-            order.paykit_stack_id.clone(),
-            order.paykit_total_sats,
-        );
+        let target = match order.paykit_api.as_deref() {
+            Some("fork") => match (
+                order.paykit_stack_endpoint.clone(),
+                order.paykit_stack_id.clone(),
+            ) {
+                (Some(endpoint), Some(stack_id)) => {
+                    PaykitLifecycleTarget::Fork { endpoint, stack_id }
+                }
+                _ => anyhow::bail!(
+                    "preparing fork order {} is missing its persisted paykit pin",
+                    payload.order_id
+                ),
+            },
+            Some("upstream") => PaykitLifecycleTarget::Upstream {
+                creator: order.seller_pubky.clone(),
+            },
+            other => anyhow::bail!(
+                "preparing order {} has invalid paykit_api {:?}",
+                payload.order_id,
+                other
+            ),
+        };
+        let total_sats = order.paykit_total_sats;
         tx.commit().await?;
-        let (Some(endpoint), Some(stack_id), Some(total_sats)) = pin else {
+        let Some(total_sats) = total_sats else {
             anyhow::bail!(
-                "preparing order {} is missing its persisted paykit pin",
+                "preparing order {} is missing paykit_total_sats",
                 payload.order_id
             );
         };
-        (endpoint, stack_id, total_sats, attempt)
+        (target, total_sats, attempt)
     };
     let total_sats = u64::try_from(total_sats)
         .map_err(|_| anyhow::anyhow!("order {} paykit_total_sats is negative", payload.order_id))?;
     match paykit
         .activate_payment_request(
-            &endpoint,
+            &target,
             payload.invoice_id,
-            &stack_id,
             total_sats,
             u64::try_from(attempt).unwrap_or(0),
         )
         .await
     {
         Ok(activated) => {
-            // §B.11.3: a well-formed activation success has
-            // `state: "observing"`. Any other state in a 200 is a
-            // malformed success — retryable under the lease like an
-            // unparseable body, never terminal, never active.
-            if activated.state != "observing" {
-                tracing::warn!(
-                    order_id = %payload.order_id,
-                    invoice_id = %payload.invoice_id,
-                    state = %activated.state,
-                    "paykit activate returned a 200 with a non-observing state; retrying"
-                );
-                return Ok(false);
-            }
             if activated.total_sats != total_sats {
                 tracing::error!(
                     order_id = %payload.order_id,
@@ -1044,11 +1059,13 @@ async fn deliver_paykit_activation(
             // row cannot apply the flip twice.
             let flipped = sqlx::query(
                 "UPDATE orders SET paykit_activation_state = 'active', \
-                 paykit_request_state = 'pending', updated_at = $2 \
+                 paykit_request_state = 'pending', paykit_expires_at = $3, \
+                 hold_expires_at = $3, updated_at = $2 \
                  WHERE id = $1 AND paykit_activation_state = 'preparing'",
             )
             .bind(payload.order_id)
             .bind(now)
+            .bind(activated.payment_deadline)
             .execute(&mut *tx)
             .await?;
             let retracked = flipped.rows_affected() == 0
@@ -1096,7 +1113,6 @@ async fn deliver_paykit_activation(
                 tracing::error!(
                     order_id = %payload.order_id,
                     invoice_id = %payload.invoice_id,
-                    stack_id = %stack_id,
                     "ALERT paykit reports an unknown invoice (stack mixup); voiding the bind"
                 );
                 void_prepare_effects(pool, row.id, payload.order_id, now).await?;
@@ -1114,8 +1130,6 @@ async fn deliver_paykit_activation(
             PaykitCommandError::StackIdentityMismatch => {
                 tracing::error!(
                     order_id = %payload.order_id,
-                    persisted_stack_id = %stack_id,
-                    endpoint = %endpoint,
                     "ALERT the persisted paykit endpoint answered with a different stack \
                      identity; voiding the bind"
                 );
@@ -1234,11 +1248,19 @@ async fn deliver_paykit_void(
     let invoice_id: Uuid = payload_str(&row.payload, "invoice_id", row.id)?
         .parse()
         .map_err(|_| anyhow::anyhow!("outbox row {} invoice_id is not a uuid", row.id))?;
-    let stack_id = payload_str(&row.payload, "stack_id", row.id)?;
-    let endpoint = payload_str(&row.payload, "stack_endpoint", row.id)?;
     let reason = payload_str(&row.payload, "reason", row.id)?;
+    let target = match row.payload["paykit_api"].as_str().unwrap_or("fork") {
+        "fork" => PaykitLifecycleTarget::Fork {
+            stack_id: payload_str(&row.payload, "stack_id", row.id)?.to_string(),
+            endpoint: payload_str(&row.payload, "stack_endpoint", row.id)?.to_string(),
+        },
+        "upstream" => PaykitLifecycleTarget::Upstream {
+            creator: payload_str(&row.payload, "creator", row.id)?.to_string(),
+        },
+        value => anyhow::bail!("outbox row {} has invalid paykit_api {value}", row.id),
+    };
     match paykit
-        .void_payment_request(endpoint, invoice_id, stack_id, reason)
+        .void_payment_request(&target, invoice_id, reason)
         .await
     {
         Ok(voided) => {
@@ -1291,7 +1313,6 @@ async fn deliver_paykit_void(
             tracing::error!(
                 row_id = row.id,
                 invoice_id = %invoice_id,
-                stack_id = %stack_id,
                 "ALERT paykit void refused with a stack identity mismatch; stamping delivered"
             );
             stamp_delivered_only(pool, row.id, now).await?;
@@ -3131,14 +3152,16 @@ async fn expire_preparing_order(
     #[derive(sqlx::FromRow)]
     struct PreparingPin {
         paykit_invoice_id: Option<Uuid>,
+        paykit_api: Option<String>,
         paykit_stack_id: Option<String>,
         paykit_stack_endpoint: Option<String>,
+        seller_pubky: String,
         hold_expires_at: Option<DateTime<Utc>>,
         payment_id: Uuid,
     }
     let pin: Option<PreparingPin> = sqlx::query_as(
-        "SELECT o.paykit_invoice_id, o.paykit_stack_id, o.paykit_stack_endpoint, \
-             o.hold_expires_at, p.id AS payment_id \
+        "SELECT o.paykit_invoice_id, o.paykit_api, o.paykit_stack_id, o.paykit_stack_endpoint, \
+             o.seller_pubky, o.hold_expires_at, p.id AS payment_id \
              FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
     )
     .bind(order_id)
@@ -3146,13 +3169,24 @@ async fn expire_preparing_order(
     .await?;
     let Some(PreparingPin {
         paykit_invoice_id: Some(invoice_id),
-        paykit_stack_id: Some(stack_id),
-        paykit_stack_endpoint: Some(endpoint),
+        paykit_api: Some(api),
+        paykit_stack_id,
+        paykit_stack_endpoint,
+        seller_pubky,
         hold_expires_at,
         payment_id,
     }) = pin
     else {
         anyhow::bail!("preparing order {order_id} is missing its persisted paykit pin");
+    };
+    let target = match (api.as_str(), paykit_stack_endpoint, paykit_stack_id) {
+        ("fork", Some(endpoint), Some(stack_id)) => {
+            PaykitLifecycleTarget::Fork { endpoint, stack_id }
+        }
+        ("upstream", None, None) => PaykitLifecycleTarget::Upstream {
+            creator: seller_pubky,
+        },
+        _ => anyhow::bail!("preparing order {order_id} has invalid paykit lifecycle pins"),
     };
     let Some(paykit) = state
         .payments
@@ -3166,7 +3200,7 @@ async fn expire_preparing_order(
         return Ok(false);
     };
     match paykit
-        .void_payment_request(&endpoint, invoice_id, &stack_id, "hold_expired")
+        .void_payment_request(&target, invoice_id, "hold_expired")
         .await
     {
         Ok(voided) => {
@@ -3213,8 +3247,6 @@ async fn expire_preparing_order(
         Err(PaykitCommandError::StackIdentityMismatch) => {
             tracing::error!(
                 order_id = %order_id,
-                stack_id = %stack_id,
-                endpoint = %endpoint,
                 "ALERT the persisted paykit endpoint answered with a different stack identity \
                  at hold-expiry void; voiding locally"
             );
@@ -3251,7 +3283,6 @@ async fn expire_preparing_order(
             tracing::error!(
                 order_id = %order_id,
                 invoice_id = %invoice_id,
-                endpoint = %endpoint,
                 "ALERT paykit_unreachable_at_void: voiding locally past the 30-minute grace \
                  and deferring the remote void to a paykit.void outbox row"
             );
@@ -3323,30 +3354,38 @@ async fn void_and_expire_preparing_order(
     )
     .await?;
     if enqueue_void_retry {
-        let pin: (Option<Uuid>, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT paykit_invoice_id, paykit_stack_id, paykit_stack_endpoint \
+        let pin: (Option<Uuid>, Option<String>, Option<String>, Option<String>, String) = sqlx::query_as(
+            "SELECT paykit_invoice_id, paykit_api, paykit_stack_id, paykit_stack_endpoint, seller_pubky \
              FROM orders WHERE id = $1",
         )
         .bind(order_id)
         .fetch_one(&mut *tx)
         .await?;
-        let (Some(invoice_id), Some(stack_id), Some(endpoint)) = pin else {
-            anyhow::bail!("preparing order {order_id} is missing its persisted paykit pin");
+        let (Some(invoice_id), Some(api), stack_id, endpoint, creator) = pin else {
+            anyhow::bail!("preparing order {order_id} is missing its paykit invoice");
         };
-        sqlx::query(
-            "INSERT INTO outbox (event_id, kind, payload, created_at) \
-             VALUES ($1, 'paykit.void', $2, $3)",
+        let pin = match (api.as_str(), stack_id, endpoint) {
+            ("fork", Some(stack_id), Some(stack_endpoint)) => {
+                crate::handlers::cancellation::PaykitVoidPin::Fork {
+                    invoice_id,
+                    stack_id,
+                    stack_endpoint,
+                }
+            }
+            ("upstream", None, None) => crate::handlers::cancellation::PaykitVoidPin::Upstream {
+                invoice_id,
+                creator,
+            },
+            _ => anyhow::bail!("preparing order {order_id} has invalid paykit lifecycle pins"),
+        };
+        crate::handlers::cancellation::enqueue_paykit_void(
+            &mut tx,
+            event_id,
+            order_id,
+            &pin,
+            "hold_expired",
+            now,
         )
-        .bind(event_id)
-        .bind(serde_json::json!({
-            "invoice_id": invoice_id,
-            "order_id": order_id,
-            "stack_id": stack_id,
-            "stack_endpoint": endpoint,
-            "reason": "hold_expired",
-        }))
-        .bind(now)
-        .execute(&mut *tx)
         .await?;
     }
     sqlx::query("UPDATE outbox SET delivered_at = $2 WHERE id = $1")

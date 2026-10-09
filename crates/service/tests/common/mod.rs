@@ -2604,6 +2604,213 @@ async fn serve_paykit_payment_request(
     }
 }
 
+async fn serve_upstream_prepare(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    const PATH: &str = "/marketplace/payment-requests/prepare";
+    let host = header_host(&headers);
+    let Some(parsed) = paykit_verify_signed(&state, "POST", PATH, &headers, &body) else {
+        return paykit_unauthorized();
+    };
+    paykit_record_call(&state, "POST", PATH, &host, &parsed);
+    let expected = [
+        "amount_sats",
+        "creator",
+        "operation_id",
+        "payment_window_seconds",
+        "reader",
+        "reference",
+    ];
+    let Some(object) = parsed.as_object() else {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let mut guard = state.lock().expect("fake paykit lock");
+    if let Some(code) = guard.create_error.clone() {
+        return paykit_error(
+            StatusCode::from_u16(guard.create_error_status).expect("valid fake status"),
+            &code,
+        );
+    }
+    let key = (
+        parsed["creator"].as_str().unwrap_or_default().to_string(),
+        parsed["operation_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    );
+    if let Some(prepared) = guard.prepared.get(&key) {
+        return if prepared.binding == parsed {
+            (StatusCode::OK, axum::Json(prepared.body.clone())).into_response()
+        } else {
+            paykit_error(StatusCode::CONFLICT, "operation_conflict")
+        };
+    }
+    let amount_sats = parsed["amount_sats"].as_u64().unwrap_or_default();
+    let window = parsed["payment_window_seconds"]
+        .as_i64()
+        .unwrap_or_default();
+    if amount_sats == 0
+        || window <= 0
+        || uuid::Uuid::parse_str(parsed["reference"].as_str().unwrap_or_default()).is_err()
+    {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let invoice_id = uuid::Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let prepare_expires_at = (now + chrono::Duration::minutes(15)).to_rfc3339();
+    guard.invoices.insert(
+        invoice_id,
+        FakePaykitInvoice {
+            invoice_id,
+            state: "prepared".into(),
+            total_sats: amount_sats,
+            expires_at: (now + chrono::Duration::seconds(window)).to_rfc3339(),
+            prepare_expires_at: prepare_expires_at.clone(),
+        },
+    );
+    let response = json!({
+        "invoice_id": invoice_id,
+        "state": "prepared",
+        "total_sats": amount_sats,
+        "prepare_expires_at": prepare_expires_at,
+    });
+    guard.prepared.insert(
+        key,
+        FakePaykitPrepared {
+            binding: parsed,
+            invoice_id,
+            body: response.clone(),
+        },
+    );
+    (StatusCode::OK, axum::Json(response)).into_response()
+}
+
+async fn serve_upstream_command(
+    state: Arc<Mutex<FakePaykitState>>,
+    command: &'static str,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = format!("/marketplace/payment-requests/{command}");
+    let host = header_host(&headers);
+    let Some(parsed) = paykit_verify_signed(&state, "POST", &path, &headers, &body) else {
+        return paykit_unauthorized();
+    };
+    paykit_record_call(&state, "POST", &path, &host, &parsed);
+    let Some(invoice_id) = parsed["invoice_id"]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+    else {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let mut guard = state.lock().expect("fake paykit lock");
+    if let Some((status, code)) = guard.command_failure.clone() {
+        return paykit_error(
+            StatusCode::from_u16(status).expect("valid fake status"),
+            &code,
+        );
+    }
+    if command == "resolve" {
+        let outcome = parsed["outcome"].as_str().unwrap_or_default().to_string();
+        let resolved_at = chrono::Utc::now().to_rfc3339();
+        if let Some((existing, at)) = guard.resolutions.get(&invoice_id) {
+            return if existing == &outcome {
+                (
+                    StatusCode::OK,
+                    axum::Json(
+                        json!({"invoice_id": invoice_id, "outcome": existing, "resolved_at": at}),
+                    ),
+                )
+                    .into_response()
+            } else {
+                paykit_error(StatusCode::CONFLICT, "resolution_conflict")
+            };
+        }
+        if !guard.invoices.contains_key(&invoice_id) {
+            return paykit_error(StatusCode::NOT_FOUND, "unknown_invoice");
+        }
+        guard
+            .resolutions
+            .insert(invoice_id, (outcome.clone(), resolved_at.clone()));
+        return (
+            StatusCode::OK,
+            axum::Json(
+                json!({"invoice_id": invoice_id, "outcome": outcome, "resolved_at": resolved_at}),
+            ),
+        )
+            .into_response();
+    }
+    let Some(invoice) = guard.invoices.get_mut(&invoice_id) else {
+        return paykit_error(StatusCode::NOT_FOUND, "unknown_invoice");
+    };
+    match command {
+        "activate" => {
+            if parsed["total_sats"].as_u64() != Some(invoice.total_sats) {
+                return paykit_error(StatusCode::CONFLICT, "activation_total_mismatch");
+            }
+            if invoice.state == "voided" {
+                return paykit_error(StatusCode::CONFLICT, "invoice_finalized");
+            }
+            invoice.state = "active".into();
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "invoice_id": invoice_id, "state": "active",
+                    "activated_at": chrono::Utc::now().to_rfc3339(),
+                    "payment_deadline": invoice.expires_at, "total_sats": invoice.total_sats,
+                })),
+            )
+                .into_response()
+        }
+        "void" => {
+            if invoice.state == "active" {
+                return paykit_error(StatusCode::CONFLICT, "invoice_finalized");
+            }
+            invoice.state = "voided".into();
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "invoice_id": invoice_id, "state": "voided",
+                    "voided_at": chrono::Utc::now().to_rfc3339(),
+                })),
+            )
+                .into_response()
+        }
+        _ => paykit_error(StatusCode::NOT_FOUND, "unknown_command"),
+    }
+}
+
+async fn serve_upstream_activate(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    serve_upstream_command(state, "activate", headers, body).await
+}
+
+async fn serve_upstream_void(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    serve_upstream_command(state, "void", headers, body).await
+}
+
+async fn serve_upstream_resolve(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    serve_upstream_command(state, "resolve", headers, body).await
+}
+
 /// The intrinsic contract for `activate`/`void` (§B.11.3, §B.11.6): stack
 /// identity, unknown invoices, state-machine edges. Scripted replies run
 /// first; this runs when no script is queued.
@@ -3036,6 +3243,22 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         .route(
             "/v0/payment-requests/{invoice_id}/resolve",
             axum::routing::post(serve_paykit_resolve),
+        )
+        .route(
+            "/marketplace/payment-requests/prepare",
+            axum::routing::post(serve_upstream_prepare),
+        )
+        .route(
+            "/marketplace/payment-requests/activate",
+            axum::routing::post(serve_upstream_activate),
+        )
+        .route(
+            "/marketplace/payment-requests/void",
+            axum::routing::post(serve_upstream_void),
+        )
+        .route(
+            "/marketplace/payment-requests/resolve",
+            axum::routing::post(serve_upstream_resolve),
         )
         .route(
             "/transactions/status",

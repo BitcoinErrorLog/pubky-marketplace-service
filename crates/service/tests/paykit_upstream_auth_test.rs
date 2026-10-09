@@ -15,7 +15,8 @@ use base64::Engine;
 use common::*;
 use ed25519_dalek::{Signer, SigningKey, Verifier};
 use marketplace_service::payments::{
-    paykit_signature_preimage, PaykitApi, PaykitClient, PaykitRequestError, PaykitStatusOutcome,
+    paykit_signature_preimage, PaykitApi, PaykitClient, PaykitLifecycleTarget, PaykitPrepared,
+    PaykitRequestError, PaykitStatusOutcome,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -237,15 +238,139 @@ async fn the_public_rail_flag_follows_upstream_health_ready(pool: PgPool) {
 async fn upstream_signs_every_request_with_the_preimage() {
     let paykit = upstream_paykit().await;
     let client = upstream_client(&paykit);
-    paykit.set_status(
-        REFERENCE,
-        json!({ "status": "undetected", "confirmations": 0, "amount_matched": false }),
-    );
     assert_eq!(
         client.payment_status(SELLER, REFERENCE).await,
-        PaykitStatusOutcome::Undetected
+        PaykitStatusOutcome::Unavailable
     );
-    assert_eq!(paykit.calls().len(), 1, "the status call authenticated");
+    assert!(
+        paykit.calls().is_empty(),
+        "a Marketplace UUID is never guessed to be a Locks bundle_id"
+    );
+}
+
+#[tokio::test]
+async fn upstream_lifecycle_uses_the_closed_four_command_contract() {
+    let paykit = upstream_paykit().await;
+    let client = upstream_client(&paykit);
+    let order_id = uuid::Uuid::new_v4();
+    let prepared = client
+        .create_payment_request(
+            SELLER,
+            "w3g1m3s5rbuyer1111111111111111111111111111111111111111",
+            order_id,
+            1,
+            42_000,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            3_600,
+        )
+        .await
+        .expect("prepare accepted");
+    let PaykitPrepared::Upstream {
+        invoice_id,
+        total_sats,
+        ..
+    } = prepared
+    else {
+        panic!("upstream response stays typed upstream")
+    };
+    let prepare = &paykit.calls()[0];
+    assert_eq!(prepare.path, "/marketplace/payment-requests/prepare");
+    assert_eq!(prepare.body["amount_sats"], json!(42_000));
+    assert_eq!(prepare.body["payment_window_seconds"], json!(3_600));
+    assert_eq!(prepare.body["creator"], json!(format!("pubky{SELLER}")));
+    assert_eq!(
+        prepare.body["reader"],
+        json!("pubkyw3g1m3s5rbuyer1111111111111111111111111111111111111111")
+    );
+    assert_eq!(
+        prepare
+            .body
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "amount_sats",
+            "creator",
+            "operation_id",
+            "payment_window_seconds",
+            "reader",
+            "reference"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    let reference = prepare.body["reference"].as_str().unwrap();
+    assert_eq!(
+        uuid::Uuid::parse_str(reference).unwrap().get_version_num(),
+        4
+    );
+    assert_eq!(
+        prepare.body["operation_id"],
+        json!(format!("marketplace-payment:{reference}:1"))
+    );
+
+    let target = PaykitLifecycleTarget::Upstream {
+        creator: SELLER.to_string(),
+    };
+    client
+        .activate_payment_request(&target, invoice_id, total_sats, 99)
+        .await
+        .expect("activate accepted");
+    let activate = &paykit.calls()[1];
+    assert_eq!(activate.path, "/marketplace/payment-requests/activate");
+    assert_eq!(
+        activate.body,
+        json!({"creator": format!("pubky{SELLER}"), "invoice_id": invoice_id, "total_sats": total_sats})
+    );
+
+    let resolved = client
+        .resolve_payment_request(&target, invoice_id, "paid_manually", chrono::Utc::now())
+        .await
+        .expect("resolve accepted");
+    assert_eq!(resolved.resolved.unwrap().outcome, "paid_manually");
+    let resolve = &paykit.calls()[2];
+    assert_eq!(resolve.path, "/marketplace/payment-requests/resolve");
+    assert_eq!(
+        resolve.body,
+        json!({"creator": format!("pubky{SELLER}"), "invoice_id": invoice_id, "outcome": "paid_manually"})
+    );
+
+    let second = client
+        .create_payment_request(
+            SELLER,
+            "w3g1m3s5rbuyer1111111111111111111111111111111111111111",
+            order_id,
+            2,
+            42_000,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            3_600,
+        )
+        .await
+        .expect("second prepare accepted");
+    let PaykitPrepared::Upstream {
+        invoice_id: second_invoice,
+        ..
+    } = second
+    else {
+        panic!("upstream response stays typed upstream")
+    };
+    client
+        .void_payment_request(
+            &target,
+            second_invoice,
+            "fork-only reason is not serialized",
+        )
+        .await
+        .expect("void accepted");
+    let void = &paykit.calls()[4];
+    assert_eq!(void.path, "/marketplace/payment-requests/void");
+    assert_eq!(
+        void.body,
+        json!({"creator": format!("pubky{SELLER}"), "invoice_id": second_invoice})
+    );
 }
 
 #[tokio::test]

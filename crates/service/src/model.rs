@@ -649,6 +649,9 @@ pub struct OrderRow {
     /// Two-phase paykit protocol (§B.11): the invoice phase 1 prepared.
     /// Internal correlation, never serialized.
     pub paykit_invoice_id: Option<Uuid>,
+    /// Durable lifecycle protocol for this invoice. Configuration changes
+    /// must not reinterpret queued work.
+    pub paykit_api: Option<String>,
     /// The issuing stack's identity, from the phase-1 response body (never
     /// configuration); every later message on this invoice is checked
     /// against it. Never serialized.
@@ -755,6 +758,7 @@ impl std::fmt::Debug for OrderRow {
             .field("paykit_delivery_state", &self.paykit_delivery_state)
             .field("paykit_last_checked_at", &self.paykit_last_checked_at)
             .field("paykit_invoice_id", &self.paykit_invoice_id)
+            .field("paykit_api", &self.paykit_api)
             .field("paykit_stack_id", &self.paykit_stack_id)
             .field("paykit_stack_endpoint", &self.paykit_stack_endpoint)
             .field("paykit_total_sats", &self.paykit_total_sats)
@@ -862,6 +866,7 @@ impl OrderRow {
             paykit_delivery_state: None,
             paykit_last_checked_at: None,
             paykit_invoice_id: None,
+            paykit_api: None,
             paykit_stack_id: None,
             paykit_stack_endpoint: None,
             paykit_total_sats: None,

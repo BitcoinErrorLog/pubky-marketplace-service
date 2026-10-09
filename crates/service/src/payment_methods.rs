@@ -48,8 +48,9 @@ use crate::handlers::{
 };
 use crate::model::{OrderRow, PaymentRow};
 use crate::payments::{
-    attempt_reference, validate_paypal_email, validate_stripe_payment_link,
-    validate_stripe_restricted_key, PaykitRequestError, PaymentsRuntime, StripeError,
+    attempt_reference, upstream_attempt_reference, validate_paypal_email,
+    validate_stripe_payment_link, validate_stripe_restricted_key, PaykitApi, PaykitLifecycleTarget,
+    PaykitPrepared, PaykitRequestError, PaymentsRuntime, StripeError,
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
@@ -58,6 +59,12 @@ mod paypal_refund;
 
 const CONFIG_COLUMNS: &str = "seller_pubky, bitcoin_enabled, stripe_payment_link, \
      stripe_restricted_key_ciphertext, paypal_merchant_email, created_at, updated_at";
+
+#[derive(Clone)]
+struct PreparedBind {
+    invoice_id: Uuid,
+    target: PaykitLifecycleTarget,
+}
 
 #[derive(Debug, sqlx::FromRow)]
 struct SellerPaymentConfigRow {
@@ -747,7 +754,12 @@ pub async fn bind_payment_method(
                 let Some(attempt) = reserved_attempt else {
                     return internal("paykit bind attempt", &"no attempt was reserved");
                 };
-                (None, Some(attempt_reference(order.id, attempt)), "paykit")
+                let paykit = payments.paykit.as_ref().expect("checked above");
+                let reference = match paykit.api() {
+                    PaykitApi::Fork => attempt_reference(order.id, attempt),
+                    PaykitApi::Upstream => upstream_attempt_reference(order.id, attempt),
+                };
+                (None, Some(reference), "paykit")
             }
             "stripe" => {
                 let Some(link) = config
@@ -890,7 +902,7 @@ pub async fn bind_payment_method(
     // or a retry after a rolled-back bind — is a new Paykit invoice, never
     // a second binding against an old one. The bind AND the
     // `paykit.activate` outbox row commit atomically or not at all.
-    let mut prepared: Option<(uuid::Uuid, String, String)> = None;
+    let mut prepared: Option<PreparedBind> = None;
     // The re-read key for an ambiguous COMMIT: the attempt's reference
     // plus the invoice id, captured when phase 1 runs.
     let mut bind_reference: Option<String> = None;
@@ -900,19 +912,18 @@ pub async fn bind_payment_method(
             .as_ref()
             .map(|(_, sats)| *sats)
             .expect("checked above");
-        let endpoint = paykit.base_url().to_string();
         let expires_at = updated_order.hold_expires_at.unwrap_or_else(|| {
             now + chrono::Duration::seconds(state.config.bitcoin_payment_window_seconds)
         });
-        let idempotency_key = format!("{reference}:{attempt}");
         let phase1 = paykit
             .create_payment_request(
                 &order.seller_pubky,
                 &order.buyer_pubky,
-                reference,
+                order.id,
+                attempt,
                 amount_sats,
                 expires_at,
-                &idempotency_key,
+                state.config.bitcoin_payment_window_seconds,
             )
             .await;
         let phase1 = match phase1 {
@@ -955,13 +966,106 @@ pub async fn bind_payment_method(
                 };
             }
         };
-        if phase1.total_sats != amount_sats + phase1.nonce_sats {
+        let (
+            invoice_id,
+            total_sats,
+            prepare_expires_at,
+            paykit_expires_at,
+            stack_id,
+            stack_endpoint,
+            allocation_mode,
+            address_fingerprint,
+            target,
+        ) = match phase1 {
+            PaykitPrepared::Fork {
+                invoice_id,
+                stack_id,
+                allocation_mode,
+                nonce_sats,
+                total_sats,
+                expires_at: echoed_expires_at,
+                prepare_expires_at,
+                derived_address_fingerprint,
+            } => {
+                if total_sats != amount_sats + nonce_sats {
+                    tracing::error!(order_id = %order.id, "ALERT paykit phase 1 total mismatch");
+                    let _ = tx.rollback().await;
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "paykit_total_inconsistent",
+                        "The Paykit server returned an inconsistent payment total.",
+                    );
+                }
+                if echoed_expires_at.timestamp() != expires_at.timestamp() {
+                    tracing::error!(order_id = %order.id, "ALERT paykit phase 1 expiry mismatch");
+                    let target = PaykitLifecycleTarget::Fork {
+                        endpoint: paykit.base_url().to_string(),
+                        stack_id: stack_id.clone(),
+                    };
+                    prepared = Some(PreparedBind { invoice_id, target });
+                    let _ = tx.rollback().await;
+                    spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "paykit_expiry_inconsistent",
+                        "The Paykit server returned an inconsistent payment expiry.",
+                    );
+                }
+                let endpoint = paykit.base_url().to_string();
+                let target = PaykitLifecycleTarget::Fork {
+                    endpoint: endpoint.clone(),
+                    stack_id: stack_id.clone(),
+                };
+                (
+                    invoice_id,
+                    total_sats,
+                    prepare_expires_at,
+                    Some(expires_at),
+                    Some(stack_id),
+                    Some(endpoint),
+                    Some(allocation_mode),
+                    Some(derived_address_fingerprint),
+                    target,
+                )
+            }
+            PaykitPrepared::Upstream {
+                invoice_id,
+                total_sats,
+                prepare_expires_at,
+            } => {
+                if total_sats != amount_sats {
+                    tracing::error!(order_id = %order.id, "ALERT upstream paykit changed requested total");
+                    let _ = tx.rollback().await;
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "paykit_total_inconsistent",
+                        "The Paykit server returned an inconsistent payment total.",
+                    );
+                }
+                (
+                    invoice_id,
+                    total_sats,
+                    prepare_expires_at,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    PaykitLifecycleTarget::Upstream {
+                        creator: order.seller_pubky.clone(),
+                    },
+                )
+            }
+        };
+        prepared = Some(PreparedBind {
+            invoice_id,
+            target: target.clone(),
+        });
+        bind_reference = Some(reference.clone());
+        if total_sats == 0 {
             tracing::error!(
                 order_id = %order.id,
-                amount_sats,
-                nonce_sats = phase1.nonce_sats,
-                total_sats = phase1.total_sats,
-                "ALERT paykit phase 1 total_sats != amount_sats + nonce_sats; refusing the bind"
+                "ALERT paykit phase 1 returned a zero total; refusing the bind"
             );
             let _ = tx.rollback().await;
             return method_error(
@@ -970,30 +1074,7 @@ pub async fn bind_payment_method(
                 "The Paykit server returned an inconsistent payment total.",
             );
         }
-        prepared = Some((phase1.invoice_id, phase1.stack_id.clone(), endpoint.clone()));
-        bind_reference = Some(reference.clone());
-        // The echoed `expires_at` must equal the hold deadline this call
-        // sent (the wire format truncates to UTC seconds, so the comparison
-        // is exact at second precision): a stack answering with a later
-        // expiry would keep the remote invoice payable past the local void
-        // at hold + 30 min, breaking the hard bound. Refuse in the same
-        // class as a total mismatch — no bind, the rollback releases the
-        // hold, one courtesy void, alerted.
-        if phase1.expires_at.timestamp() != expires_at.timestamp() {
-            tracing::error!(
-                order_id = %order.id,
-                hold_expires_at = %expires_at,
-                echoed_expires_at = %phase1.expires_at,
-                "ALERT paykit phase 1 expires_at != the hold deadline; refusing the bind"
-            );
-            let _ = tx.rollback().await;
-            spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
-            return method_error(
-                ErrorCode::InvalidState,
-                "paykit_expiry_inconsistent",
-                "The Paykit server returned an inconsistent payment expiry.",
-            );
-        }
+
         // Persist the prepared invoice in the SAME transaction as the bind:
         // the stack identity and endpoint come from this call (never from
         // configuration read later), the total is the figure the buyer is
@@ -1005,7 +1086,7 @@ pub async fn bind_payment_method(
         // 15-minute reaper is the guarantee).
         let persisted = async {
             sqlx::query(
-                "UPDATE orders SET paykit_invoice_id = $2, paykit_stack_id = $3, \
+                "UPDATE orders SET paykit_invoice_id = $2, paykit_api = $19, paykit_stack_id = $3, \
                  paykit_stack_endpoint = $4, paykit_total_sats = $5, paykit_expires_at = $6, \
                  paykit_prepare_expires_at = $7, paykit_allocation_mode = $8, \
                  paykit_address_fingerprint = $9, paykit_activation_state = 'preparing', \
@@ -1016,14 +1097,14 @@ pub async fn bind_payment_method(
                  WHERE id = $1",
             )
             .bind(order.id)
-            .bind(phase1.invoice_id)
-            .bind(&phase1.stack_id)
-            .bind(&endpoint)
-            .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
-            .bind(expires_at)
-            .bind(phase1.prepare_expires_at)
-            .bind(&phase1.allocation_mode)
-            .bind(&phase1.derived_address_fingerprint)
+            .bind(invoice_id)
+            .bind(&stack_id)
+            .bind(&stack_endpoint)
+            .bind(i64::try_from(total_sats).expect("total_sats fits i64"))
+            .bind(paykit_expires_at)
+            .bind(prepare_expires_at)
+            .bind(&allocation_mode)
+            .bind(&address_fingerprint)
             .bind(now)
             .bind(
                 bitcoin_quote
@@ -1076,6 +1157,7 @@ pub async fn bind_payment_method(
                     .and_then(|(quote, _)| quote.as_ref())
                     .map(|_| expires_at),
             )
+            .bind(paykit.api().as_str())
             .execute(&mut *tx)
             .await?;
             // Bitcoin settlement is typed as SAT/0. Merchandise terms stay
@@ -1085,7 +1167,7 @@ pub async fn bind_payment_method(
                  updated_at = $3 WHERE id = $1",
             )
             .bind(payment.id)
-            .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
+            .bind(i64::try_from(total_sats).expect("total_sats fits i64"))
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -1095,11 +1177,10 @@ pub async fn bind_payment_method(
             )
             .bind(event_id)
             .bind(json!({
-                "invoice_id": phase1.invoice_id,
+                "invoice_id": invoice_id,
                 "order_id": order.id,
-                "stack_id": phase1.stack_id,
-                "total_sats": phase1.total_sats,
-                "stack_endpoint": endpoint,
+                "paykit_api": paykit.api().as_str(),
+                "total_sats": total_sats,
                 "activation_attempt": 0,
             }))
             .bind(now)
@@ -1216,14 +1297,15 @@ pub mod test_faults {
 async fn resolve_ambiguous_bind_commit(
     state: &AppState,
     payments: &std::sync::Arc<PaymentsRuntime>,
-    prepared: &Option<(uuid::Uuid, String, String)>,
+    prepared: &Option<PreparedBind>,
     order_id: Uuid,
     bind_reference: &Option<String>,
     commit_error: &sqlx::Error,
 ) {
-    let (Some((invoice_id, _, _)), Some(reference)) = (prepared, bind_reference) else {
+    let (Some(prepared), Some(reference)) = (prepared, bind_reference) else {
         return;
     };
+    let invoice_id = prepared.invoice_id;
     // The reference names the attempt. `paykit_bind_attempt` is not
     // compared: a concurrent bind may reserve the next number after this
     // one committed.
@@ -1252,7 +1334,11 @@ async fn resolve_ambiguous_bind_commit(
         Ok(None) => {
             // Confirmed absent: the transaction rolled back. One
             // best-effort void (paykit's 15-minute reaper is the guarantee).
-            spawn_courtesy_void(payments, prepared, "marketplace_bind_rolled_back");
+            spawn_courtesy_void(
+                payments,
+                &Some(prepared.clone()),
+                "marketplace_bind_rolled_back",
+            );
         }
         Err(read_error) => {
             // Outcome unknown: enqueue nothing. If the bind is durable its
@@ -1276,10 +1362,10 @@ async fn resolve_ambiguous_bind_commit(
 /// phase-1 call used; paykit's 15-minute prepare reaper is the guarantee.
 fn spawn_courtesy_void(
     payments: &std::sync::Arc<PaymentsRuntime>,
-    prepared: &Option<(uuid::Uuid, String, String)>,
+    prepared: &Option<PreparedBind>,
     reason: &'static str,
 ) {
-    let Some((invoice_id, stack_id, endpoint)) = prepared.clone() else {
+    let Some(prepared) = prepared.clone() else {
         return;
     };
     let payments = payments.clone();
@@ -1288,14 +1374,14 @@ fn spawn_courtesy_void(
             return;
         };
         let outcome = paykit
-            .void_payment_request(&endpoint, invoice_id, &stack_id, reason)
+            .void_payment_request(&prepared.target, prepared.invoice_id, reason)
             .await;
         match outcome {
             Ok(voided) => {
-                tracing::info!(invoice_id = %invoice_id, state = %voided.state, "courtesy void delivered")
+                tracing::info!(invoice_id = %prepared.invoice_id, state = %voided.state, "courtesy void delivered")
             }
             Err(error) => tracing::warn!(
-                invoice_id = %invoice_id,
+                invoice_id = %prepared.invoice_id,
                 error = ?error,
                 "courtesy void failed; paykit's prepare reaper is the backstop"
             ),
