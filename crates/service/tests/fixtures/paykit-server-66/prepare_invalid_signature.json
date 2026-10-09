@@ -1,0 +1,17 @@
+{
+  "description": "A signature by a key that is not in `[signed_services] trusted_public_keys`",
+  "name": "prepare_invalid_signature",
+  "request": {
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyzgrus1dgrp6ujqzeyhen5ghqxupgcrqmuqrn67k6xqpwkhr874by\",\"operation_id\":\"marketplace-payment:RCSYZPCY72B6PT0HDQ7SR225NC:1\",\"payment_window_seconds\":1800,\"reader\":\"pubkydwyreddqufizxkqy7wiho1e4oq6dpfqwmusu9rkh8ndpu49zd3dy\",\"reference\":\"a59ea622-851b-4eab-b7dc-0e5da7f73cea\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "09p9my_WoEhTI1NGNagAfexg9jy-FjIr0hTHBf8spLtrOXcvwd8ez30V1hf7bgr3YIFcn5OFNIdMw7qEKYwQBw"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"invalid_signature\",\"message\":\"request authentication failed\"}}",
+    "content_type": "application/json",
+    "status": 401
+  },
+  "sent_at": "2026-10-09T11:59:20.025873898Z",
+  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+}

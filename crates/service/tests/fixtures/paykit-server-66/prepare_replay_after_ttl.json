@@ -1,0 +1,17 @@
+{
+  "description": "The same request replayed after the 1 second preparation TTL elapsed: still the stored answer",
+  "name": "prepare_replay_after_ttl",
+  "request": {
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyfp49gwq8zecey6qpa3fhodaofiyzyehp9mspzx6eci176xuahr8y\",\"operation_id\":\"marketplace-payment:YWFA349J8GCG6RYXSNS2S007NC:11\",\"payment_window_seconds\":1800,\"reader\":\"pubkydwyreddqufizxkqy7wiho1e4oq6dpfqwmusu9rkh8ndpu49zd3dy\",\"reference\":\"22ee0e87-c16a-419c-b92b-8c39958b30fe\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "Q-g_VADwS6XHXdKtqO2UO2lJPUjiW9EMkaOwXKS2aMYxKOY62Gh3XKLQfSIeuiS5yr_kFxlV-Z1kcSaepw2kDg"
+  },
+  "response": {
+    "body": "{\"invoice_id\":\"9c5984d1-c331-40cf-8341-ce8c08b294fb\",\"state\":\"prepared\",\"total_sats\":120000,\"prepare_expires_at\":\"2026-10-09T11:59:23.197514Z\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T11:59:25.202826275Z",
+  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+}

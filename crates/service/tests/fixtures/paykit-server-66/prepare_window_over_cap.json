@@ -1,0 +1,17 @@
+{
+  "description": "A payment window above the 24 hour cap: refused, never clamped",
+  "name": "prepare_window_over_cap",
+  "request": {
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyzgrus1dgrp6ujqzeyhen5ghqxupgcrqmuqrn67k6xqpwkhr874by\",\"operation_id\":\"marketplace-payment:SH1JFCXHDW047V0W54QD891DD4:3\",\"payment_window_seconds\":86401,\"reader\":\"pubkydwyreddqufizxkqy7wiho1e4oq6dpfqwmusu9rkh8ndpu49zd3dy\",\"reference\":\"1e4a03dd-abc8-49d6-bb3d-47bad5479616\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "7V3d42-kIdKxYCcR0zz9-hrM5ONt2S-w-9h97ZeHv59P3EBjSoZJR2NjZ0DyUmzXRv28yt8YOxTcx24jYPqkDA"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"invalid_request\",\"message\":\"request is invalid\"}}",
+    "content_type": "application/json",
+    "status": 400
+  },
+  "sent_at": "2026-10-09T11:59:19.992733744Z",
+  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+}

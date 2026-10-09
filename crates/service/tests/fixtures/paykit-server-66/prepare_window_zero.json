@@ -1,0 +1,17 @@
+{
+  "description": "A zero payment window: refused",
+  "name": "prepare_window_zero",
+  "request": {
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyzgrus1dgrp6ujqzeyhen5ghqxupgcrqmuqrn67k6xqpwkhr874by\",\"operation_id\":\"marketplace-payment:8487RVH7ZX48Q8CP7PGJGBP2M8:4\",\"payment_window_seconds\":0,\"reader\":\"pubkydwyreddqufizxkqy7wiho1e4oq6dpfqwmusu9rkh8ndpu49zd3dy\",\"reference\":\"89b8234c-1ecb-4bdf-9f38-403b7c4d02be\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "cLRc9nUkfneC_Xe1QRse2Z0QOpUTAPHVMidFfBHaIiHdX98H43ZIIbcUMsQVRLe-bSVr1TKdgPFKEcA6JXSEAA"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"invalid_request\",\"message\":\"request is invalid\"}}",
+    "content_type": "application/json",
+    "status": 400
+  },
+  "sent_at": "2026-10-09T11:59:20.001653116Z",
+  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+}

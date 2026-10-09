@@ -1,0 +1,816 @@
+diff --git a/paykit-server-e2e/tests/capture_marketplace_prepare.rs b/paykit-server-e2e/tests/capture_marketplace_prepare.rs
+new file mode 100644
+index 0000000..de7a575
+--- /dev/null
++++ b/paykit-server-e2e/tests/capture_marketplace_prepare.rs
+@@ -0,0 +1,669 @@
++//! Captures real `POST /marketplace/payment-requests/prepare` exchanges from a
++//! running paykit-server (pubky/paykit-server #66 head 3eff693) for the
++//! pubky-marketplace-service contract fixtures.
++//!
++//! Real: the production `Server` (router, signed-service auth layer,
++//! readiness gating, workers), PostgreSQL, the `MarketplacePreparationStore`,
++//! creator sessions validated against a real Pubky homeserver
++//! (`pubky-testnet`), Paykit App Registry discovery against that homeserver,
++//! and the creator's Bitcoin receiving credentials from `CreatorStore`.
++//! Requests are sent over TCP with their signature header exactly as a
++//! trusted service sends them.
++//!
++//! Inputs: `CAPTURE_INPUTS` names a JSON file with the attempt identities the
++//! Marketplace service derives (`operation_id`, `reference`) and
++//! `CAPTURE_DIR` the output directory.
++
++use std::{net::SocketAddr, sync::Arc, time::Duration};
++
++use async_trait::async_trait;
++use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
++use bitcoin::{
++    Network,
++    bip32::{ChildNumber, Xpriv, Xpub},
++    secp256k1::Secp256k1,
++};
++use ed25519_dalek::{Signer, SigningKey};
++use paykit_sdk::{
++    PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap,
++};
++use paykit_server::{
++    Server,
++    bitcoin::{ObservationTarget, ObservedOutput},
++    config::{BitcoinNetwork, Config, ConfigEnvironment},
++    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
++    http::auth::signature_preimage,
++    persistence::{CreatorCredentials, CreatorStore},
++    startup::initialize_database,
++    workers::observer::{ElectrumPort, ObserverError},
++};
++use paykit_server_e2e::postgres::TestDatabase;
++use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
++use serde::Deserialize;
++use serde_json::{Value, json};
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++#[path = "fixtures/sdk_capture.rs"]
++mod sdk_fixtures;
++
++const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
++const PATH: &str = "/marketplace/payment-requests/prepare";
++const SERVER_REVISION: &str = "3eff69345c749b9ee9f6e036d5d8b8b81e08e698";
++
++struct NoObservations;
++
++#[async_trait]
++impl ElectrumPort for NoObservations {
++    async fn observations(
++        &self,
++        _targets: &[ObservationTarget],
++    ) -> Result<Vec<ObservedOutput>, ObserverError> {
++        Ok(Vec::new())
++    }
++}
++
++#[derive(Deserialize)]
++struct Attempt {
++    attempt: i32,
++    attempt_reference: String,
++    operation_id: String,
++    reference: String,
++}
++
++#[derive(Deserialize)]
++struct Inputs {
++    amount_sats: u64,
++    payment_window_seconds: u64,
++    signing_seed_hex: String,
++    attempts: Vec<Attempt>,
++}
++
++fn decode_hex(text: &str) -> Vec<u8> {
++    (0..text.len())
++        .step_by(2)
++        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
++        .collect()
++}
++
++fn account_xpub(seed: u8, account_index: u32) -> String {
++    let secp = Secp256k1::new();
++    let account = Xpriv::new_master(Network::Testnet, &[seed; 32])
++        .unwrap()
++        .derive_priv(
++            &secp,
++            &[
++                ChildNumber::from_hardened_idx(84).unwrap(),
++                ChildNumber::from_hardened_idx(1).unwrap(),
++                ChildNumber::from_hardened_idx(account_index).unwrap(),
++            ],
++        )
++        .unwrap();
++    Xpub::from_priv(&secp, &account).to_string()
++}
++
++fn config(
++    database_url: &str,
++    signing_key: &SigningKey,
++    prepare_ttl: Option<&str>,
++    extra_trusted: Option<&SigningKey>,
++) -> Config {
++    let key_of = |key: &SigningKey| {
++        pubky::PublicKey::from(
++            pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
++        )
++        .to_string()
++    };
++    let mut trusted = vec![format!("\"{}\"", key_of(signing_key))];
++    if let Some(extra) = extra_trusted {
++        trusted.push(format!("\"{}\"", key_of(extra)));
++    }
++    let ttl = prepare_ttl
++        .map(|ttl| format!("marketplace_prepare_ttl = \"{ttl}\""))
++        .unwrap_or_default();
++    Config::from_toml_and_environment(
++        &format!(
++            r#"
++[http]
++listen_addr = "127.0.0.1:0"
++[signed_services]
++trusted_public_keys = [{}]
++[setup]
++allowed_origins = ["https://app.example"]
++[paykit]
++client_id = "app.paykit.server"
++app_id = "paykit-server"
++network = "testnet"
++{ttl}
++[bitcoin]
++network = "testnet"
++[electrum]
++endpoint = "tcp://127.0.0.1:1"
++poll_interval = "1h"
++request_timeout = "1s"
++connect_retries = 0
++[outbox]
++poll_interval = "1h"
++batch_size = 16
++lease_duration = "5s"
++retry_initial = "1s"
++retry_max = "2s"
++[shutdown]
++drain_timeout = "2s"
++"#,
++            trusted.join(", ")
++        ),
++        ConfigEnvironment {
++            database_url: Some(database_url.to_owned()),
++            master_key: Some(MASTER_KEY.to_owned()),
++        },
++    )
++    .unwrap()
++}
++
++struct Creator {
++    creator: CreatorPubky,
++}
++
++async fn create_creator(
++    bootstrap: &PubkySessionBootstrap,
++    homeserver: &PubkyPublicKey,
++    store: &CreatorStore,
++    seed: u8,
++    bitcoin: bool,
++    valid_session: bool,
++) -> Creator {
++    let keypair = Keypair::random();
++    let account = bootstrap
++        .sign_up(
++            &PubkyLocalSecretKey::new(keypair.secret_key()),
++            homeserver,
++            None,
++            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
++        )
++        .await
++        .unwrap();
++    let session_secret = if valid_session {
++        account.export_session_secret().await.unwrap().into_inner()
++    } else {
++        "not-a-session".to_owned()
++    };
++    let creator = parse_creator(&format!("pubky{}", account.public_key)).unwrap();
++    store
++        .create(&CreatorCredentials::new(
++            creator.clone(),
++            session_secret,
++            PubkyLocalSecretKey::new(keypair.secret_key())
++                .derive_paykit_identity_secret_key(1)
++                .unwrap(),
++            bitcoin.then(|| paykit_server::domain::receiving::BitcoinAccount {
++                xpub: account_xpub(seed, 0).into(),
++                account_index: 0,
++            }),
++            None,
++        ))
++        .await
++        .unwrap();
++    let observer = PubkySessionBootstrap::with_pubky(
++        account.access.outbox_client.clone(),
++        "app.paykit.test-observer",
++    )
++    .unwrap()
++    .sign_in(
++        &PubkyLocalSecretKey::new(keypair.secret_key()),
++        paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
++    )
++    .await
++    .unwrap();
++    let _sdk = sdk_fixtures::hosted_sdk(observer.access.clone(), "paykit-server", 0).await;
++    store.mark_setup_complete(&creator).await.unwrap();
++    Creator { creator }
++}
++
++async fn create_reader(
++    bootstrap: &PubkySessionBootstrap,
++    homeserver: &PubkyPublicKey,
++    registry: Option<bool>,
++) -> ReaderPubky {
++    let account = bootstrap
++        .sign_up(
++            &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
++            homeserver,
++            None,
++            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
++        )
++        .await
++        .unwrap();
++    let key = account.public_key.clone();
++    let access: PubkySessionAccess = account.access;
++    if let Some(payment_requests) = registry {
++        let _sdk = sdk_fixtures::hosted_sdk_with_requests(access, "bitkit", 0, payment_requests)
++            .await;
++    }
++    parse_reader(&format!("pubky{key}")).unwrap()
++}
++
++struct Exchange {
++    sent_at: String,
++    status: u16,
++    content_type: Option<String>,
++    body: String,
++}
++
++async fn send(address: SocketAddr, signature: &str, body: &str) -> Exchange {
++    let sent_at = time::OffsetDateTime::now_utc()
++        .format(&time::format_description::well_known::Rfc3339)
++        .unwrap();
++    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
++    let head = format!(
++        "POST {PATH} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\nx-paykit-signature: {signature}\r\n\r\n",
++        body.len()
++    );
++    stream.write_all(head.as_bytes()).await.unwrap();
++    stream.write_all(body.as_bytes()).await.unwrap();
++    let mut response = Vec::new();
++    stream.read_to_end(&mut response).await.unwrap();
++    let header_end = response
++        .windows(4)
++        .position(|window| window == b"\r\n\r\n")
++        .unwrap();
++    let headers = std::str::from_utf8(&response[..header_end]).unwrap();
++    let status = headers
++        .lines()
++        .next()
++        .unwrap()
++        .split_whitespace()
++        .nth(1)
++        .unwrap()
++        .parse::<u16>()
++        .unwrap();
++    let content_type = headers.lines().skip(1).find_map(|line| {
++        line.to_ascii_lowercase()
++            .starts_with("content-type:")
++            .then(|| line.split_once(':').unwrap().1.trim().to_owned())
++    });
++    let raw = &response[(header_end + 4)..];
++    let body = if headers
++        .to_ascii_lowercase()
++        .contains("transfer-encoding: chunked")
++    {
++        dechunk(raw)
++    } else {
++        raw.to_vec()
++    };
++    Exchange {
++        sent_at,
++        status,
++        content_type,
++        body: String::from_utf8(body).unwrap(),
++    }
++}
++
++fn dechunk(mut raw: &[u8]) -> Vec<u8> {
++    let mut out = Vec::new();
++    loop {
++        let line_end = raw.windows(2).position(|window| window == b"\r\n").unwrap();
++        let size = usize::from_str_radix(std::str::from_utf8(&raw[..line_end]).unwrap(), 16)
++            .unwrap();
++        raw = &raw[line_end + 2..];
++        if size == 0 {
++            return out;
++        }
++        out.extend_from_slice(&raw[..size]);
++        raw = &raw[size + 2..];
++    }
++}
++
++fn sign(key: &SigningKey, body: &str) -> String {
++    URL_SAFE_NO_PAD.encode(
++        key.sign(&signature_preimage("POST", PATH, body.as_bytes()))
++            .to_bytes(),
++    )
++}
++
++fn canonical(value: &Value) -> String {
++    serde_json_canonicalizer::to_string(value).unwrap()
++}
++
++struct Recorder {
++    dir: std::path::PathBuf,
++}
++
++impl Recorder {
++    fn record(
++        &self,
++        name: &str,
++        description: &str,
++        signature: &str,
++        body: &str,
++        exchange: &Exchange,
++    ) {
++        let document = json!({
++            "name": name,
++            "description": description,
++            "server_revision": SERVER_REVISION,
++            "request": {
++                "method": "POST",
++                "path": PATH,
++                "signature": signature,
++                "body": body,
++            },
++            "sent_at": exchange.sent_at,
++            "response": {
++                "status": exchange.status,
++                "content_type": exchange.content_type,
++                "body": exchange.body,
++            },
++        });
++        std::fs::write(
++            self.dir.join(format!("{name}.json")),
++            serde_json::to_string_pretty(&document).unwrap() + "\n",
++        )
++        .unwrap();
++        println!("captured {name}: {} {}", exchange.status, exchange.body);
++    }
++}
++
++fn prepare_body(
++    creator: &CreatorPubky,
++    reader: &ReaderPubky,
++    attempt: &Attempt,
++    inputs: &Inputs,
++) -> Value {
++    json!({
++        "amount_sats": inputs.amount_sats,
++        "creator": creator.to_string(),
++        "operation_id": attempt.operation_id,
++        "payment_window_seconds": inputs.payment_window_seconds,
++        "reader": reader.to_string(),
++        "reference": attempt.reference,
++    })
++}
++
++async fn serve(server: Server) -> SocketAddr {
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    tokio::spawn(server.run_until(listener, std::future::pending::<()>()));
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
++    loop {
++        let request = format!(
++            "GET /health/ready HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
++        );
++        if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
++            stream.write_all(request.as_bytes()).await.unwrap();
++            let mut response = Vec::new();
++            stream.read_to_end(&mut response).await.unwrap();
++            if response.starts_with(b"HTTP/1.1 200") {
++                return address;
++            }
++        }
++        assert!(tokio::time::Instant::now() < deadline, "server not ready");
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++}
++
++#[tokio::test]
++async fn capture_marketplace_prepare_exchanges() {
++    let inputs: Inputs = serde_json::from_slice(
++        &std::fs::read(std::env::var("CAPTURE_INPUTS").expect("CAPTURE_INPUTS")).unwrap(),
++    )
++    .unwrap();
++    let recorder = Recorder {
++        dir: std::path::PathBuf::from(std::env::var("CAPTURE_DIR").expect("CAPTURE_DIR")),
++    };
++    std::fs::create_dir_all(&recorder.dir).unwrap();
++
++    let service_key = SigningKey::from_bytes(
++        &<[u8; 32]>::try_from(decode_hex(&inputs.signing_seed_hex)).unwrap(),
++    );
++    let other_key = SigningKey::from_bytes(&[9; 32]);
++    let attempt = |number: i32| {
++        inputs
++            .attempts
++            .iter()
++            .find(|attempt| attempt.attempt == number)
++            .unwrap_or_else(|| panic!("input attempt {number}"))
++    };
++
++    let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
++    let testnet = EphemeralTestnet::builder()
++        .postgres(pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap())
++        .build()
++        .await
++        .unwrap();
++    let pubky = testnet.sdk().unwrap();
++    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
++    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
++
++    // Server one: the default preparation TTL (15 minutes).
++    let database = TestDatabase::create().await;
++    let server_config = config(database.database_url(), &service_key, None, None);
++    let pool = initialize_database(&server_config).await.unwrap();
++    let creators = CreatorStore::new(
++        &pool,
++        Arc::new(
++            paykit_server::crypto::Crypto::from_master_key(server_config.master_key().as_bytes())
++                .unwrap(),
++        ),
++    );
++    let seller = create_creator(&bootstrap, &homeserver, &creators, 41, true, true).await;
++    let seller_without_bitcoin =
++        create_creator(&bootstrap, &homeserver, &creators, 42, false, true).await;
++    let seller_bad_session =
++        create_creator(&bootstrap, &homeserver, &creators, 43, true, false).await;
++    let buyer = create_reader(&bootstrap, &homeserver, Some(true)).await;
++    let buyer_without_registry = create_reader(&bootstrap, &homeserver, None).await;
++    let buyer_not_payable = create_reader(&bootstrap, &homeserver, Some(false)).await;
++
++    let server = Server::build_with_transports(
++        server_config,
++        pool.clone(),
++        pubky.clone(),
++        Arc::new(NoObservations),
++    )
++    .await
++    .unwrap();
++    let address = serve(server).await;
++
++    let first = prepare_body(&seller.creator, &buyer, attempt(1), &inputs);
++    let first_body = canonical(&first);
++    let first_signature = sign(&service_key, &first_body);
++
++    let exchange = send(address, &first_signature, &first_body).await;
++    assert_eq!(exchange.status, 200, "{}", exchange.body);
++    let first_response = exchange.body.clone();
++    recorder.record(
++        "prepare_new",
++        "A new attempt: the first preparation of operation `marketplace-payment:{attempt_reference}:1` for an order's seller and buyer",
++        &first_signature,
++        &first_body,
++        &exchange,
++    );
++
++    let exchange = send(address, &first_signature, &first_body).await;
++    assert_eq!(exchange.status, 200);
++    assert_eq!(exchange.body, first_response, "an exact replay returns the stored answer");
++    recorder.record(
++        "prepare_replay",
++        "The identical request again: the stored answer, no new invoice",
++        &first_signature,
++        &first_body,
++        &exchange,
++    );
++
++    let mut changed = first.clone();
++    changed["amount_sats"] = json!(inputs.amount_sats + 1);
++    let changed_body = canonical(&changed);
++    let changed_signature = sign(&service_key, &changed_body);
++    let exchange = send(address, &changed_signature, &changed_body).await;
++    assert_eq!(exchange.status, 409);
++    recorder.record(
++        "prepare_conflict_changed_binding",
++        "The same operation id with a different amount: a changed binding",
++        &changed_signature,
++        &changed_body,
++        &exchange,
++    );
++
++    let second_body = canonical(&prepare_body(&seller.creator, &buyer, attempt(2), &inputs));
++    let second_signature = sign(&service_key, &second_body);
++    let exchange = send(address, &second_signature, &second_body).await;
++    assert_eq!(exchange.status, 200);
++    assert_ne!(exchange.body, first_response, "a new operation id is a new invoice");
++    recorder.record(
++        "prepare_next_attempt",
++        "The next bind attempt of the same order: a new operation id and reference give a new invoice",
++        &second_signature,
++        &second_body,
++        &exchange,
++    );
++
++    let mut over_cap = prepare_body(&seller.creator, &buyer, attempt(3), &inputs);
++    over_cap["payment_window_seconds"] = json!(86_401);
++    let over_cap_body = canonical(&over_cap);
++    let over_cap_signature = sign(&service_key, &over_cap_body);
++    let exchange = send(address, &over_cap_signature, &over_cap_body).await;
++    assert_eq!(exchange.status, 400);
++    recorder.record(
++        "prepare_window_over_cap",
++        "A payment window above the 24 hour cap: refused, never clamped",
++        &over_cap_signature,
++        &over_cap_body,
++        &exchange,
++    );
++
++    let mut zero = prepare_body(&seller.creator, &buyer, attempt(4), &inputs);
++    zero["payment_window_seconds"] = json!(0);
++    let zero_body = canonical(&zero);
++    let zero_signature = sign(&service_key, &zero_body);
++    let exchange = send(address, &zero_signature, &zero_body).await;
++    assert_eq!(exchange.status, 400);
++    recorder.record(
++        "prepare_window_zero",
++        "A zero payment window: refused",
++        &zero_signature,
++        &zero_body,
++        &exchange,
++    );
++
++    let mut crockford = prepare_body(&seller.creator, &buyer, attempt(5), &inputs);
++    crockford["reference"] = json!(attempt(5).attempt_reference);
++    let crockford_body = canonical(&crockford);
++    let crockford_signature = sign(&service_key, &crockford_body);
++    let exchange = send(address, &crockford_signature, &crockford_body).await;
++    assert_eq!(exchange.status, 400);
++    recorder.record(
++        "prepare_reference_not_uuid",
++        "The fork's 26 character Crockford reference instead of a UUIDv4: refused",
++        &crockford_signature,
++        &crockford_body,
++        &exchange,
++    );
++
++    let mut forbidden = prepare_body(&seller.creator, &buyer, attempt(6), &inputs);
++    forbidden["stack_id"] = json!("stack-1");
++    let forbidden_body = canonical(&forbidden);
++    let forbidden_signature = sign(&service_key, &forbidden_body);
++    let exchange = send(address, &forbidden_signature, &forbidden_body).await;
++    assert_eq!(exchange.status, 400);
++    recorder.record(
++        "prepare_forbidden_fork_field",
++        "A fork-only field (`stack_id`): the closed schema refuses it",
++        &forbidden_signature,
++        &forbidden_body,
++        &exchange,
++    );
++
++    let untrusted_signature = sign(&other_key, &first_body);
++    let exchange = send(address, &untrusted_signature, &first_body).await;
++    assert_eq!(exchange.status, 401);
++    recorder.record(
++        "prepare_invalid_signature",
++        "A signature by a key that is not in `[signed_services] trusted_public_keys`",
++        &untrusted_signature,
++        &first_body,
++        &exchange,
++    );
++
++    for (name, description, attempt_number, creator, reader) in [
++        (
++            "prepare_reader_setup_pending",
++            "A buyer with no App Registry yet",
++            7,
++            &seller.creator,
++            &buyer_without_registry,
++        ),
++        (
++            "prepare_reader_not_payable",
++            "A buyer whose registry has no app that takes payment requests",
++            8,
++            &seller.creator,
++            &buyer_not_payable,
++        ),
++        (
++            "prepare_seller_without_bitcoin",
++            "A seller with no Bitcoin receiving details",
++            9,
++            &seller_without_bitcoin.creator,
++            &buyer,
++        ),
++        (
++            "prepare_creator_session_invalid",
++            "A seller whose stored homeserver session is not valid",
++            10,
++            &seller_bad_session.creator,
++            &buyer,
++        ),
++    ] {
++        let body = canonical(&prepare_body(creator, reader, attempt(attempt_number), &inputs));
++        let signature = sign(&service_key, &body);
++        let exchange = send(address, &signature, &body).await;
++        recorder.record(name, description, &signature, &body, &exchange);
++    }
++
++    // Server two: a one second preparation TTL, to replay after expiry.
++    let short_database = TestDatabase::create().await;
++    let short_config = config(short_database.database_url(), &service_key, Some("1s"), None);
++    let short_pool = initialize_database(&short_config).await.unwrap();
++    let short_creators = CreatorStore::new(
++        &short_pool,
++        Arc::new(
++            paykit_server::crypto::Crypto::from_master_key(short_config.master_key().as_bytes())
++                .unwrap(),
++        ),
++    );
++    let short_seller =
++        create_creator(&bootstrap, &homeserver, &short_creators, 44, true, true).await;
++    let short_server = Server::build_with_transports(
++        short_config,
++        short_pool.clone(),
++        pubky.clone(),
++        Arc::new(NoObservations),
++    )
++    .await
++    .unwrap();
++    let short_address = serve(short_server).await;
++    let ttl_body = canonical(&prepare_body(&short_seller.creator, &buyer, attempt(11), &inputs));
++    let ttl_signature = sign(&service_key, &ttl_body);
++    let exchange = send(short_address, &ttl_signature, &ttl_body).await;
++    assert_eq!(exchange.status, 200);
++    let ttl_first = exchange.body.clone();
++    recorder.record(
++        "prepare_new_short_ttl",
++        "A preparation on a server configured with `marketplace_prepare_ttl = \"1s\"`",
++        &ttl_signature,
++        &ttl_body,
++        &exchange,
++    );
++    tokio::time::sleep(Duration::from_secs(3)).await;
++    let exchange = send(short_address, &ttl_signature, &ttl_body).await;
++    assert_eq!(exchange.status, 200);
++    assert_eq!(exchange.body, ttl_first, "replay survives the preparation TTL");
++    recorder.record(
++        "prepare_replay_after_ttl",
++        "The same request replayed after the 1 second preparation TTL elapsed: still the stored answer",
++        &ttl_signature,
++        &ttl_body,
++        &exchange,
++    );
++    let _ = (&creators, &short_pool);
++}
+diff --git a/paykit-server-e2e/tests/fixtures/sdk_capture.rs b/paykit-server-e2e/tests/fixtures/sdk_capture.rs
+new file mode 100644
+index 0000000..60ef718
+--- /dev/null
++++ b/paykit-server-e2e/tests/fixtures/sdk_capture.rs
+@@ -0,0 +1,135 @@
++use std::sync::{Arc, Mutex};
++
++use async_trait::async_trait;
++use paykit_sdk::{
++    PaymentAdapter, PaymentTarget, PrivatePaymentEndpointCandidate,
++    PrivatePaymentEndpointSelectionRequest, PubkySessionAccess, PubkySessionProvider,
++    PublicPaymentEndpointCandidate, PublicPaymentEndpointSelectionRequest, PublicReceivingDetail,
++};
++
++#[derive(Clone)]
++pub struct TestSessionProvider {
++    access: Arc<Mutex<Option<PubkySessionAccess>>>,
++}
++
++impl TestSessionProvider {
++    pub fn new(access: PubkySessionAccess) -> Self {
++        Self {
++            access: Arc::new(Mutex::new(Some(access))),
++        }
++    }
++}
++
++#[async_trait]
++impl PubkySessionProvider for TestSessionProvider {
++    async fn load_session_access(&self) -> paykit_sdk::Result<Option<PubkySessionAccess>> {
++        Ok(self.access.lock().unwrap().clone())
++    }
++
++    async fn load_public_storage(
++        &self,
++    ) -> paykit_sdk::Result<Option<pubky_testnet::pubky::PublicStorage>> {
++        Ok(self
++            .access
++            .lock()
++            .unwrap()
++            .as_ref()
++            .map(|access| access.outbox_client.public_storage()))
++    }
++
++    async fn clear_session_access(&self) -> paykit_sdk::Result<()> {
++        *self.access.lock().unwrap() = None;
++        Ok(())
++    }
++}
++
++#[derive(Clone, Copy, Default)]
++pub struct TestPaymentAdapter;
++
++#[async_trait]
++impl PaymentAdapter for TestPaymentAdapter {
++    async fn select_private_payment_endpoints(
++        &self,
++        request: &PrivatePaymentEndpointSelectionRequest,
++    ) -> paykit_sdk::Result<Vec<PrivatePaymentEndpointCandidate>> {
++        Ok(request.candidates.clone())
++    }
++
++    async fn build_private_payment_target(
++        &self,
++        endpoint: &PrivatePaymentEndpointCandidate,
++    ) -> paykit_sdk::Result<PaymentTarget> {
++        Ok(PaymentTarget {
++            payload: endpoint.payload.clone(),
++        })
++    }
++
++    async fn current_public_receiving_details(
++        &self,
++    ) -> paykit_sdk::Result<Vec<PublicReceivingDetail>> {
++        Ok(Vec::new())
++    }
++
++    async fn select_public_payment_endpoints(
++        &self,
++        request: &PublicPaymentEndpointSelectionRequest,
++    ) -> paykit_sdk::Result<Vec<PublicPaymentEndpointCandidate>> {
++        Ok(request.candidates.clone())
++    }
++
++    async fn build_public_payment_target(
++        &self,
++        endpoint: &PublicPaymentEndpointCandidate,
++    ) -> paykit_sdk::Result<PaymentTarget> {
++        Ok(PaymentTarget {
++            payload: endpoint.payload.clone(),
++        })
++    }
++}
++
++pub type HostedSdk = paykit_sdk::PaykitSdk<
++    paykit_sdk::PubkySharedStateStorage,
++    TestSessionProvider,
++    TestPaymentAdapter,
++>;
++
++pub async fn hosted_sdk(access: PubkySessionAccess, app_id: &str, counter_seed: u64) -> HostedSdk {
++    hosted_sdk_with_requests(access, app_id, counter_seed, true).await
++}
++
++pub async fn hosted_sdk_with_requests(
++    access: PubkySessionAccess,
++    app_id: &str,
++    counter_seed: u64,
++    payment_requests: bool,
++) -> HostedSdk {
++    let provider = TestSessionProvider::new(access);
++    let storage = paykit_sdk::PubkySharedStateStorage::new(provider.clone());
++    let sdk = paykit_sdk::PaykitSdk::new(
++        storage.clone(),
++        provider,
++        TestPaymentAdapter,
++        paykit_sdk::PaykitSdkConfig::new(app_id).unwrap(),
++    );
++    sdk.initialize().await.unwrap();
++    sdk.publish_paykit_noise_key_authorization().await.unwrap();
++    let mut backup = sdk.export_backup_state().await.unwrap();
++    backup.next_outbound_private_message_id = counter_seed;
++    sdk.restore_backup_state(backup).await.unwrap();
++    let app = if app_id == "paykit-server" {
++        paykit_server::real_setup::server_app()
++    } else {
++        paykit_lib::PaykitApp::new(
++            "Test App",
++            paykit_lib::PaykitAppCapabilities {
++                private_payments: true,
++                payment_requests,
++                receipts: true,
++                outgoing_payments: true,
++            },
++        )
++        .unwrap()
++    };
++    sdk.publish_paykit_app(app).await.unwrap();
++    sdk
++}

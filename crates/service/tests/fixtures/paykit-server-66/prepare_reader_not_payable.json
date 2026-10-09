@@ -1,0 +1,17 @@
+{
+  "description": "A buyer whose registry has no app that takes payment requests",
+  "name": "prepare_reader_not_payable",
+  "request": {
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyzgrus1dgrp6ujqzeyhen5ghqxupgcrqmuqrn67k6xqpwkhr874by\",\"operation_id\":\"marketplace-payment:C9MCS8PNE8MHN962YZ5NQXSFEM:8\",\"payment_window_seconds\":1800,\"reader\":\"pubkyji8tex8k9ii1hi6i6x7rcpsww3ybembtrsanogshasoap6tz4g7o\",\"reference\":\"db8c8b1f-a666-4741-b334-15e59444a07a\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "yy5y8Ow0Lb3X0T65dtgzgxOnzQhvOTrLEmF6mLKOUU0JMPk3KUXICZ06MderyYSIo5zRGeRDqcofI34Ygxr_CQ"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"reader_not_payable\",\"message\":\"reader has no Paykit app able to pay requests\"}}",
+    "content_type": "application/json",
+    "status": 409
+  },
+  "sent_at": "2026-10-09T11:59:20.119465705Z",
+  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+}

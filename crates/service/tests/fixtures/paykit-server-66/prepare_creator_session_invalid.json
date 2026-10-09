@@ -1,0 +1,17 @@
+{
+  "description": "A seller whose stored homeserver session is not valid",
+  "name": "prepare_creator_session_invalid",
+  "request": {
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyst6a6e7sinnunehqyhmuj95iisg38bf6jfocprk7bfnc3du13xiy\",\"operation_id\":\"marketplace-payment:EK0N8V1SXC74FNF8EEPJB0TS58:10\",\"payment_window_seconds\":1800,\"reader\":\"pubkydwyreddqufizxkqy7wiho1e4oq6dpfqwmusu9rkh8ndpu49zd3dy\",\"reference\":\"9502e9eb-b8a4-407b-a674-daf3bca23696\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "wIIXpMfYWMTvXefBrgzX0UcEd9d923LldthYzPyfDVB_Gofip7mTtj6NWHhm7mST5Jh64xJxcPxHU1nVok5mBw"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"creator_session_invalid\",\"message\":\"creator session is invalid\"}}",
+    "content_type": "application/json",
+    "status": 409
+  },
+  "sent_at": "2026-10-09T11:59:20.215060843Z",
+  "server_revision": "3eff69345c749b9ee9f6e036d5d8b8b81e08e698"
+}
