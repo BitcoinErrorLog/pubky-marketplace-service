@@ -37,8 +37,12 @@ pub const ENV_STRIPE_API_BASE: &str = "STRIPE_API_BASE";
 /// enables the bitcoin method and makes the signing key mandatory.
 pub const ENV_PAYKIT_SERVER_URL: &str = "PAYKIT_SERVER_URL";
 /// Environment variable holding the 32-byte hex ed25519 seed whose public
-/// key paykit-server trusts as `marketplace.trusted_public_key`.
+/// key paykit-server trusts: `marketplace.trusted_public_key` on the fork,
+/// an entry of `[signed_services] trusted_public_keys` upstream.
 pub const ENV_PAYKIT_REQUEST_SIGNING_KEY: &str = "PAYKIT_REQUEST_SIGNING_KEY";
+/// Environment variable selecting the paykit-server API the client speaks:
+/// `fork` (the default) or `upstream`. See [`PaykitApi`].
+pub const ENV_PAYKIT_SERVER_API: &str = "PAYKIT_SERVER_API";
 /// Environment variable overriding the Shippo API base URL. Production
 /// leaves it unset (`https://api.goshippo.com`); tests point it at a local
 /// double so the real HTTP client is exercised end to end.
@@ -954,11 +958,63 @@ impl PaykitCommandError {
     }
 }
 
-/// The signed Paykit client: `x-paykit-signature` over the canonical JSON
-/// body, verified by paykit-server against `marketplace.trusted_public_key`.
+/// Which paykit-server API the client speaks. One setting decides both the
+/// signature preimage and the seller-readiness call, so a cutover (and its
+/// rollback) is a single configuration change.
+///
+/// - `Fork` (default): `x-paykit-signature` signs the canonical JSON body
+///   alone, and seller readiness is the public `GET /v0/accounts/{creator}`.
+/// - `Upstream` (`pubky/paykit-server` rc9 and #55): the signature covers
+///   [`paykit_signature_preimage`] (method, path and body), and seller
+///   readiness is the signed `POST /setup/status`.
+///
+/// The payment-request lifecycle routes (prepare, activate, void, resolve)
+/// are fork routes today. Under `Upstream` they are signed like every other
+/// request but upstream does not serve them yet, so a Bitcoin bind answers
+/// `paykit_unavailable` until the lifecycle adapter lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaykitApi {
+    #[default]
+    Fork,
+    Upstream,
+}
+
+impl PaykitApi {
+    /// Parses the [`ENV_PAYKIT_SERVER_API`] value.
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim() {
+            "fork" => Ok(Self::Fork),
+            "upstream" => Ok(Self::Upstream),
+            _ => anyhow::bail!("{ENV_PAYKIT_SERVER_API} must be `fork` or `upstream`"),
+        }
+    }
+}
+
+/// The bytes paykit-server verifies the `x-paykit-signature` over:
+/// `"paykit-http-signature-v1\0" + METHOD + "\0" + path + "\0" + raw_body`,
+/// with the method upper-cased and `path` the query-free request path
+/// exactly as the server receives it.
+pub fn paykit_signature_preimage(method: &str, path: &str, raw_body: &[u8]) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"paykit-http-signature-v1\0";
+    let method = method.to_ascii_uppercase();
+    let mut preimage =
+        Vec::with_capacity(DOMAIN.len() + method.len() + 1 + path.len() + 1 + raw_body.len());
+    preimage.extend_from_slice(DOMAIN);
+    preimage.extend_from_slice(method.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(path.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(raw_body);
+    preimage
+}
+
+/// The signed Paykit client: `x-paykit-signature` verified by paykit-server
+/// against its trusted service key. What the signature covers depends on
+/// the configured [`PaykitApi`].
 pub struct PaykitClient {
     base_url: String,
     signing_key: SigningKey,
+    api: PaykitApi,
     http: reqwest::Client,
 }
 
@@ -966,6 +1022,7 @@ impl std::fmt::Debug for PaykitClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PaykitClient")
             .field("base_url", &self.base_url)
+            .field("api", &self.api)
             .field("signing_key", &"<redacted>")
             .finish()
     }
@@ -1039,12 +1096,85 @@ impl PaykitClient {
         Ok(Self {
             base_url,
             signing_key: SigningKey::from_bytes(&seed),
+            api: PaykitApi::Fork,
             http: reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?,
         })
     }
 
-    /// Whether the seller has a claimed watch-only account on paykit-server.
-    pub async fn account_exists(&self, seller_pubky: &str) -> Result<bool, PaykitRequestError> {
+    /// Selects the paykit-server API this client speaks (default
+    /// [`PaykitApi::Fork`]).
+    pub fn with_api(mut self, api: PaykitApi) -> Self {
+        self.api = api;
+        self
+    }
+
+    /// Whether the seller can receive Bitcoin right now: the only input to
+    /// `bitcoin_available`. `Ok(true)` only for a ready seller; `Ok(false)`
+    /// when the seller has to (re)do Paykit setup; `Err(Unavailable)` when
+    /// paykit-server cannot say, so the availability cache retries and serves
+    /// the last known value until it goes stale. Nothing here ever starts a
+    /// Paykit authorization flow.
+    pub async fn seller_ready(&self, seller_pubky: &str) -> Result<bool, PaykitRequestError> {
+        match self.api {
+            PaykitApi::Fork => self.fork_account_claimed(seller_pubky).await,
+            PaykitApi::Upstream => self.upstream_setup_ready(seller_pubky).await,
+        }
+    }
+
+    /// Upstream seller readiness: signed `POST /setup/status` for BTC. Only
+    /// `ready` permits Bitcoin offers; `setup_required` means the seller
+    /// must set up Paykit; `unavailable`, a non-2xx answer, a transport
+    /// failure and any body outside the closed `{"status": ...}` contract
+    /// are all retryable outages.
+    async fn upstream_setup_ready(&self, seller_pubky: &str) -> Result<bool, PaykitRequestError> {
+        let url = format!("{}/setup/status", self.base_url);
+        let (body, signature) = self
+            .signed_body(
+                &url,
+                &serde_json::json!({
+                    "asset": "BTC",
+                    "creator": pubky_app_key(seller_pubky),
+                }),
+            )
+            .map_err(|error| {
+                tracing::error!(error = %error, "paykit setup status request could not be signed");
+                PaykitRequestError::Unavailable
+            })?;
+        let response = self
+            .http
+            .post(url)
+            .header("x-paykit-signature", signature)
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| PaykitRequestError::Unavailable)?;
+        if !response.status().is_success() {
+            tracing::warn!(status = %response.status(), "paykit setup status rejected");
+            return Err(PaykitRequestError::Unavailable);
+        }
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|_| PaykitRequestError::Unavailable)?;
+        let status = body
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .and_then(|object| object.get("status"))
+            .and_then(serde_json::Value::as_str);
+        match status {
+            Some("ready") => Ok(true),
+            Some("setup_required") => Ok(false),
+            Some("unavailable") => Err(PaykitRequestError::Unavailable),
+            _ => {
+                tracing::warn!("paykit setup status answered outside its contract");
+                Err(PaykitRequestError::Unavailable)
+            }
+        }
+    }
+
+    /// Fork seller readiness: whether the seller has a claimed watch-only
+    /// account (`GET /v0/accounts/{creator}`).
+    async fn fork_account_claimed(&self, seller_pubky: &str) -> Result<bool, PaykitRequestError> {
         let response = self
             .http
             .get(format!(
@@ -1071,7 +1201,9 @@ impl PaykitClient {
     }
 
     /// Reads Paykit's rail-wide Bitcoin offer gate (see
-    /// [`rail_offer_available`] for the accepted readiness shapes).
+    /// [`rail_offer_available`] for the accepted readiness shapes). It is
+    /// the public, unsigned `GET /health/ready`, which fork and upstream
+    /// both serve, so it does not depend on [`PaykitApi`].
     pub async fn rail_health(&self) -> Result<bool, PaykitRequestError> {
         let response = self
             .http
@@ -1090,11 +1222,25 @@ impl PaykitClient {
         Ok(rail_offer_available(&body))
     }
 
-    fn signed_body(&self, value: &serde_json::Value) -> anyhow::Result<(String, String)> {
+    /// Canonicalizes `value` and signs it for a `POST` to `url`. The fork
+    /// signs the body alone; upstream signs the request preimage, whose path
+    /// is the URL's path (including any base-URL prefix the server sees).
+    fn signed_body(
+        &self,
+        url: &str,
+        value: &serde_json::Value,
+    ) -> anyhow::Result<(String, String)> {
         let body = serde_json_canonicalizer::to_string(value)?;
+        let message = match self.api {
+            PaykitApi::Fork => body.as_bytes().to_vec(),
+            PaykitApi::Upstream => {
+                let url = url::Url::parse(url)?;
+                paykit_signature_preimage("POST", url.path(), body.as_bytes())
+            }
+        };
         let signature = base64::Engine::encode(
             &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            self.signing_key.sign(body.as_bytes()).to_bytes(),
+            self.signing_key.sign(&message).to_bytes(),
         );
         Ok((body, signature))
     }
@@ -1123,19 +1269,23 @@ impl PaykitClient {
         expires_at: chrono::DateTime<chrono::Utc>,
         idempotency_key: &str,
     ) -> Result<PaykitPrepared, PaykitRequestError> {
+        let url = format!("{}/v0/payment-requests", self.base_url);
         let (body, signature) = self
-            .signed_body(&serde_json::json!({
-                "amount_sats": amount_sats,
-                "creator": pubky_app_key(seller_pubky),
-                "reader": pubky_app_key(buyer_pubky),
-                "reference": reference,
-                "expires_at": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "idempotency_key": idempotency_key,
-            }))
+            .signed_body(
+                &url,
+                &serde_json::json!({
+                    "amount_sats": amount_sats,
+                    "creator": pubky_app_key(seller_pubky),
+                    "reader": pubky_app_key(buyer_pubky),
+                    "reference": reference,
+                    "expires_at": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "idempotency_key": idempotency_key,
+                }),
+            )
             .map_err(|_| PaykitRequestError::Rejected)?;
         let response = self
             .http
-            .post(format!("{}/v0/payment-requests", self.base_url))
+            .post(url)
             .header("x-paykit-signature", signature)
             .body(body)
             .send()
@@ -1186,11 +1336,12 @@ impl PaykitClient {
         path: &str,
         body: serde_json::Value,
     ) -> Result<reqwest::Response, PaykitCommandError> {
-        let (body, signature) = self.signed_body(&body).map_err(|_| {
+        let url = format!("{}{path}", endpoint.trim_end_matches('/'));
+        let (body, signature) = self.signed_body(&url, &body).map_err(|_| {
             PaykitCommandError::UnexpectedRejection("body did not canonicalize".to_string())
         })?;
         self.http
-            .post(format!("{}{path}", endpoint.trim_end_matches('/')))
+            .post(url)
             .header("x-paykit-signature", signature)
             .body(body)
             .send()
@@ -1388,15 +1539,19 @@ impl PaykitClient {
         seller_pubky: &str,
         reference: &str,
     ) -> (PaykitStatusOutcome, Option<PaykitDeliveryState>) {
-        let Ok((body, signature)) = self.signed_body(&serde_json::json!({
-            "bundle_id": reference,
-            "creator": pubky_app_key(seller_pubky),
-        })) else {
+        let url = format!("{}/transactions/status", self.base_url);
+        let Ok((body, signature)) = self.signed_body(
+            &url,
+            &serde_json::json!({
+                "bundle_id": reference,
+                "creator": pubky_app_key(seller_pubky),
+            }),
+        ) else {
             return (PaykitStatusOutcome::Unavailable, None);
         };
         let response = self
             .http
-            .post(format!("{}/transactions/status", self.base_url))
+            .post(url)
             .header("x-paykit-signature", signature)
             .body(body)
             .send()
@@ -1509,6 +1664,38 @@ impl std::fmt::Debug for PaymentsRuntime {
     }
 }
 
+/// The Paykit client from its three settings. URL and signing key come
+/// together or not at all; the API selector is meaningless without them, so
+/// setting it alone is refused rather than silently ignored.
+fn paykit_client_from_settings(
+    url: Option<String>,
+    signing_seed: Option<String>,
+    api: Option<String>,
+) -> anyhow::Result<Option<PaykitClient>> {
+    match (url, signing_seed) {
+        (None, None) => {
+            if api.is_some() {
+                anyhow::bail!(
+                    "{ENV_PAYKIT_SERVER_API} is set without {ENV_PAYKIT_SERVER_URL} and \
+                     {ENV_PAYKIT_REQUEST_SIGNING_KEY}"
+                );
+            }
+            Ok(None)
+        }
+        (Some(url), Some(seed)) => {
+            let api = api
+                .map(|value| PaykitApi::parse(&value))
+                .transpose()?
+                .unwrap_or_default();
+            Ok(Some(PaykitClient::new(&url, &seed)?.with_api(api)))
+        }
+        _ => anyhow::bail!(
+            "Paykit is partially configured: set both {ENV_PAYKIT_SERVER_URL} and \
+             {ENV_PAYKIT_REQUEST_SIGNING_KEY}, or neither"
+        ),
+    }
+}
+
 /// Builds the production runtime from the environment, failing closed:
 /// `STRIPE_KEY_ENCRYPTION_KEY` enables the surface; `PAYKIT_SERVER_URL` and
 /// `PAYKIT_REQUEST_SIGNING_KEY` must be set together or not at all.
@@ -1528,17 +1715,11 @@ pub fn payments_runtime_from_env() -> anyhow::Result<Option<Arc<PaymentsRuntime>
     let stripe_base =
         std::env::var(ENV_STRIPE_API_BASE).unwrap_or_else(|_| "https://api.stripe.com".to_string());
     let stripe = StripeClient::new(&stripe_base)?;
-    let paykit = match (
+    let paykit = paykit_client_from_settings(
         std::env::var(ENV_PAYKIT_SERVER_URL).ok(),
         std::env::var(ENV_PAYKIT_REQUEST_SIGNING_KEY).ok(),
-    ) {
-        (None, None) => None,
-        (Some(url), Some(seed)) => Some(PaykitClient::new(&url, &seed)?),
-        _ => anyhow::bail!(
-            "Paykit is partially configured: set both {ENV_PAYKIT_SERVER_URL} and \
-             {ENV_PAYKIT_REQUEST_SIGNING_KEY}, or neither"
-        ),
-    };
+        std::env::var(ENV_PAYKIT_SERVER_API).ok(),
+    )?;
     let ipn_verify_url = std::env::var(ENV_PAYPAL_IPN_VERIFY_URL)
         .unwrap_or_else(|_| "https://ipnpb.paypal.com/cgi-bin/webscr".to_string());
     let paypal_ipn = PaypalIpnVerifier::new(&ipn_verify_url)?;
@@ -1652,6 +1833,123 @@ mod tests {
     use super::*;
 
     const KEY: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    /// The signing seed of `paykit-server/tests/setup_status.rs`
+    /// (`SigningKey::from_bytes(&[7; 32])`).
+    const UPSTREAM_TEST_SEED: &str =
+        "0707070707070707070707070707070707070707070707070707070707070707";
+    const UPSTREAM_CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    fn upstream_test_client(api: PaykitApi) -> PaykitClient {
+        PaykitClient::new("https://paykit.example", UPSTREAM_TEST_SEED)
+            .unwrap()
+            .with_api(api)
+    }
+
+    /// Signatures produced by upstream's own `signature_preimage` (PR #55
+    /// head `a109148`) over `POST /setup/status`: the bare-creator body is
+    /// upstream's test body, the BTC body is what this client sends.
+    #[test]
+    fn the_upstream_client_signs_what_upstream_verifies() {
+        let client = upstream_test_client(PaykitApi::Upstream);
+        let url = "https://paykit.example/setup/status";
+        let (body, signature) = client
+            .signed_body(url, &serde_json::json!({ "creator": UPSTREAM_CREATOR }))
+            .unwrap();
+        assert_eq!(
+            body,
+            r#"{"creator":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"}"#
+        );
+        assert_eq!(
+            signature,
+            "uGwZVTdCxIRugXQo2gui7dAz7Ude3mobvcretytsMx55Iyr3rCzLEm-rwpfJcphCTPOj6VAzD4sNMr2wT60OAw"
+        );
+        let (body, signature) = client
+            .signed_body(
+                url,
+                &serde_json::json!({ "creator": UPSTREAM_CREATOR, "asset": "BTC" }),
+            )
+            .unwrap();
+        assert_eq!(
+            body,
+            r#"{"asset":"BTC","creator":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"}"#
+        );
+        assert_eq!(
+            signature,
+            "iJiAIXxTD2HUUwDus4BykJGxIrq7tG1wvzQvcxufWJutnh500DNkImHqx5rk-BNt0_gXJ8bRexIJdaS254oECw"
+        );
+    }
+
+    #[test]
+    fn the_api_selector_needs_the_paykit_url_and_key_and_defaults_to_the_fork() {
+        let url = Some("https://paykit.example".to_string());
+        let seed = Some(UPSTREAM_TEST_SEED.to_string());
+        let api = |client: Option<PaykitClient>| client.expect("configured").api;
+
+        assert_eq!(
+            api(paykit_client_from_settings(url.clone(), seed.clone(), None).unwrap()),
+            PaykitApi::Fork
+        );
+        assert_eq!(
+            api(
+                paykit_client_from_settings(url.clone(), seed.clone(), Some("upstream".into()))
+                    .unwrap()
+            ),
+            PaykitApi::Upstream
+        );
+        assert!(paykit_client_from_settings(None, None, None)
+            .unwrap()
+            .is_none());
+        assert!(
+            paykit_client_from_settings(url.clone(), seed.clone(), Some("rc9".into())).is_err()
+        );
+        assert!(paykit_client_from_settings(None, None, Some("upstream".into())).is_err());
+        assert!(paykit_client_from_settings(url, None, Some("upstream".into())).is_err());
+        assert!(paykit_client_from_settings(None, seed, None).is_err());
+    }
+
+    #[test]
+    fn the_fork_client_still_signs_the_bare_canonical_body() {
+        let fork = upstream_test_client(PaykitApi::Fork);
+        let upstream = upstream_test_client(PaykitApi::Upstream);
+        let value = serde_json::json!({ "creator": UPSTREAM_CREATOR });
+        let url = "https://paykit.example/setup/status";
+        let (body, signature) = fork.signed_body(url, &value).unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        assert_eq!(
+            signature,
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                key.sign(body.as_bytes()).to_bytes(),
+            )
+        );
+        assert_ne!(signature, upstream.signed_body(url, &value).unwrap().1);
+    }
+
+    #[test]
+    fn the_signed_path_is_the_request_path_including_a_base_url_prefix() {
+        let client = upstream_test_client(PaykitApi::Upstream);
+        let value = serde_json::json!({ "creator": UPSTREAM_CREATOR });
+        let plain = client
+            .signed_body("https://paykit.example/setup/status", &value)
+            .unwrap();
+        let prefixed = client
+            .signed_body("https://paykit.example/paykit/setup/status", &value)
+            .unwrap();
+        assert_ne!(plain.1, prefixed.1);
+        let (body, signature) = prefixed;
+        let signature =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, signature)
+                .unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        use ed25519_dalek::Verifier;
+        key.verifying_key()
+            .verify(
+                &paykit_signature_preimage("POST", "/paykit/setup/status", body.as_bytes()),
+                &ed25519_dalek::Signature::from_slice(&signature).unwrap(),
+            )
+            .unwrap();
+    }
 
     #[test]
     fn restricted_keys_round_trip_and_bind_the_seller() {
