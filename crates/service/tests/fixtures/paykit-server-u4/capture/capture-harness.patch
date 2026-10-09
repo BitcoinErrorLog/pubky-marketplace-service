@@ -1,0 +1,814 @@
+diff --git a/paykit-server-e2e/tests/capture_setup_status.rs b/paykit-server-e2e/tests/capture_setup_status.rs
+new file mode 100644
+index 0000000..7ebff23
+--- /dev/null
++++ b/paykit-server-e2e/tests/capture_setup_status.rs
+@@ -0,0 +1,808 @@
++//! Captures real `POST /setup/status` exchanges from a running paykit-server
++//! (pubky/paykit-server `v0.1.0-rc10`, 7326a3f) for the
++//! pubky-marketplace-service contract fixtures.
++//!
++//! Real: the production `Server` (router, signed-service authentication
++//! layer, `SetupStatusService`, the creator session validator), PostgreSQL,
++//! the `CreatorStore` with its migrations, creator sessions, App Registry and
++//! Noise key authorization validated against a real Pubky homeserver
++//! (`pubky-testnet`), and the creators' stored receiving details. Requests go
++//! over TCP with the signature header exactly as a trusted service sends it.
++//! Nothing is stubbed: `[usdt] rpc_url` is configured but `/setup/status`
++//! never calls it, so it points at a closed local port.
++//!
++//! `CAPTURE_INPUTS` names a JSON file `{ "signing_seed_hex": "..." }` (the
++//! service test key); `CAPTURE_DIR` is the output directory.
++
++use std::{net::SocketAddr, sync::Arc, time::Duration};
++
++use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
++use bitcoin::{
++    Network,
++    bip32::{ChildNumber, Xpriv, Xpub},
++    secp256k1::Secp256k1,
++};
++use ed25519_dalek::{Signer, SigningKey};
++use paykit_sdk::{
++    PAYKIT_SESSION_CAPABILITIES, PaykitIdentitySecretKey, PubkyAuthCompanionClaim,
++    PubkyLocalSecretKey, PubkyPublicKey, PubkySessionBootstrap,
++};
++use paykit_server::{
++    Server,
++    bitkit_claim::{QUERY_PARAMETER, parse_auth_request, parse_reconnect_auth_request},
++    config::{Config, ConfigEnvironment},
++    domain::locks::{CreatorPubky, parse_creator},
++    http::auth::signature_preimage,
++    startup::initialize_database,
++};
++use paykit_server_e2e::postgres::TestDatabase;
++use pubky_testnet::EphemeralTestnet;
++use serde::Deserialize;
++use serde_json::{Value, json};
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++#[path = "fixtures/sdk.rs"]
++mod sdk_fixtures;
++
++const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
++const PATH: &str = "/setup/status";
++const USDT_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
++const USDT_TOKEN: &str = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9";
++
++#[derive(Deserialize)]
++struct Inputs {
++    signing_seed_hex: String,
++}
++
++fn decode_hex(text: &str) -> Vec<u8> {
++    (0..text.len())
++        .step_by(2)
++        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
++        .collect()
++}
++
++fn account_xpub(seed: u8) -> Xpub {
++    let secp = Secp256k1::new();
++    let account = Xpriv::new_master(Network::Testnet, &[seed; 32])
++        .unwrap()
++        .derive_priv(
++            &secp,
++            &[
++                ChildNumber::from_hardened_idx(84).unwrap(),
++                ChildNumber::from_hardened_idx(1).unwrap(),
++                ChildNumber::from_hardened_idx(0).unwrap(),
++            ],
++        )
++        .unwrap();
++    Xpub::from_priv(&secp, &account)
++}
++
++fn config(database_url: &str, signing_key: &SigningKey, usdt: bool) -> Config {
++    let key = pubky::PublicKey::from(
++        pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
++    )
++    .to_string();
++    let usdt = if usdt {
++        "[usdt]\nrpc_url = \"http://127.0.0.1:1/\"\n"
++    } else {
++        ""
++    };
++    Config::from_toml_and_environment(
++        &format!(
++            r#"
++[http]
++listen_addr = "127.0.0.1:0"
++[signed_services]
++trusted_public_keys = ["{key}"]
++[setup]
++allowed_origins = ["https://app.example"]
++[paykit]
++client_id = "app.paykit.server"
++app_id = "paykit-server"
++network = "testnet"
++[bitcoin]
++network = "testnet"
++[electrum]
++endpoint = "tcp://127.0.0.1:1"
++poll_interval = "1h"
++request_timeout = "1s"
++connect_retries = 0
++[outbox]
++poll_interval = "1h"
++batch_size = 16
++lease_duration = "5s"
++retry_initial = "1s"
++retry_max = "2s"
++[shutdown]
++drain_timeout = "2s"
++{usdt}
++"#
++        ),
++        ConfigEnvironment {
++            database_url: Some(database_url.to_owned()),
++            master_key: Some(MASTER_KEY.to_owned()),
++        },
++    )
++    .unwrap()
++}
++
++/// A Bitkit wallet: a Pubky account with the Paykit app registry and Noise key
++/// authorization a real wallet publishes, before any paykit-server setup.
++struct Wallet {
++    root: PubkyLocalSecretKey,
++    creator: CreatorPubky,
++    _sdk: sdk_fixtures::HostedSdk,
++}
++
++async fn wallet(bootstrap: &PubkySessionBootstrap, homeserver: &PubkyPublicKey) -> Wallet {
++    let root = PubkyLocalSecretKey::new(pubky_testnet::pubky::Keypair::random().secret_key());
++    let auth = bootstrap
++        .sign_up(
++            &root,
++            homeserver,
++            None,
++            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
++        )
++        .await
++        .unwrap();
++    let creator = parse_creator(&auth.public_key.to_app_key()).unwrap();
++    let sdk = sdk_fixtures::hosted_sdk(auth.access.clone(), "bitkit", 0).await;
++    Wallet {
++        root,
++        creator,
++        _sdk: sdk,
++    }
++}
++
++/// What Bitkit sends once the user approves the setup (or reconnect)
++/// permissions: Paykit access, and optionally a Bitcoin account and a USDT
++/// address. A permission the user declines is absent.
++fn receiving_payload(
++    key: &PaykitIdentitySecretKey,
++    bitcoin_seed: Option<u8>,
++    usdt_address: Option<&str>,
++) -> Vec<u8> {
++    let mut payload = json!({
++        "paykit_access": {
++            "key_generation": key.key_generation(),
++            "secret": URL_SAFE_NO_PAD.encode(key.as_bytes()),
++        },
++    });
++    if let Some(seed) = bitcoin_seed {
++        payload["bitcoin_account"] = json!({
++            "account_index": 0,
++            "address_type": "nativeSegwit",
++            "xpub": account_xpub(seed).to_string(),
++        });
++    }
++    if let Some(address) = usdt_address {
++        payload["usdt-arbitrum-address"] =
++            json!({ "value": address, "chain_id": "42161", "token": USDT_TOKEN });
++    }
++    serde_json::to_vec(&payload).unwrap()
++}
++
++/// One HTTP exchange with a running server, byte for byte.
++async fn http(
++    address: SocketAddr,
++    method: &str,
++    path_and_query: &str,
++    signature: Option<&str>,
++    body: &str,
++) -> Exchange {
++    let sent_at = time::OffsetDateTime::now_utc()
++        .format(&time::format_description::well_known::Rfc3339)
++        .unwrap();
++    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
++    let signature = signature
++        .map(|signature| format!("x-paykit-signature: {signature}\r\n"))
++        .unwrap_or_default();
++    let head = format!(
++        "{method} {path_and_query} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n{signature}\r\n",
++        body.len()
++    );
++    stream.write_all(head.as_bytes()).await.unwrap();
++    stream.write_all(body.as_bytes()).await.unwrap();
++    let mut response = Vec::new();
++    stream.read_to_end(&mut response).await.unwrap();
++    let header_end = response
++        .windows(4)
++        .position(|window| window == b"\r\n\r\n")
++        .unwrap();
++    let headers = std::str::from_utf8(&response[..header_end]).unwrap();
++    let status = headers
++        .lines()
++        .next()
++        .unwrap()
++        .split_whitespace()
++        .nth(1)
++        .unwrap()
++        .parse::<u16>()
++        .unwrap();
++    let content_type = headers.lines().skip(1).find_map(|line| {
++        line.to_ascii_lowercase()
++            .starts_with("content-type:")
++            .then(|| line.split_once(':').unwrap().1.trim().to_owned())
++    });
++    let raw = &response[(header_end + 4)..];
++    let body = if headers
++        .to_ascii_lowercase()
++        .contains("transfer-encoding: chunked")
++    {
++        dechunk(raw)
++    } else {
++        raw.to_vec()
++    };
++    Exchange {
++        sent_at,
++        status,
++        content_type,
++        body: String::from_utf8(body).unwrap(),
++    }
++}
++
++/// Runs a paykit-server setup (`reconnect_creator = None`) or reconnect
++/// through the production `/setup` routes, as the Shop's iframe does: the
++/// iframe page carries Bitkit's authorization URL, the wallet approves it
++/// with its companion claim, and the page's own completion poll finishes it.
++async fn run_setup(
++    address: SocketAddr,
++    bootstrap: &PubkySessionBootstrap,
++    wallet: &Wallet,
++    reconnect_creator: Option<&CreatorPubky>,
++    payload: Vec<u8>,
++) {
++    let query = "return_to=https%3A%2F%2Fapp.example&state=capture";
++    let path = match reconnect_creator {
++        Some(creator) => format!("/setup/reconnect?{query}&creator={creator}"),
++        None => format!("/setup?{query}"),
++    };
++    let page = http(address, "GET", &path, None, "").await;
++    assert_eq!(page.status, 200, "{}", page.body);
++    let between = |text: &str, start: &str, end: &str| -> String {
++        let from = text.find(start).expect("marker present") + start.len();
++        let to = from + text[from..].find(end).expect("terminator present");
++        text[from..to].to_owned()
++    };
++    let authorization_url =
++        between(&page.body, "class=\"bitkit-btn\" href=\"", "\"").replace("&amp;", "&");
++    let flow_id = between(&page.body, "const flowId=\"", "\"");
++    let request = if reconnect_creator.is_some() {
++        parse_reconnect_auth_request(&authorization_url, PAYKIT_SESSION_CAPABILITIES)
++    } else {
++        parse_auth_request(&authorization_url, PAYKIT_SESSION_CAPABILITIES)
++    }
++    .unwrap();
++    let claim =
++        PubkyAuthCompanionClaim::new(QUERY_PARAMETER, request.claim_type(), payload).unwrap();
++    bootstrap
++        .approve_auth_with_companion_claim(
++            &authorization_url,
++            PAYKIT_SESSION_CAPABILITIES,
++            &wallet.root,
++            &claim,
++        )
++        .await
++        .unwrap();
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
++    loop {
++        let poll = http(
++            address,
++            "POST",
++            &format!("/setup/{flow_id}/complete"),
++            None,
++            "",
++        )
++        .await;
++        match poll.status {
++            200 => return,
++            408 | 425 | 429 | 502 | 503 | 504 => {}
++            other => panic!("setup failed with {other}: {}", poll.body),
++        }
++        assert!(tokio::time::Instant::now() < deadline, "setup timed out");
++        tokio::time::sleep(Duration::from_millis(250)).await;
++    }
++}
++
++struct Exchange {
++    sent_at: String,
++    status: u16,
++    content_type: Option<String>,
++    body: String,
++}
++
++async fn send(address: SocketAddr, signature: &str, body: &str) -> Exchange {
++    http(address, "POST", PATH, Some(signature), body).await
++}
++
++fn dechunk(mut raw: &[u8]) -> Vec<u8> {
++    let mut out = Vec::new();
++    loop {
++        let line_end = raw.windows(2).position(|window| window == b"\r\n").unwrap();
++        let size =
++            usize::from_str_radix(std::str::from_utf8(&raw[..line_end]).unwrap(), 16).unwrap();
++        raw = &raw[line_end + 2..];
++        if size == 0 {
++            return out;
++        }
++        out.extend_from_slice(&raw[..size]);
++        raw = &raw[size + 2..];
++    }
++}
++
++fn sign(key: &SigningKey, body: &str) -> String {
++    URL_SAFE_NO_PAD.encode(
++        key.sign(&signature_preimage("POST", PATH, body.as_bytes()))
++            .to_bytes(),
++    )
++}
++
++fn canonical(value: &Value) -> String {
++    serde_json_canonicalizer::to_string(value).unwrap()
++}
++
++fn signed(key: &SigningKey, creator: &CreatorPubky, asset: Option<&str>) -> (String, String) {
++    let mut body = json!({ "creator": creator.to_string() });
++    if let Some(asset) = asset {
++        body["asset"] = json!(asset);
++    }
++    let body = canonical(&body);
++    let signature = sign(key, &body);
++    (body, signature)
++}
++
++struct Recorder {
++    dir: std::path::PathBuf,
++}
++
++impl Recorder {
++    fn record(
++        &self,
++        name: &str,
++        description: &str,
++        server: &str,
++        signature: &str,
++        body: &str,
++        exchange: &Exchange,
++    ) {
++        let document = json!({
++            "name": name,
++            "description": description,
++            "server": server,
++            "server_revision": std::env::var("CAPTURE_SERVER_REVISION").expect("CAPTURE_SERVER_REVISION"),
++            "request": {
++                "method": "POST",
++                "path": PATH,
++                "signature": signature,
++                "body": body,
++            },
++            "sent_at": exchange.sent_at,
++            "response": {
++                "status": exchange.status,
++                "content_type": exchange.content_type,
++                "body": exchange.body,
++            },
++        });
++        std::fs::write(
++            self.dir.join(format!("{name}.json")),
++            serde_json::to_string_pretty(&document).unwrap() + "\n",
++        )
++        .unwrap();
++        println!("captured {name}: {} {}", exchange.status, exchange.body);
++    }
++}
++
++async fn serve(server: Server) -> SocketAddr {
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    tokio::spawn(server.run_until(listener, std::future::pending::<()>()));
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
++    loop {
++        let request =
++            format!("GET /health/ready HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
++        if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
++            stream.write_all(request.as_bytes()).await.unwrap();
++            let mut response = Vec::new();
++            stream.read_to_end(&mut response).await.unwrap();
++            if response.starts_with(b"HTTP/1.1 200") {
++                return address;
++            }
++        }
++        assert!(tokio::time::Instant::now() < deadline, "server not ready");
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
++async fn capture_setup_status_exchanges() {
++    let inputs: Inputs = serde_json::from_slice(
++        &std::fs::read(std::env::var("CAPTURE_INPUTS").expect("CAPTURE_INPUTS")).unwrap(),
++    )
++    .unwrap();
++    let recorder = Recorder {
++        dir: std::path::PathBuf::from(std::env::var("CAPTURE_DIR").expect("CAPTURE_DIR")),
++    };
++    std::fs::create_dir_all(&recorder.dir).unwrap();
++
++    let service_key = SigningKey::from_bytes(
++        &<[u8; 32]>::try_from(decode_hex(&inputs.signing_seed_hex)).unwrap(),
++    );
++    let other_key = SigningKey::from_bytes(&[9; 32]);
++
++    let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
++    let testnet = EphemeralTestnet::builder()
++        .postgres(pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap())
++        .build()
++        .await
++        .unwrap();
++    let pubky = testnet.sdk().unwrap();
++    // The relay `Server::build` dials for a testnet deployment.
++    let relay = http_relay::HttpRelay::builder()
++        .http_port(15412)
++        .run()
++        .await
++        .unwrap();
++    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
++        .unwrap()
++        .with_auth_relay(relay.local_url().join("inbox").unwrap().as_str())
++        .unwrap();
++    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
++
++    let database = TestDatabase::create().await;
++    let usdt_config = config(database.database_url(), &service_key, true);
++    let pool = initialize_database(&usdt_config).await.unwrap();
++    // Setup runs through two throwaway server instances (one per deployment
++    // flavour). The servers that answer `/setup/status` are built afterwards,
++    // so each starts from the persisted credentials: a bearer cached by the
++    // process that ran a setup is not what is under test.
++    let setup_server = Server::build_with_transports(
++        config(database.database_url(), &service_key, true),
++        pool.clone(),
++        pubky.clone(),
++        Arc::new(NoObservations),
++    )
++    .await
++    .unwrap();
++    let usdt_address = serve(setup_server).await;
++
++    // Wallets and what each one approved at setup, through the real routes.
++    let key_of = |wallet: &Wallet| wallet.root.derive_paykit_identity_secret_key(1).unwrap();
++    let dual = wallet(&bootstrap, &homeserver).await;
++    run_setup(
++        usdt_address,
++        &bootstrap,
++        &dual,
++        None,
++        receiving_payload(&key_of(&dual), Some(51), Some(USDT_ADDRESS)),
++    )
++    .await;
++    let bitcoin_only = wallet(&bootstrap, &homeserver).await;
++    run_setup(
++        usdt_address,
++        &bootstrap,
++        &bitcoin_only,
++        None,
++        receiving_payload(&key_of(&bitcoin_only), Some(52), None),
++    )
++    .await;
++    let reconnected = wallet(&bootstrap, &homeserver).await;
++    run_setup(
++        usdt_address,
++        &bootstrap,
++        &reconnected,
++        None,
++        receiving_payload(&key_of(&reconnected), Some(53), None),
++    )
++    .await;
++    let never_set_up = wallet(&bootstrap, &homeserver).await;
++
++    // The same deployment without `[usdt]` offers no USDT permission at all.
++    let plain_setup_server = Server::build_with_transports(
++        config(database.database_url(), &service_key, false),
++        pool.clone(),
++        pubky.clone(),
++        Arc::new(NoObservations),
++    )
++    .await
++    .unwrap();
++    let plain_setup_address = serve(plain_setup_server).await;
++    let plain_wallet = wallet(&bootstrap, &homeserver).await;
++    run_setup(
++        plain_setup_address,
++        &bootstrap,
++        &plain_wallet,
++        None,
++        paykit_server::bitkit_claim::encode_unsigned_payload(
++            0,
++            &account_xpub(54).encode(),
++            &key_of(&plain_wallet),
++        )
++        .to_vec(),
++    )
++    .await;
++
++    // Every status read below goes to a server built just for it. In this
++    // harness a server that restored a seller's credentials right after the
++    // setups answered `setup_required` for that seller from then on, while a
++    // server built for the read restored them on its first read, so each
++    // exchange is captured against its own server (all sharing one database).
++    let fresh_server = |usdt: bool| {
++        let pool = pool.clone();
++        let pubky = pubky.clone();
++        let config = config(database.database_url(), &service_key, usdt);
++        async move {
++            let server =
++                Server::build_with_transports(config, pool, pubky, Arc::new(NoObservations))
++                    .await
++                    .unwrap();
++            serve(server).await
++        }
++    };
++
++    let request = |creator: &CreatorPubky, field: Option<&str>| {
++        let mut body = json!({ "creator": creator.to_string() });
++        if let Some((name, value)) = field.and_then(|field| field.split_once(':')) {
++            body[name] = json!(value);
++        }
++        let body = canonical(&body);
++        let signature = sign(&service_key, &body);
++        (body, signature)
++    };
++
++    macro_rules! capture {
++        ($name:expr, $desc:expr, $server:expr, $address:expr, $wallet:expr, $asset:expr, $expected:expr) => {{
++            let address = fresh_server($server == WITH).await;
++            let (body, signature) = request(&$wallet.creator, $asset);
++            let exchange = send(address, &signature, &body).await;
++            assert_eq!(exchange.status, 200, "{}: {}", $name, exchange.body);
++            let expected: Option<&str> = $expected;
++            if let Some(expected) = expected {
++                assert_eq!(exchange.body, expected, "{}", $name);
++            }
++            recorder.record($name, $desc, $server, &signature, &body, &exchange);
++        }};
++    }
++
++    const WITH: &str = "usdt_configured";
++    const WITHOUT: &str = "usdt_not_configured";
++    const READY: &str = r#"{"status":"ready"}"#;
++    const SETUP_REQUIRED: &str = r#"{"status":"setup_required"}"#;
++
++    if std::env::var("CAPTURE_PRE_U4").is_ok() {
++        // A server without `accepted_asset` refuses the field as unknown.
++        let (body, signature) = request(&dual.creator, Some("accepted_asset:USDT"));
++        let exchange = send(fresh_server(true).await, &signature, &body).await;
++        assert_eq!(exchange.status, 400, "{}", exchange.body);
++        recorder.record(
++            "setup_status_accepted_asset_pre_u4",
++            "accepted_asset USDT sent to a paykit-server that predates the field: refused as an unknown field.",
++            WITH,
++            &signature,
++            &body,
++            &exchange,
++        );
++        return;
++    }
++
++    capture!(
++        "setup_status_authority_ready",
++        "No asset: a seller who completed Paykit setup in Bitkit. Authority only.",
++        WITH,
++        (),
++        dual,
++        None,
++        Some(READY)
++    );
++    capture!(
++        "setup_status_authority_ready_bitcoin_only",
++        "No asset: a seller who completed Paykit setup with Bitcoin only and declined USDT.",
++        WITH,
++        (),
++        bitcoin_only,
++        None,
++        Some(READY)
++    );
++    capture!(
++        "setup_status_authority_never_set_up",
++        "No asset: a Bitkit wallet that never ran Paykit setup with this server.",
++        WITH,
++        (),
++        never_set_up,
++        None,
++        Some(SETUP_REQUIRED)
++    );
++    capture!(
++        "setup_status_btc_dual",
++        "asset BTC (the denomination): a seller who approved a Bitcoin account and a USDT address.",
++        WITH,
++        (),
++        dual,
++        Some("asset:BTC"),
++        Some(READY)
++    );
++    capture!(
++        "setup_status_btc_bitcoin_only",
++        "asset BTC (the denomination): a seller who approved a Bitcoin account and declined USDT.",
++        WITH,
++        (),
++        bitcoin_only,
++        Some("asset:BTC"),
++        Some(READY)
++    );
++    capture!(
++        "setup_status_usdt_dual",
++        "accepted_asset USDT, `[usdt]` configured: a seller who approved a Bitcoin account and a USDT address.",
++        WITH,
++        (),
++        dual,
++        Some("accepted_asset:USDT"),
++        Some(READY)
++    );
++    capture!(
++        "setup_status_usdt_bitcoin_only",
++        "accepted_asset USDT, `[usdt]` configured: a seller who approved a Bitcoin account and DECLINED the USDT address.",
++        WITH,
++        (),
++        bitcoin_only,
++        Some("accepted_asset:USDT"),
++        Some(SETUP_REQUIRED)
++    );
++    capture!(
++        "setup_status_usdt_never_set_up",
++        "accepted_asset USDT, `[usdt]` configured: a Bitkit wallet that never ran Paykit setup with this server.",
++        WITH,
++        (),
++        never_set_up,
++        Some("accepted_asset:USDT"),
++        Some(SETUP_REQUIRED)
++    );
++    capture!(
++        "setup_status_usdt_before_reconnect",
++        "accepted_asset USDT, `[usdt]` configured: a Bitcoin-only seller, before reconnecting to add USDT.",
++        WITH,
++        (),
++        reconnected,
++        Some("accepted_asset:USDT"),
++        Some(SETUP_REQUIRED)
++    );
++    run_setup(
++        usdt_address,
++        &bootstrap,
++        &reconnected,
++        Some(&reconnected.creator),
++        receiving_payload(&key_of(&reconnected), None, Some(USDT_ADDRESS)),
++    )
++    .await;
++    capture!(
++        "setup_status_usdt_after_reconnect",
++        "accepted_asset USDT, `[usdt]` configured: the same seller after a reconnect that added a USDT address.",
++        WITH,
++        (),
++        reconnected,
++        Some("accepted_asset:USDT"),
++        Some(READY)
++    );
++    capture!(
++        "setup_status_btc_after_reconnect",
++        "asset BTC (the denomination): the same seller after the reconnect; the Bitcoin account is untouched.",
++        WITH,
++        (),
++        reconnected,
++        Some("asset:BTC"),
++        Some(READY)
++    );
++    capture!(
++        "setup_status_usdt_without_usdt_config",
++        "accepted_asset USDT, no `[usdt]` config: a seller who approved Bitcoin and USDT on another deployment, asked here.",
++        WITHOUT,
++        (),
++        dual,
++        Some("accepted_asset:USDT"),
++        Some(SETUP_REQUIRED)
++    );
++    capture!(
++        "setup_status_authority_without_usdt_config",
++        "No asset, no `[usdt]` config: the same seller's authority is usable.",
++        WITHOUT,
++        (),
++        dual,
++        None,
++        Some(READY)
++    );
++    capture!(
++        "setup_status_usdt_without_usdt_config_bitcoin_wallet",
++        "accepted_asset USDT, no `[usdt]` config: a seller set up on a deployment that offered no USDT permission.",
++        WITHOUT,
++        (),
++        plain_wallet,
++        Some("accepted_asset:USDT"),
++        Some(SETUP_REQUIRED)
++    );
++    capture!(
++        "setup_status_btc_without_usdt_config",
++        "asset BTC (the denomination), no `[usdt]` config: Bitcoin is unaffected.",
++        WITHOUT,
++        (),
++        plain_wallet,
++        Some("asset:BTC"),
++        Some(READY)
++    );
++
++    let creator = dual.creator.to_string();
++    for (name, description, body_value) in [
++        (
++            "setup_status_invalid_asset",
++            "An asset outside BTC, USD and USDT: refused.",
++            json!({ "asset": "ETH", "creator": creator }),
++        ),
++        (
++            "setup_status_unknown_field",
++            "A field outside the closed body: refused.",
++            json!({ "creator": creator, "extra": true }),
++        ),
++        (
++            "setup_status_accepted_asset_usd",
++            "accepted_asset USD: a denomination, not a payment asset, refused.",
++            json!({ "accepted_asset": "USD", "creator": creator }),
++        ),
++        (
++            "setup_status_accepted_asset_lowercase",
++            "accepted_asset btc: values are case sensitive, refused.",
++            json!({ "accepted_asset": "btc", "creator": creator }),
++        ),
++    ] {
++        let body = canonical(&body_value);
++        let signature = sign(&service_key, &body);
++        let exchange = send(fresh_server(true).await, &signature, &body).await;
++        assert_eq!(exchange.status, 400, "{name}: {}", exchange.body);
++        recorder.record(name, description, WITH, &signature, &body, &exchange);
++    }
++    let body = canonical(&json!({ "accepted_asset": "USDT", "creator": creator }));
++    let signature = sign(&other_key, &body);
++    let exchange = send(fresh_server(true).await, &signature, &body).await;
++    assert_eq!(exchange.status, 401);
++    recorder.record(
++        "setup_status_invalid_signature",
++        "A signature by a key that is not in `[signed_services] trusted_public_keys`.",
++        WITH,
++        &signature,
++        &body,
++        &exchange,
++    );
++
++    drop(relay);
++    drop(testnet);
++    capture!(
++        "setup_status_authority_homeserver_down",
++        "No asset: the homeserver that holds the seller's Pubky session stopped answering.",
++        WITH,
++        (),
++        dual,
++        None,
++        Some(r#"{"status":"unavailable"}"#)
++    );
++    capture!(
++        "setup_status_usdt_homeserver_down",
++        "accepted_asset USDT: the homeserver that holds the seller's Pubky session stopped answering.",
++        WITH,
++        (),
++        dual,
++        Some("accepted_asset:USDT"),
++        Some(r#"{"status":"unavailable"}"#)
++    );
++}
++
++struct NoObservations;
++
++#[async_trait::async_trait]
++impl paykit_server::workers::observer::ElectrumPort for NoObservations {
++    async fn observations(
++        &self,
++        _targets: &[paykit_server::bitcoin::ObservationTarget],
++    ) -> Result<
++        Vec<paykit_server::bitcoin::ObservedOutput>,
++        paykit_server::workers::observer::ObserverError,
++    > {
++        Ok(Vec::new())
++    }
++}

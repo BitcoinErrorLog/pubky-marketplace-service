@@ -1,0 +1,18 @@
+{
+  "description": "asset BTC (the denomination): a seller who approved a Bitcoin account and declined USDT.",
+  "name": "setup_status_btc_bitcoin_only",
+  "request": {
+    "body": "{\"asset\":\"BTC\",\"creator\":\"pubky9nbrh4fg1mcxhu9dggii46x7q5suzqcbpyuqubjnqc9s4eupxq5y\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "mMwa-mokpfMN9B5OqSxaUpXduuoOGX2HhOpEuJDwPM1uB8183INACjLI3vHP4vTPPHp8cUfk_Igc4VQLKMthAQ"
+  },
+  "response": {
+    "body": "{\"status\":\"ready\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T18:26:55.928305921Z",
+  "server": "usdt_configured",
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
+}

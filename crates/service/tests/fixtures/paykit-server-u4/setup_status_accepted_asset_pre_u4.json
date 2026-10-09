@@ -1,0 +1,18 @@
+{
+  "description": "accepted_asset USDT sent to a paykit-server that predates the field: refused as an unknown field.",
+  "name": "setup_status_accepted_asset_pre_u4",
+  "request": {
+    "body": "{\"accepted_asset\":\"USDT\",\"creator\":\"pubkywxsoptwy1r73emteamcj6xhcrkeoukk6wpnp8jr8r1c61rtmbi1o\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "Qvp_iQWtPJaeAhsQ8t1hglSnarhxHGFq858Y5hzDbPrVNWHIXsTRQegRiacGDj12RLagq0Auf1fRd9ROSNfQDw"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"invalid_request\",\"message\":\"request is invalid\"}}",
+    "content_type": "application/json",
+    "status": 400
+  },
+  "sent_at": "2026-10-09T18:18:06.816850693Z",
+  "server": "usdt_configured",
+  "server_revision": "662dca0619a9aa2962bcd677bd5ddd4563cd2784 (v0.1.0-rc11, no U4)"
+}

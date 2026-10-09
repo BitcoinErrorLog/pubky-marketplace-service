@@ -1,0 +1,18 @@
+{
+  "description": "No asset: a Bitkit wallet that never ran Paykit setup with this server.",
+  "name": "setup_status_authority_never_set_up",
+  "request": {
+    "body": "{\"creator\":\"pubkyoq1keq6cas8m8ybggag4e9b1x15yufk9ecn8sfqnx7sin6ane8zy\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "AwYYmfvgNy70by2GivhtbMxOP-5Z0Frz1PDjVk8HQSGK2Ub6hcWdsRJ7zRVFYUU7yIkNgACxrP4xxs06WxrkDA"
+  },
+  "response": {
+    "body": "{\"status\":\"setup_required\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T18:26:55.379360628Z",
+  "server": "usdt_configured",
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
+}
