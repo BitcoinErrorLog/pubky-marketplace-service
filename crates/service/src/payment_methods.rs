@@ -47,9 +47,12 @@ use crate::handlers::{
     order_json_with_reviews,
 };
 use crate::model::{OrderRow, PaymentRow};
+use crate::payment_attempt::{
+    operation_id, payment_reference, payment_window_seconds, AttemptIdentity, PaymentAsset,
+};
 use crate::payments::{
     attempt_reference, validate_paypal_email, validate_stripe_payment_link,
-    validate_stripe_restricted_key, PaykitRequestError, PaymentsRuntime, StripeError,
+    validate_stripe_restricted_key, PaykitApi, PaykitRequestError, PaymentsRuntime, StripeError,
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
@@ -894,6 +897,9 @@ pub async fn bind_payment_method(
     // The re-read key for an ambiguous COMMIT: the attempt's reference
     // plus the invoice id, captured when phase 1 runs.
     let mut bind_reference: Option<String> = None;
+    // The upstream API prepares an unpublished request: nothing exists at
+    // paykit-server to void if this bind rolls back.
+    let mut upstream_prepared = false;
     if let (Some(reference), Some(attempt)) = (&paykit_reference, reserved_attempt) {
         let paykit = payments.paykit.as_ref().expect("checked above");
         let amount_sats = bitcoin_quote
@@ -904,96 +910,94 @@ pub async fn bind_payment_method(
         let expires_at = updated_order.hold_expires_at.unwrap_or_else(|| {
             now + chrono::Duration::seconds(state.config.bitcoin_payment_window_seconds)
         });
-        let idempotency_key = format!("{reference}:{attempt}");
-        let phase1 = paykit
-            .create_payment_request(
-                &order.seller_pubky,
-                &order.buyer_pubky,
+        let pins = if paykit.api() == PaykitApi::Upstream {
+            match prepare_upstream_attempt(
+                paykit,
+                &order,
                 reference,
+                attempt,
                 amount_sats,
                 expires_at,
-                &idempotency_key,
+                now,
             )
-            .await;
-        let phase1 = match phase1 {
-            Ok(prepared) => prepared,
-            Err(error) => {
+            .await
+            {
+                Ok(pins) => pins,
+                Err(response) => {
+                    let _ = tx.rollback().await;
+                    return response;
+                }
+            }
+        } else {
+            let idempotency_key = format!("{reference}:{attempt}");
+            let phase1 = paykit
+                .create_payment_request(
+                    &order.seller_pubky,
+                    &order.buyer_pubky,
+                    reference,
+                    amount_sats,
+                    expires_at,
+                    &idempotency_key,
+                )
+                .await;
+            let phase1 = match phase1 {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    return phase1_refusal(error);
+                }
+            };
+            if phase1.total_sats != amount_sats + phase1.nonce_sats {
+                tracing::error!(
+                    order_id = %order.id,
+                    amount_sats,
+                    nonce_sats = phase1.nonce_sats,
+                    total_sats = phase1.total_sats,
+                    "ALERT paykit phase 1 total_sats != amount_sats + nonce_sats; refusing the bind"
+                );
                 let _ = tx.rollback().await;
-                return match error {
-                    PaykitRequestError::SellerAccountUnavailable => method_error(
-                        ErrorCode::InvalidState,
-                        "seller_account_unclaimed",
-                        "The seller has no claimed Bitcoin receiving account.",
-                    ),
-                    PaykitRequestError::ReaderNotPayable => method_error(
-                        ErrorCode::InvalidState,
-                        "buyer_paykit_wallet_required",
-                        "Connect Bitkit (or another Paykit wallet) to pay with Bitcoin.",
-                    ),
-                    // A 4xx refusal, so no client treats it as an outage to
-                    // retry: the buyer finishes wallet setup, then pays again.
-                    PaykitRequestError::ReaderSetupPending => method_error(
-                        ErrorCode::InvalidState,
-                        "buyer_paykit_wallet_setup_needed",
-                        "Reader wallet setup needed. Finish setting up Bitkit (or another Paykit wallet) for this identity, then choose Pay again.",
-                    ),
-                    PaykitRequestError::Rejected => method_error(
-                        ErrorCode::InvalidState,
-                        "paykit_rejected",
-                        "The Paykit payment request was refused (the buyer may have no Paykit-enabled wallet).",
-                    ),
-                    PaykitRequestError::TotalInconsistent => method_error(
-                        ErrorCode::InvalidState,
-                        "paykit_total_inconsistent",
-                        "The Paykit server returned an inconsistent payment total.",
-                    ),
-                    PaykitRequestError::Unavailable => method_error(
-                        ErrorCode::UpstreamUnavailable,
-                        "paykit_unavailable",
-                        "The Paykit server could not be reached; try again.",
-                    ),
-                };
+                return method_error(
+                    ErrorCode::InvalidState,
+                    "paykit_total_inconsistent",
+                    "The Paykit server returned an inconsistent payment total.",
+                );
+            }
+            prepared = Some((phase1.invoice_id, phase1.stack_id.clone(), endpoint.clone()));
+            bind_reference = Some(reference.clone());
+            // The echoed `expires_at` must equal the hold deadline this call
+            // sent (the wire format truncates to UTC seconds, so the comparison
+            // is exact at second precision): a stack answering with a later
+            // expiry would keep the remote invoice payable past the local void
+            // at hold + 30 min, breaking the hard bound. Refuse in the same
+            // class as a total mismatch — no bind, the rollback releases the
+            // hold, one courtesy void, alerted.
+            if phase1.expires_at.timestamp() != expires_at.timestamp() {
+                tracing::error!(
+                    order_id = %order.id,
+                    hold_expires_at = %expires_at,
+                    echoed_expires_at = %phase1.expires_at,
+                    "ALERT paykit phase 1 expires_at != the hold deadline; refusing the bind"
+                );
+                let _ = tx.rollback().await;
+                spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+                return method_error(
+                    ErrorCode::InvalidState,
+                    "paykit_expiry_inconsistent",
+                    "The Paykit server returned an inconsistent payment expiry.",
+                );
+            }
+            BindPins {
+                invoice_id: phase1.invoice_id,
+                stack_id: Some(phase1.stack_id.clone()),
+                stack_endpoint: Some(endpoint.clone()),
+                total_sats: phase1.total_sats,
+                prepare_expires_at: phase1.prepare_expires_at,
+                allocation_mode: Some(phase1.allocation_mode.clone()),
+                address_fingerprint: Some(phase1.derived_address_fingerprint.clone()),
+                upstream: None,
             }
         };
-        if phase1.total_sats != amount_sats + phase1.nonce_sats {
-            tracing::error!(
-                order_id = %order.id,
-                amount_sats,
-                nonce_sats = phase1.nonce_sats,
-                total_sats = phase1.total_sats,
-                "ALERT paykit phase 1 total_sats != amount_sats + nonce_sats; refusing the bind"
-            );
-            let _ = tx.rollback().await;
-            return method_error(
-                ErrorCode::InvalidState,
-                "paykit_total_inconsistent",
-                "The Paykit server returned an inconsistent payment total.",
-            );
-        }
-        prepared = Some((phase1.invoice_id, phase1.stack_id.clone(), endpoint.clone()));
-        bind_reference = Some(reference.clone());
-        // The echoed `expires_at` must equal the hold deadline this call
-        // sent (the wire format truncates to UTC seconds, so the comparison
-        // is exact at second precision): a stack answering with a later
-        // expiry would keep the remote invoice payable past the local void
-        // at hold + 30 min, breaking the hard bound. Refuse in the same
-        // class as a total mismatch — no bind, the rollback releases the
-        // hold, one courtesy void, alerted.
-        if phase1.expires_at.timestamp() != expires_at.timestamp() {
-            tracing::error!(
-                order_id = %order.id,
-                hold_expires_at = %expires_at,
-                echoed_expires_at = %phase1.expires_at,
-                "ALERT paykit phase 1 expires_at != the hold deadline; refusing the bind"
-            );
-            let _ = tx.rollback().await;
-            spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
-            return method_error(
-                ErrorCode::InvalidState,
-                "paykit_expiry_inconsistent",
-                "The Paykit server returned an inconsistent payment expiry.",
-            );
-        }
+        upstream_prepared = pins.upstream.is_some();
         // Persist the prepared invoice in the SAME transaction as the bind:
         // the stack identity and endpoint come from this call (never from
         // configuration read later), the total is the figure the buyer is
@@ -1016,14 +1020,14 @@ pub async fn bind_payment_method(
                  WHERE id = $1",
             )
             .bind(order.id)
-            .bind(phase1.invoice_id)
-            .bind(&phase1.stack_id)
-            .bind(&endpoint)
-            .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
+            .bind(pins.invoice_id)
+            .bind(&pins.stack_id)
+            .bind(&pins.stack_endpoint)
+            .bind(i64::try_from(pins.total_sats).expect("total_sats fits i64"))
             .bind(expires_at)
-            .bind(phase1.prepare_expires_at)
-            .bind(&phase1.allocation_mode)
-            .bind(&phase1.derived_address_fingerprint)
+            .bind(pins.prepare_expires_at)
+            .bind(&pins.allocation_mode)
+            .bind(&pins.address_fingerprint)
             .bind(now)
             .bind(
                 bitcoin_quote
@@ -1085,26 +1089,43 @@ pub async fn bind_payment_method(
                  updated_at = $3 WHERE id = $1",
             )
             .bind(payment.id)
-            .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
+            .bind(i64::try_from(pins.total_sats).expect("total_sats fits i64"))
             .bind(now)
             .execute(&mut *tx)
             .await?;
-            sqlx::query(
-                "INSERT INTO outbox (event_id, kind, payload, created_at) \
-                 VALUES ($1, 'paykit.activate', $2, $3)",
-            )
-            .bind(event_id)
-            .bind(json!({
-                "invoice_id": phase1.invoice_id,
-                "order_id": order.id,
-                "stack_id": phase1.stack_id,
-                "total_sats": phase1.total_sats,
-                "stack_endpoint": endpoint,
-                "activation_attempt": 0,
-            }))
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+            if let Some(attempt) = &pins.upstream {
+                sqlx::query(
+                    "UPDATE orders SET paykit_payment_reference = $2, \
+                     paykit_operation_id = $3, paykit_payment_window_seconds = $4, \
+                     paykit_asset = $5 WHERE id = $1",
+                )
+                .bind(order.id)
+                .bind(attempt.reference)
+                .bind(&attempt.operation_id)
+                .bind(attempt.payment_window_seconds)
+                .bind(attempt.asset.as_str())
+                .execute(&mut *tx)
+                .await?;
+            } else if let (Some(stack_id), Some(stack_endpoint)) =
+                (&pins.stack_id, &pins.stack_endpoint)
+            {
+                sqlx::query(
+                    "INSERT INTO outbox (event_id, kind, payload, created_at) \
+                     VALUES ($1, 'paykit.activate', $2, $3)",
+                )
+                .bind(event_id)
+                .bind(json!({
+                    "invoice_id": pins.invoice_id,
+                    "order_id": order.id,
+                    "stack_id": stack_id,
+                    "total_sats": pins.total_sats,
+                    "stack_endpoint": stack_endpoint,
+                    "activation_attempt": 0,
+                }))
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
             Ok::<(), sqlx::Error>(())
         }
         .await;
@@ -1116,7 +1137,7 @@ pub async fn bind_payment_method(
     }
 
     // The response reflects the persisted phase-1 pin.
-    let updated_order: OrderRow = if prepared.is_some() {
+    let updated_order: OrderRow = if prepared.is_some() || upstream_prepared {
         match fetch_order_for_update(&mut tx, order_id).await {
             Ok(Some(order)) => order,
             Ok(None) => {
@@ -1169,6 +1190,122 @@ pub async fn bind_payment_method(
             internal("payment method commit", &error)
         }
     }
+}
+
+/// The prepared attempt's pins as the bind persists them. The fork fills
+/// every field; the upstream API answers no stack, endpoint, allocation mode
+/// or address fingerprint, and names the attempt by [`AttemptIdentity`]
+/// instead.
+struct BindPins {
+    invoice_id: Uuid,
+    stack_id: Option<String>,
+    stack_endpoint: Option<String>,
+    total_sats: u64,
+    prepare_expires_at: DateTime<Utc>,
+    allocation_mode: Option<String>,
+    address_fingerprint: Option<String>,
+    upstream: Option<AttemptIdentity>,
+}
+
+/// The bind's answer to a refused Paykit preparation, whichever API refused.
+fn phase1_refusal(error: PaykitRequestError) -> Response {
+    match error {
+        PaykitRequestError::SellerAccountUnavailable => method_error(
+            ErrorCode::InvalidState,
+            "seller_account_unclaimed",
+            "The seller has no claimed Bitcoin receiving account.",
+        ),
+        PaykitRequestError::ReaderNotPayable => method_error(
+            ErrorCode::InvalidState,
+            "buyer_paykit_wallet_required",
+            "Connect Bitkit (or another Paykit wallet) to pay with Bitcoin.",
+        ),
+        // A 4xx refusal, so no client treats it as an outage to
+        // retry: the buyer finishes wallet setup, then pays again.
+        PaykitRequestError::ReaderSetupPending => method_error(
+            ErrorCode::InvalidState,
+            "buyer_paykit_wallet_setup_needed",
+            "Reader wallet setup needed. Finish setting up Bitkit (or another Paykit wallet) for this identity, then choose Pay again.",
+        ),
+        PaykitRequestError::Rejected => method_error(
+            ErrorCode::InvalidState,
+            "paykit_rejected",
+            "The Paykit payment request was refused (the buyer may have no Paykit-enabled wallet).",
+        ),
+        PaykitRequestError::TotalInconsistent => method_error(
+            ErrorCode::InvalidState,
+            "paykit_total_inconsistent",
+            "The Paykit server returned an inconsistent payment total.",
+        ),
+        PaykitRequestError::Unavailable => method_error(
+            ErrorCode::UpstreamUnavailable,
+            "paykit_unavailable",
+            "The Paykit server could not be reached; try again.",
+        ),
+    }
+}
+
+/// Bitcoin phase 1 on the upstream API (`pubky/paykit-server` #66): prepares
+/// the attempt's unpublished payment request.
+///
+/// The operation id and the payment reference are derived from the bind
+/// attempt, so a retry of the attempt replays the same preparation. The
+/// payment window sent is the remaining hold, in whole seconds rounded up:
+/// paykit-server starts it when activation commits, so no payment deadline
+/// exists yet and the hold-against-deadline check belongs to activation. The
+/// only time bound a preparation carries is its activation deadline
+/// (`prepare_expires_at`, 15 minutes by default on paykit-server's clock),
+/// which must still lie ahead.
+async fn prepare_upstream_attempt(
+    paykit: &crate::payments::PaykitClient,
+    order: &OrderRow,
+    attempt_reference: &str,
+    attempt: i32,
+    amount_sats: u64,
+    hold_expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<BindPins, Response> {
+    let window_seconds = payment_window_seconds(hold_expires_at, now);
+    let identity = AttemptIdentity {
+        reference: payment_reference(order.id, attempt),
+        operation_id: operation_id(attempt_reference, attempt),
+        asset: PaymentAsset::Btc,
+        payment_window_seconds: i32::try_from(window_seconds).unwrap_or(i32::MAX),
+    };
+    let prepared = paykit
+        .prepare_marketplace_payment(
+            &order.seller_pubky,
+            &order.buyer_pubky,
+            identity.reference,
+            amount_sats,
+            &identity.operation_id,
+            u64::try_from(identity.payment_window_seconds).unwrap_or(1),
+        )
+        .await
+        .map_err(phase1_refusal)?;
+    if prepared.prepare_expires_at <= now {
+        tracing::error!(
+            order_id = %order.id,
+            prepare_expires_at = %prepared.prepare_expires_at,
+            "ALERT paykit prepare answered an activation deadline that already passed; \
+             refusing the bind"
+        );
+        return Err(method_error(
+            ErrorCode::InvalidState,
+            "paykit_expiry_inconsistent",
+            "The Paykit server returned an inconsistent payment expiry.",
+        ));
+    }
+    Ok(BindPins {
+        invoice_id: prepared.invoice_id,
+        stack_id: None,
+        stack_endpoint: None,
+        total_sats: prepared.total_sats,
+        prepare_expires_at: prepared.prepare_expires_at,
+        allocation_mode: None,
+        address_fingerprint: None,
+        upstream: Some(identity),
+    })
 }
 
 /// Test-only fault hooks for the bind path. Compiled out in release

@@ -58,6 +58,7 @@ use crate::handlers::payment::confirm_order;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
 use crate::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
 use crate::model::{ListingRow, PaymentRow};
+use crate::payment_attempt::PreparedAttempt;
 use crate::payments::{PaykitClient, PaykitCommandError, PaykitStatusOutcome, PaykitStatusSource};
 use crate::queries::PAYMENT_COLUMNS;
 use crate::{expiry, fx, AppState};
@@ -3110,6 +3111,12 @@ async fn expire_preparing_order(
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let pool = &state.pool;
+    if PreparedAttempt::load(&mut *pool.acquire().await?, order_id)
+        .await?
+        .is_some()
+    {
+        return expire_upstream_preparing_order(pool, order_id, now).await;
+    }
     // Take the activate row's lease first: a delivery in flight settles the
     // invoice itself, so this order is skipped this tick.
     let leased: Option<(i64,)> = sqlx::query_as(
@@ -3175,13 +3182,27 @@ async fn expire_preparing_order(
                 invoice_state = %voided.state,
                 "voided a preparing order's invoice at hold expiry"
             );
-            void_and_expire_preparing_order(pool, order_id, payment_id, outbox_row_id, now, false)
-                .await?;
+            void_and_expire_preparing_order(
+                pool,
+                order_id,
+                payment_id,
+                Some(outbox_row_id),
+                now,
+                false,
+            )
+            .await?;
             Ok(true)
         }
         Err(PaykitCommandError::PrepareExpired) | Err(PaykitCommandError::UnknownInvoice) => {
-            void_and_expire_preparing_order(pool, order_id, payment_id, outbox_row_id, now, false)
-                .await?;
+            void_and_expire_preparing_order(
+                pool,
+                order_id,
+                payment_id,
+                Some(outbox_row_id),
+                now,
+                false,
+            )
+            .await?;
             Ok(true)
         }
         Err(PaykitCommandError::InvoiceFinalized) => {
@@ -3218,8 +3239,15 @@ async fn expire_preparing_order(
                 "ALERT the persisted paykit endpoint answered with a different stack identity \
                  at hold-expiry void; voiding locally"
             );
-            void_and_expire_preparing_order(pool, order_id, payment_id, outbox_row_id, now, false)
-                .await?;
+            void_and_expire_preparing_order(
+                pool,
+                order_id,
+                payment_id,
+                Some(outbox_row_id),
+                now,
+                false,
+            )
+            .await?;
             Ok(true)
         }
         Err(PaykitCommandError::ActivationTotalMismatch)
@@ -3228,8 +3256,15 @@ async fn expire_preparing_order(
                 order_id = %order_id,
                 "ALERT paykit hold-expiry void hit an unknown contract state; voiding locally"
             );
-            void_and_expire_preparing_order(pool, order_id, payment_id, outbox_row_id, now, false)
-                .await?;
+            void_and_expire_preparing_order(
+                pool,
+                order_id,
+                payment_id,
+                Some(outbox_row_id),
+                now,
+                false,
+            )
+            .await?;
             Ok(true)
         }
         Err(PaykitCommandError::Unavailable) => {
@@ -3255,8 +3290,15 @@ async fn expire_preparing_order(
                 "ALERT paykit_unreachable_at_void: voiding locally past the 30-minute grace \
                  and deferring the remote void to a paykit.void outbox row"
             );
-            void_and_expire_preparing_order(pool, order_id, payment_id, outbox_row_id, now, true)
-                .await?;
+            void_and_expire_preparing_order(
+                pool,
+                order_id,
+                payment_id,
+                Some(outbox_row_id),
+                now,
+                true,
+            )
+            .await?;
             Ok(true)
         }
     }
@@ -3272,7 +3314,7 @@ async fn void_and_expire_preparing_order(
     pool: &PgPool,
     order_id: Uuid,
     payment_id: Uuid,
-    outbox_row_id: i64,
+    outbox_row_id: Option<i64>,
     now: DateTime<Utc>,
     enqueue_void_retry: bool,
 ) -> anyhow::Result<()> {
@@ -3349,13 +3391,37 @@ async fn void_and_expire_preparing_order(
         .execute(&mut *tx)
         .await?;
     }
-    sqlx::query("UPDATE outbox SET delivered_at = $2 WHERE id = $1")
-        .bind(outbox_row_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+    if let Some(outbox_row_id) = outbox_row_id {
+        sqlx::query("UPDATE outbox SET delivered_at = $2 WHERE id = $1")
+            .bind(outbox_row_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(())
+}
+
+/// The hold-expiry cell for a `preparing` order whose attempt the upstream
+/// API prepared. Preparation publishes nothing and leaves no activation row,
+/// so there is no lease to take and no invoice at paykit-server to void: the
+/// preparation lapses at its activation deadline, and the order releases
+/// locally. Returns true when the order expired.
+async fn expire_upstream_preparing_order(
+    pool: &PgPool,
+    order_id: Uuid,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let (payment_id,): (Uuid,) = sqlx::query_as("SELECT id FROM payments WHERE order_id = $1")
+        .bind(order_id)
+        .fetch_one(pool)
+        .await?;
+    void_and_expire_preparing_order(pool, order_id, payment_id, None, now, false).await?;
+    tracing::info!(
+        order_id = %order_id,
+        "released a preparing order's unpublished upstream attempt at hold expiry"
+    );
+    Ok(true)
 }
 
 /// RFC3339-shaped prefix (`YYYY-MM-DDTHH:MM:SS`). Used only to over-include
