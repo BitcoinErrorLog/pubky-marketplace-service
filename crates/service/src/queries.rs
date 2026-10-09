@@ -520,6 +520,11 @@ pub async fn list_orders(
     if let Err(error) = attach_pickup_terms_flags(&state.pool, &orders, &mut views).await {
         return internal_error("pickup terms flags", &error);
     }
+    if let Err(error) =
+        crate::refund_destination::attach_to_views(&state.pool, &orders, &mut views).await
+    {
+        return internal_error("refund destinations", &error);
+    }
     (StatusCode::OK, Json(json!({ "orders": views }))).into_response()
 }
 
@@ -590,6 +595,11 @@ pub async fn get_order(
             let mut views = [view];
             if let Err(error) = attach_pickup_terms_flags(&state.pool, &orders, &mut views).await {
                 return internal_error("pickup terms flags", &error);
+            }
+            if let Err(error) =
+                crate::refund_destination::attach_to_views(&state.pool, &orders, &mut views).await
+            {
+                return internal_error("refund destinations", &error);
             }
             view = views.into_iter().next().expect("one view");
             (StatusCode::OK, Json(view)).into_response()

@@ -446,6 +446,7 @@ fn command_kind(payload: &CommandPayload) -> CommandKind {
         CommandPayload::ApproveReturn(_) => CommandKind::ApproveReturn,
         CommandPayload::ReceiveReturn(_) => CommandKind::ReceiveReturn,
         CommandPayload::RecordExternalRefund(_) => CommandKind::RecordExternalRefund,
+        CommandPayload::ConfirmRefundDestination(_) => CommandKind::ConfirmRefundDestination,
         CommandPayload::CreateReview(_) => CommandKind::CreateReview,
         CommandPayload::UpdateReview(_) => CommandKind::UpdateReview,
         CommandPayload::SetBandConsent(_) => CommandKind::SetBandConsent,
@@ -717,6 +718,9 @@ async fn dispatch(
                 now,
             )
             .await
+        }
+        CommandPayload::ConfirmRefundDestination(payload) => {
+            crate::handlers::refund_destination::confirm(tx, actor, command, payload, now).await
         }
         CommandPayload::CreateReview(payload) => {
             crate::handlers::reviews::create(

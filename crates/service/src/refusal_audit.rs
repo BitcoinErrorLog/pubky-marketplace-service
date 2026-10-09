@@ -288,10 +288,11 @@ pub enum CommandKind {
     ClearDigitalDelivery = 36,
     SetDeliveryEmail = 37,
     DeliverDigital = 38,
+    ConfirmRefundDestination = 39,
 }
 
 impl CommandKind {
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::InvalidEnvelope,
         Self::RegisterListing,
         Self::SyncListing,
@@ -331,6 +332,7 @@ impl CommandKind {
         Self::ClearDigitalDelivery,
         Self::SetDeliveryEmail,
         Self::DeliverDigital,
+        Self::ConfirmRefundDestination,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -374,6 +376,7 @@ impl CommandKind {
             Self::ClearDigitalDelivery => "clear_digital_delivery",
             Self::SetDeliveryEmail => "set_delivery_email",
             Self::DeliverDigital => "deliver_digital",
+            Self::ConfirmRefundDestination => "confirm_refund_destination",
         }
     }
 }
