@@ -3094,3 +3094,319 @@ async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::OK, "prepare after the storm: {body}");
 }
+
+// ---------------------------------------------------------------------------
+// Lock asset = price denomination (Ben, B8). The seller's lock names the
+// unit the listing is PRICED in, mapped through an explicit table (USD/2 ->
+// USD cents, BTC/8 and SAT/0 -> BTC sats), never the rail the buyer pays on.
+// ---------------------------------------------------------------------------
+
+const DENOMINATED_SHIPPING_MINOR: i64 = 1_200;
+
+/// A Locks order for a listing priced at `unit_minor` in `currency` /
+/// `exponent` (shipping adds [`DENOMINATED_SHIPPING_MINOR`] in the same
+/// unit), whose seller-authored lock is `lock_asset` / `lock_amount`.
+/// Returns the app, the buyer, the pending order and the order total.
+async fn denominated_locks_order(
+    pool: PgPool,
+    currency: &str,
+    exponent: i32,
+    unit_minor: i64,
+    lock_asset: &str,
+    lock_amount: Option<i64>,
+) -> (TestApp, TestActor, PendingOrder, i64) {
+    let total = unit_minor + DENOMINATED_SHIPPING_MINOR;
+    let lock_amount = lock_amount.unwrap_or(total);
+    let seller_key = common::random_keypair();
+    let seller_pubky = seller_key.1.clone();
+    let resource = lock_resource_for_payment(&seller_pubky, lock_amount, lock_asset);
+    let path = resource
+        .strip_prefix(&seller_pubky)
+        .expect("creator prefixes resource")
+        .to_string();
+    let app = test_app_with_lock_documents(
+        pool,
+        HashMap::from([(
+            (seller_pubky.clone(), path),
+            lock_document_for(&seller_pubky, lock_amount, lock_asset),
+        )]),
+    )
+    .await;
+    let seller = TestActor {
+        token: common::authenticate(&app, &seller_key.0).await,
+        keypair: seller_key.0,
+        pubky: seller_pubky,
+    };
+    let buyer = new_actor(&app).await;
+
+    let mut listing = register_command(&seller.pubky, 1);
+    listing["payload"]["unit_price"] =
+        json!({ "amount_minor": unit_minor, "currency": currency, "exponent": exponent });
+    listing["payload"]["shipping_minor"] = json!(DENOMINATED_SHIPPING_MINOR);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": resource,
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&app, &seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
+    let (status, body) =
+        execute(&app, &buyer.token, &common::checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
+    let order = PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id present")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id present")
+            .to_string(),
+    };
+    (app, buyer, order, total)
+}
+
+/// Prepare succeeds and the correlation copies the checkout snapshot's
+/// price denomination and amount (the snapshot is the sole source).
+async fn assert_prepare_accepts(
+    app: &TestApp,
+    buyer: &TestActor,
+    order: &PendingOrder,
+    currency: &str,
+    exponent: i32,
+    total: i64,
+) {
+    let snapshot: (i64, String, i32) = sqlx::query_as(
+        "SELECT amount_minor, asset, exponent FROM payment_locks_checkout_snapshots \
+         WHERE payment_id = $1::uuid",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("snapshot row exists");
+    assert_eq!(snapshot, (total, currency.to_string(), exponent));
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 700),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+    let correlation: (i64, String, i32) = sqlx::query_as(
+        "SELECT amount_minor, asset, exponent FROM payment_locks_correlations \
+         WHERE payment_id = $1::uuid",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("correlation row exists");
+    assert_eq!(correlation, snapshot);
+    let (_, adapter, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(adapter, "locks");
+}
+
+/// Prepare is refused with the lock-document refusal and creates nothing.
+async fn assert_prepare_refuses_the_lock(app: &TestApp, buyer: &TestActor, order: &PendingOrder) {
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 701),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The seller's Locks document does not match the payment.")
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        0,
+        "a refused lock never creates a correlation"
+    );
+    assert!(
+        binding_outcomes(&app.pool, &order.payment_id)
+            .await
+            .is_empty(),
+        "the refusal rolls back whole"
+    );
+    let (_, adapter, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(adapter, "sandbox", "the payment adapter is untouched");
+}
+
+// Pins the existing Bitcoin-denominated case: a BTC/8 listing with a BTC
+// lock counts sats on both sides, as it did before the explicit map.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_accepts_a_btc8_listing_with_a_btc_lock(pool: PgPool) {
+    let (app, buyer, order, total) =
+        denominated_locks_order(pool, "BTC", 8, 100_000, "BTC", None).await;
+    assert_prepare_accepts(&app, &buyer, &order, "BTC", 8, total).await;
+}
+
+// A SAT/0 listing is the same denomination as BTC/8 (one sat): it maps to
+// the BTC lock unit instead of being refused for naming a different asset.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_accepts_a_sat0_listing_with_a_btc_lock(pool: PgPool) {
+    let (app, buyer, order, total) =
+        denominated_locks_order(pool, "SAT", 0, 100_000, "BTC", None).await;
+    assert_prepare_accepts(&app, &buyer, &order, "SAT", 0, total).await;
+}
+
+// The USD case every existing suite relies on, pinned next to the new ones
+// with the correlation assertions.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_accepts_a_usd2_listing_with_a_usd_lock(pool: PgPool) {
+    let (app, buyer, order, total) =
+        denominated_locks_order(pool, "USD", 2, 12_500, "USD", None).await;
+    assert_eq!(total, 13_700);
+    assert_prepare_accepts(&app, &buyer, &order, "USD", 2, total).await;
+}
+
+// USDT never grants access (locks#73) and Shop listings are never priced in
+// USDT, so a USDT lock matches no listing denomination, whether its amount
+// is the listing's own minor units or the 1:1 parity millionths.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_usdt_lock_on_a_usd2_listing(pool: PgPool) {
+    let (app, buyer, order, _total) =
+        denominated_locks_order(pool, "USD", 2, 12_500, "USDT", Some(13_700)).await;
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_usdt_parity_lock_on_a_usd2_listing(pool: PgPool) {
+    let (app, buyer, order, _total) =
+        denominated_locks_order(pool, "USD", 2, 12_500, "USDT", Some(137_000_000)).await;
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_usdt_lock_on_a_btc8_listing(pool: PgPool) {
+    let (app, buyer, order, _total) =
+        denominated_locks_order(pool, "BTC", 8, 100_000, "USDT", None).await;
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_usdt_lock_on_a_sat0_listing(pool: PgPool) {
+    let (app, buyer, order, _total) =
+        denominated_locks_order(pool, "SAT", 0, 100_000, "USDT", None).await;
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+// The lock must name the listing's own denomination: a USD listing never
+// matches a BTC lock (or the reverse) even at an equal number.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_btc_lock_on_a_usd2_listing(pool: PgPool) {
+    let (app, buyer, order, _total) =
+        denominated_locks_order(pool, "USD", 2, 12_500, "BTC", None).await;
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_usd_lock_on_a_btc8_listing(pool: PgPool) {
+    let (app, buyer, order, _total) =
+        denominated_locks_order(pool, "BTC", 8, 100_000, "USD", None).await;
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_usd_lock_on_a_sat0_listing(pool: PgPool) {
+    let (app, buyer, order, _total) =
+        denominated_locks_order(pool, "SAT", 0, 100_000, "USD", None).await;
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+// "SAT" is not a Locks asset (Locks counts sats under BTC), so a lock that
+// names it is never the mapped unit of a SAT/0 listing.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_sat_named_lock_on_a_sat0_listing(pool: PgPool) {
+    let (app, buyer, order, _total) =
+        denominated_locks_order(pool, "SAT", 0, 100_000, "SAT", None).await;
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+// The amount still has to be exact in the mapped unit.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_btc_lock_with_a_different_sat_amount(pool: PgPool) {
+    let (app, buyer, order, total) =
+        denominated_locks_order(pool, "SAT", 0, 100_000, "BTC", Some(100_000 + 1_200 + 1)).await;
+    assert_eq!(total, 101_200);
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+// A denomination with no Locks unit (an exponent the currency never uses, or
+// a currency Locks does not count) is refused instead of compared by string.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_usd_listing_with_a_non_cent_exponent(pool: PgPool) {
+    let (app, buyer, order, _total) =
+        denominated_locks_order(pool, "USD", 3, 12_500, "USD", None).await;
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_listing_priced_in_a_currency_locks_does_not_count(pool: PgPool) {
+    let (app, buyer, order, _total) =
+        denominated_locks_order(pool, "EUR", 2, 12_500, "EUR", None).await;
+    assert_prepare_refuses_the_lock(&app, &buyer, &order).await;
+}
+
+// The price of record is the immutable `merchandise_*` triple. If it no
+// longer equals the sealed snapshot, prepare refuses statically before any
+// authority row exists, even when the payment's own economics still equal
+// the snapshot.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_refuses_a_payment_whose_price_of_record_drifts_from_the_snapshot(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+    sqlx::query("UPDATE payments SET merchandise_currency = 'BTC' WHERE id = $1::uuid")
+        .bind(&order.payment_id)
+        .execute(&app.pool)
+        .await
+        .expect("price of record drifted");
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 702),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("The checkout Locks snapshot does not match the payment.")
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+        0,
+        "no authority row is created on a mismatch"
+    );
+}
+
+// Checkout seals the price of record, not whatever the mutable payment
+// columns hold: the snapshot's economics equal `merchandise_*`.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn checkout_snapshots_the_merchandise_denomination(pool: PgPool) {
+    let (app, _buyer, order, total) =
+        denominated_locks_order(pool, "SAT", 0, 100_000, "BTC", None).await;
+    let (matches,): (bool,) = sqlx::query_as(
+        "SELECT s.amount_minor = p.merchandise_amount_minor \
+             AND s.asset = p.merchandise_currency \
+             AND s.exponent = p.merchandise_exponent \
+         FROM payment_locks_checkout_snapshots s JOIN payments p ON p.id = s.payment_id \
+         WHERE s.payment_id = $1::uuid",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("snapshot joins its payment");
+    assert!(matches);
+    let (amount,): (i64,) =
+        sqlx::query_as("SELECT merchandise_amount_minor FROM payments WHERE id = $1::uuid")
+            .bind(&order.payment_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("payment row exists");
+    assert_eq!(amount, total);
+}
