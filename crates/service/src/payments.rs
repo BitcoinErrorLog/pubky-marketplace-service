@@ -26,6 +26,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+use crate::payment_attempt::UpstreamPrepared;
+
 /// Environment variable holding the 32-byte hex key sealing Stripe
 /// restricted keys at rest. Setting it enables the payment-methods surface.
 pub const ENV_STRIPE_KEY_ENCRYPTION_KEY: &str = "STRIPE_KEY_ENCRYPTION_KEY";
@@ -968,10 +970,11 @@ impl PaykitCommandError {
 ///   [`paykit_signature_preimage`] (method, path and body), and seller
 ///   readiness is the signed `POST /setup/status`.
 ///
-/// The payment-request lifecycle routes (prepare, activate, void, resolve)
-/// are fork routes today. Under `Upstream` they are signed like every other
-/// request but upstream does not serve them yet, so a Bitcoin bind answers
-/// `paykit_unavailable` until the lifecycle adapter lands.
+/// Under `Upstream` the Bitcoin bind prepares through
+/// [`PaykitClient::prepare_marketplace_payment`]. Activate, void and resolve
+/// are fork routes until the later upstream slices land: they are signed like
+/// every other request, but a prepared upstream attempt is not yet
+/// activated (see [`crate::payment_attempt`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaykitApi {
     #[default]
@@ -1025,6 +1028,49 @@ impl std::fmt::Debug for PaykitClient {
             .field("api", &self.api)
             .field("signing_key", &"<redacted>")
             .finish()
+    }
+}
+
+/// The upstream preparation route (`pubky/paykit-server` #66).
+pub const UPSTREAM_PREPARE_PATH: &str = "/marketplace/payment-requests/prepare";
+
+/// Maps one refusal of the upstream preparation route to the bind's error
+/// classes. Only the codes #66 can answer are named; anything else is an
+/// outage the buyer may retry.
+///
+/// - `409 conflict`: the operation was prepared with a different binding.
+///   The service derives every field from its own attempt, so this is a bug
+///   here, never a buyer error: refused and alerted.
+/// - `401 invalid_signature`: the signing key is not in paykit-server's
+///   `[signed_services] trusted_public_keys`. Nothing the buyer can fix:
+///   alerted, and shown as an outage.
+/// - `409 creator_session_invalid`: the seller must reconnect Paykit.
+/// - `400 invalid_request`: a malformed request, an over-cap window, or a
+///   seller without Bitcoin receiving details (paykit-server answers all
+///   three alike).
+/// - `409 reader_not_payable` and `503 reader_setup_pending`: the buyer's
+///   wallet cannot pay, or is not set up yet.
+pub fn upstream_prepare_error(status: reqwest::StatusCode, code: &str) -> PaykitRequestError {
+    match (status.as_u16(), code) {
+        (409, "conflict") => {
+            tracing::error!(
+                "ALERT paykit prepare refused a changed binding for one operation; \
+                 the service derived a different request for the same attempt"
+            );
+            PaykitRequestError::Rejected
+        }
+        (401, "invalid_signature") => {
+            tracing::error!(
+                "ALERT paykit prepare rejected the request signature; the service key is not \
+                 in paykit-server's signed_services trusted_public_keys"
+            );
+            PaykitRequestError::Unavailable
+        }
+        (409, "creator_session_invalid") => PaykitRequestError::SellerAccountUnavailable,
+        (400, "invalid_request") => PaykitRequestError::Rejected,
+        (409, "reader_not_payable") => PaykitRequestError::ReaderNotPayable,
+        (503, "reader_setup_pending") => PaykitRequestError::ReaderSetupPending,
+        _ => PaykitRequestError::Unavailable,
     }
 }
 
@@ -1251,6 +1297,90 @@ impl PaykitClient {
     /// `PAYKIT_SERVER_URL` is repointed.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The paykit-server API this client speaks.
+    pub fn api(&self) -> PaykitApi {
+        self.api
+    }
+
+    /// Upstream preparation (`pubky/paykit-server` #66): prepares, or
+    /// replays, the unpublished payment request of one bind attempt with a
+    /// signed `POST /marketplace/payment-requests/prepare`.
+    ///
+    /// The closed body is `{amount_sats, creator, operation_id,
+    /// payment_window_seconds, reader, reference}`: `operation_id` and
+    /// `reference` come from [`crate::payment_attempt`], and the window is a
+    /// duration that starts at activation, never an absolute deadline. A
+    /// `200` carries `total_sats == amount_sats` (the upstream path adds no
+    /// nonce); any other total is refused as
+    /// [`PaykitRequestError::TotalInconsistent`]. Callable only on a
+    /// [`PaykitApi::Upstream`] client.
+    pub async fn prepare_marketplace_payment(
+        &self,
+        seller_pubky: &str,
+        buyer_pubky: &str,
+        reference: uuid::Uuid,
+        amount_sats: u64,
+        operation_id: &str,
+        payment_window_seconds: u64,
+    ) -> Result<UpstreamPrepared, PaykitRequestError> {
+        if self.api != PaykitApi::Upstream {
+            tracing::error!("the upstream prepare was called on a fork paykit client");
+            return Err(PaykitRequestError::Rejected);
+        }
+        let url = format!("{}{UPSTREAM_PREPARE_PATH}", self.base_url);
+        let (body, signature) = self
+            .signed_body(
+                &url,
+                &serde_json::json!({
+                    "amount_sats": amount_sats,
+                    "creator": pubky_app_key(seller_pubky),
+                    "operation_id": operation_id,
+                    "payment_window_seconds": payment_window_seconds,
+                    "reader": pubky_app_key(buyer_pubky),
+                    "reference": reference.hyphenated().to_string(),
+                }),
+            )
+            .map_err(|_| PaykitRequestError::Rejected)?;
+        let response = self
+            .http
+            .post(url)
+            .header("x-paykit-signature", signature)
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| PaykitRequestError::Unavailable)?;
+        let status = response.status();
+        if status.is_success() {
+            let prepared = match status == reqwest::StatusCode::OK {
+                true => response.json::<UpstreamPrepared>().await.ok(),
+                false => None,
+            };
+            let Some(prepared) = prepared.filter(|prepared| prepared.state == "prepared") else {
+                tracing::error!(
+                    status = %status,
+                    "paykit prepare answered outside its contract; refusing the bind"
+                );
+                return Err(PaykitRequestError::Rejected);
+            };
+            if prepared.total_sats != amount_sats {
+                tracing::error!(
+                    amount_sats,
+                    total_sats = prepared.total_sats,
+                    "ALERT paykit prepare total_sats != amount_sats; refusing the bind"
+                );
+                return Err(PaykitRequestError::TotalInconsistent);
+            }
+            return Ok(prepared);
+        }
+        let code = response
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|body| body["error"]["code"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        Err(upstream_prepare_error(status, &code))
     }
 
     /// Phase 1 (§B.11.3): prepares (or idempotently replays) the Paykit
