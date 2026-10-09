@@ -1,0 +1,18 @@
+{
+  "description": "asset BTC (the denomination): the same seller after the reconnect; the Bitcoin account is untouched.",
+  "name": "setup_status_btc_after_reconnect",
+  "request": {
+    "body": "{\"asset\":\"BTC\",\"creator\":\"pubkybjxqppda9bqnr45afr8czmj4ppy67ztwrn7jic7waug4yay64r6y\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "xrq-LIivMp6g60wBCwPvzBCaxK1zHgO-O0tL3femJke1l2hC9yXtEyttrJP0ub8JuNR2Y4gJNHuoVrpAh0w5Cw"
+  },
+  "response": {
+    "body": "{\"status\":\"ready\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T18:26:57.767923504Z",
+  "server": "usdt_configured",
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
+}

@@ -1,0 +1,18 @@
+{
+  "description": "accepted_asset USDT, `[usdt]` configured: a seller who approved a Bitcoin account and a USDT address.",
+  "name": "setup_status_usdt_dual",
+  "request": {
+    "body": "{\"accepted_asset\":\"USDT\",\"creator\":\"pubkyxnj8u7jodw3wfdap53qfo9wf9ca4n84mukkg6q7wqwri47nsq44y\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "5ydvWxWWisowpnBTdJILjFibzPA3rEHpemaP42Yc9VMM15V2b2somV-RfoZVWvY6YjdEqJwg3zicrVzjNhcSDQ"
+  },
+  "response": {
+    "body": "{\"status\":\"ready\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T18:26:56.199094148Z",
+  "server": "usdt_configured",
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
+}

@@ -1,0 +1,18 @@
+{
+  "description": "accepted_asset USDT, `[usdt]` configured: the same seller after a reconnect that added a USDT address.",
+  "name": "setup_status_usdt_after_reconnect",
+  "request": {
+    "body": "{\"accepted_asset\":\"USDT\",\"creator\":\"pubkybjxqppda9bqnr45afr8czmj4ppy67ztwrn7jic7waug4yay64r6y\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "x-RaDQQowMOziW4VoXvYlWHudycVmTuv4k43jVgZ8fsOhOikcIVjykkSMJuIa4AUJdiRuY-Bhs-hVoMcibNGAA"
+  },
+  "response": {
+    "body": "{\"status\":\"ready\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T18:26:57.464245535Z",
+  "server": "usdt_configured",
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
+}

@@ -1,0 +1,18 @@
+{
+  "description": "accepted_asset USDT, no `[usdt]` config: a seller set up on a deployment that offered no USDT permission.",
+  "name": "setup_status_usdt_without_usdt_config_bitcoin_wallet",
+  "request": {
+    "body": "{\"accepted_asset\":\"USDT\",\"creator\":\"pubky443ew7nmekjrju5k711z1t5ewk8hnqu6z1rwj5fqot7fy9esbryo\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "YBuv5VWGj6I4Yp0PrHIivY84kNPv3MGPmtAUt2u99inKRER6bdcGsO455SSGYCfj3EpEPoyviSKx7MEBXbiEAg"
+  },
+  "response": {
+    "body": "{\"status\":\"setup_required\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T18:26:58.51065577Z",
+  "server": "usdt_not_configured",
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
+}

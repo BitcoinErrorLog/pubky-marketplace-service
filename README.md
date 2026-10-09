@@ -283,7 +283,7 @@ the Paykit bind and refunds are separate slices.
   carrying `usdt_enabled` is refused as the unknown field it is, and
   paykit-server is only ever asked about Bitcoin.
   - Readiness comes only from paykit-server's signed `POST /setup/status`
-    (`PAYKIT_SERVER_API=upstream`): `{asset: "USDT"}` for the seller, and the
+    (`PAYKIT_SERVER_API=upstream`): `{accepted_asset: "USDT"}` for the seller, and the
     authority-only `{}` body to tell a seller with no Paykit account
     (`setup`) from one that only lacks USDT (`reconnect`). The authority is
     looked up only when USDT is not ready. `unavailable`, a non-2xx answer
@@ -303,16 +303,23 @@ the Paykit bind and refunds are separate slices.
     the stored consent unchanged; only an explicit boolean changes it. The
     consent is not gated on readiness, and a seller who is not ready is never
     offered USDT.
-  - **Upstream gap.** rc10 (and `master` at `c351f15`) answers `ready` for
-    `asset: "USDT"` whenever `[usdt]` is configured and the seller has any
-    receiving detail, including a Bitcoin-only seller who declined the USDT
-    address (`application/setup_status.rs`, `status_for_asset`). The service
-    maps the answer as it is, so on a `[usdt]` deployment `ready` means
-    "`[usdt]` is configured", not "the seller approved a USDT address", and the
-    `reconnect` action appears only where `[usdt]` is not configured. Paykit's
-    own validation of a Marketplace request against the seller's approval
-    remains the safety net. The captured exchanges are in
-    `crates/service/tests/fixtures/paykit-server-rc10/`.
+  - **USDT readiness needs a paykit-server that has `accepted_asset` on
+    `/setup/status`** ([pubky/paykit-server#70](https://github.com/pubky/paykit-server/pull/70), a draft until it is merged and released). USDT
+    is asked as `{"accepted_asset":"USDT","creator":...}`, the payment
+    asset, never as the `asset` denomination; Bitcoin keeps
+    `{"asset":"BTC",...}` and the authority lookup keeps `{"creator":...}`,
+    so flag-off bytes are unchanged. On such a server a Bitcoin-only seller
+    who declined the USDT address is `setup_required` with action `reconnect`,
+    and `ready` once a reconnect adds the address. paykit-server rc10 and
+    rc11 answered `ready` to `asset: "USDT"` for any ready seller on a
+    `[usdt]` deployment, so they cannot tell these sellers apart.
+  - **Deploy order.** A paykit-server without the field refuses the USDT body
+    with `400 invalid_request`. That is a non-2xx answer, so USDT fails closed
+    as `usdt_setup: "unavailable"` with no action, no authority lookup, and
+    `usdt_available: false`. Upgrade paykit-server to a build with
+    `accepted_asset` first (a paykit-server release containing #70), then switch `USDT_PAYMENTS_ENABLED` on. The
+    captured exchanges, including that refusal, are in
+    `crates/service/tests/fixtures/paykit-server-u4/`.
 - **Bind.** Until the upstream Marketplace prepare can carry a USDT request,
   every `usdt` bind is refused with `usdt_unavailable` and leaves the order
   untouched (unbound, unheld, no attempt spent). The log says which

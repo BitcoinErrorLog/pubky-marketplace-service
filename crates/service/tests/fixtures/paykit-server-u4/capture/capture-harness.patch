@@ -1,9 +1,9 @@
 diff --git a/paykit-server-e2e/tests/capture_setup_status.rs b/paykit-server-e2e/tests/capture_setup_status.rs
 new file mode 100644
-index 0000000..d4f35ef
+index 0000000..7ebff23
 --- /dev/null
 +++ b/paykit-server-e2e/tests/capture_setup_status.rs
-@@ -0,0 +1,783 @@
+@@ -0,0 +1,808 @@
 +//! Captures real `POST /setup/status` exchanges from a running paykit-server
 +//! (pubky/paykit-server `v0.1.0-rc10`, 7326a3f) for the
 +//! pubky-marketplace-service contract fixtures.
@@ -52,7 +52,6 @@ index 0000000..d4f35ef
 +
 +const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 +const PATH: &str = "/setup/status";
-+const SERVER_REVISION: &str = "7326a3f9a035d79d8b6977b7c1a5fb742327ff37";
 +const USDT_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
 +const USDT_TOKEN: &str = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9";
 +
@@ -376,7 +375,7 @@ index 0000000..d4f35ef
 +            "name": name,
 +            "description": description,
 +            "server": server,
-+            "server_revision": SERVER_REVISION,
++            "server_revision": std::env::var("CAPTURE_SERVER_REVISION").expect("CAPTURE_SERVER_REVISION"),
 +            "request": {
 +                "method": "POST",
 +                "path": PATH,
@@ -546,10 +545,10 @@ index 0000000..d4f35ef
 +        }
 +    };
 +
-+    let request = |creator: &CreatorPubky, asset: Option<&str>| {
++    let request = |creator: &CreatorPubky, field: Option<&str>| {
 +        let mut body = json!({ "creator": creator.to_string() });
-+        if let Some(asset) = asset {
-+            body["asset"] = json!(asset);
++        if let Some((name, value)) = field.and_then(|field| field.split_once(':')) {
++            body[name] = json!(value);
 +        }
 +        let body = canonical(&body);
 +        let signature = sign(&service_key, &body);
@@ -574,6 +573,22 @@ index 0000000..d4f35ef
 +    const WITHOUT: &str = "usdt_not_configured";
 +    const READY: &str = r#"{"status":"ready"}"#;
 +    const SETUP_REQUIRED: &str = r#"{"status":"setup_required"}"#;
++
++    if std::env::var("CAPTURE_PRE_U4").is_ok() {
++        // A server without `accepted_asset` refuses the field as unknown.
++        let (body, signature) = request(&dual.creator, Some("accepted_asset:USDT"));
++        let exchange = send(fresh_server(true).await, &signature, &body).await;
++        assert_eq!(exchange.status, 400, "{}", exchange.body);
++        recorder.record(
++            "setup_status_accepted_asset_pre_u4",
++            "accepted_asset USDT sent to a paykit-server that predates the field: refused as an unknown field.",
++            WITH,
++            &signature,
++            &body,
++            &exchange,
++        );
++        return;
++    }
 +
 +    capture!(
 +        "setup_status_authority_ready",
@@ -604,57 +619,57 @@ index 0000000..d4f35ef
 +    );
 +    capture!(
 +        "setup_status_btc_dual",
-+        "asset BTC: a seller who approved a Bitcoin account and a USDT address.",
++        "asset BTC (the denomination): a seller who approved a Bitcoin account and a USDT address.",
 +        WITH,
 +        (),
 +        dual,
-+        Some("BTC"),
++        Some("asset:BTC"),
 +        Some(READY)
 +    );
 +    capture!(
 +        "setup_status_btc_bitcoin_only",
-+        "asset BTC: a seller who approved a Bitcoin account and declined USDT.",
++        "asset BTC (the denomination): a seller who approved a Bitcoin account and declined USDT.",
 +        WITH,
 +        (),
 +        bitcoin_only,
-+        Some("BTC"),
++        Some("asset:BTC"),
 +        Some(READY)
 +    );
 +    capture!(
 +        "setup_status_usdt_dual",
-+        "asset USDT, `[usdt]` configured: a seller who approved a Bitcoin account and a USDT address.",
++        "accepted_asset USDT, `[usdt]` configured: a seller who approved a Bitcoin account and a USDT address.",
 +        WITH,
 +        (),
 +        dual,
-+        Some("USDT"),
++        Some("accepted_asset:USDT"),
 +        Some(READY)
 +    );
 +    capture!(
 +        "setup_status_usdt_bitcoin_only",
-+        "asset USDT, `[usdt]` configured: a seller who approved a Bitcoin account and DECLINED the USDT address.",
++        "accepted_asset USDT, `[usdt]` configured: a seller who approved a Bitcoin account and DECLINED the USDT address.",
 +        WITH,
 +        (),
 +        bitcoin_only,
-+        Some("USDT"),
-+        Some(READY)
++        Some("accepted_asset:USDT"),
++        Some(SETUP_REQUIRED)
 +    );
 +    capture!(
 +        "setup_status_usdt_never_set_up",
-+        "asset USDT, `[usdt]` configured: a Bitkit wallet that never ran Paykit setup with this server.",
++        "accepted_asset USDT, `[usdt]` configured: a Bitkit wallet that never ran Paykit setup with this server.",
 +        WITH,
 +        (),
 +        never_set_up,
-+        Some("USDT"),
++        Some("accepted_asset:USDT"),
 +        Some(SETUP_REQUIRED)
 +    );
 +    capture!(
 +        "setup_status_usdt_before_reconnect",
-+        "asset USDT, `[usdt]` configured: a Bitcoin-only seller, before reconnecting to add USDT.",
++        "accepted_asset USDT, `[usdt]` configured: a Bitcoin-only seller, before reconnecting to add USDT.",
 +        WITH,
 +        (),
 +        reconnected,
-+        Some("USDT"),
-+        Some(READY)
++        Some("accepted_asset:USDT"),
++        Some(SETUP_REQUIRED)
 +    );
 +    run_setup(
 +        usdt_address,
@@ -666,29 +681,29 @@ index 0000000..d4f35ef
 +    .await;
 +    capture!(
 +        "setup_status_usdt_after_reconnect",
-+        "asset USDT, `[usdt]` configured: the same seller after a reconnect that added a USDT address.",
++        "accepted_asset USDT, `[usdt]` configured: the same seller after a reconnect that added a USDT address.",
 +        WITH,
 +        (),
 +        reconnected,
-+        Some("USDT"),
++        Some("accepted_asset:USDT"),
 +        Some(READY)
 +    );
 +    capture!(
 +        "setup_status_btc_after_reconnect",
-+        "asset BTC: the same seller after the reconnect; the Bitcoin account is untouched.",
++        "asset BTC (the denomination): the same seller after the reconnect; the Bitcoin account is untouched.",
 +        WITH,
 +        (),
 +        reconnected,
-+        Some("BTC"),
++        Some("asset:BTC"),
 +        Some(READY)
 +    );
 +    capture!(
 +        "setup_status_usdt_without_usdt_config",
-+        "asset USDT, no `[usdt]` config: a seller who approved Bitcoin and USDT on another deployment, asked here.",
++        "accepted_asset USDT, no `[usdt]` config: a seller who approved Bitcoin and USDT on another deployment, asked here.",
 +        WITHOUT,
 +        (),
 +        dual,
-+        Some("USDT"),
++        Some("accepted_asset:USDT"),
 +        Some(SETUP_REQUIRED)
 +    );
 +    capture!(
@@ -702,20 +717,20 @@ index 0000000..d4f35ef
 +    );
 +    capture!(
 +        "setup_status_usdt_without_usdt_config_bitcoin_wallet",
-+        "asset USDT, no `[usdt]` config: a seller set up on a deployment that offered no USDT permission.",
++        "accepted_asset USDT, no `[usdt]` config: a seller set up on a deployment that offered no USDT permission.",
 +        WITHOUT,
 +        (),
 +        plain_wallet,
-+        Some("USDT"),
++        Some("accepted_asset:USDT"),
 +        Some(SETUP_REQUIRED)
 +    );
 +    capture!(
 +        "setup_status_btc_without_usdt_config",
-+        "asset BTC, no `[usdt]` config: Bitcoin is unaffected.",
++        "asset BTC (the denomination), no `[usdt]` config: Bitcoin is unaffected.",
 +        WITHOUT,
 +        (),
 +        plain_wallet,
-+        Some("BTC"),
++        Some("asset:BTC"),
 +        Some(READY)
 +    );
 +
@@ -731,6 +746,16 @@ index 0000000..d4f35ef
 +            "A field outside the closed body: refused.",
 +            json!({ "creator": creator, "extra": true }),
 +        ),
++        (
++            "setup_status_accepted_asset_usd",
++            "accepted_asset USD: a denomination, not a payment asset, refused.",
++            json!({ "accepted_asset": "USD", "creator": creator }),
++        ),
++        (
++            "setup_status_accepted_asset_lowercase",
++            "accepted_asset btc: values are case sensitive, refused.",
++            json!({ "accepted_asset": "btc", "creator": creator }),
++        ),
 +    ] {
 +        let body = canonical(&body_value);
 +        let signature = sign(&service_key, &body);
@@ -738,7 +763,7 @@ index 0000000..d4f35ef
 +        assert_eq!(exchange.status, 400, "{name}: {}", exchange.body);
 +        recorder.record(name, description, WITH, &signature, &body, &exchange);
 +    }
-+    let body = canonical(&json!({ "asset": "USDT", "creator": creator }));
++    let body = canonical(&json!({ "accepted_asset": "USDT", "creator": creator }));
 +    let signature = sign(&other_key, &body);
 +    let exchange = send(fresh_server(true).await, &signature, &body).await;
 +    assert_eq!(exchange.status, 401);
@@ -764,11 +789,11 @@ index 0000000..d4f35ef
 +    );
 +    capture!(
 +        "setup_status_usdt_homeserver_down",
-+        "asset USDT: the homeserver that holds the seller's Pubky session stopped answering.",
++        "accepted_asset USDT: the homeserver that holds the seller's Pubky session stopped answering.",
 +        WITH,
 +        (),
 +        dual,
-+        Some("USDT"),
++        Some("accepted_asset:USDT"),
 +        Some(r#"{"status":"unavailable"}"#)
 +    );
 +}
