@@ -99,3 +99,11 @@ default (no rewrite), a `listings` trigger that maintains it, replaces the
 primary key. It builds no index on an existing table and sets
 `lock_timeout` like 0050. No index serves the follower's revival read (live
 listings with `revived_from_cursor` set); it filters the live listings.
+
+0052 (Paykit prepared attempts) adds four nullable `orders` columns for an
+attempt the upstream paykit API prepares (`paykit_payment_reference`,
+`paykit_operation_id`, `paykit_payment_window_seconds`, `paykit_asset`) and
+one `NOT VALID` CHECK that keeps them all-or-nothing and the window positive.
+No default, no rewrite, no index; it sets `lock_timeout` like 0050. A binary
+from before it lists its `orders` columns and ignores them. `paykit_asset` has
+no CHECK on purpose: a later asset is a new value, not a migration.
