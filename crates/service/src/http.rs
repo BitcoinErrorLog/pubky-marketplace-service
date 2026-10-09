@@ -270,7 +270,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         .payment_availability
         .rail_snapshot(state.clock.now())
         .await;
-    Json(json!({
+    let mut body = json!({
         "status": "ok",
         "offer_checkout": true,
         "pickup_available": state.pickup_available(),
@@ -281,7 +281,13 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
             "bitcoin_offer_available": bitcoin_offer_available,
             "age_seconds": age_seconds,
         },
-    }))
+    });
+    // Present only while the USDT flag is on, so the body is byte-identical
+    // to a build without USDT otherwise. The Shop reads exactly this key.
+    if state.config.usdt_payments_enabled {
+        body["usdt_payments"] = json!({ "available": true });
+    }
+    Json(body)
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
