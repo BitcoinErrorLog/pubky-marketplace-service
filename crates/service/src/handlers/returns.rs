@@ -21,7 +21,11 @@ use crate::clock::format_timestamp;
 use crate::handlers::{fetch_order_for_update, finish_order_action, guard_order_action};
 use crate::model::OrderRow;
 use crate::queries::ORDER_COLUMNS;
+use crate::refund_destination::{self, is_transaction_hash, is_usdt_order};
 use crate::result::{CommandFailure, HandlerResult};
+
+pub const REASON_REFUND_DESTINATION_REQUIRED: &str = "refund_destination_required";
+pub const REASON_INVALID_REFUND_REFERENCE: &str = "invalid_refund_reference";
 
 pub async fn request(
     tx: &mut Transaction<'_, Postgres>,
@@ -300,17 +304,44 @@ pub async fn record_external_refund(
             "The external refund cannot be recorded.",
         )));
     }
+    // A USDT refund goes to the address the buyer confirmed and is evidenced
+    // by its Arbitrum transaction hash. The address is copied into the
+    // record, so a later change cannot rewrite what was recorded.
+    let usdt_destination = if is_usdt_order(&order) {
+        let Some(destination) = refund_destination::fetch(tx, order.id).await? else {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "The buyer has not confirmed a refund address.",
+                REASON_REFUND_DESTINATION_REQUIRED,
+            )));
+        };
+        if !is_transaction_hash(&payload.transaction_id) {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                "A USDT refund needs the Arbitrum transaction hash.",
+                REASON_INVALID_REFUND_REFERENCE,
+            )));
+        }
+        Some(destination)
+    } else {
+        None
+    };
     debug_assert!(can_transition(
         &order_machine(),
         &order.state,
         "refunded_external"
     ));
 
-    let external_refund = json!({
+    let mut external_refund = json!({
         "amount_minor": payload.amount_minor,
         "transaction_id": payload.transaction_id,
         "recorded_at": format_timestamp(now),
     });
+    if let Some(destination) = &usdt_destination {
+        external_refund["destination_address"] = json!(destination.address);
+    }
     let return_request = order.return_request.clone().map(|mut request| {
         request["state"] = json!("refunded");
         request["updated_at"] = json!(format_timestamp(now));
