@@ -459,14 +459,16 @@ pub async fn prepare(
         )));
     }
     // Every snapshotted fact must equal the locked payment/order rows
-    // exactly — order, reader (buyer), recipient (seller), and the full
-    // economics — before any authority row is created.
+    // exactly — order, reader (buyer), recipient (seller), and the price
+    // of record — before any authority row is created. The snapshot
+    // describes the listing's price DENOMINATION, so it is compared with
+    // the immutable `merchandise_*` columns; the payment's own economics
+    // must additionally still be that untouched price, so a rail bind (or
+    // a voided bind's leftovers) can never reach a Locks authority row.
     if snapshot.order_id != payment.order_id
         || snapshot.expected_reader_pubky != payment.buyer_pubky
         || snapshot.expected_recipient_pubky != payment.seller_pubky
-        || snapshot.amount_minor != payment.amount_minor
-        || snapshot.asset != payment.currency
-        || snapshot.exponent != payment.exponent
+        || !snapshot_matches_price_of_record(&snapshot, &payment)
     {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,
@@ -565,6 +567,7 @@ pub async fn prepare(
         &snapshot.criterion_id,
         snapshot.amount_minor,
         &snapshot.asset,
+        snapshot.exponent,
     ) {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,
@@ -631,16 +634,59 @@ pub async fn prepare(
     }))
 }
 
+/// The snapshot's denomination and amount equal the payment's immutable
+/// price of record (`merchandise_*`), and the payment's own economics are
+/// still that price: nothing has rewritten them to another rail's terms.
+fn snapshot_matches_price_of_record(snapshot: &CheckoutSnapshot, payment: &PaymentRow) -> bool {
+    payment.merchandise_amount_minor == Some(snapshot.amount_minor)
+        && payment.merchandise_currency.as_deref() == Some(snapshot.asset.as_str())
+        && payment.merchandise_exponent == Some(snapshot.exponent)
+        && payment.amount_minor == snapshot.amount_minor
+        && payment.currency == snapshot.asset
+        && payment.exponent == snapshot.exponent
+}
+
+/// Maps a Shop price denomination to the unit the Lock Server counts, as
+/// `(lock asset, lock amount)`. Locks counts `BTC` locks in sats, `USD`
+/// locks in cents and `USDT` locks in millionths (paykit-server rc10).
+///
+/// Only the denominations a Locks listing can be priced in map: `USD/2`,
+/// `BTC/8` (1e-8 BTC is one sat) and `SAT/0`. Everything else, including
+/// any exponent that disagrees with its currency, has no Locks unit and
+/// returns `None`. `USDT` is deliberately absent: listings are never priced
+/// in USDT, and a USDT lock never grants access (locks#73).
+///
+/// The lock's asset names the price denomination, not the currency the
+/// buyer pays in: a `USD` lock can be paid in quoted BTC (and, after
+/// locks#75, USDT) without changing what the lock compares against.
+fn locks_denomination(
+    currency: &str,
+    exponent: i32,
+    amount_minor: i64,
+) -> Option<(&'static str, i64)> {
+    match (currency, exponent) {
+        ("USD", 2) => Some(("USD", amount_minor)),
+        ("BTC", 8) | ("SAT", 0) => Some(("BTC", amount_minor)),
+        _ => None,
+    }
+}
+
 /// The marketplace economics gate on top of the upstream policy invariants:
 /// the sole `paykit-payment` criterion must be the seller-authored criterion
-/// from the checkout snapshot, and its amount/asset must equal the immutable
-/// payment facts exactly (no conversion, no unit guessing).
+/// from the checkout snapshot, and its asset/amount must equal the
+/// snapshot's price denomination mapped through [`locks_denomination`]. A
+/// denomination with no Locks unit never matches.
 fn criterion_matches_payment(
     content_lock: &crate::content_lock::ContentLock,
     criterion_id: &str,
     amount_minor: i64,
-    asset: &str,
+    currency: &str,
+    exponent: i32,
 ) -> bool {
+    let Some((lock_asset, lock_amount)) = locks_denomination(currency, exponent, amount_minor)
+    else {
+        return false;
+    };
     let [criterion] = &content_lock.criteria[..] else {
         return false;
     };
@@ -657,10 +703,189 @@ fn criterion_matches_payment(
             .params
             .get("asset")
             .and_then(serde_json::Value::as_str)
-            == Some(asset)
+            == Some(lock_asset)
         && criterion
             .params
             .get("amount")
             .and_then(serde_json::Value::as_str)
-            == Some(amount_minor.to_string().as_str())
+            == Some(lock_amount.to_string().as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{criterion_matches_payment, locks_denomination};
+    use crate::content_lock::ContentLock;
+    use pubky_common::crypto::Keypair;
+    use serde_json::json;
+
+    fn lock_with(asset: &str, amount: i64) -> ContentLock {
+        let creator = format!("pubky{}", Keypair::random().public_key().z32());
+        serde_json::from_value(json!({
+            "version": 1,
+            "creator": creator,
+            "primary_resource": {
+                "path": "/priv/locks.app/content/post.json",
+                "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+                "content_type": "application/json",
+                "size": 5,
+            },
+            "criteria": [{
+                "criterion_id": "paykit",
+                "verifier_type": "paykit-payment",
+                "params": {
+                    "amount": amount.to_string(),
+                    "asset": asset,
+                    "recipient_pubky": creator,
+                },
+            }],
+            "lock_logic": { "type": "all", "criteria": ["paykit"] },
+            "access_policy": { "requested_credential_ttl_seconds": 900 },
+            "lock_server": { "override": null },
+            "created_at": "2026-05-29T12:00:00Z",
+        }))
+        .expect("test lock document matches the upstream schema")
+    }
+
+    #[test]
+    fn the_denomination_map_is_explicit_and_closed() {
+        assert_eq!(locks_denomination("USD", 2, 13_700), Some(("USD", 13_700)));
+        assert_eq!(
+            locks_denomination("BTC", 8, 100_000),
+            Some(("BTC", 100_000))
+        );
+        assert_eq!(locks_denomination("SAT", 0, 42_000), Some(("BTC", 42_000)));
+    }
+
+    #[test]
+    fn a_denomination_with_a_disagreeing_exponent_has_no_locks_unit() {
+        for (currency, exponent) in [
+            ("USD", 0),
+            ("USD", 3),
+            ("USD", 8),
+            ("BTC", 0),
+            ("BTC", 2),
+            ("SAT", 2),
+            ("SAT", 8),
+        ] {
+            assert_eq!(
+                locks_denomination(currency, exponent, 1_000),
+                None,
+                "{currency}/{exponent}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_and_usdt_denominations_have_no_locks_unit() {
+        for (currency, exponent) in [
+            ("USDT", 6),
+            ("USDT", 2),
+            ("EUR", 2),
+            ("XBT", 8),
+            ("usd", 2),
+            ("btc", 8),
+            ("", 2),
+        ] {
+            assert_eq!(
+                locks_denomination(currency, exponent, 1_000),
+                None,
+                "{currency}/{exponent}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_usd_and_btc_locks_match_their_own_denomination() {
+        assert!(criterion_matches_payment(
+            &lock_with("USD", 13_700),
+            "paykit",
+            13_700,
+            "USD",
+            2
+        ));
+        assert!(criterion_matches_payment(
+            &lock_with("BTC", 100_000),
+            "paykit",
+            100_000,
+            "BTC",
+            8
+        ));
+    }
+
+    #[test]
+    fn a_sat_priced_listing_matches_a_btc_lock_in_sats() {
+        let lock = lock_with("BTC", 42_000);
+        assert!(criterion_matches_payment(&lock, "paykit", 42_000, "SAT", 0));
+        assert!(!criterion_matches_payment(
+            &lock, "paykit", 42_001, "SAT", 0
+        ));
+    }
+
+    #[test]
+    fn the_lock_asset_must_be_the_mapped_unit_not_the_listing_currency() {
+        assert!(!criterion_matches_payment(
+            &lock_with("SAT", 42_000),
+            "paykit",
+            42_000,
+            "SAT",
+            0
+        ));
+        assert!(!criterion_matches_payment(
+            &lock_with("BTC", 13_700),
+            "paykit",
+            13_700,
+            "USD",
+            2
+        ));
+        assert!(!criterion_matches_payment(
+            &lock_with("USD", 13_700),
+            "paykit",
+            13_700,
+            "BTC",
+            8
+        ));
+        assert!(!criterion_matches_payment(
+            &lock_with("USD", 13_700),
+            "paykit",
+            13_700,
+            "SAT",
+            0
+        ));
+    }
+
+    #[test]
+    fn a_usdt_lock_never_matches_any_listing_denomination() {
+        for (currency, exponent, amount) in
+            [("USD", 2, 13_700), ("BTC", 8, 100_000), ("SAT", 0, 100_000)]
+        {
+            for lock_amount in [amount, amount * 10_000] {
+                assert!(
+                    !criterion_matches_payment(
+                        &lock_with("USDT", lock_amount),
+                        "paykit",
+                        amount,
+                        currency,
+                        exponent
+                    ),
+                    "{currency}/{exponent} must not match a USDT lock of {lock_amount}"
+                );
+            }
+        }
+        assert!(!criterion_matches_payment(
+            &lock_with("USDT", 137_000_000),
+            "paykit",
+            137_000_000,
+            "USDT",
+            6
+        ));
+    }
+
+    #[test]
+    fn the_criterion_id_and_amount_must_still_match() {
+        let lock = lock_with("USD", 13_700);
+        assert!(!criterion_matches_payment(&lock, "other", 13_700, "USD", 2));
+        assert!(!criterion_matches_payment(
+            &lock, "paykit", 13_701, "USD", 2
+        ));
+    }
 }
