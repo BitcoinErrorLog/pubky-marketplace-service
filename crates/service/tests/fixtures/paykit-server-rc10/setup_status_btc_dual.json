@@ -1,0 +1,18 @@
+{
+  "description": "asset BTC: a seller who approved a Bitcoin account and a USDT address.",
+  "name": "setup_status_btc_dual",
+  "request": {
+    "body": "{\"asset\":\"BTC\",\"creator\":\"pubkyirqapc3t8bxyuzu89mkewx73nz3u74etrpcx1rzb9be5wxwucsbo\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "JTL0qLywo8zclJaj3jOXPKo3rwn8sP_ulMA8SP74hH3cmyhwRfA5WSkSeYX0At6OuR109FRArCYhlohqt1vpBw"
+  },
+  "response": {
+    "body": "{\"status\":\"ready\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T16:37:21.439433125Z",
+  "server": "usdt_configured",
+  "server_revision": "7326a3f9a035d79d8b6977b7c1a5fb742327ff37"
+}

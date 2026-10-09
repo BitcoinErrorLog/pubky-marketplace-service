@@ -1,0 +1,18 @@
+{
+  "description": "A field outside the closed body: refused.",
+  "name": "setup_status_unknown_field",
+  "request": {
+    "body": "{\"creator\":\"pubkyirqapc3t8bxyuzu89mkewx73nz3u74etrpcx1rzb9be5wxwucsbo\",\"extra\":true}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "8OoN_vbCMWL8m5BUqlkiZfh_KJp3ZU63qfAhMXBtN5mg2IPwq5RGOpgTk4jo5nxi_519ATy-M9vLk1qKAn38DA"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"invalid_request\",\"message\":\"request is invalid\"}}",
+    "content_type": "application/json",
+    "status": 400
+  },
+  "sent_at": "2026-10-09T16:37:24.927680046Z",
+  "server": "usdt_configured",
+  "server_revision": "7326a3f9a035d79d8b6977b7c1a5fb742327ff37"
+}

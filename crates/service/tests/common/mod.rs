@@ -6,6 +6,7 @@
 pub mod fx_feed;
 pub mod paykit_review;
 pub mod paykit_server_66;
+pub mod paykit_server_rc10;
 pub mod paykit_upstream_prepare;
 
 use std::sync::Arc;
@@ -2043,6 +2044,10 @@ struct FakePaykitState {
     setup_status_failure: Option<u16>,
     /// Body served verbatim instead of the scripted status, when forced.
     setup_status_body: Option<Value>,
+    /// (Seller (bare z32), `asset` of the request) -> an exchange captured
+    /// from paykit-server, replayed verbatim (status and body) for that
+    /// seller and asset. Consulted before the per-seller scripted status.
+    setup_replays: HashMap<(String, Option<String>), (u16, String)>,
     /// The upstream `prepare` route: stored operations and test knobs.
     prepare: paykit_upstream_prepare::PrepareState,
 }
@@ -2120,6 +2125,25 @@ impl FakePaykit {
             .lock()
             .expect("fake paykit lock")
             .setup_status_body = Some(body);
+    }
+
+    /// Answers `POST /setup/status` for `seller_pubky` (bare z32) and the
+    /// request's `asset` (`None` for the authority-only body) with the
+    /// response of a captured paykit-server exchange, byte for byte.
+    pub fn replay_setup_status(
+        &self,
+        seller_pubky: &str,
+        asset: Option<&str>,
+        fixture: &paykit_server_rc10::Fixture,
+    ) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .setup_replays
+            .insert(
+                (seller_pubky.to_string(), asset.map(str::to_string)),
+                (fixture.status, fixture.response_body.clone()),
+            );
     }
 
     pub fn set_claimed(&self, seller_pubky: &str) {
@@ -2368,6 +2392,18 @@ async fn serve_paykit_setup_status(
     }
     let creator = parsed["creator"].as_str().unwrap_or_default();
     let seller = creator.strip_prefix("pubky").unwrap_or(creator);
+    let asset = parsed.get("asset").and_then(Value::as_str);
+    if let Some((status, body)) = guard
+        .setup_replays
+        .get(&(seller.to_string(), asset.map(str::to_string)))
+    {
+        return (
+            StatusCode::from_u16(*status).expect("captured status"),
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body.clone(),
+        )
+            .into_response();
+    }
     let status = guard
         .setup_statuses
         .get(seller)
@@ -3014,6 +3050,7 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         setup_statuses: HashMap::new(),
         setup_status_failure: None,
         setup_status_body: None,
+        setup_replays: HashMap::new(),
         prepare: Default::default(),
     }));
     let router = Router::new()

@@ -1,0 +1,18 @@
+{
+  "description": "A signature by a key that is not in `[signed_services] trusted_public_keys`.",
+  "name": "setup_status_invalid_signature",
+  "request": {
+    "body": "{\"asset\":\"USDT\",\"creator\":\"pubkyirqapc3t8bxyuzu89mkewx73nz3u74etrpcx1rzb9be5wxwucsbo\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "4ecOo3Xc1J3OQa9ShoVlhvZUo0jCyjjsh6DQLt_JGM7R2NhgsDrEM4N5OyFitj2diVhDIo6mhgWdCIVnxue1Dg"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"invalid_signature\",\"message\":\"request authentication failed\"}}",
+    "content_type": "application/json",
+    "status": 401
+  },
+  "sent_at": "2026-10-09T16:37:25.168707494Z",
+  "server": "usdt_configured",
+  "server_revision": "7326a3f9a035d79d8b6977b7c1a5fb742327ff37"
+}
