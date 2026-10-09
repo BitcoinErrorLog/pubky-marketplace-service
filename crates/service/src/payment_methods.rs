@@ -1097,15 +1097,24 @@ pub async fn bind_payment_method(
             let response_received_at = state.clock.now();
             let activation_cutoff = response_received_at
                 .checked_add_signed(chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS));
+            let maximum_prepare_expiry = state
+                .config
+                .paykit_max_prepare_ttl_seconds
+                .checked_add(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS)
+                .and_then(chrono::Duration::try_seconds)
+                .and_then(|ttl| response_received_at.checked_add_signed(ttl));
             let hold_extension_seconds = state
                 .config
                 .bitcoin_payment_window_seconds
                 .checked_add(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS);
-            if activation_cutoff.is_none_or(|cutoff| prepare_expires_at <= cutoff) {
+            if activation_cutoff.is_none_or(|cutoff| prepare_expires_at <= cutoff)
+                || maximum_prepare_expiry.is_none_or(|maximum| prepare_expires_at > maximum)
+            {
                 tracing::error!(
                     order_id = %order.id,
                     %prepare_expires_at,
-                    "ALERT upstream paykit returned a prepare deadline inside the clock margin"
+                    max_prepare_ttl_seconds = state.config.paykit_max_prepare_ttl_seconds,
+                    "ALERT upstream paykit returned a prepare deadline outside local bounds"
                 );
                 let _ = tx.rollback().await;
                 spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");

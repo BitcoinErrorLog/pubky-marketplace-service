@@ -18,6 +18,8 @@ pub const DEFAULT_DELIVERY_SWEEP_BATCH_SIZE: i64 = 100;
 /// Upper bound of `automation_rate_limits.tokens`. Env `rate × burst`
 /// capacity must fit this CHECK or process start fails closed.
 pub const AUTOMATION_RATE_LIMIT_MAX_TOKENS: i64 = 20_000;
+/// Hard deployment-policy ceiling for accepted upstream preparation TTLs.
+pub const MAX_PAYKIT_PREPARE_TTL_SECONDS: i64 = 86_400;
 
 #[derive(Clone)]
 pub struct Config {
@@ -100,6 +102,11 @@ pub struct Config {
     /// the buyer is shown. Honor a deployment value ≥ 60; do not cap below
     /// a live Railway override.
     pub bitcoin_payment_window_seconds: i64,
+    /// Largest remaining upstream Paykit preparation TTL Marketplace accepts
+    /// (`PAYKIT_MAX_PREPARE_TTL_SECONDS`, default 900, range 60..=86400).
+    /// Align this with the producer's configured prepare TTL. Responses above
+    /// it are rejected before inventory is committed.
+    pub paykit_max_prepare_ttl_seconds: i64,
     /// Hold window armed by `payment.sandbox_advance`'s first transition
     /// out of `awaiting_entitlement`, the sandbox lock point
     /// (`SANDBOX_PAYMENT_WINDOW_SECONDS`, default 900, minimum 60).
@@ -294,6 +301,12 @@ impl Config {
         if bitcoin_payment_window_seconds < 60 {
             anyhow::bail!("BITCOIN_PAYMENT_WINDOW_SECONDS must be at least 60");
         }
+        let paykit_max_prepare_ttl_seconds = bounded_i64(
+            "PAYKIT_MAX_PREPARE_TTL_SECONDS",
+            900,
+            60,
+            MAX_PAYKIT_PREPARE_TTL_SECONDS,
+        )?;
         let sandbox_payment_window_seconds = env_i64("SANDBOX_PAYMENT_WINDOW_SECONDS", 900)?;
         if sandbox_payment_window_seconds < 60 {
             anyhow::bail!("SANDBOX_PAYMENT_WINDOW_SECONDS must be at least 60");
@@ -369,6 +382,7 @@ impl Config {
             checkout_hold_window_seconds,
             fiat_payment_window_seconds,
             bitcoin_payment_window_seconds,
+            paykit_max_prepare_ttl_seconds,
             sandbox_payment_window_seconds,
             drop_claim_window_seconds,
             locks_poll_seconds,
@@ -430,6 +444,7 @@ impl Config {
             // defaults. Production `from_env` uses 600 / 1800.
             fiat_payment_window_seconds: 3_600,
             bitcoin_payment_window_seconds: 7_200,
+            paykit_max_prepare_ttl_seconds: 900,
             sandbox_payment_window_seconds: 900,
             drop_claim_window_seconds: 600,
             locks_poll_seconds: 30,
@@ -539,6 +554,14 @@ fn positive_i64(name: &str, default: i64) -> anyhow::Result<i64> {
     let value = env_i64(name, default)?;
     if value < 1 {
         anyhow::bail!("{name} must be at least 1");
+    }
+    Ok(value)
+}
+
+fn bounded_i64(name: &str, default: i64, min: i64, max: i64) -> anyhow::Result<i64> {
+    let value = env_i64(name, default)?;
+    if !(min..=max).contains(&value) {
+        anyhow::bail!("{name} must be between {min} and {max}");
     }
     Ok(value)
 }
@@ -672,6 +695,7 @@ mod tests {
         let previous_checkout_hold = std::env::var("CHECKOUT_HOLD_WINDOW_SECONDS").ok();
         let previous_fiat_window = std::env::var("FIAT_PAYMENT_WINDOW_SECONDS").ok();
         let previous_bitcoin_window = std::env::var("BITCOIN_PAYMENT_WINDOW_SECONDS").ok();
+        let previous_prepare_ttl = std::env::var("PAYKIT_MAX_PREPARE_TTL_SECONDS").ok();
         std::env::set_var("DATABASE_URL", "postgres://example.invalid/test");
         std::env::set_var(
             "REFUSAL_AUDIT_DATABASE_URL",
@@ -693,6 +717,7 @@ mod tests {
         std::env::remove_var("CHECKOUT_HOLD_WINDOW_SECONDS");
         std::env::remove_var("FIAT_PAYMENT_WINDOW_SECONDS");
         std::env::remove_var("BITCOIN_PAYMENT_WINDOW_SECONDS");
+        std::env::remove_var("PAYKIT_MAX_PREPARE_TTL_SECONDS");
         let result = Config::from_env();
         match previous_database_url {
             Some(value) => std::env::set_var("DATABASE_URL", value),
@@ -716,6 +741,7 @@ mod tests {
             ("CHECKOUT_HOLD_WINDOW_SECONDS", previous_checkout_hold),
             ("FIAT_PAYMENT_WINDOW_SECONDS", previous_fiat_window),
             ("BITCOIN_PAYMENT_WINDOW_SECONDS", previous_bitcoin_window),
+            ("PAYKIT_MAX_PREPARE_TTL_SECONDS", previous_prepare_ttl),
         ] {
             match previous {
                 Some(value) => std::env::set_var(name, value),
@@ -731,6 +757,36 @@ mod tests {
         assert_eq!(config.checkout_hold_window_seconds, 900);
         assert_eq!(config.fiat_payment_window_seconds, 600);
         assert_eq!(config.bitcoin_payment_window_seconds, 1_800);
+        assert_eq!(config.paykit_max_prepare_ttl_seconds, 900);
+    }
+
+    #[test]
+    fn upstream_prepare_ttl_config_is_closed_and_bounded() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous = std::env::var("PAYKIT_MAX_PREPARE_TTL_SECONDS").ok();
+        for (value, accepted) in [
+            ("59", false),
+            ("60", true),
+            ("86400", true),
+            ("86401", false),
+        ] {
+            std::env::set_var("PAYKIT_MAX_PREPARE_TTL_SECONDS", value);
+            assert_eq!(
+                super::bounded_i64(
+                    "PAYKIT_MAX_PREPARE_TTL_SECONDS",
+                    900,
+                    60,
+                    super::MAX_PAYKIT_PREPARE_TTL_SECONDS,
+                )
+                .is_ok(),
+                accepted,
+                "value {value}"
+            );
+        }
+        match previous {
+            Some(value) => std::env::set_var("PAYKIT_MAX_PREPARE_TTL_SECONDS", value),
+            None => std::env::remove_var("PAYKIT_MAX_PREPARE_TTL_SECONDS"),
+        }
     }
 
     #[test]

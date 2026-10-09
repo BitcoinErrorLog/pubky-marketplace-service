@@ -47,6 +47,7 @@ const stagingEnv = {
   MARKETPLACE_GRANT_VERIFY_LEASE_SECONDS: preserve(),
   MARKETPLACE_GRANT_WORKER_BATCH_SIZE: preserve(),
   PAYKIT_REQUEST_SIGNING_KEY: preserve(),
+  PAYKIT_MAX_PREPARE_TTL_SECONDS: preserve(),
   PAYKIT_SERVER_URL: preserve(),
   // Staging must never take live PayPal money.
   PAYPAL_CHECKOUT_URL: "https://www.sandbox.paypal.com/cgi-bin/webscr",

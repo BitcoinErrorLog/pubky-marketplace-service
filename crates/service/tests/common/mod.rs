@@ -2004,6 +2004,8 @@ struct FakePaykitState {
     /// forced (the "paykit is down" knob, ahead of any script).
     command_failure: Option<(u16, String)>,
     create_shape: FakePaykitCreateShape,
+    /// Upstream preparation lifetime returned by the fake producer.
+    upstream_prepare_ttl_seconds: i64,
     nonce_sats: u64,
     stack_id: String,
     allocation_mode: String,
@@ -2086,6 +2088,13 @@ impl FakePaykit {
     /// preimage (method, path, body); a body-only signature is a 401.
     pub fn use_upstream_api(&self) {
         self.state.lock().expect("fake paykit lock").api = PaykitApi::Upstream;
+    }
+
+    pub fn set_upstream_prepare_ttl_seconds(&self, seconds: i64) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .upstream_prepare_ttl_seconds = seconds;
     }
 
     /// Scripts the `/setup/status` answer (`ready`, `setup_required`,
@@ -2681,7 +2690,8 @@ async fn serve_upstream_prepare(
     }
     let invoice_id = uuid::Uuid::new_v4();
     let now = chrono::Utc::now();
-    let prepare_expires_at = (now + chrono::Duration::minutes(15)).to_rfc3339();
+    let prepare_expires_at =
+        (now + chrono::Duration::seconds(guard.upstream_prepare_ttl_seconds)).to_rfc3339();
     guard.invoices.insert(
         invoice_id,
         FakePaykitInvoice {
@@ -3245,6 +3255,7 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         create_error_status: 409,
         command_failure: None,
         create_shape: FakePaykitCreateShape::Full,
+        upstream_prepare_ttl_seconds: 15 * 60,
         nonce_sats: 437,
         stack_id: stack_id.clone(),
         allocation_mode: "exclusive".to_string(),
@@ -3528,7 +3539,11 @@ async fn test_app_with_payments_api(
         paypal_ipn: PaypalIpnVerifier::new(&ipn.base_url).expect("fake ipn verifier builds"),
         shippo: ShippoClient::new(&shippo.base_url).expect("fake shippo client builds"),
     });
-    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let now = if api == PaykitApi::Upstream {
+        Utc::now()
+    } else {
+        NOW.parse().expect("valid test timestamp")
+    };
     let clock = Arc::new(AdjustableClock::new(now));
     let state = AppState::new(pool.clone(), clock.clone(), config)
         .with_payments(Some(runtime))

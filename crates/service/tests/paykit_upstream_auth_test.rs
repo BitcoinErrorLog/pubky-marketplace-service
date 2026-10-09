@@ -39,6 +39,16 @@ struct PersistedUpstreamBind {
     paykit_activation_state: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+struct RolledBackBind {
+    state: String,
+    payment_method: Option<String>,
+    stock_held: bool,
+    hold_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    paykit_invoice_id: Option<uuid::Uuid>,
+    activation_intents: i64,
+}
+
 /// `paykit-server/tests/setup_status.rs`: `SigningKey::from_bytes(&[7; 32])`,
 /// `CREATOR`, `canonical_body()`, and `signed_request()` over
 /// `signature_preimage("POST", "/setup/status", &body)`.
@@ -889,6 +899,84 @@ async fn upstream_bind_holds_inventory_through_latest_activation_window(pool: Pg
         "activation never rewrites hold"
     );
     assert!(payment_deadline <= original_hold);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_bind_rejects_excessive_prepare_ttl_and_rolls_back_inventory(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    paykit.set_upstream_prepare_ttl_seconds(24 * 60 * 60);
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin_for_review(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    let order_id = uuid::Uuid::parse_str(&order.order_id).expect("order id");
+
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{order_id}/payment-method"),
+        Some(&buyer.token),
+        &json!({"method":"bitcoin"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "unexpected bind response: {body}"
+    );
+    assert_eq!(body["error"]["reason"], "paykit_expiry_inconsistent");
+
+    let facts: RolledBackBind = sqlx::query_as(
+        "SELECT o.state, o.payment_method, o.stock_held, o.hold_expires_at, \
+         o.paykit_invoice_id, (SELECT count(*) FROM outbox b \
+         WHERE b.kind = 'paykit.activate' AND b.payload->>'order_id' = o.id::text) \
+         AS activation_intents \
+         FROM orders o WHERE o.id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("rolled-back order");
+    assert_eq!(facts.state, "pending_payment");
+    assert_eq!(facts.payment_method, None);
+    assert!(!facts.stock_held, "inventory hold rolled back");
+    assert_eq!(facts.hold_expires_at, None);
+    assert_eq!(facts.paykit_invoice_id, None);
+    assert_eq!(facts.activation_intents, 0, "activation intent rolled back");
+
+    let listing: (i64, i64, i64) = sqlx::query_as(
+        "SELECT available_quantity, reserved_quantity, sold_quantity FROM listings \
+         WHERE aggregate_id = $1",
+    )
+    .bind(format!("listing:{}_boots_01", seller.pubky))
+    .fetch_one(&pool)
+    .await
+    .expect("listing inventory");
+    assert_eq!(listing, (16, 0, 0), "inventory restored");
+
+    let void_call = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(call) = paykit
+                .calls()
+                .into_iter()
+                .find(|call| call.path == "/marketplace/payment-requests/void")
+            {
+                break call;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("courtesy void sent");
+    let invoice_id = void_call.body["invoice_id"]
+        .as_str()
+        .expect("void invoice id")
+        .parse()
+        .expect("invoice uuid");
+    assert_eq!(
+        paykit.invoice(invoice_id).expect("prepared invoice").state,
+        "voided"
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

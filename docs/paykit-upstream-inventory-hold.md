@@ -14,6 +14,13 @@ Upstream prepare returns its authoritative `prepare_expires_at`. Paykit atomical
 
 `payment_deadline = Paykit activation clock + requested payment_window_seconds`
 
+Marketplace accepts that deadline only when its remaining TTL is no more than
+`PAYKIT_MAX_PREPARE_TTL_SECONDS` (default 900, closed range 60–86400), plus the
+same 60-second cross-service clock-skew allowance. Operators must align this
+setting with Paykit's `prepare_ttl_seconds`. A longer response is treated as
+contract corruption: Marketplace rolls back the bind and inventory hold and
+best-effort voids the prepared invoice.
+
 Marketplace therefore fixes the original hold after successful prepare to:
 
 `prepare_expires_at + bitcoin_payment_window_seconds + 60 seconds`
@@ -48,4 +55,4 @@ Accepted producer is reviewed Paykit commit `cce84b127febdc0411cd709df2b7cc913f6
 4. Activation and publication-outbox insertion commit atomically.
 5. Worst tolerated Marketplace/Paykit clock plus expiry-scheduling skew is 60 seconds.
 
-Consumer rejects a prepare whose remaining TTL is already inside margin. Consumer treats an activation response outside persisted bounds as contract corruption: it must not silently change Paykit terms or extend original hold. Such corruption requires operator alert and fresh producer/consumer review; 60 seconds is explicit operational assumption, not proof against unbounded clock faults.
+Consumer rejects a prepare whose remaining TTL is already inside margin or exceeds the configured maximum plus margin. With the largest permitted config, remaining preparation time is bounded to 86,460 seconds; with the default it is bounded to 960 seconds. The final hold adds only the configured payment window and one further 60-second expiry-scheduling margin. Consumer treats an activation response outside persisted bounds as contract corruption: it must not silently change Paykit terms or extend original hold. Such corruption requires operator alert and fresh producer/consumer review; 60 seconds is explicit operational assumption, not proof against unbounded clock faults.
