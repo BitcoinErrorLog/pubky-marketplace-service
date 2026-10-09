@@ -952,6 +952,15 @@ pub enum PaykitLifecycleTarget {
     Upstream { creator: String },
 }
 
+impl PaykitLifecycleTarget {
+    fn api(&self) -> PaykitApi {
+        match self {
+            Self::Fork { .. } => PaykitApi::Fork,
+            Self::Upstream { .. } => PaykitApi::Upstream,
+        }
+    }
+}
+
 /// The verbatim outcome of one signed `resolve` call, for the delivery
 /// arm's response-class mapping (§B.8.8). Every HTTP status — success,
 /// named refusal, or unmapped — reaches the caller; only a transport
@@ -1018,10 +1027,9 @@ impl PaykitCommandError {
 ///   [`paykit_signature_preimage`] (method, path and body), and seller
 ///   readiness is the signed `POST /setup/status`.
 ///
-/// The payment-request lifecycle routes (prepare, activate, void, resolve)
-/// are fork routes today. Under `Upstream` they are signed like every other
-/// request but upstream does not serve them yet, so a Bitcoin bind answers
-/// `paykit_unavailable` until the lifecycle adapter lands.
+/// New work uses this configured API. Follow-up lifecycle commands instead
+/// use the API persisted with their invoice, so a cutover or rollback cannot
+/// reinterpret queued work's route, body, or signature framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaykitApi {
     #[default]
@@ -1299,13 +1307,14 @@ impl PaykitClient {
     /// Canonicalizes `value` and signs it for a `POST` to `url`. The fork
     /// signs the body alone; upstream signs the request preimage, whose path
     /// is the URL's path (including any base-URL prefix the server sees).
-    fn signed_body(
+    fn signed_body_for_api(
         &self,
+        api: PaykitApi,
         url: &str,
         value: &serde_json::Value,
     ) -> anyhow::Result<(String, String)> {
         let body = serde_json_canonicalizer::to_string(value)?;
-        let message = match self.api {
+        let message = match api {
             PaykitApi::Fork => body.as_bytes().to_vec(),
             PaykitApi::Upstream => {
                 let url = url::Url::parse(url)?;
@@ -1317,6 +1326,14 @@ impl PaykitClient {
             self.signing_key.sign(&message).to_bytes(),
         );
         Ok((body, signature))
+    }
+
+    fn signed_body(
+        &self,
+        url: &str,
+        value: &serde_json::Value,
+    ) -> anyhow::Result<(String, String)> {
+        self.signed_body_for_api(self.api, url, value)
     }
 
     /// The base URL this client dials. The bind persists this value as the
@@ -1338,6 +1355,7 @@ impl PaykitClient {
     /// `{reference}:{bind_attempt}`. The 200 body is the verbatim
     /// prepared shape; a legacy 204 or a body missing any field is a
     /// hard refusal.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_payment_request(
         &self,
         seller_pubky: &str,
@@ -1453,12 +1471,13 @@ impl PaykitClient {
     /// stack endpoint, which may predate the configured base URL).
     async fn post_signed_to(
         &self,
+        api: PaykitApi,
         endpoint: &str,
         path: &str,
         body: serde_json::Value,
     ) -> Result<reqwest::Response, PaykitCommandError> {
         let url = format!("{}{path}", endpoint.trim_end_matches('/'));
-        let (body, signature) = self.signed_body(&url, &body).map_err(|_| {
+        let (body, signature) = self.signed_body_for_api(api, &url, &body).map_err(|_| {
             PaykitCommandError::UnexpectedRejection("body did not canonicalize".to_string())
         })?;
         self.http
@@ -1512,7 +1531,9 @@ impl PaykitClient {
                 }),
             ),
         };
-        let response = self.post_signed_to(endpoint, &path, body).await?;
+        let response = self
+            .post_signed_to(target.api(), endpoint, &path, body)
+            .await?;
         let status = response.status();
         if status.is_success() {
             let bytes = response
@@ -1578,7 +1599,9 @@ impl PaykitClient {
                 }),
             ),
         };
-        let response = self.post_signed_to(endpoint, &path, body).await?;
+        let response = self
+            .post_signed_to(target.api(), endpoint, &path, body)
+            .await?;
         let status = response.status();
         if status.is_success() {
             let body = response
@@ -1628,7 +1651,9 @@ impl PaykitClient {
                 }),
             ),
         };
-        let response = self.post_signed_to(endpoint, &path, request).await?;
+        let response = self
+            .post_signed_to(target.api(), endpoint, &path, request)
+            .await?;
         let status = response.status();
         let retry_after = response
             .headers()

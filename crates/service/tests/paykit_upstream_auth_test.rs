@@ -12,17 +12,30 @@ mod common;
 
 use axum::http::StatusCode;
 use base64::Engine;
+use common::paykit_review::{create_sat_order, enable_bitcoin as enable_bitcoin_for_review};
 use common::*;
 use ed25519_dalek::{Signer, SigningKey, Verifier};
+use marketplace_service::clock::Clock;
 use marketplace_service::payments::{
     paykit_signature_preimage, PaykitApi, PaykitClient, PaykitLifecycleTarget, PaykitPrepared,
     PaykitRequestError, PaykitStatusOutcome,
 };
+use marketplace_service::resolve_delivery::deliver_due_resolve_rows;
+use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
 const SELLER: &str = "gy1wnkhfwezwdnawnur1bc3kw1x3jf5ggjj3cm37e31i5ntq3pco";
 const REFERENCE: &str = "0R8Y7ZQ3M5N9K2VJ6W4X1T8S0P";
+
+#[derive(sqlx::FromRow)]
+struct PersistedUpstreamBind {
+    paykit_invoice_id: Option<uuid::Uuid>,
+    paykit_api: Option<String>,
+    paykit_stack_id: Option<String>,
+    paykit_stack_endpoint: Option<String>,
+    paykit_activation_state: Option<String>,
+}
 
 /// `paykit-server/tests/setup_status.rs`: `SigningKey::from_bytes(&[7; 32])`,
 /// `CREATOR`, `canonical_body()`, and `signed_request()` over
@@ -374,6 +387,84 @@ async fn upstream_lifecycle_uses_the_closed_four_command_contract() {
 }
 
 #[tokio::test]
+async fn durable_target_not_current_config_selects_lifecycle_signature_framing() {
+    let upstream_server = upstream_paykit().await;
+    let prepared = upstream_client(&upstream_server)
+        .create_payment_request(
+            SELLER,
+            "w3g1m3s5rbuyer1111111111111111111111111111111111111111",
+            uuid::Uuid::new_v4(),
+            1,
+            42_000,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            3_600,
+        )
+        .await
+        .expect("upstream prepare accepted");
+    let PaykitPrepared::Upstream {
+        invoice_id,
+        total_sats,
+        ..
+    } = prepared
+    else {
+        panic!("upstream response")
+    };
+    let rollback_client = PaykitClient::new(&upstream_server.base_url, TEST_PAYKIT_SIGNING_SEED)
+        .expect("fork-configured client");
+    let upstream_target = PaykitLifecycleTarget::Upstream {
+        creator: SELLER.to_string(),
+    };
+    rollback_client
+        .activate_payment_request(&upstream_target, invoice_id, total_sats, 1)
+        .await
+        .expect("durable upstream target keeps preimage signing after rollback");
+    rollback_client
+        .resolve_payment_request(
+            &upstream_target,
+            invoice_id,
+            "paid_manually",
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("durable upstream resolve keeps preimage signing");
+
+    let fork_server = spawn_fake_paykit().await;
+    let prepared = PaykitClient::new(&fork_server.base_url, TEST_PAYKIT_SIGNING_SEED)
+        .expect("fork client")
+        .create_payment_request(
+            SELLER,
+            "w3g1m3s5rbuyer1111111111111111111111111111111111111111",
+            uuid::Uuid::new_v4(),
+            1,
+            42_000,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            3_600,
+        )
+        .await
+        .expect("fork prepare accepted");
+    let PaykitPrepared::Fork {
+        invoice_id,
+        stack_id,
+        total_sats,
+        ..
+    } = prepared
+    else {
+        panic!("fork response")
+    };
+    let cutover_client = PaykitClient::new(&fork_server.base_url, TEST_PAYKIT_SIGNING_SEED)
+        .expect("client")
+        .with_api(PaykitApi::Upstream);
+    let fork_target = PaykitLifecycleTarget::Fork {
+        endpoint: fork_server.base_url.clone(),
+        stack_id,
+    };
+    cutover_client
+        .activate_payment_request(&fork_target, invoice_id, total_sats, 1)
+        .await
+        .expect("durable fork target keeps body-only signing after cutover");
+}
+
+#[tokio::test]
 async fn the_two_signature_schemes_do_not_verify_against_each_other() {
     let upstream_server = upstream_paykit().await;
     let fork_client = PaykitClient::new(&upstream_server.base_url, TEST_PAYKIT_SIGNING_SEED)
@@ -398,6 +489,179 @@ async fn the_two_signature_schemes_do_not_verify_against_each_other() {
         "a fork server verifies the bare body, so the preimage signature is a 401"
     );
     assert!(fork_server.calls().is_empty());
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_bind_persists_api_and_recovers_activation_after_config_rollback(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin_for_review(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/payment-method", order.order_id),
+        Some(&buyer.token),
+        &json!({ "method": "bitcoin" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+
+    let order_id = uuid::Uuid::parse_str(&order.order_id).expect("order id");
+    let persisted: PersistedUpstreamBind = sqlx::query_as(
+        "SELECT paykit_invoice_id, paykit_api, paykit_stack_id, \
+         paykit_stack_endpoint, paykit_activation_state FROM orders WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("bound order");
+    let invoice_id = persisted
+        .paykit_invoice_id
+        .expect("server-issued invoice persisted");
+    assert_eq!(persisted.paykit_api.as_deref(), Some("upstream"));
+    assert_eq!(persisted.paykit_stack_id, None);
+    assert_eq!(persisted.paykit_stack_endpoint, None);
+    assert_eq!(
+        persisted.paykit_activation_state.as_deref(),
+        Some("preparing")
+    );
+
+    let payload: Value = sqlx::query_scalar(
+        "SELECT payload FROM outbox WHERE kind = 'paykit.activate' \
+         AND payload->>'order_id' = $1",
+    )
+    .bind(order_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("durable activation intent");
+    assert_eq!(payload["paykit_api"], json!("upstream"));
+    assert!(
+        payload.get("creator").is_none(),
+        "activation re-reads creator from the order"
+    );
+    assert!(payload.get("stack_id").is_none());
+    assert!(payload.get("stack_endpoint").is_none());
+
+    let rollback_client = PaykitClient::new(&paykit.base_url, TEST_PAYKIT_SIGNING_SEED)
+        .expect("fork-configured replacement client");
+    drain_outbox(&pool, Some(&rollback_client), app.clock.now(), 30)
+        .await
+        .expect("queued upstream activation drains after rollback");
+    let activation: Option<String> =
+        sqlx::query_scalar("SELECT paykit_activation_state FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .expect("activation state");
+    assert_eq!(activation.as_deref(), Some("active"));
+    assert_eq!(
+        paykit.invoice(invoice_id).expect("upstream invoice").state,
+        "active"
+    );
+
+    let event_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM events ORDER BY occurred_at DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("bind event");
+    let payment_id = uuid::Uuid::parse_str(&order.payment_id).expect("payment id");
+    let now = app.clock.now();
+    sqlx::query(
+        "INSERT INTO paykit_resolve_outbox (order_id, payment_id, event_id, invoice_id, \
+         resolution, resolved_at, paykit_api, creator_pubky, stack_id, stack_endpoint, \
+         next_attempt_at, delivery_deadline, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'paid_manually', $5, 'upstream', $6, NULL, NULL, \
+         $5, $7, $5, $5)",
+    )
+    .bind(order_id)
+    .bind(payment_id)
+    .bind(event_id)
+    .bind(invoice_id)
+    .bind(now)
+    .bind(&seller.pubky)
+    .bind(now + chrono::Duration::hours(1))
+    .execute(&pool)
+    .await
+    .expect("migration accepts upstream resolve target without fork pins");
+    assert_eq!(
+        deliver_due_resolve_rows(&app.state, &rollback_client, now, 30)
+            .await
+            .expect("durable upstream resolve drains after rollback"),
+        1
+    );
+    let delivery_state: String =
+        sqlx::query_scalar("SELECT delivery_state FROM paykit_resolve_outbox WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .expect("resolve row");
+    assert_eq!(delivery_state, "delivered");
+    assert_eq!(
+        paykit.resolution(invoice_id).map(|value| value.0),
+        Some("paid_manually".to_string())
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_expiry_queues_and_delivers_void_without_fork_pins(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin_for_review(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/payment-method", order.order_id),
+        Some(&buyer.token),
+        &json!({ "method": "bitcoin" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    let order_id = uuid::Uuid::parse_str(&order.order_id).expect("order id");
+    let invoice_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT paykit_invoice_id FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .expect("invoice persisted");
+
+    let later = app.clock.now() + chrono::Duration::hours(3);
+    assert!(
+        expire_due_payment_windows(&app.state, later)
+            .await
+            .expect("expiry runs")
+            >= 1
+    );
+    let (api, stack_id, endpoint, activation): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT paykit_api, paykit_stack_id, paykit_stack_endpoint, \
+         paykit_activation_state FROM orders WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("expired order");
+    assert_eq!(api.as_deref(), Some("upstream"));
+    assert_eq!(stack_id, None);
+    assert_eq!(endpoint, None);
+    assert_eq!(activation.as_deref(), Some("voided"));
+    assert_eq!(
+        paykit.invoice(invoice_id).expect("upstream invoice").state,
+        "voided"
+    );
+    assert!(paykit.calls().iter().any(|call| {
+        call.path == "/marketplace/payment-requests/void"
+            && call.body
+                == json!({"creator": format!("pubky{}", seller.pubky), "invoice_id": invoice_id})
+    }));
 }
 
 async fn get_public_config(app: &TestApp, seller_pubky: &str) -> (StatusCode, Value) {
