@@ -617,3 +617,417 @@ fn priv_keys_from_env_is_all_or_none_and_checks_distinctness() {
     std::env::remove_var(current);
     std::env::remove_var(previous);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: owner-held keys. The owner wraps every data key on their own
+// homeserver, then asks the service to drop its copies.
+// ---------------------------------------------------------------------------
+
+const RELEASE_ROUTE: &str = "/v1/me/priv-keys/release";
+
+async fn post_release(
+    app: &TestApp,
+    token: Option<&str>,
+    body: &Value,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    send_with_headers(app.router.clone(), "POST", RELEASE_ROUTE, token, body).await
+}
+
+async fn post_release_raw(app: &TestApp, token: &str, body: Vec<u8>) -> (StatusCode, Value) {
+    use http_body_util::BodyExt;
+    use tower::util::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(RELEASE_ROUTE)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(axum::body::Body::from(body))
+        .expect("request builds");
+    let response = app
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("request executes");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn released_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM user_priv_key_custody_releases")
+        .fetch_one(pool)
+        .await
+        .expect("released count")
+}
+
+async fn key_ids_of(app: &TestApp, token: &str) -> Vec<String> {
+    let (status, body) = get_keys(app, Some(token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .map(|entry| entry["key_id"].as_str().expect("key id").to_string())
+        .collect()
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn releasing_custody_drops_the_sealed_key_and_the_service_never_makes_another(pool: PgPool) {
+    let app = priv_app(pool.clone(), Some(keys(PRIV_KEY, None))).await;
+    let actor = new_actor(&app).await;
+    let key_ids = key_ids_of(&app, &actor.token).await;
+    assert_eq!(row_count(&pool).await, 1);
+
+    let (status, headers, body) =
+        post_release(&app, Some(&actor.token), &json!({ "key_ids": key_ids })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({ "schema_version": 1, "owner": actor.pubky, "released": true })
+    );
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(row_count(&pool).await, 0, "no sealed key remains");
+    assert_eq!(released_count(&pool).await, 1);
+
+    for _ in 0..2 {
+        let (status, body) = get_keys(&app, Some(&actor.token)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], json!("custody_released"));
+        assert!(body.get("keys").is_none());
+    }
+    assert_eq!(
+        row_count(&pool).await,
+        0,
+        "a read never mints a replacement"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_second_session_of_the_same_owner_also_finds_custody_released(pool: PgPool) {
+    let app = priv_app(pool.clone(), Some(keys(PRIV_KEY, None))).await;
+    let (keypair, _) = random_keypair();
+    let first = session_with(&app, &keypair, vec![Capability::root()]).await;
+    let key_ids = key_ids_of(&app, &first).await;
+    let (status, _, _) = post_release(&app, Some(&first), &json!({ "key_ids": key_ids })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let other_device = session_with(&app, &keypair, vec![Capability::root()]).await;
+    let (status, body) = get_keys(&app, Some(&other_device)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(row_count(&pool).await, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_repeated_release_succeeds_and_changes_nothing(pool: PgPool) {
+    let app = priv_app(pool.clone(), Some(keys(PRIV_KEY, None))).await;
+    let actor = new_actor(&app).await;
+    let key_ids = key_ids_of(&app, &actor.token).await;
+    let request = json!({ "key_ids": key_ids });
+    let (first, _, _) = post_release(&app, Some(&actor.token), &request).await;
+    let released_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT released_at FROM user_priv_key_custody_releases")
+            .fetch_one(&pool)
+            .await
+            .expect("released at");
+
+    // The answer to a lost reply: the same request, or any other well-formed
+    // one, finds the work done.
+    let (again, _, body) = post_release(&app, Some(&actor.token), &request).await;
+    let other = json!({ "key_ids": ["f".repeat(32)] });
+    let (other_status, _, other_body) = post_release(&app, Some(&actor.token), &other).await;
+
+    assert_eq!(first, StatusCode::OK);
+    assert_eq!((again, other_status), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(body["released"], json!(true));
+    assert_eq!(other_body["released"], json!(true));
+    assert_eq!(released_count(&pool).await, 1);
+    let kept: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT released_at FROM user_priv_key_custody_releases")
+            .fetch_one(&pool)
+            .await
+            .expect("released at");
+    assert_eq!(kept, released_at, "the first release time is kept");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_release_must_name_exactly_the_keys_the_service_holds(pool: PgPool) {
+    let app = priv_app(pool.clone(), Some(keys(PRIV_KEY, None))).await;
+    let actor = new_actor(&app).await;
+    let held = key_ids_of(&app, &actor.token).await;
+    // A second key issued since the owner read the first (an operator-side
+    // rotation), so the owner's list is stale.
+    let second = "fedcba9876543210fedcba9876543210";
+    let sealed = keys(PRIV_KEY, None).seal(&data_key_aad(&actor.pubky, second), &[9u8; 32]);
+    sqlx::query(
+        "INSERT INTO user_priv_keys (owner_pubky, generation, key_id, sealed_key, created_at, \
+         updated_at) VALUES ($1, 2, $2, $3, now(), now())",
+    )
+    .bind(&actor.pubky)
+    .bind(second)
+    .bind(&sealed)
+    .execute(&pool)
+    .await
+    .expect("second key");
+
+    for (label, key_ids) in [
+        ("only the first key", vec![held[0].clone()]),
+        ("an unknown key", vec!["a".repeat(32)]),
+        (
+            "the held keys plus an unknown one",
+            vec![held[0].clone(), second.to_string(), "a".repeat(32)],
+        ),
+        ("only the second key", vec![second.to_string()]),
+    ] {
+        let (status, _, body) =
+            post_release(&app, Some(&actor.token), &json!({ "key_ids": key_ids })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{label}: {body}");
+        assert_eq!(body["error"]["code"], json!("key_set_changed"), "{label}");
+        assert_eq!(row_count(&pool).await, 2, "{label}: nothing was dropped");
+        assert_eq!(released_count(&pool).await, 0, "{label}");
+    }
+
+    // The right set, in any order, releases both.
+    let (status, _, body) = post_release(
+        &app,
+        Some(&actor.token),
+        &json!({ "key_ids": [second, held[0]] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(row_count(&pool).await, 0);
+    let (count,): (i32,) = sqlx::query_as("SELECT key_count FROM user_priv_key_custody_releases")
+        .fetch_one(&pool)
+        .await
+        .expect("key count");
+    assert_eq!(count, 2);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn releasing_before_any_key_exists_drops_nothing_and_records_nothing(pool: PgPool) {
+    let app = priv_app(pool.clone(), Some(keys(PRIV_KEY, None))).await;
+    let actor = new_actor(&app).await;
+
+    let (status, _, body) = post_release(
+        &app,
+        Some(&actor.token),
+        &json!({ "key_ids": ["a".repeat(32)] }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("key_set_changed"));
+    assert_eq!(released_count(&pool).await, 0);
+    let (status, _) = get_keys(&app, Some(&actor.token)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the owner can still get a first key"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_release_only_touches_the_session_owner(pool: PgPool) {
+    let app = priv_app(pool.clone(), Some(keys(PRIV_KEY, None))).await;
+    let alice = new_actor(&app).await;
+    let bob = new_actor(&app).await;
+    let alice_ids = key_ids_of(&app, &alice.token).await;
+    let bob_ids = key_ids_of(&app, &bob.token).await;
+    assert_ne!(alice_ids, bob_ids);
+
+    // Naming Bob's key with Alice's session drops nothing of either.
+    let (status, _, _) =
+        post_release(&app, Some(&alice.token), &json!({ "key_ids": bob_ids })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(row_count(&pool).await, 2);
+
+    let (status, _, _) =
+        post_release(&app, Some(&alice.token), &json!({ "key_ids": alice_ids })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row_count(&pool).await, 1);
+    let (status, body) = get_keys(&app, Some(&bob.token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["owner"], json!(bob.pubky));
+    let (status, _) = get_keys(&app, Some(&alice.token)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn release_needs_the_same_authority_as_the_key_read(pool: PgPool) {
+    let app = priv_app(pool.clone(), Some(keys(PRIV_KEY, None))).await;
+    let owner = new_actor(&app).await;
+    let key_ids = key_ids_of(&app, &owner.token).await;
+    let request = json!({ "key_ids": key_ids });
+
+    let (status, _, _) = post_release(&app, None, &request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let refused: Vec<Vec<Capability>> = vec![
+        vec![Capability::read("/priv/pubky.app/").expect("scope")],
+        vec![Capability::read_write("/priv/pubky.app/marketplace/").expect("scope")],
+        vec![Capability::read_write("/pub/pubky.app/marketplace-service/v1/").expect("scope")],
+    ];
+    for capabilities in refused {
+        let label = format!("{capabilities:?}");
+        let (keypair, _) = random_keypair();
+        let token = session_with(&app, &keypair, capabilities).await;
+        let (status, _, body) = post_release(&app, Some(&token), &request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+        assert_eq!(body["error"]["code"], json!("needs_reauth"), "{label}");
+    }
+    let (_, pubky) = random_keypair();
+    let bridged = session_with_stored_grant(&app, &pubky, "").await;
+    let (status, _, body) = post_release(&app, Some(&bridged), &request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(row_count(&pool).await, 1, "a refused release drops nothing");
+    assert_eq!(released_count(&pool).await, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn release_is_unavailable_without_the_sealing_key(pool: PgPool) {
+    let off = priv_app(pool.clone(), None).await;
+    let actor = new_actor(&off).await;
+    let (status, _, body) = post_release(
+        &off,
+        Some(&actor.token),
+        &json!({ "key_ids": ["a".repeat(32)] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], json!("priv_keys_unavailable"));
+    assert_eq!(released_count(&pool).await, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_malformed_release_request_is_refused_before_anything_is_dropped(pool: PgPool) {
+    let app = priv_app(pool.clone(), Some(keys(PRIV_KEY, None))).await;
+    let actor = new_actor(&app).await;
+    let key_ids = key_ids_of(&app, &actor.token).await;
+    let good = key_ids[0].clone();
+
+    let too_many: Vec<String> = (0..65).map(|index| format!("{index:032x}")).collect();
+    let bodies: Vec<(&str, Vec<u8>)> = vec![
+        ("not json", b"nope".to_vec()),
+        ("empty body", Vec::new()),
+        ("an array", b"[]".to_vec()),
+        ("no key ids", br#"{"key_ids":[]}"#.to_vec()),
+        ("missing field", br#"{}"#.to_vec()),
+        (
+            "extra field",
+            serde_json::to_vec(&json!({ "key_ids": [good], "all": true })).unwrap(),
+        ),
+        (
+            "a repeated id",
+            serde_json::to_vec(&json!({ "key_ids": [good, good] })).unwrap(),
+        ),
+        (
+            "an uppercase id",
+            serde_json::to_vec(&json!({ "key_ids": [good.to_uppercase()] })).unwrap(),
+        ),
+        (
+            "a short id",
+            serde_json::to_vec(&json!({ "key_ids": ["abcd"] })).unwrap(),
+        ),
+        (
+            "a non-string id",
+            serde_json::to_vec(&json!({ "key_ids": [1] })).unwrap(),
+        ),
+        (
+            "too many ids",
+            serde_json::to_vec(&json!({ "key_ids": too_many })).unwrap(),
+        ),
+    ];
+    for (label, body) in bodies {
+        let (status, response) = post_release_raw(&app, &actor.token, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {response}");
+        assert_eq!(
+            response["error"]["code"],
+            json!("invalid_request"),
+            "{label}"
+        );
+    }
+    assert_eq!(row_count(&pool).await, 1);
+    assert_eq!(released_count(&pool).await, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn reads_racing_a_release_never_yield_a_second_key(pool: PgPool) {
+    let app = priv_app(pool.clone(), Some(keys(PRIV_KEY, None))).await;
+    let actor = new_actor(&app).await;
+    let key_ids = key_ids_of(&app, &actor.token).await;
+
+    let mut tasks = Vec::new();
+    for index in 0..9 {
+        let router = app.router.clone();
+        let token = actor.token.clone();
+        let request = json!({ "key_ids": key_ids });
+        tasks.push(tokio::spawn(async move {
+            if index == 4 {
+                send(router, "POST", RELEASE_ROUTE, Some(&token), &request).await
+            } else {
+                send(router, "GET", ROUTE, Some(&token), &Value::Null).await
+            }
+        }));
+    }
+    for task in tasks {
+        let (status, body) = task.await.expect("task");
+        match status {
+            StatusCode::OK => {
+                if let Some(entries) = body["keys"].as_array() {
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0]["key_id"], json!(key_ids[0]));
+                } else {
+                    assert_eq!(body["released"], json!(true));
+                }
+            }
+            StatusCode::CONFLICT => assert_eq!(body["error"]["code"], json!("custody_released")),
+            other => panic!("unexpected {other}: {body}"),
+        }
+    }
+    assert_eq!(row_count(&pool).await, 0);
+    assert_eq!(released_count(&pool).await, 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_release_leaves_the_boot_probe_and_other_owners_untouched(pool: PgPool) {
+    let sealing = keys(PRIV_KEY, None);
+    let app = priv_app(pool.clone(), Some(keys(PRIV_KEY, None))).await;
+    let alice = new_actor(&app).await;
+    let bob = new_actor(&app).await;
+    let alice_ids = key_ids_of(&app, &alice.token).await;
+    key_ids_of(&app, &bob.token).await;
+
+    let (status, _, _) =
+        post_release(&app, Some(&alice.token), &json!({ "key_ids": alice_ids })).await;
+    assert_eq!(status, StatusCode::OK);
+    let scan = assert_priv_key_sealing_coherent(&pool, Some(&sealing))
+        .await
+        .expect("probe passes")
+        .expect("Bob's row is probed");
+    assert_eq!(scan.probed, 1);
+
+    // The last owner released: nothing sealed remains, so the service may boot
+    // without a sealing key.
+    let (status, _, _) = post_release(
+        &app,
+        Some(&bob.token),
+        &json!({ "key_ids": key_ids_of(&app, &bob.token).await }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(assert_priv_key_sealing_coherent(&pool, None)
+        .await
+        .expect("no rows, no key needed")
+        .is_none());
+}

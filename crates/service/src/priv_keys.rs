@@ -19,6 +19,20 @@
 //! grant sessions settled before the scope was requested — get
 //! `needs_reauth`.
 //!
+//! Phase 4 (owner-held keys). A Shop session whose signer delivered scoped
+//! encryption keys wraps each data key under a key only that signer can derive
+//! and stores the wrapped copy on the owner's homeserver. It then asks
+//! `POST /v1/me/priv-keys/release` to drop the service's copies. The service
+//! cannot see the wrapped files (`/priv` is readable only by the owner), so the
+//! request is the owner's own statement that the wrapped copies exist. The
+//! release deletes every sealed key of the owner in one transaction, and only
+//! when the request names exactly the key ids the service holds, so a key issued
+//! meanwhile is never dropped unseen. A tombstone row then records the release:
+//! `GET /v1/me/priv-keys` answers `custody_released` for that owner and never
+//! creates a replacement key, which would silently orphan the data the wrapped
+//! keys protect. Creating the first key and releasing take the same
+//! per-owner advisory lock, so neither can interleave with the other.
+//!
 //! Rotation and the boot probe follow digital delivery: opens try the
 //! current key, then `PRIV_DATA_KEY_ENCRYPTION_KEY_PREVIOUS`; the re-seal
 //! pass moves rows to the current key and reports completion from a
@@ -27,6 +41,7 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -167,15 +182,59 @@ async fn owner_rows(pool: &PgPool, owner_pubky: &str) -> Result<Vec<KeyRow>, sql
     .await
 }
 
-/// Creates the owner's first data key if it has none. Concurrent callers
-/// race on the unique (owner, generation) pair; the loser's insert is a
-/// no-op and both then read the one stored key.
+/// Raised by [`release_owner_keys`] for an owner whose keys were released to
+/// them (Phase 4). The service holds none and must not make a new one.
+#[derive(Debug)]
+pub struct CustodyReleased;
+
+impl std::fmt::Display for CustodyReleased {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the owner's priv data keys were released to the owner")
+    }
+}
+
+impl std::error::Error for CustodyReleased {}
+
+async fn lock_owner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    owner_pubky: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('priv-keys|' || $1, 0))")
+        .bind(owner_pubky)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn custody_was_released(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    owner_pubky: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM user_priv_key_custody_releases WHERE owner_pubky = $1)",
+    )
+    .bind(owner_pubky)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// Creates the owner's first data key if it has none and never released
+/// them. Concurrent callers race on the unique (owner, generation) pair; the
+/// loser's insert is a no-op and both then read the one stored key. A release
+/// takes the same per-owner lock, so a key cannot appear after it. Returns
+/// whether the owner's custody was released instead.
 async fn create_first_key(
     pool: &PgPool,
     keys: &PrivKeys,
     owner_pubky: &str,
     now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_owner(&mut tx, owner_pubky).await?;
+    if custody_was_released(&mut tx, owner_pubky).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
     let mut data_key = [0u8; DATA_KEY_LEN];
     rand::rngs::OsRng.fill_bytes(&mut data_key);
     let mut key_id_bytes = [0u8; 16];
@@ -193,15 +252,17 @@ async fn create_first_key(
     .bind(&key_id)
     .bind(&sealed)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(false)
 }
 
 /// Returns every data key the owner holds, oldest first, creating the first
 /// one on the owner's first request. A stored key that does not open, or
 /// opens to the wrong length, is an error: the caller must never receive a
-/// fresh key in place of one that already protects data.
+/// fresh key in place of one that already protects data. An owner whose keys
+/// were released to them gets [`CustodyReleased`], never a new key.
 pub async fn release_owner_keys(
     pool: &PgPool,
     keys: &PrivKeys,
@@ -210,7 +271,9 @@ pub async fn release_owner_keys(
 ) -> anyhow::Result<Vec<ReleasedKey>> {
     let mut rows = owner_rows(pool, owner_pubky).await?;
     if rows.is_empty() {
-        create_first_key(pool, keys, owner_pubky, now).await?;
+        if create_first_key(pool, keys, owner_pubky, now).await? {
+            return Err(CustodyReleased.into());
+        }
         rows = owner_rows(pool, owner_pubky).await?;
     }
     rows.into_iter()
@@ -273,6 +336,13 @@ pub async fn get_own_priv_keys(
     let owner = &session.actor.0;
     let released = match release_owner_keys(&state.pool, keys, owner, state.clock.now()).await {
         Ok(released) => released,
+        Err(error) if error.downcast_ref::<CustodyReleased>().is_some() => {
+            return refusal(
+                StatusCode::CONFLICT,
+                "custody_released",
+                "The private data keys are held by their owner; the service no longer has them.",
+            );
+        }
         Err(error) => {
             tracing::error!(
                 error = %error,
@@ -314,6 +384,165 @@ pub async fn get_own_priv_keys(
         )
             .into_response(),
     )
+}
+
+/// What a release request did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyRelease {
+    /// The service holds no key for the owner: the release just happened, or
+    /// an earlier one did.
+    Released,
+    /// The request does not name exactly the keys the service holds. Nothing
+    /// was dropped.
+    KeySetChanged,
+}
+
+/// Drops every sealed key of the owner and records that custody was released,
+/// when `key_ids` is exactly the set the service holds. A repeat of a
+/// completed release succeeds without looking at `key_ids`.
+pub async fn release_owner_custody(
+    pool: &PgPool,
+    owner_pubky: &str,
+    key_ids: &[String],
+    now: DateTime<Utc>,
+) -> Result<CustodyRelease, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_owner(&mut tx, owner_pubky).await?;
+    if custody_was_released(&mut tx, owner_pubky).await? {
+        tx.rollback().await?;
+        return Ok(CustodyRelease::Released);
+    }
+    let held: Vec<String> = sqlx::query_scalar(
+        "SELECT key_id FROM user_priv_keys WHERE owner_pubky = $1 \
+         ORDER BY generation ASC FOR UPDATE",
+    )
+    .bind(owner_pubky)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut held_sorted = held.clone();
+    held_sorted.sort();
+    let mut named = key_ids.to_vec();
+    named.sort();
+    if held.is_empty() || held_sorted != named {
+        tx.rollback().await?;
+        return Ok(CustodyRelease::KeySetChanged);
+    }
+    sqlx::query("DELETE FROM user_priv_keys WHERE owner_pubky = $1")
+        .bind(owner_pubky)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO user_priv_key_custody_releases (owner_pubky, released_at, key_count) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(owner_pubky)
+    .bind(now)
+    .bind(held.len() as i32)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(CustodyRelease::Released)
+}
+
+/// The most key ids one release request may name. An owner holds one key
+/// today; the cap only bounds a hostile body.
+const MAX_RELEASE_KEY_IDS: usize = 64;
+
+fn is_key_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Parses `{"key_ids": ["<32 lowercase hex>", ...]}`: non-empty, no repeats,
+/// every id well formed, nothing else in the body.
+fn parse_release_request(body: &[u8]) -> Option<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReleaseRequest {
+        key_ids: Vec<String>,
+    }
+    let request: ReleaseRequest = serde_json::from_slice(body).ok()?;
+    let ids = request.key_ids;
+    let distinct: std::collections::BTreeSet<&String> = ids.iter().collect();
+    if ids.is_empty()
+        || ids.len() > MAX_RELEASE_KEY_IDS
+        || distinct.len() != ids.len()
+        || !ids.iter().all(|id| is_key_id(id))
+    {
+        return None;
+    }
+    Some(ids)
+}
+
+/// `POST /v1/me/priv-keys/release`: the session owner's statement that every
+/// data key the service holds for them is now wrapped on their homeserver. The
+/// owner is always the session's actor. Same authorization as the key read.
+pub async fn release_own_priv_keys(
+    State(state): State<AppState>,
+    Extension(session): Extension<AuthSession>,
+    body: Bytes,
+) -> Response {
+    if !capability_covers_priv_app(&session.capabilities) {
+        return refusal(
+            StatusCode::FORBIDDEN,
+            "needs_reauth",
+            "The session grant does not include read and write access to /priv/pubky.app/.",
+        );
+    }
+    if state.priv_keys.is_none() {
+        return refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "priv_keys_unavailable",
+            "Private data keys are not available on this deployment.",
+        );
+    }
+    let Some(key_ids) = parse_release_request(&body) else {
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Expected a JSON body {\"key_ids\": [...]} naming each key by its 32-character lowercase hex id.",
+        );
+    };
+    let owner = &session.actor.0;
+    match release_owner_custody(&state.pool, owner, &key_ids, state.clock.now()).await {
+        Ok(CustodyRelease::Released) => {
+            tracing::info!(
+                actor_prefix = logging::actor_prefix(owner),
+                keys = key_ids.len(),
+                "released priv data key custody to the owner"
+            );
+            no_store(
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "schema_version": 1,
+                        "owner": owner,
+                        "released": true,
+                    })),
+                )
+                    .into_response(),
+            )
+        }
+        Ok(CustodyRelease::KeySetChanged) => refusal(
+            StatusCode::CONFLICT,
+            "key_set_changed",
+            "The keys held for this owner are not the keys named in the request.",
+        ),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                actor_prefix = logging::actor_prefix(owner),
+                "priv data key custody release failed"
+            );
+            refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "The private data keys could not be released.",
+            )
+        }
+    }
 }
 
 struct SealedRow {
