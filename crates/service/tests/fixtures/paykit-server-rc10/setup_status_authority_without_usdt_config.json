@@ -1,0 +1,18 @@
+{
+  "description": "No asset, no `[usdt]` config: the same seller's authority is usable.",
+  "name": "setup_status_authority_without_usdt_config",
+  "request": {
+    "body": "{\"creator\":\"pubkyirqapc3t8bxyuzu89mkewx73nz3u74etrpcx1rzb9be5wxwucsbo\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "RqblNrsRkGyOfmJYWKt5MGfv1dOCxGKCCtiJqH7r4y2KukZqAVOQpKcGEptSt_3_7zMTPKsI5zSwLc84bHdYDQ"
+  },
+  "response": {
+    "body": "{\"status\":\"ready\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T16:37:23.926697988Z",
+  "server": "usdt_not_configured",
+  "server_revision": "7326a3f9a035d79d8b6977b7c1a5fb742327ff37"
+}

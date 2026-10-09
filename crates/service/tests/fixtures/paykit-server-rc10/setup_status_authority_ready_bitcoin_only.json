@@ -1,0 +1,18 @@
+{
+  "description": "No asset: a seller who completed Paykit setup with Bitcoin only and declined USDT.",
+  "name": "setup_status_authority_ready_bitcoin_only",
+  "request": {
+    "body": "{\"creator\":\"pubkywgpptagioueqkwt4yftfr55frsyqzncu9xzs5y7bw7jiie3u316y\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "g3uYoFdlOPfiC9ma6sIk7GRXF2EoHAibWyMlhKcOgrZ7idUWji4pVhWSarhEiwVm4TTeQg8Lg16MKkjfcqVDDw"
+  },
+  "response": {
+    "body": "{\"status\":\"ready\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T16:37:20.925945046Z",
+  "server": "usdt_configured",
+  "server_revision": "7326a3f9a035d79d8b6977b7c1a5fb742327ff37"
+}
