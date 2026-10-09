@@ -60,6 +60,10 @@ mod paypal_refund;
 const CONFIG_COLUMNS: &str = "seller_pubky, bitcoin_enabled, stripe_payment_link, \
      stripe_restricted_key_ciphertext, paypal_merchant_email, created_at, updated_at";
 
+/// Bounded Marketplace/Paykit clock and expiry-sweep margin used only for
+/// upstream two-phase binds. See `docs/paykit-upstream-inventory-hold.md`.
+pub const UPSTREAM_HOLD_CLOCK_SKEW_SECONDS: i64 = 60;
+
 #[derive(Clone)]
 struct PreparedBind {
     invoice_id: Uuid,
@@ -1081,6 +1085,54 @@ pub async fn bind_payment_method(
             );
         }
 
+        // Upstream starts the immutable payment window at activation, not at
+        // prepare. Its database atomically refuses activation at
+        // `prepare_expires_at`, so the latest possible producer deadline is
+        // prepare expiry + the full payment window. Fix the inventory hold to
+        // that bound plus one explicit clock/reaper margin. Fork semantics stay
+        // unchanged: its request already carries Marketplace's exact hold.
+        let upstream_hold_expires_at = if matches!(target, PaykitLifecycleTarget::Upstream { .. }) {
+            // Re-sample after the network call: handler-entry time would let a
+            // slow prepare response hide an already exhausted producer TTL.
+            let response_received_at = state.clock.now();
+            let activation_cutoff = response_received_at
+                .checked_add_signed(chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS));
+            let hold_extension_seconds = state
+                .config
+                .bitcoin_payment_window_seconds
+                .checked_add(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS);
+            if activation_cutoff.is_none_or(|cutoff| prepare_expires_at <= cutoff) {
+                tracing::error!(
+                    order_id = %order.id,
+                    %prepare_expires_at,
+                    "ALERT upstream paykit returned a prepare deadline inside the clock margin"
+                );
+                let _ = tx.rollback().await;
+                spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+                return method_error(
+                    ErrorCode::InvalidState,
+                    "paykit_expiry_inconsistent",
+                    "The Paykit server returned an inconsistent preparation expiry.",
+                );
+            }
+            hold_extension_seconds
+                .and_then(chrono::Duration::try_seconds)
+                .and_then(|extension| prepare_expires_at.checked_add_signed(extension))
+        } else {
+            None
+        };
+        if matches!(target, PaykitLifecycleTarget::Upstream { .. })
+            && upstream_hold_expires_at.is_none()
+        {
+            let _ = tx.rollback().await;
+            spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+            return method_error(
+                ErrorCode::InvalidState,
+                "paykit_expiry_inconsistent",
+                "The Paykit server returned an inconsistent preparation expiry.",
+            );
+        }
+
         // Persist the prepared invoice in the SAME transaction as the bind:
         // the stack identity and endpoint come from this call (never from
         // configuration read later), the total is the figure the buyer is
@@ -1117,7 +1169,8 @@ pub async fn bind_payment_method(
                  updated_at = $10, bitcoin_quote_rate = $11, bitcoin_quote_source = $12, \
                  bitcoin_quote_fetched_at = $13, bitcoin_quoted_sats = $14, \
                  bitcoin_quote_expires_at = $18, bitcoin_quote_currency = $15, \
-                 bitcoin_quote_exponent = $16, bitcoin_quote_spread_bps = $17 \
+                 bitcoin_quote_exponent = $16, bitcoin_quote_spread_bps = $17, \
+                 hold_expires_at = COALESCE($20, hold_expires_at) \
                  WHERE id = $1",
             )
             .bind(order.id)
@@ -1182,6 +1235,7 @@ pub async fn bind_payment_method(
                     .map(|_| expires_at),
             )
             .bind(paykit.api().as_str())
+            .bind(upstream_hold_expires_at)
             .execute(&mut *tx)
             .await?;
             // Bitcoin settlement is typed as SAT/0. Merchandise terms stay

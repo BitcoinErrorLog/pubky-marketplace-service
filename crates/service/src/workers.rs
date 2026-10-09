@@ -781,6 +781,13 @@ struct ActivatePayload {
     activation_attempt: i64,
 }
 
+#[derive(sqlx::FromRow)]
+struct ActivationBounds {
+    hold_expires_at: Option<DateTime<Utc>>,
+    paykit_prepare_expires_at: Option<DateTime<Utc>>,
+    paykit_api: Option<String>,
+}
+
 fn parse_activate_payload(row: &ClaimedOutboxRow) -> anyhow::Result<ActivatePayload> {
     let invoice_id = payload_str(&row.payload, "invoice_id", row.id)?
         .parse()
@@ -922,6 +929,7 @@ async fn deliver_paykit_activation(
     // incrementing the attempt in the payload before the call.
     let (target, total_sats, attempt) = {
         let mut tx = pool.begin().await?;
+        lock_order_payment(&mut tx, payload.order_id).await?;
         let Some(order) = fetch_order_for_update(&mut tx, payload.order_id).await? else {
             anyhow::bail!(
                 "paykit.activate row {} references a missing order {}",
@@ -989,6 +997,43 @@ async fn deliver_paykit_activation(
             );
             return Ok(true);
         }
+        if order.paykit_api.as_deref() == Some("upstream") {
+            // `now` is sampled once per worker pass and may be stale behind a
+            // slow batch. PostgreSQL clock time under the locked order is the
+            // authoritative local guard; `GREATEST` retains deterministic
+            // future-time test/sweep calls without letting a stale caller
+            // move the guard backwards in production.
+            let guard_now: DateTime<Utc> =
+                sqlx::query_scalar("SELECT GREATEST($1::timestamptz, clock_timestamp())")
+                    .bind(now)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let activation_cutoff = order.paykit_prepare_expires_at.map(|deadline| {
+                deadline
+                    - chrono::Duration::seconds(
+                        crate::payment_methods::UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
+                    )
+            });
+            let activation_allowed = order.stock_held
+                && order
+                    .hold_expires_at
+                    .is_some_and(|deadline| guard_now < deadline)
+                && activation_cutoff.is_some_and(|deadline| guard_now < deadline);
+            if !activation_allowed {
+                // No signed activate leaves this process. A previous attempt
+                // may have committed remotely with a lost response, so record
+                // the released attempt for signed-status reconciliation; do
+                // not issue a blind remote void.
+                tx.commit().await?;
+                tracing::warn!(
+                    order_id = %order.id,
+                    activation_attempt = payload.activation_attempt,
+                    "refused upstream paykit activation outside the original inventory hold boundary"
+                );
+                void_prepare_effects(pool, row.id, payload.order_id, now).await?;
+                return Ok(true);
+            }
+        }
         let attempt = payload.activation_attempt + 1;
         sqlx::query(
             "UPDATE outbox SET payload = jsonb_set(payload, '{activation_attempt}', $2) \
@@ -1055,12 +1100,43 @@ async fn deliver_paykit_activation(
             }
             let mut tx = pool.begin().await?;
             lock_order_payment(&mut tx, payload.order_id).await?;
+            let bounds: Option<ActivationBounds> = sqlx::query_as(
+                "SELECT hold_expires_at, paykit_prepare_expires_at, paykit_api \
+                 FROM orders WHERE id = $1 FOR UPDATE",
+            )
+            .bind(payload.order_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(bounds) = bounds else {
+                anyhow::bail!("activated paykit order {} vanished", payload.order_id);
+            };
+            if bounds.paykit_api.as_deref() == Some("upstream")
+                && (bounds
+                    .hold_expires_at
+                    .is_none_or(|hold| activated.payment_deadline > hold)
+                    || bounds
+                        .paykit_prepare_expires_at
+                        .is_none_or(|prepare| activated.activated_at >= prepare))
+            {
+                // Remote activation is already durable. Preserve its exact
+                // terms and original local hold; alert instead of extending
+                // inventory or blindly voiding a potentially live request.
+                tracing::error!(
+                    order_id = %payload.order_id,
+                    %activated.activated_at,
+                    %activated.payment_deadline,
+                    prepare_expires_at = ?bounds.paykit_prepare_expires_at,
+                    hold_expires_at = ?bounds.hold_expires_at,
+                    "ALERT upstream paykit activation exceeded persisted inventory bounds"
+                );
+            }
             // Conditional on `preparing` under the row lock: a redelivered
             // row cannot apply the flip twice.
             let flipped = sqlx::query(
                 "UPDATE orders SET paykit_activation_state = 'active', \
                  paykit_request_state = 'pending', paykit_expires_at = $3, \
-                 hold_expires_at = $3, updated_at = $2 \
+                 hold_expires_at = CASE WHEN paykit_api = 'fork' THEN $3 ELSE hold_expires_at END, \
+                 updated_at = $2 \
                  WHERE id = $1 AND paykit_activation_state = 'preparing'",
             )
             .bind(payload.order_id)
