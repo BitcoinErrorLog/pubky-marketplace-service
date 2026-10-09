@@ -192,6 +192,28 @@ to a listing only through cancellation, as today. While a reversal is
 outstanding, the pickup retention purge keeps the order's pinned pickup
 snapshot, because a canceled reversal can reopen the order.
 
+## Digital orders
+
+A digital order's purchase is withheld on the PayPal facts, not only on the
+order state (`handlers::digital::payment_taken_back`). While
+`payment_reversed_at` is set, in any state, the buyer's download
+(`GET /v1/orders/{id}/digital-delivery/{line_index}`) and the seller's read of
+the buyer's delivery email are refused with reason `payment_reversed`. A
+refund, full or partial, recorded from an IPN on an order that has not ended
+withholds both for good with reason `payment_refunded`; a full refund or
+reversal that moved the order to `refunded_external` is the ended state
+(`delivery_ended`, or `payment_reversed` while the reversal is outstanding).
+A `Canceled_Reversal` that restores every reversed amount clears
+`payment_reversed_at`, so downloads and the seller's read come back; a refund
+is never undone. The buyer's own read of their address, the seller's delivery
+evidence and `fulfillment.deliver_digital` are unchanged. The notifications
+above are the seller's and buyer's notice. Tests:
+`paypal_full_reversal_revokes_digital_access`,
+`paypal_partial_reversal_revokes_digital_access`,
+`paypal_partial_refund_revokes_digital_access`,
+`paypal_full_refund_ends_digital_access` and
+`paypal_reversal_withholds_the_buyer_email_from_the_seller`.
+
 ## Reputation
 
 The reputation worker counts a refund in `terminated_badly` only when the

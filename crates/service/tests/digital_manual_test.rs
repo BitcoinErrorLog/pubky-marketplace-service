@@ -1663,3 +1663,116 @@ async fn later_review_does_not_extend_email_retention(pool: PgPool) {
     );
     assert_eq!(email_rows(&app).await, vec![(order.id.clone(), false)]);
 }
+
+async fn post_ipn_fixture(
+    app: &TestApp,
+    name: &str,
+    order_id: &str,
+    overrides: &[(&str, &str)],
+) -> StatusCode {
+    let path = format!(
+        "{}/tests/fixtures/paypal_ipn/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (field, value) in url::form_urlencoded::parse(text.trim_end().as_bytes()) {
+        let value = if value == "{{ORDER_ID}}" {
+            order_id.into()
+        } else if let Some((_, replacement)) = overrides.iter().find(|(key, _)| *key == field) {
+            (*replacement).into()
+        } else {
+            value
+        };
+        serializer.append_pair(&field, &value);
+    }
+    let (status, _) = send_bytes(
+        app.router.clone(),
+        "POST",
+        "/v0/paypal/ipn",
+        serializer.finish().into_bytes(),
+    )
+    .await;
+    status
+}
+
+/// A PayPal email-kind order paid by `completed.ipn` (137.00 USD): the
+/// seller may read the buyer's address once paid.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn paypal_reversal_withholds_the_buyer_email_from_the_seller(pool: PgPool) {
+    let (app, _paykit, _server) = keyed_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({ "bitcoin_enabled": false, "paypal_merchant_email": "merchant@example.com" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "config put failed: {body}");
+    register(
+        &app,
+        &seller,
+        "guide_01",
+        json!({ "amount_minor": 13_700, "currency": "USD", "exponent": 2 }),
+        5,
+    )
+    .await;
+    set_kind(&app, &seller, "guide_01", email_kind()).await;
+    let order = one_order(&app, &buyer, &[(&seller, "guide_01")], Some(EMAIL)).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/payment-method", order.id),
+        Some(&buyer.token),
+        &json!({ "method": "paypal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    assert_eq!(
+        post_ipn_fixture(&app, "completed.ipn", &order.id, &[]).await,
+        StatusCode::OK
+    );
+    assert_eq!(state_of(&app, &order.id).await, "paid");
+    let (status, _, body) = read_email(&app, &seller.token, &order.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["delivery_email"], json!(EMAIL));
+
+    // A partial reversal leaves the order paid but the seller loses the
+    // address; the buyer still reads their own.
+    assert_eq!(
+        post_ipn_fixture(
+            &app,
+            "reversal-full.ipn",
+            &order.id,
+            &[("mc_gross", "-40.00"), ("txn_id", "5MC93249NP7742999")]
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(state_of(&app, &order.id).await, "paid");
+    let (status, cache, body) = read_email(&app, &seller.token, &order.id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(cache, "no-store");
+    assert_eq!(body["error"]["reason"], json!("payment_reversed"));
+    assert!(!body.to_string().contains(EMAIL));
+    let (status, _, body) = read_email(&app, &buyer.token, &order.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // PayPal restores the reversal: the seller reads the address again.
+    assert_eq!(
+        post_ipn_fixture(
+            &app,
+            "canceled-reversal.ipn",
+            &order.id,
+            &[("mc_gross", "40.00"), ("txn_id", "6ND04350PQ8853999")]
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (status, _, body) = read_email(&app, &seller.token, &order.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["delivery_email"], json!(EMAIL));
+}
