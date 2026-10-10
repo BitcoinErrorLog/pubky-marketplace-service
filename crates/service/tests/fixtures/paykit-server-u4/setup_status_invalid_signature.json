@@ -1,0 +1,18 @@
+{
+  "description": "A signature by a key that is not in `[signed_services] trusted_public_keys`.",
+  "name": "setup_status_invalid_signature",
+  "request": {
+    "body": "{\"accepted_asset\":\"USDT\",\"creator\":\"pubkyxnj8u7jodw3wfdap53qfo9wf9ca4n84mukkg6q7wqwri47nsq44y\"}",
+    "method": "POST",
+    "path": "/setup/status",
+    "signature": "6t1_ikH3pmAFYugRs3Je7--K5_3cs2TAmoeXOZGtCGq0l03fJFtOAUBMej0Vq-6bu1rujcj2k7nq-DcXGE4aDg"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"invalid_signature\",\"message\":\"request authentication failed\"}}",
+    "content_type": "application/json",
+    "status": 401
+  },
+  "sent_at": "2026-10-09T18:26:59.979240316Z",
+  "server": "usdt_configured",
+  "server_revision": "pubky/paykit-server#70 at 69222059ee30b44379a85521106859a697b70811 (v0.1.0-rc11 plus 3 commits)"
+}
