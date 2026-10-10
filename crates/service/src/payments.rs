@@ -786,6 +786,12 @@ impl PaykitDeliveryState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaykitStatusOutcome {
     Undetected,
+    /// Upstream Marketplace invoice is active without a Bitcoin observation.
+    /// Its producer-owned deadline must survive lost-activation recovery so
+    /// the worker can keep polling through the bounded late-observation tail.
+    ActiveUndetected {
+        payment_deadline: chrono::DateTime<chrono::Utc>,
+    },
     Detected {
         facts: PaykitStatusFacts,
     },
@@ -1921,10 +1927,17 @@ impl PaykitClient {
             "failed" => Some(PaykitDeliveryState::Failed),
             _ => return (PaykitStatusOutcome::Unavailable, None),
         };
+        // PostgreSQL timestamps retain microsecond precision. Compare the
+        // producer deadline at that persisted precision so a valid status
+        // remains pollable after its recovered deadline is round-tripped.
+        let deadline_matches = expected_deadline.is_none_or(|expected| {
+            body.payment_deadline
+                .is_some_and(|actual| actual.timestamp_micros() == expected.timestamp_micros())
+        });
         if body.state != "active"
             || body.activated_at.is_none()
             || body.payment_deadline.is_none()
-            || expected_deadline.is_some_and(|deadline| body.payment_deadline != Some(deadline))
+            || !deadline_matches
             || delivery.is_none()
         {
             return if matches!(body.state.as_str(), "prepared" | "voided")
@@ -1946,7 +1959,14 @@ impl PaykitClient {
         );
         let Some(bitcoin) = body.bitcoin else {
             return match body.payment_state.as_deref() {
-                Some("undetected" | "expired") => (PaykitStatusOutcome::Undetected, delivery),
+                Some("undetected" | "expired") => (
+                    PaykitStatusOutcome::ActiveUndetected {
+                        payment_deadline: body
+                            .payment_deadline
+                            .expect("active status requires a payment deadline"),
+                    },
+                    delivery,
+                ),
                 _ => (PaykitStatusOutcome::Unavailable, delivery),
             };
         };
@@ -1982,7 +2002,11 @@ impl PaykitClient {
                     facts,
                 },
                 Some("detected") => PaykitStatusOutcome::Detected { facts },
-                Some("undetected" | "expired") => PaykitStatusOutcome::Undetected,
+                Some("undetected" | "expired") => PaykitStatusOutcome::ActiveUndetected {
+                    payment_deadline: body
+                        .payment_deadline
+                        .expect("active status requires a payment deadline"),
+                },
                 _ => PaykitStatusOutcome::Unavailable,
             }
         };

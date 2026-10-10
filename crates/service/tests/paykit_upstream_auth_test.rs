@@ -938,7 +938,7 @@ async fn bind_upstream_order(
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn upstream_invoice_active_void_retracks_through_later_status(pool: PgPool) {
     let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
-    let (_seller, _buyer, order_id, invoice_id) = bind_upstream_order(&app, &paykit).await;
+    let (seller, _buyer, order_id, invoice_id) = bind_upstream_order(&app, &paykit).await;
     let hold_expires_at: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("SELECT hold_expires_at FROM orders WHERE id = $1")
             .bind(order_id)
@@ -979,18 +979,68 @@ async fn upstream_invoice_active_void_retracks_through_later_status(pool: PgPool
         )
     );
 
-    let mut fixture = producer_status_fixture();
-    fixture["invoice_id"] = json!(invoice_id);
-    fixture["payment_deadline"] = json!(payment_deadline.to_rfc3339());
-    paykit.set_marketplace_status(invoice_id, fixture);
+    let mut undetected = producer_status_fixture();
+    undetected["invoice_id"] = json!(invoice_id);
+    undetected["payment_deadline"] = json!(payment_deadline.to_rfc3339());
+    undetected["bitcoin"] = Value::Null;
+    undetected["payment_state"] = json!("undetected");
+    undetected["outcome"] = Value::Null;
+    undetected["resolved_at"] = Value::Null;
+    paykit.set_marketplace_status(invoice_id, undetected);
     poll_now(&app, hold_expires_at + chrono::Duration::seconds(1)).await;
-    let payment_state: String =
-        sqlx::query_scalar("SELECT state FROM payments WHERE order_id = $1")
+    let recovered_deadline: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT paykit_expires_at FROM orders WHERE id = $1")
             .bind(order_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(payment_state, "confirmed");
+    assert_eq!(
+        recovered_deadline.map(|deadline| deadline.timestamp_micros()),
+        Some(payment_deadline.timestamp_micros())
+    );
+
+    assert_eq!(
+        expire_due_payment_windows(&app.state, hold_expires_at + chrono::Duration::seconds(2))
+            .await
+            .unwrap(),
+        1
+    );
+    let expired: String = sqlx::query_scalar("SELECT state FROM payments WHERE order_id = $1")
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(expired, "expired");
+    sqlx::query(
+        "UPDATE listings SET available_quantity = 0, reserved_quantity = 0, \
+         sold_quantity = total_quantity, state = 'sold' WHERE aggregate_id = $1",
+    )
+    .bind(listing_aggregate(&seller.pubky))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut confirmed = producer_status_fixture();
+    confirmed["invoice_id"] = json!(invoice_id);
+    confirmed["payment_deadline"] = json!(payment_deadline.to_rfc3339());
+    confirmed["bitcoin"]["paid_on_time"] = json!(false);
+    paykit.set_marketplace_status(invoice_id, confirmed);
+    assert_eq!(
+        poll_now(&app, hold_expires_at + chrono::Duration::seconds(62)).await,
+        1
+    );
+    let (order_state, payment_state, review_reason): (String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT o.state, p.state, p.review_reason FROM orders o \
+             JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(order_state, "paid");
+    assert_eq!(payment_state, "manual_review");
+    assert_eq!(review_reason.as_deref(), Some("refund_required"));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

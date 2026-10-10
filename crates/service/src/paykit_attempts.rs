@@ -305,7 +305,9 @@ async fn apply_attempt_status(
             }
             Ok(false)
         }
-        PaykitStatusOutcome::Undetected | PaykitStatusOutcome::NotFound => {
+        PaykitStatusOutcome::Undetected
+        | PaykitStatusOutcome::ActiveUndetected { .. }
+        | PaykitStatusOutcome::NotFound => {
             let tail_ends = attempt.expires_at.unwrap_or(attempt.released_at)
                 + chrono::Duration::hours(OBSERVATION_TAIL_HOURS);
             if attempt.detected_at.is_none() && now >= tail_ends {

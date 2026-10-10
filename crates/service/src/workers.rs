@@ -2560,7 +2560,7 @@ async fn apply_report_inside_seller_window(
         PaykitStatusOutcome::AcceptancePending { facts } => ("confirmed", true, facts),
         PaykitStatusOutcome::Detected { facts } => ("detected", true, facts),
         PaykitStatusOutcome::ManualReview { .. } => return Ok(false),
-        PaykitStatusOutcome::Undetected => {
+        PaykitStatusOutcome::Undetected | PaykitStatusOutcome::ActiveUndetected { .. } => {
             return mark_shared_manual_disappeared(pool, row, now).await
         }
         PaykitStatusOutcome::NotFound | PaykitStatusOutcome::Unavailable => return Ok(false),
@@ -2745,6 +2745,7 @@ async fn apply_paykit_status_outcome(
         PaykitStatusOutcome::Confirmed { facts, .. }
         | PaykitStatusOutcome::AcceptancePending { facts }
         | PaykitStatusOutcome::Detected { facts } => facts.payment_deadline,
+        PaykitStatusOutcome::ActiveUndetected { payment_deadline } => Some(*payment_deadline),
         _ => None,
     };
     if row.paykit_api == "upstream" && row.paykit_expires_at.is_none() {
@@ -2893,7 +2894,7 @@ async fn apply_paykit_status_outcome(
                 }
             }
         }
-        PaykitStatusOutcome::Undetected => {
+        PaykitStatusOutcome::Undetected | PaykitStatusOutcome::ActiveUndetected { .. } => {
             if row.paykit_allocation_mode.as_deref() == Some("shared_manual") {
                 mark_shared_manual_disappeared(&state.pool, row, now).await
             } else {
