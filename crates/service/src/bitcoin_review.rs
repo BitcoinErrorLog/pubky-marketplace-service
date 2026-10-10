@@ -54,6 +54,7 @@ use crate::handlers::{
 use crate::model::{seller_observation, OrderRow, PaymentRow};
 use crate::payments::PaykitObservation;
 use crate::queries::{ORDER_COLUMNS, PAYMENT_COLUMNS};
+use crate::refund_destination::{self, is_transaction_hash, is_usdt_order};
 use crate::workers::SYSTEM_ACTOR;
 use crate::AppState;
 
@@ -639,7 +640,9 @@ pub struct ResolveBitcoinPaymentBody {
     #[serde(default)]
     reason: Option<String>,
     /// Validated external refund reference; REQUIRED for `refunded`,
-    /// forbidden otherwise (the payments CHECK mirrors this).
+    /// forbidden otherwise (the payments CHECK mirrors this). A USDT order's
+    /// reference is the Arbitrum transaction hash: `0x` and 64 lower-case hex
+    /// digits.
     #[serde(default)]
     external_refund_reference: Option<String>,
 }
@@ -648,6 +651,23 @@ pub struct ResolveBitcoinPaymentBody {
 /// reference): 1–64 printable ASCII characters.
 fn valid_refund_reference(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.chars().all(|c| c.is_ascii_graphic())
+}
+
+/// A reference that can be valid for some order: the Bitcoin shape, or a
+/// USDT transaction hash, which is 66 characters. Which of the two applies
+/// is decided once the order is known.
+fn plausible_refund_reference(value: &str) -> bool {
+    valid_refund_reference(value) || is_transaction_hash(value)
+}
+
+/// Whether the buyer confirmed a refund address for the order.
+async fn destination_confirmed(pool: &PgPool, order_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM order_refund_destinations WHERE order_id = $1)",
+    )
+    .bind(order_id)
+    .fetch_one(pool)
+    .await
 }
 
 /// The canonical request hash behind the idempotency rule: same key + same
@@ -739,7 +759,7 @@ pub async fn resolve_bitcoin_payment(
         );
     }
     match (body.outcome.as_str(), &body.external_refund_reference) {
-        ("refunded", Some(reference)) if valid_refund_reference(reference) => {}
+        ("refunded", Some(reference)) if plausible_refund_reference(reference) => {}
         ("refunded", _) => {
             return audited_resolve_refusal(
                 &state,
@@ -789,9 +809,11 @@ pub async fn resolve_bitcoin_payment(
             "Only the seller of this order's listing may perform this action.",
         );
     }
-    // Scope (r12): Paykit Bitcoin only, with both pins persisted. Locks,
-    // Stripe, PayPal, sandbox, and missing-pin rows are out of scope.
-    if order.payment_method.as_deref() != Some("bitcoin") {
+    // Scope (r12): Paykit Bitcoin, and USDT orders paid through the same
+    // Paykit rail, with both pins persisted. Locks, Stripe, PayPal, sandbox,
+    // and missing-pin rows are out of scope.
+    let usdt_order = is_usdt_order(&order);
+    if order.payment_method.as_deref() != Some("bitcoin") && !usdt_order {
         return audited_resolve_refusal(
             &state,
             &actor.0,
@@ -821,6 +843,42 @@ pub async fn resolve_bitcoin_payment(
             ReviewReason::MissingPin,
             "This order has no pinned paykit stack to resolve against.",
         );
+    }
+    // A reference is a 64-character Bitcoin reference, or on a USDT order
+    // the Arbitrum transaction hash of the seller's refund, which also needs
+    // the address the buyer confirmed.
+    if let Some(reference) = body.external_refund_reference.as_deref() {
+        let fits_the_order = if usdt_order {
+            is_transaction_hash(reference)
+        } else {
+            valid_refund_reference(reference)
+        };
+        if !fits_the_order {
+            return audited_resolve_refusal(
+                &state,
+                &actor.0,
+                Some(resolution_id),
+                ErrorCode::InvalidCommand,
+                ReviewReason::InvalidRefundReference,
+                "A refunded resolution requires a valid external refund reference.",
+            );
+        }
+    }
+    if usdt_order && body.outcome == "refunded" {
+        let confirmed = match destination_confirmed(&state.pool, order_id).await {
+            Ok(confirmed) => confirmed,
+            Err(error) => return internal("refund destination lookup", &error),
+        };
+        if !confirmed {
+            return audited_resolve_refusal(
+                &state,
+                &actor.0,
+                Some(resolution_id),
+                ErrorCode::InvalidState,
+                ReviewReason::RefundDestinationRequired,
+                "The buyer has not confirmed a refund address.",
+            );
+        }
     }
     // (2) Idempotency: same key + same body replays the winner; same key +
     // a different body conflicts; a different key after resolution is
@@ -1727,17 +1785,46 @@ async fn apply_refunded_effects(
             format!("order in unexpected state {}", current.state),
         ));
     }
-    let Some(amount_minor) = order.paykit_observed_sats else {
+    // A Bitcoin refund is the frozen observed amount in sats. A USDT refund
+    // is the quoted USDT amount in order units, sent to the address the
+    // buyer confirmed, which is copied into the record.
+    let usdt_destination = if is_usdt_order(order) {
+        let destination = refund_destination::fetch(tx, order.id)
+            .await
+            .map_err(|e| ResolutionFailure::Internal("refund destination".into(), e.to_string()))?
+            .ok_or_else(|| {
+                ResolutionFailure::Internal(
+                    "refund destination".into(),
+                    "the buyer has not confirmed a refund address".into(),
+                )
+            })?;
+        Some(destination)
+    } else {
+        None
+    };
+    let amount_minor = if usdt_destination.is_some() {
+        refund_destination::quoted_refund_amount_minor(order)
+    } else {
+        order.paykit_observed_sats
+    };
+    let Some(amount_minor) = amount_minor else {
         return Err(ResolutionFailure::Internal(
             "refund requires manual confirmation".into(),
-            "the Paykit observed amount has not been frozen".into(),
+            if usdt_destination.is_some() {
+                "the order carries no whole-unit USDT quote".into()
+            } else {
+                "the Paykit observed amount has not been frozen".into()
+            },
         ));
     };
-    let external_refund = json!({
+    let mut external_refund = json!({
         "amount_minor": amount_minor,
         "transaction_id": input.refund_reference,
         "recorded_at": format_timestamp(now),
     });
+    if let Some(destination) = &usdt_destination {
+        external_refund["destination_address"] = json!(destination.address);
+    }
     let updated: OrderRow = sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, state = 'refunded_external', \
          external_refund = $3, updated_at = $4 WHERE id = $1 AND revision = $2 \
