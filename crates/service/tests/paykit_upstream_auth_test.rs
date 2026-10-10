@@ -34,6 +34,10 @@ const REFERENCE: &str = "0R8Y7ZQ3M5N9K2VJ6W4X1T8S0P";
 struct PersistedUpstreamBind {
     paykit_invoice_id: Option<uuid::Uuid>,
     paykit_api: Option<String>,
+    paykit_payment_reference: Option<uuid::Uuid>,
+    paykit_operation_id: Option<String>,
+    paykit_payment_window_seconds: Option<i32>,
+    paykit_asset: Option<String>,
     paykit_stack_id: Option<String>,
     paykit_stack_endpoint: Option<String>,
     paykit_activation_state: Option<String>,
@@ -431,6 +435,55 @@ async fn marketplace_status_routes_late_or_terminal_matching_money_as_late_evide
 }
 
 #[tokio::test]
+async fn marketplace_status_distinguishes_acceptance_lag_from_manual_review_states() {
+    let deadline = Some("1970-01-02T00:00:00Z".parse().unwrap());
+    for request_state in [Some("proposed"), None] {
+        let paykit = upstream_paykit().await;
+        let mut fixture = producer_status_fixture();
+        fixture["request_state"] = request_state.map_or(Value::Null, |state| json!(state));
+        paykit.set_marketplace_status(STATUS_INVOICE, fixture);
+        assert!(matches!(
+            upstream_client(&paykit)
+                .marketplace_payment_status(SELLER, STATUS_INVOICE, deadline)
+                .await
+                .0,
+            PaykitStatusOutcome::AcceptancePending { .. }
+        ));
+    }
+
+    for request_state in ["recovery_required", "invalid_conflict"] {
+        let paykit = upstream_paykit().await;
+        let mut fixture = producer_status_fixture();
+        fixture["request_state"] = json!(request_state);
+        paykit.set_marketplace_status(STATUS_INVOICE, fixture);
+        assert!(matches!(
+            upstream_client(&paykit)
+                .marketplace_payment_status(SELLER, STATUS_INVOICE, deadline)
+                .await
+                .0,
+            PaykitStatusOutcome::ManualReview { reason, .. } if reason == request_state
+        ));
+    }
+
+    let paykit = upstream_paykit().await;
+    let mut fixture = producer_status_fixture();
+    fixture["request_state"] = json!("recovery_required");
+    fixture["bitcoin"] = Value::Null;
+    fixture["payment_state"] = json!("undetected");
+    paykit.set_marketplace_status(STATUS_INVOICE, fixture);
+    assert!(matches!(
+        upstream_client(&paykit)
+            .marketplace_payment_status(SELLER, STATUS_INVOICE, deadline)
+            .await
+            .0,
+        PaykitStatusOutcome::ManualReview {
+            observation: None,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn upstream_lifecycle_uses_the_closed_four_command_contract() {
     let paykit = upstream_paykit().await;
     let client = upstream_client(&paykit);
@@ -734,7 +787,8 @@ async fn upstream_bind_persists_api_and_recovers_activation_after_config_rollbac
 
     let order_id = uuid::Uuid::parse_str(&order.order_id).expect("order id");
     let persisted: PersistedUpstreamBind = sqlx::query_as(
-        "SELECT paykit_invoice_id, paykit_api, paykit_stack_id, \
+        "SELECT paykit_invoice_id, paykit_api, paykit_payment_reference, \
+         paykit_operation_id, paykit_payment_window_seconds, paykit_asset, paykit_stack_id, \
          paykit_stack_endpoint, paykit_activation_state FROM orders WHERE id = $1",
     )
     .bind(order_id)
@@ -745,6 +799,18 @@ async fn upstream_bind_persists_api_and_recovers_activation_after_config_rollbac
         .paykit_invoice_id
         .expect("server-issued invoice persisted");
     assert_eq!(persisted.paykit_api.as_deref(), Some("upstream"));
+    let support_reference = persisted
+        .paykit_payment_reference
+        .expect("support payment reference persisted");
+    assert_eq!(
+        persisted.paykit_operation_id.as_deref(),
+        Some(format!("marketplace-payment:{support_reference}:1").as_str())
+    );
+    assert_eq!(
+        persisted.paykit_payment_window_seconds,
+        Some(i32::try_from(app.state.config.bitcoin_payment_window_seconds).unwrap())
+    );
+    assert_eq!(persisted.paykit_asset.as_deref(), Some("BTC"));
     assert_eq!(persisted.paykit_stack_id, None);
     assert_eq!(persisted.paykit_stack_endpoint, None);
     assert_eq!(
@@ -1204,6 +1270,131 @@ async fn upstream_worker_polls_durable_invoice_identity_and_confirms_on_time_pay
             "invoice_id": invoice_id,
         })
     );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_worker_never_auto_pays_while_request_acceptance_lags(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin_for_review(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    let order_id = uuid::Uuid::parse_str(&order.order_id).unwrap();
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{order_id}/payment-method"),
+        Some(&buyer.token),
+        &json!({"method":"bitcoin"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    drain_outbox(&pool, client, app.clock.now(), 30)
+        .await
+        .unwrap();
+    let (invoice_id, deadline, original_hold): (
+        uuid::Uuid,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ) = sqlx::query_as(
+        "SELECT paykit_invoice_id, paykit_expires_at, hold_expires_at FROM orders WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut fixture = producer_status_fixture();
+    fixture["invoice_id"] = json!(invoice_id);
+    fixture["payment_deadline"] = json!(deadline.to_rfc3339());
+    fixture["request_state"] = json!("proposed");
+    paykit.set_marketplace_status(invoice_id, fixture);
+
+    assert_eq!(
+        poll_now(&app, deadline - chrono::Duration::seconds(1)).await,
+        0
+    );
+    let (payment_state, hold): (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "SELECT p.state, o.hold_expires_at FROM payments p JOIN orders o ON o.id = p.order_id \
+         WHERE o.id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(payment_state, "awaiting_entitlement");
+    assert_eq!(hold, original_hold, "status polling never extends hold");
+
+    let next_poll = deadline + chrono::Duration::seconds(app.state.config.paykit_poll_seconds);
+    assert_eq!(poll_now(&app, next_poll).await, 1);
+    let (payment_state, order_state, hold): (String, String, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as(
+            "SELECT p.state, o.state, o.hold_expires_at FROM payments p \
+             JOIN orders o ON o.id = p.order_id WHERE o.id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(payment_state, "manual_review");
+    assert_ne!(order_state, "paid");
+    assert_eq!(hold, original_hold, "manual review preserves original hold");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_worker_routes_invalid_request_lifecycle_to_manual_review(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin_for_review(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    let order_id = uuid::Uuid::parse_str(&order.order_id).unwrap();
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{order_id}/payment-method"),
+        Some(&buyer.token),
+        &json!({"method":"bitcoin"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    drain_outbox(&pool, client, app.clock.now(), 30)
+        .await
+        .unwrap();
+    let (invoice_id, deadline): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT paykit_invoice_id, paykit_expires_at FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut fixture = producer_status_fixture();
+    fixture["invoice_id"] = json!(invoice_id);
+    fixture["payment_deadline"] = json!(deadline.to_rfc3339());
+    fixture["request_state"] = json!("invalid_conflict");
+    paykit.set_marketplace_status(invoice_id, fixture);
+
+    assert_eq!(poll_now(&app, app.clock.now()).await, 1);
+    let (payment_state, review_reason, order_state): (String, Option<String>, String) =
+        sqlx::query_as(
+            "SELECT p.state, p.review_reason, o.state FROM payments p \
+             JOIN orders o ON o.id = p.order_id WHERE o.id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(payment_state, "manual_review");
+    assert_eq!(review_reason.as_deref(), Some("upstream_inconsistent"));
+    assert_ne!(order_state, "paid");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

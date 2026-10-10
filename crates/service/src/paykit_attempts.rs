@@ -234,6 +234,27 @@ async fn apply_attempt_status(
         } => {
             route_released_settlement(state, attempt, amount_matched, &facts.observation, now).await
         }
+        PaykitStatusOutcome::AcceptancePending { facts } => {
+            if attempt.expires_at.is_some_and(|deadline| now >= deadline) {
+                route_released_settlement(state, attempt, true, &facts.observation, now).await
+            } else {
+                Ok(false)
+            }
+        }
+        PaykitStatusOutcome::ManualReview { observation, .. } => {
+            route_released_settlement(
+                state,
+                attempt,
+                false,
+                &observation.unwrap_or(PaykitObservation {
+                    txid: None,
+                    observed_sats: None,
+                    confirmations: None,
+                }),
+                now,
+            )
+            .await
+        }
         PaykitStatusOutcome::Detected { facts } => {
             let observation = observation_json("detected", true, &facts.observation, now, false);
             let first = sqlx::query(

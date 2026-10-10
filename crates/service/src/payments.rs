@@ -791,6 +791,16 @@ pub enum PaykitStatusOutcome {
         amount_matched: bool,
         facts: PaykitStatusFacts,
     },
+    /// Matching money observed before request acceptance reaches status.
+    /// This is not payment authority; worker polls until existing deadline.
+    AcceptancePending {
+        facts: PaykitStatusFacts,
+    },
+    /// Producer reported a lifecycle that cannot be trusted automatically.
+    ManualReview {
+        reason: String,
+        observation: Option<PaykitObservation>,
+    },
     NotFound,
     Unavailable,
 }
@@ -1032,8 +1042,11 @@ impl PaykitCommandError {
         match (status.as_u16(), code.as_str()) {
             (409, "prepare_expired") => PaykitCommandError::PrepareExpired,
             (409, "invoice_finalized") => PaykitCommandError::InvoiceFinalized,
+            (409, "lifecycle_terminal" | "invoice_active") => PaykitCommandError::InvoiceFinalized,
             (404, "unknown_invoice") => PaykitCommandError::UnknownInvoice,
+            (404, "not_found") => PaykitCommandError::UnknownInvoice,
             (409, "activation_total_mismatch") => PaykitCommandError::ActivationTotalMismatch,
+            (409, "total_mismatch") => PaykitCommandError::ActivationTotalMismatch,
             (409, "stack_identity_mismatch") => PaykitCommandError::StackIdentityMismatch,
             _ if status.is_server_error() => PaykitCommandError::Unavailable,
             _ if status.is_client_error() => PaykitCommandError::UnexpectedRejection(code),
@@ -1157,6 +1170,11 @@ pub fn upstream_attempt_reference(order_id: uuid::Uuid, attempt: i32) -> String 
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+/// Stable operation identity paired with [`upstream_attempt_reference`].
+pub fn upstream_operation_id(reference: &str, attempt: i32) -> String {
+    format!("marketplace-payment:{reference}:{attempt}")
 }
 
 /// The single per-order reference every bind used before per-attempt
@@ -1412,7 +1430,7 @@ impl PaykitClient {
                 serde_json::json!({
                     "amount_sats": amount_sats,
                     "creator": pubky_app_key(seller_pubky),
-                    "operation_id": format!("marketplace-payment:{reference}:{bind_attempt}"),
+                    "operation_id": upstream_operation_id(&reference, bind_attempt),
                     "payment_window_seconds": payment_window_seconds,
                     "reader": pubky_app_key(buyer_pubky),
                     "reference": reference,
@@ -1480,12 +1498,36 @@ impl PaykitClient {
             .and_then(|body| body["error"]["code"].as_str().map(str::to_owned))
             .unwrap_or_default();
         match (status, code.as_str()) {
-            (_, "creator_session_invalid") => Err(PaykitRequestError::SellerAccountUnavailable),
+            (_, "creator_session_invalid" | "seller_setup_pending") => {
+                Err(PaykitRequestError::SellerAccountUnavailable)
+            }
             (_, "reader_not_payable") => Err(PaykitRequestError::ReaderNotPayable),
             (_, "reader_setup_pending") => Err(PaykitRequestError::ReaderSetupPending),
+            (_, "operation_conflict") => {
+                tracing::error!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "ALERT upstream paykit refused a marketplace-derived prepare request"
+                );
+                Err(PaykitRequestError::Rejected)
+            }
+            (_, "invalid_signature") => {
+                tracing::error!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "ALERT upstream paykit rejected the Marketplace signing identity"
+                );
+                Err(PaykitRequestError::Unavailable)
+            }
             (_, "invalid_request" | "invoice_conflict") | (reqwest::StatusCode::CONFLICT, _) => {
                 Err(PaykitRequestError::Rejected)
             }
+            // A timed-out preparation may have committed remotely. Never
+            // replay this spent attempt: next bind reserves a fresh identity,
+            // while orphan preparation stays unpublished and expires.
+            (_, "dependency_timeout") => Err(PaykitRequestError::Unavailable),
             // `bitcoin_creation_disabled` (503, §C.16) and everything else:
             // refused cleanly as an availability failure, as today.
             _ => Err(PaykitRequestError::Unavailable),
@@ -1819,6 +1861,8 @@ impl PaykitClient {
                         | "canceled"
                         | "proof_submitted"
                         | "active_recurring"
+                        | "recovery_required"
+                        | "invalid_conflict"
                 )
             })
             || !body.payment_state.as_deref().is_none_or(|state| {
@@ -1862,7 +1906,25 @@ impl PaykitClient {
             body.request_state.as_deref(),
             Some("accepted" | "proof_submitted" | "active_recurring")
         );
+        let manual_review_state = matches!(
+            body.request_state.as_deref(),
+            Some("recovery_required" | "invalid_conflict")
+        );
         let Some(bitcoin) = body.bitcoin else {
+            if manual_review_state {
+                tracing::error!(
+                    %invoice_id,
+                    request_state = ?body.request_state,
+                    "ALERT upstream paykit request lifecycle requires manual review"
+                );
+                return (
+                    PaykitStatusOutcome::ManualReview {
+                        reason: body.request_state.unwrap_or_default(),
+                        observation: None,
+                    },
+                    delivery,
+                );
+            }
             return match body.payment_state.as_deref() {
                 Some("undetected" | "expired") => (PaykitStatusOutcome::Undetected, delivery),
                 _ => (PaykitStatusOutcome::Unavailable, delivery),
@@ -1879,6 +1941,25 @@ impl PaykitClient {
                 confirmations: Some(bitcoin.confirmations),
             },
         };
+        if manual_review_state {
+            tracing::error!(
+                %invoice_id,
+                request_state = ?body.request_state,
+                "ALERT upstream paykit request lifecycle requires manual review"
+            );
+            return (
+                PaykitStatusOutcome::ManualReview {
+                    reason: body.request_state.unwrap_or_default(),
+                    observation: Some(facts.observation),
+                },
+                delivery,
+            );
+        }
+        if bitcoin.amount_matched
+            && matches!(body.request_state.as_deref(), None | Some("proposed"))
+        {
+            return (PaykitStatusOutcome::AcceptancePending { facts }, delivery);
+        }
         let outcome = if bitcoin.amount_matched
             && (!safe_request || body.payment_state.as_deref() == Some("expired"))
         {
@@ -2261,6 +2342,47 @@ mod tests {
     const UPSTREAM_TEST_SEED: &str =
         "0707070707070707070707070707070707070707070707070707070707070707";
     const UPSTREAM_CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[test]
+    fn upstream_attempt_identity_known_answers_stay_stable() {
+        for (order, attempt, expected) in [
+            (
+                "00000000-0000-0000-0000-000000000000",
+                1,
+                "24078310-6330-4644-b272-86ca913119df",
+            ),
+            (
+                "00112233-4455-6677-8899-aabbccddeeff",
+                42,
+                "aced6b3e-d2bb-4dc4-8e63-d5e2ab88b625",
+            ),
+        ] {
+            let reference = upstream_attempt_reference(order.parse().unwrap(), attempt);
+            assert_eq!(reference, expected);
+            assert_eq!(
+                upstream_operation_id(&reference, attempt),
+                format!("marketplace-payment:{expected}:{attempt}")
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_lifecycle_codes_map_to_existing_worker_outcomes() {
+        for code in ["lifecycle_terminal", "invoice_active"] {
+            assert_eq!(
+                PaykitCommandError::from_status(reqwest::StatusCode::CONFLICT, code.into()),
+                PaykitCommandError::InvoiceFinalized
+            );
+        }
+        assert_eq!(
+            PaykitCommandError::from_status(reqwest::StatusCode::CONFLICT, "total_mismatch".into(),),
+            PaykitCommandError::ActivationTotalMismatch
+        );
+        assert_eq!(
+            PaykitCommandError::from_status(reqwest::StatusCode::NOT_FOUND, "not_found".into()),
+            PaykitCommandError::UnknownInvoice
+        );
+    }
 
     fn upstream_test_client(api: PaykitApi) -> PaykitClient {
         PaykitClient::new("https://paykit.example", UPSTREAM_TEST_SEED)

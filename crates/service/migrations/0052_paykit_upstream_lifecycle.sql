@@ -4,7 +4,33 @@
 
 ALTER TABLE orders
     ADD COLUMN IF NOT EXISTS paykit_api TEXT
-        CHECK (paykit_api IN ('fork', 'upstream'));
+        CHECK (paykit_api IN ('fork', 'upstream')),
+    ADD COLUMN IF NOT EXISTS paykit_payment_reference UUID,
+    ADD COLUMN IF NOT EXISTS paykit_operation_id TEXT,
+    ADD COLUMN IF NOT EXISTS paykit_payment_window_seconds INTEGER,
+    ADD COLUMN IF NOT EXISTS paykit_asset TEXT;
+
+-- Support can name exact upstream attempt without re-deriving it. Fork rows
+-- keep all four columns NULL. Keep asset open for later rails.
+ALTER TABLE orders
+    DROP CONSTRAINT IF EXISTS orders_paykit_prepared_attempt_check;
+ALTER TABLE orders
+    ADD CONSTRAINT orders_paykit_prepared_attempt_check CHECK (
+        (paykit_payment_reference IS NULL) = (paykit_operation_id IS NULL)
+        AND (paykit_payment_reference IS NULL) = (paykit_payment_window_seconds IS NULL)
+        AND (paykit_payment_reference IS NULL) = (paykit_asset IS NULL)
+        AND (paykit_payment_window_seconds IS NULL OR paykit_payment_window_seconds > 0)
+    ) NOT VALID;
+
+ALTER TABLE payments
+    DROP CONSTRAINT IF EXISTS payments_review_reason_check;
+ALTER TABLE payments
+    ADD CONSTRAINT payments_review_reason_check CHECK (
+        review_reason IS NULL OR review_reason IN (
+            'late_settlement', 'refund_required', 'amount_mismatch',
+            'unpinned_legacy', 'upstream_inconsistent'
+        )
+    ) NOT VALID;
 
 UPDATE orders SET paykit_api = 'fork'
 WHERE paykit_invoice_id IS NOT NULL AND paykit_api IS NULL;

@@ -463,6 +463,8 @@ async fn classify_response(
     // Permanent named refusals, each terminating visibly.
     let terminal_reason = match (status, code) {
         (404, "unknown_invoice") => Some("unknown_invoice"),
+        (404, "not_found") => Some("not_found"),
+        (409, "resolution_conflict") => Some("resolution_conflict"),
         (409, "invoice_not_activated") => Some("invoice_not_activated"),
         (409, "invoice_already_resolved") => Some("invoice_already_resolved"),
         (409, "invoice_finalized") => Some("invoice_finalized"),

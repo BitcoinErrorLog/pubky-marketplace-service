@@ -48,7 +48,7 @@ use crate::handlers::{
 };
 use crate::model::{OrderRow, PaymentRow};
 use crate::payments::{
-    attempt_reference, upstream_attempt_reference, validate_paypal_email,
+    attempt_reference, upstream_attempt_reference, upstream_operation_id, validate_paypal_email,
     validate_stripe_payment_link, validate_stripe_restricted_key, PaykitApi, PaykitLifecycleTarget,
     PaykitPrepared, PaykitRequestError, PaymentsRuntime, StripeError,
 };
@@ -842,7 +842,8 @@ pub async fn bind_payment_method(
         "UPDATE orders SET revision = revision + 1, payment_method = $2, \
          fiat_checkout_url = $3, paykit_request_reference = $4, \
          paykit_request_state = CASE WHEN $4::text IS NULL THEN NULL ELSE 'preparing' END, \
-         paykit_delivery_state = NULL, \
+         paykit_delivery_state = NULL, paykit_payment_reference = NULL, \
+         paykit_operation_id = NULL, paykit_payment_window_seconds = NULL, paykit_asset = NULL, \
          updated_at = $5 WHERE id = $1 RETURNING {}",
         crate::queries::ORDER_COLUMNS
     ))
@@ -1179,7 +1180,9 @@ pub async fn bind_payment_method(
                  bitcoin_quote_fetched_at = $13, bitcoin_quoted_sats = $14, \
                  bitcoin_quote_expires_at = $18, bitcoin_quote_currency = $15, \
                  bitcoin_quote_exponent = $16, bitcoin_quote_spread_bps = $17, \
-                 hold_expires_at = COALESCE($20, hold_expires_at) \
+                 hold_expires_at = COALESCE($20, hold_expires_at), \
+                 paykit_payment_reference = $21, paykit_operation_id = $22, \
+                 paykit_payment_window_seconds = $23, paykit_asset = $24 \
                  WHERE id = $1",
             )
             .bind(order.id)
@@ -1245,6 +1248,29 @@ pub async fn bind_payment_method(
             )
             .bind(paykit.api().as_str())
             .bind(upstream_hold_expires_at)
+            .bind(if paykit.api() == PaykitApi::Upstream {
+                Some(reference.parse::<Uuid>().expect("upstream reference is UUID"))
+            } else {
+                None
+            })
+            .bind(if paykit.api() == PaykitApi::Upstream {
+                Some(upstream_operation_id(reference, attempt))
+            } else {
+                None
+            })
+            .bind(if paykit.api() == PaykitApi::Upstream {
+                Some(
+                    i32::try_from(state.config.bitcoin_payment_window_seconds)
+                        .expect("validated payment window fits i32"),
+                )
+            } else {
+                None
+            })
+            .bind(if paykit.api() == PaykitApi::Upstream {
+                Some("BTC")
+            } else {
+                None
+            })
             .execute(&mut *tx)
             .await?;
             // Bitcoin settlement is typed as SAT/0. Merchandise terms stay

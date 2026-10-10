@@ -234,6 +234,13 @@ async fn permanent_refusals_terminate_visibly_without_retries(pool: PgPool) {
     let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
     let cases: Vec<(&str, u16, &str, &str)> = vec![
         ("unknown_invoice", 404, "unknown_invoice", "unknown_invoice"),
+        ("not_found", 404, "not_found", "not_found"),
+        (
+            "resolution_conflict",
+            409,
+            "resolution_conflict",
+            "resolution_conflict",
+        ),
         (
             "invoice_not_activated",
             409,

@@ -2762,7 +2762,7 @@ async fn serve_upstream_command(
             };
         }
         if !guard.invoices.contains_key(&invoice_id) {
-            return paykit_error(StatusCode::NOT_FOUND, "unknown_invoice");
+            return paykit_error(StatusCode::NOT_FOUND, "not_found");
         }
         guard
             .resolutions
@@ -2776,15 +2776,15 @@ async fn serve_upstream_command(
             .into_response();
     }
     let Some(invoice) = guard.invoices.get_mut(&invoice_id) else {
-        return paykit_error(StatusCode::NOT_FOUND, "unknown_invoice");
+        return paykit_error(StatusCode::NOT_FOUND, "not_found");
     };
     match command {
         "activate" => {
             if parsed["total_sats"].as_u64() != Some(invoice.total_sats) {
-                return paykit_error(StatusCode::CONFLICT, "activation_total_mismatch");
+                return paykit_error(StatusCode::CONFLICT, "total_mismatch");
             }
             if invoice.state == "voided" {
-                return paykit_error(StatusCode::CONFLICT, "invoice_finalized");
+                return paykit_error(StatusCode::CONFLICT, "lifecycle_terminal");
             }
             invoice.state = "active".into();
             (
@@ -2799,7 +2799,7 @@ async fn serve_upstream_command(
         }
         "void" => {
             if invoice.state == "active" {
-                return paykit_error(StatusCode::CONFLICT, "invoice_finalized");
+                return paykit_error(StatusCode::CONFLICT, "invoice_active");
             }
             invoice.state = "voided".into();
             (

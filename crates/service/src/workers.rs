@@ -2557,7 +2557,9 @@ async fn apply_report_inside_seller_window(
             amount_matched,
             facts,
         } => ("confirmed", *amount_matched, facts),
+        PaykitStatusOutcome::AcceptancePending { facts } => ("confirmed", true, facts),
         PaykitStatusOutcome::Detected { facts } => ("detected", true, facts),
+        PaykitStatusOutcome::ManualReview { .. } => return Ok(false),
         PaykitStatusOutcome::Undetected => {
             return mark_shared_manual_disappeared(pool, row, now).await
         }
@@ -2646,6 +2648,74 @@ async fn mark_shared_manual_disappeared(
     .execute(pool)
     .await?;
     Ok(false)
+}
+
+/// Producer lifecycle corruption is never payment authority. Stop automatic
+/// handling, preserve the current hold, and surface one durable review.
+async fn apply_upstream_manual_review(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    reason: &str,
+    observation: Option<&crate::payments::PaykitObservation>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let updated: Option<(i64,)> = sqlx::query_as(
+        "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+         review_reason = 'upstream_inconsistent', manual_review_entered_at = $2, updated_at = $2 \
+         WHERE id = $1 AND state IN ('awaiting_entitlement', 'expired') RETURNING revision",
+    )
+    .bind(row.payment_id)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((revision,)) = updated else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let event_id = crate::executor::insert_event(
+        &mut tx,
+        row.id,
+        &ids::payment_aggregate_id(row.payment_id),
+        revision,
+        &row.buyer_pubky,
+        "payment.manual_review",
+        now,
+    )
+    .await?;
+    crate::handlers::insert_bitcoin_manual_review_intent(
+        &mut tx,
+        event_id,
+        &row.seller_pubky,
+        row.id,
+        crate::handlers::BitcoinReviewNotice::ConfirmationFailed,
+        now,
+    )
+    .await?;
+    let observation_json = observation.map(|facts| {
+        crate::bitcoin_review::observation_json("confirmed", false, facts, now, false)
+    });
+    sqlx::query(
+        "UPDATE orders SET paykit_request_state = 'confirmed', \
+         paykit_seller_confirmation_entered_at = NULL, \
+         paykit_seller_confirmation_deadline = NULL, \
+         paykit_observation = COALESCE($3, paykit_observation), updated_at = $2 WHERE id = $1",
+    )
+    .bind(row.id)
+    .bind(now)
+    .bind(observation_json)
+    .execute(&mut *tx)
+    .await?;
+    if let Some(observation) = observation {
+        freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
+    }
+    tx.commit().await?;
+    tracing::error!(
+        order_id = %row.id,
+        %reason,
+        "ALERT upstream paykit lifecycle routed payment to manual review"
+    );
+    Ok(true)
 }
 
 /// Applies the polled paykit status for ONE claimed order. Errors
@@ -2738,6 +2808,39 @@ async fn apply_paykit_status_outcome(
                     Ok(false)
                 }
             }
+        }
+        PaykitStatusOutcome::AcceptancePending { facts } => {
+            if row
+                .paykit_expires_at
+                .is_some_and(|deadline| now >= deadline)
+            {
+                tracing::error!(
+                    order_id = %row.id,
+                    deadline = ?row.paykit_expires_at,
+                    "ALERT matched upstream money never reached an accepted request state; \
+                     routing to manual review"
+                );
+                apply_confirmed_paykit_payment(
+                    &state.pool,
+                    row,
+                    true,
+                    &facts.observation,
+                    state.confirm_keys(),
+                    now,
+                    true,
+                )
+                .await
+            } else {
+                // Reconciliation may expose Bitcoin before request cursor.
+                // Poll within existing deadline; never extend hold or pay.
+                Ok(false)
+            }
+        }
+        PaykitStatusOutcome::ManualReview {
+            reason,
+            observation,
+        } => {
+            apply_upstream_manual_review(&state.pool, row, &reason, observation.as_ref(), now).await
         }
         PaykitStatusOutcome::Detected { facts } => {
             // A LATE detection is fail-safe: display-only at most, never
