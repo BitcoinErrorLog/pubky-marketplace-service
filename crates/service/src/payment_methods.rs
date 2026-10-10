@@ -638,7 +638,9 @@ fn public_config_view(
 /// `seller_has_rail`), since Stripe payments are verified with that key.
 /// `usdt_available` exists only while `USDT_PAYMENTS_ENABLED` is on and is
 /// true only when every one of these holds: the deployment speaks to upstream
-/// paykit-server, the seller switched USDT on in the Shop, and the signed
+/// paykit-server, `PAYKIT_MARKETPLACE_ASSETS` lists USDT (the bind's own
+/// precondition, so a buyer is never offered an option every bind refuses),
+/// the seller switched USDT on in the Shop, and the signed
 /// `POST /setup/status` with `asset: "USDT"` says `ready` (cached per
 /// seller and asset, like Bitcoin). A seller whose USDT setup is missing,
 /// whether new, Bitcoin-only or Ring-only, or whose status cannot be read,
@@ -721,9 +723,13 @@ pub async fn get_payment_config(
 }
 
 /// Whether a seller is offered USDT right now (see [`get_payment_config`]).
-/// The seller's consent is read first so a seller who never opted in costs
-/// no Paykit lookup.
+/// The deployment's asset list is read first, then the seller's consent, so
+/// neither a deployment that cannot prepare USDT nor a seller who never opted
+/// in costs a Paykit lookup.
 async fn seller_usdt_available(state: &AppState, seller_pubky: &str) -> Result<bool, sqlx::Error> {
+    if !state.config.paykit_marketplace_assets.includes_usdt() {
+        return Ok(false);
+    }
     if !usdt_option_enabled(&state.pool, seller_pubky).await? {
         return Ok(false);
     }

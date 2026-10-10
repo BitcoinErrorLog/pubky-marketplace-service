@@ -217,6 +217,12 @@ the Paykit bind and refunds are separate slices.
   Off, the key is absent and `usdt` is an `invalid_method` with today's
   message. The Shop shows USDT only when its own flag is on and `/health`
   reports it.
+- **Deploy unit.** The flag-on payment-config keys (`usdt_enabled`,
+  `usdt_setup`, `usdt_setup_action`, `usdt_available`) exist only from the
+  seller readiness slice below, so the slice that adds the flag and the one
+  that adds those keys deploy together: with the flag on and only the first
+  deployed, a `PUT` carrying `usdt_enabled` is still refused as an unknown
+  field. Keep `USDT_PAYMENTS_ENABLED` off until both are deployed.
 - **Seller readiness.** While the flag is on, a seller's own payment config
   (`GET`/`PUT /v0/sellers/me/payment-config`) also carries
   `usdt_enabled` (the seller's Shop-level consent, stored in
@@ -236,7 +242,9 @@ the Paykit bind and refunds are separate slices.
     into an authorization flow. On the fork, or without Paykit, `usdt_setup`
     is `unavailable` and paykit-server is not asked.
   - `usdt_available` is true only when the deployment speaks to upstream
-    paykit-server, the seller consented, and the USDT status is `ready`. It
+    paykit-server, `PAYKIT_MARKETPLACE_ASSETS` lists `USDT` (the bind's own
+    precondition, so a buyer is never offered an option every bind refuses),
+    the seller consented, and the USDT status is `ready`. It
     is cached per (seller, asset) like Bitcoin's. The seller's own `GET` and
     `PUT` read paykit-server uncached, so a Bitkit setup or reconnect shows
     at once.

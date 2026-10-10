@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use common::paykit_server_u4 as u4;
 use common::*;
 use marketplace_service::config::Config;
+use marketplace_service::payment_attempt::MarketplaceAssets;
 use marketplace_service::payments::{
     PaykitApi, PaykitClient, PaykitRequestError, SetupAsset, SetupStatus,
 };
@@ -23,7 +24,16 @@ use sqlx::PgPool;
 const OWN: &str = "/v0/sellers/me/payment-config";
 const EPOCH: &str = "1970-01-01T00:00:00.000Z";
 
+/// The flag on and a deployment whose Marketplace prepare lists USDT.
 fn usdt_config() -> Config {
+    let mut config = usdt_config_btc_only();
+    config.paykit_marketplace_assets =
+        MarketplaceAssets::parse(Some("BTC,USDT"), PaykitApi::Upstream).expect("assets parse");
+    config
+}
+
+/// The flag on, but `PAYKIT_MARKETPLACE_ASSETS` left at its default (`BTC`).
+fn usdt_config_btc_only() -> Config {
     let mut config = Config::for_tests();
     config.usdt_payments_enabled = true;
     config
@@ -718,6 +728,77 @@ async fn usdt_is_available_only_when_consented_and_ready(pool: PgPool) {
         get_public(&app, &seller.pubky).await["usdt_available"],
         json!(false)
     );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn usdt_is_never_offered_when_the_deployment_does_not_list_it(pool: PgPool) {
+    // The flag is on, the seller consented and Paykit says USDT is ready, but
+    // `PAYKIT_MARKETPLACE_ASSETS` is the default `BTC`: the bind would refuse
+    // every USDT attempt, so no buyer is offered one, and the public read
+    // does not even ask Paykit.
+    let (app, paykit) =
+        test_app_with_paykit_api_config(pool, usdt_config_btc_only(), PaykitApi::Upstream).await;
+    let seller = new_actor(&app).await;
+    replay(
+        &paykit,
+        &seller.pubky,
+        "setup_status_usdt_dual",
+        "setup_status_authority_ready",
+    );
+    paykit.set_claimed(&seller.pubky);
+    let (status, _) = put(
+        &app,
+        &seller.token,
+        &with(rails(true), "usdt_enabled", json!(true)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let calls_after_save = usdt_calls(&paykit);
+    let public = get_public(&app, &seller.pubky).await;
+    assert_eq!(public["usdt_available"], json!(false));
+    assert_eq!(
+        public["bitcoin_available"],
+        json!(true),
+        "Bitcoin is unaffected"
+    );
+    assert_eq!(usdt_calls(&paykit), calls_after_save);
+
+    // The seller's own view still reports readiness and consent, so setup and
+    // the toggle keep working before the deployment lists USDT.
+    let (_, own) = get_own(&app, &seller.token).await;
+    assert_eq!(
+        usdt_fields(&own),
+        (json!(true), json!("ready"), Value::Null)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn listing_usdt_in_the_deployment_is_what_turns_the_offer_on(pool: PgPool) {
+    // Same seller, same Paykit answers: only the asset list differs.
+    for (config, offered) in [(usdt_config_btc_only(), false), (usdt_config(), true)] {
+        let paykit_pool = pool.clone();
+        let (app, paykit) =
+            test_app_with_paykit_api_config(paykit_pool, config, PaykitApi::Upstream).await;
+        let seller = new_actor(&app).await;
+        replay(
+            &paykit,
+            &seller.pubky,
+            "setup_status_usdt_dual",
+            "setup_status_authority_ready",
+        );
+        paykit.set_claimed(&seller.pubky);
+        put(
+            &app,
+            &seller.token,
+            &with(rails(true), "usdt_enabled", json!(true)),
+        )
+        .await;
+        assert_eq!(
+            get_public(&app, &seller.pubky).await["usdt_available"],
+            json!(offered)
+        );
+    }
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
