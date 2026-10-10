@@ -25,13 +25,31 @@ fn env_value(name: &str) -> Option<String> {
 }
 
 fn git_head() -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
+    track_git_head();
+    git(&["rev-parse", "HEAD"])
+}
+
+/// Rebuilds when HEAD moves: HEAD itself, the branch it points at, and
+/// packed-refs (where a packed branch lives).
+fn track_git_head() {
+    let mut paths = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        paths.push(branch);
+    }
+    for path in paths {
+        if let Some(file) = git(&["rev-parse", "--path-format=absolute", "--git-path", &path]) {
+            if std::path::Path::new(&file).exists() {
+                println!("cargo:rerun-if-changed={file}");
+            }
+        }
+    }
+}
+
+fn git(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let sha = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-    (!sha.is_empty()).then_some(sha)
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!value.is_empty()).then_some(value)
 }
