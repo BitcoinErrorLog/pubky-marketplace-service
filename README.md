@@ -196,7 +196,9 @@ the Paykit bind and refunds are separate slices.
   `orders.payment_asset`, `payment_network`, `payment_amount_minor`,
   `payment_exponent` and `payment_quote_basis` (migration 0053), all NULL
   unless the order is paid in USDT. They are distinct from
-  `orders.paykit_asset`, which is what a Paykit request is *denominated* in.
+  `orders.paykit_asset` (migration 0052; `BTC` on an upstream bind via
+  `PaymentAsset`, NULL on the fork), which is what a Paykit request is
+  *denominated* in.
   The order's `currency` and `total_minor` stay the price of record.
   Canonical option ids are `{method}.{asset}.{network}`:
   `paykit.btc.bitcoin`, `paykit.usdt.arbitrum-one`, `paypal.fiat`,

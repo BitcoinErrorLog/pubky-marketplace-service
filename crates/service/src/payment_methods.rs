@@ -47,7 +47,7 @@ use crate::handlers::{
     order_json_with_reviews,
 };
 use crate::model::{OrderRow, PaymentRow};
-use crate::payment_attempt::{MarketplaceAssets, PaymentOption};
+use crate::payment_attempt::{MarketplaceAssets, PaymentAsset, PaymentOption};
 use crate::payments::{
     attempt_reference, upstream_attempt_reference, upstream_operation_id, validate_paypal_email,
     validate_stripe_payment_link, validate_stripe_restricted_key, PaykitApi, PaykitClient,
@@ -1317,7 +1317,7 @@ pub async fn bind_payment_method(
                 None
             })
             .bind(if paykit.api() == PaykitApi::Upstream {
-                Some("BTC")
+                Some(PaymentAsset::Btc.as_str())
             } else {
                 None
             })
