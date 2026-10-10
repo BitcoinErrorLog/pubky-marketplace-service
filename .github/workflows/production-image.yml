@@ -80,6 +80,7 @@ jobs:
           docker buildx build \
             --file Dockerfile \
             --platform linux/amd64 \
+            --build-arg GIT_COMMIT="$SOURCE_SHA" \
             --label "org.opencontainers.image.revision=$SOURCE_SHA" \
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --tag "$IMAGE:sha-$SOURCE_SHA" \

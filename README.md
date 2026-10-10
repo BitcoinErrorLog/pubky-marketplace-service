@@ -477,7 +477,8 @@ Like the receipt attestation, every claim derives from stored rows, so
 repeated fetches by either participant return the byte-identical token and
 nothing is stored.
 
-Endpoints: `GET /health`, `GET /ready` (checks the database),
+Endpoints: `GET /health`, `GET /version` (name, crate version, commit and
+build time), `GET /ready` (checks the database),
 `POST /v1/auth/sessions`,
 `POST /v1/commands` (Bearer session required),
 the public drop projection `GET /v0/drops/{seller_pubky}/{drop_id}`
@@ -1337,6 +1338,9 @@ commands, exactly as in the engine.
 - Structured logs via `tracing`; log fields are command kind, command id,
   aggregate id, revision, and outcome code — no payload contents, no
   addresses, no message bodies.
-- `/health` is liveness; `/ready` verifies database connectivity.
+- `/health` is liveness; `/ready` verifies database connectivity;
+  `/version` reports the crate version, the commit (`GIT_COMMIT`, else
+  `RAILWAY_GIT_COMMIT_SHA`, else `git rev-parse HEAD`) and `BUILD_TIME`,
+  baked in at build time, each `unknown` when missing.
 - The worker runtime runs in-process; every drain is guarded by leases plus
   `FOR UPDATE SKIP LOCKED`, so multiple service instances are safe.

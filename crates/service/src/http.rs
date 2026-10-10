@@ -198,6 +198,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/version", get(version))
         .route("/ready", get(ready))
         .route(
             "/v1/auth/sessions",
@@ -265,6 +266,16 @@ async fn log_request(request: axum::extract::Request, next: middleware::Next) ->
 /// whether local pickup can be used on this deployment (the sealing key is
 /// configured AND sandbox payments are disabled, §A7); clients hide the
 /// pickup option everywhere when it is off.
+/// The build this process runs, baked in at compile time by `build.rs`.
+async fn version() -> Json<Value> {
+    Json(json!({
+        "name": "marketplace-service",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("MARKETPLACE_GIT_COMMIT"),
+        "built_at": env!("MARKETPLACE_BUILT_AT"),
+    }))
+}
+
 async fn health(State(state): State<AppState>) -> Json<Value> {
     let (bitcoin_offer_available, age_seconds) = state
         .payment_availability
