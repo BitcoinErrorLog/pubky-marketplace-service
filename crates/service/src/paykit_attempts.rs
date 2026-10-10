@@ -65,13 +65,15 @@ pub(crate) async fn record_released_attempt(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO paykit_superseded_attempts (order_id, invoice_id, reference, paykit_api, stack_id, \
-         stack_endpoint, total_sats, expires_at, prepare_expires_at, allocation_mode, \
+         stack_endpoint, payment_reference, operation_id, payment_window_seconds, asset, \
+         total_sats, expires_at, prepare_expires_at, allocation_mode, \
          address_fingerprint, bitcoin_quote_rate, bitcoin_quote_source, \
          bitcoin_quote_fetched_at, bitcoin_quoted_sats, bitcoin_quote_expires_at, \
          bitcoin_quote_currency, bitcoin_quote_exponent, bitcoin_quote_spread_bps, \
          released_at) \
          SELECT id, paykit_invoice_id, paykit_request_reference, paykit_api, paykit_stack_id, \
-         paykit_stack_endpoint, paykit_total_sats, paykit_expires_at, \
+         paykit_stack_endpoint, paykit_payment_reference, paykit_operation_id, \
+         paykit_payment_window_seconds, paykit_asset, paykit_total_sats, paykit_expires_at, \
          paykit_prepare_expires_at, paykit_allocation_mode, paykit_address_fingerprint, \
          bitcoin_quote_rate, bitcoin_quote_source, bitcoin_quote_fetched_at, \
          bitcoin_quoted_sats, bitcoin_quote_expires_at, bitcoin_quote_currency, \
@@ -217,7 +219,7 @@ async fn apply_attempt_status(
         "upstream" => PaykitApi::Upstream,
         _ => return Ok(false),
     };
-    match source
+    let outcome = source
         .status_for(
             &attempt.seller_pubky,
             &attempt.reference(),
@@ -226,8 +228,27 @@ async fn apply_attempt_status(
             attempt.expires_at,
         )
         .await
-        .0
-    {
+        .0;
+    let recovered_deadline = match &outcome {
+        PaykitStatusOutcome::Confirmed { facts, .. }
+        | PaykitStatusOutcome::AcceptancePending { facts }
+        | PaykitStatusOutcome::Detected { facts } => facts.payment_deadline,
+        _ => None,
+    };
+    if attempt.paykit_api == "upstream" && attempt.expires_at.is_none() {
+        if let Some(deadline) = recovered_deadline {
+            sqlx::query(
+                "UPDATE paykit_superseded_attempts SET expires_at = $3 \
+                 WHERE order_id = $1 AND invoice_id = $2 AND expires_at IS NULL",
+            )
+            .bind(attempt.order_id)
+            .bind(attempt.invoice_id)
+            .bind(deadline)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
+    match outcome {
         PaykitStatusOutcome::Confirmed {
             amount_matched,
             facts,
@@ -235,25 +256,22 @@ async fn apply_attempt_status(
             route_released_settlement(state, attempt, amount_matched, &facts.observation, now).await
         }
         PaykitStatusOutcome::AcceptancePending { facts } => {
-            if attempt.expires_at.is_some_and(|deadline| now >= deadline) {
+            if attempt
+                .expires_at
+                .or(facts.payment_deadline)
+                .is_some_and(|deadline| now >= deadline)
+            {
                 route_released_settlement(state, attempt, true, &facts.observation, now).await
             } else {
                 Ok(false)
             }
         }
-        PaykitStatusOutcome::ManualReview { observation, .. } => {
-            route_released_settlement(
-                state,
-                attempt,
-                false,
-                &observation.unwrap_or(PaykitObservation {
-                    txid: None,
-                    observed_sats: None,
-                    confirmations: None,
-                }),
-                now,
-            )
-            .await
+        PaykitStatusOutcome::ManualReview {
+            reason,
+            observation,
+        } => {
+            route_released_lifecycle_review(state, attempt, &reason, observation.as_ref(), now)
+                .await
         }
         PaykitStatusOutcome::Detected { facts } => {
             let observation = observation_json("detected", true, &facts.observation, now, false);
@@ -315,8 +333,12 @@ struct ReleasedPins {
     state: String,
     reference: Option<String>,
     paykit_api: String,
-    stack_id: String,
-    stack_endpoint: String,
+    stack_id: Option<String>,
+    stack_endpoint: Option<String>,
+    payment_reference: Option<Uuid>,
+    operation_id: Option<String>,
+    payment_window_seconds: Option<i32>,
+    asset: Option<String>,
     total_sats: i64,
     expires_at: Option<DateTime<Utc>>,
     prepare_expires_at: Option<DateTime<Utc>>,
@@ -330,6 +352,100 @@ struct ReleasedPins {
     bitcoin_quote_currency: Option<String>,
     bitcoin_quote_exponent: Option<i16>,
     bitcoin_quote_spread_bps: Option<i32>,
+}
+
+struct ReleasedIdentity {
+    stack_id: Option<String>,
+    stack_endpoint: Option<String>,
+    payment_reference: Option<Uuid>,
+    operation_id: Option<String>,
+    payment_window_seconds: Option<i32>,
+    asset: Option<String>,
+}
+
+impl ReleasedPins {
+    fn identity(&self) -> anyhow::Result<ReleasedIdentity> {
+        let valid = match self.paykit_api.as_str() {
+            "fork" => {
+                self.stack_id.is_some()
+                    && self.stack_endpoint.is_some()
+                    && self.payment_reference.is_none()
+                    && self.operation_id.is_none()
+                    && self.payment_window_seconds.is_none()
+                    && self.asset.is_none()
+            }
+            "upstream" => {
+                self.stack_id.is_none()
+                    && self.stack_endpoint.is_none()
+                    && self.payment_reference.is_some()
+                    && self
+                        .operation_id
+                        .as_ref()
+                        .is_some_and(|value| !value.is_empty())
+                    && self.payment_window_seconds.is_some_and(|value| value > 0)
+                    && self.asset.as_ref().is_some_and(|value| !value.is_empty())
+            }
+            _ => false,
+        };
+        if !valid {
+            anyhow::bail!(
+                "released attempt has invalid {} identity shape",
+                self.paykit_api
+            );
+        }
+        Ok(ReleasedIdentity {
+            stack_id: self.stack_id.clone(),
+            stack_endpoint: self.stack_endpoint.clone(),
+            payment_reference: self.payment_reference,
+            operation_id: self.operation_id.clone(),
+            payment_window_seconds: self.payment_window_seconds,
+            asset: self.asset.clone(),
+        })
+    }
+}
+
+async fn route_released_lifecycle_review(
+    state: &AppState,
+    attempt: &WatchedAttempt,
+    reason: &str,
+    observation: Option<&PaykitObservation>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    if attempt.paykit_api != "upstream" {
+        anyhow::bail!(
+            "released {} attempt returned an upstream lifecycle error",
+            attempt.paykit_api
+        );
+    }
+    let mut details = serde_json::json!({
+        "status": "lifecycle_error",
+        "reason": reason,
+        "observed_at": now,
+    });
+    if let Some(observation) = observation {
+        details["observation"] = serde_json::to_value(observation)?;
+    }
+    let updated = sqlx::query(
+        "UPDATE paykit_superseded_attempts SET state = 'needs_review', \
+         review_reason = 'upstream_inconsistent', observation = $3, closed_at = $4 \
+         WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching'",
+    )
+    .bind(attempt.order_id)
+    .bind(attempt.invoice_id)
+    .bind(&details)
+    .bind(now)
+    .execute(&state.pool)
+    .await?;
+    if updated.rows_affected() == 1 {
+        tracing::error!(
+            order_id = %attempt.order_id,
+            invoice_id = %attempt.invoice_id,
+            lifecycle_reason = reason,
+            code = "paykit_released_attempt_upstream_inconsistent",
+            "ALERT released paykit attempt has an invalid upstream lifecycle; held for review"
+        );
+    }
+    Ok(updated.rows_affected() == 1)
 }
 
 /// Confirmed money on a released attempt, in one transaction under the
@@ -361,7 +477,8 @@ async fn route_released_settlement(
         anyhow::bail!("released paykit attempt names a missing order");
     };
     let pins: Option<ReleasedPins> = sqlx::query_as(
-        "SELECT state, reference, paykit_api, stack_id, stack_endpoint, total_sats, expires_at, \
+        "SELECT state, reference, paykit_api, stack_id, stack_endpoint, payment_reference, \
+         operation_id, payment_window_seconds, asset, total_sats, expires_at, \
          prepare_expires_at, allocation_mode, address_fingerprint, bitcoin_quote_rate, \
          bitcoin_quote_source, bitcoin_quote_fetched_at, bitcoin_quoted_sats, \
          bitcoin_quote_expires_at, bitcoin_quote_currency, bitcoin_quote_exponent, \
@@ -376,6 +493,7 @@ async fn route_released_settlement(
         tx.rollback().await?;
         return Ok(false);
     };
+    let identity = pins.identity()?;
     let current_invoice = order.paykit_invoice_id;
     if current_invoice == Some(attempt.invoice_id) && order.paykit_request_state.is_some() {
         // The order poller tracks this invoice again.
@@ -440,14 +558,16 @@ async fn route_released_settlement(
          bitcoin_quote_spread_bps = $18, paykit_activation_state = 'active', \
          paykit_request_state = 'confirmed', paykit_delivery_state = NULL, \
          paykit_observation = $19, \
-         paykit_observed_sats = $20, paykit_seller_confirmation_entered_at = NULL, \
+         paykit_observed_sats = $20, paykit_payment_reference = $23, \
+         paykit_operation_id = $24, paykit_payment_window_seconds = $25, paykit_asset = $26, \
+         paykit_seller_confirmation_entered_at = NULL, \
          paykit_seller_confirmation_deadline = NULL, updated_at = $21 WHERE id = $1",
     )
     .bind(order.id)
     .bind(attempt.invoice_id)
     .bind(pins.reference.unwrap_or_else(|| attempt.reference()))
-    .bind(&pins.stack_id)
-    .bind(&pins.stack_endpoint)
+    .bind(&identity.stack_id)
+    .bind(&identity.stack_endpoint)
     .bind(pins.total_sats)
     .bind(pins.expires_at)
     .bind(pins.prepare_expires_at)
@@ -465,6 +585,10 @@ async fn route_released_settlement(
     .bind(observation.observed_sats.map(i64::try_from).transpose()?)
     .bind(now)
     .bind(&pins.paykit_api)
+    .bind(identity.payment_reference)
+    .bind(&identity.operation_id)
+    .bind(identity.payment_window_seconds)
+    .bind(&identity.asset)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -614,9 +738,9 @@ pub enum ReviewOutcome {
     /// reference. Allowed for every review reason.
     Refunded,
     /// No money was confirmed, so no refund is due; the note is the reason.
-    /// Allowed only for `detected_unconfirmed` (a detection that never
-    /// confirmed). Confirmed money (`payment_settled`, `other_rail`) is
-    /// closed only by a refund.
+    /// Allowed only when no money was confirmed: `detected_unconfirmed` or
+    /// `upstream_inconsistent`. Confirmed money (`payment_settled`,
+    /// `other_rail`) is closed only by a refund.
     Dismissed,
 }
 
@@ -671,7 +795,12 @@ pub async fn resolve_needs_review(
         tx.rollback().await?;
         return Ok(false);
     };
-    if outcome == ReviewOutcome::Dismissed && reason != "detected_unconfirmed" {
+    if outcome == ReviewOutcome::Dismissed
+        && !matches!(
+            reason.as_str(),
+            "detected_unconfirmed" | "upstream_inconsistent"
+        )
+    {
         tx.rollback().await?;
         anyhow::bail!(
             "{reason} is confirmed money the order did not take: it closes only as refunded \
@@ -682,7 +811,7 @@ pub async fn resolve_needs_review(
         "UPDATE paykit_superseded_attempts SET state = 'resolved', resolution_outcome = $3, \
          resolution_note = $4, resolved_by = $5, resolved_at = $6 \
          WHERE order_id = $1 AND invoice_id = $2 AND state = 'needs_review' \
-         AND ($3 = 'refunded' OR review_reason = 'detected_unconfirmed')",
+         AND ($3 = 'refunded' OR review_reason IN ('detected_unconfirmed', 'upstream_inconsistent'))",
     )
     .bind(order_id)
     .bind(invoice_id)

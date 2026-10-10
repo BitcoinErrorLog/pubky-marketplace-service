@@ -161,6 +161,7 @@ async fn fork_status_v2_bodies_parse_unchanged() {
                 facts: PaykitStatusFacts {
                     allocation_mode: "exclusive".to_string(),
                     late_settlement: false,
+                    payment_deadline: None,
                     observation: PaykitObservation {
                         txid: None,
                         observed_sats: None,
@@ -182,6 +183,7 @@ async fn fork_status_v2_bodies_parse_unchanged() {
             facts: PaykitStatusFacts {
                 allocation_mode: "shared_manual".to_string(),
                 late_settlement: true,
+                payment_deadline: None,
                 observation: PaykitObservation {
                     txid: None,
                     observed_sats: None,

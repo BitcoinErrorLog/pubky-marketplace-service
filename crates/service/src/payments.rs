@@ -741,6 +741,10 @@ pub struct PaykitObservation {
 pub struct PaykitStatusFacts {
     pub allocation_mode: String,
     pub late_settlement: bool,
+    /// Upstream's exact activated invoice deadline. Fork status does not
+    /// carry it. Used to re-pin a lost activation response before applying
+    /// later status.
+    pub payment_deadline: Option<chrono::DateTime<chrono::Utc>>,
     pub observation: PaykitObservation,
 }
 
@@ -1920,7 +1924,7 @@ impl PaykitClient {
         if body.state != "active"
             || body.activated_at.is_none()
             || body.payment_deadline.is_none()
-            || body.payment_deadline != expected_deadline
+            || expected_deadline.is_some_and(|deadline| body.payment_deadline != Some(deadline))
             || delivery.is_none()
         {
             return if matches!(body.state.as_str(), "prepared" | "voided")
@@ -1951,6 +1955,7 @@ impl PaykitClient {
             late_settlement: !bitcoin.paid_on_time
                 || !safe_request
                 || body.payment_state.as_deref() == Some("expired"),
+            payment_deadline: body.payment_deadline,
             observation: PaykitObservation {
                 txid: Some(bitcoin.txid),
                 observed_sats: Some(bitcoin.observed_sats),
@@ -2100,6 +2105,7 @@ impl PaykitClient {
         let facts = PaykitStatusFacts {
             allocation_mode,
             late_settlement: body.late_settlement,
+            payment_deadline: None,
             observation: PaykitObservation {
                 txid: body.txid,
                 observed_sats: body.observed_sats,

@@ -3380,6 +3380,7 @@ pub fn exclusive_facts() -> marketplace_service::payments::PaykitStatusFacts {
     marketplace_service::payments::PaykitStatusFacts {
         allocation_mode: "exclusive".to_string(),
         late_settlement: false,
+        payment_deadline: None,
         observation: Default::default(),
     }
 }

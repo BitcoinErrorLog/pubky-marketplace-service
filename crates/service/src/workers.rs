@@ -2741,6 +2741,25 @@ async fn apply_paykit_status_outcome(
             row.paykit_expires_at,
         )
         .await;
+    let recovered_deadline = match &outcome {
+        PaykitStatusOutcome::Confirmed { facts, .. }
+        | PaykitStatusOutcome::AcceptancePending { facts }
+        | PaykitStatusOutcome::Detected { facts } => facts.payment_deadline,
+        _ => None,
+    };
+    if row.paykit_api == "upstream" && row.paykit_expires_at.is_none() {
+        if let Some(deadline) = recovered_deadline {
+            sqlx::query(
+                "UPDATE orders SET paykit_expires_at = $3 WHERE id = $1 \
+                 AND paykit_invoice_id = $2 AND paykit_expires_at IS NULL",
+            )
+            .bind(row.id)
+            .bind(row.paykit_invoice_id)
+            .bind(deadline)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
     if let Some(delivery) = delivery {
         record_paykit_delivery(&state.pool, row, delivery).await?;
     }
@@ -2812,6 +2831,7 @@ async fn apply_paykit_status_outcome(
         PaykitStatusOutcome::AcceptancePending { facts } => {
             if row
                 .paykit_expires_at
+                .or(facts.payment_deadline)
                 .is_some_and(|deadline| now >= deadline)
             {
                 tracing::error!(

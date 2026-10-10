@@ -23,6 +23,7 @@ A released invoice can still receive money, for example when an activation commi
 - `payment_settled`: money confirmed on a released attempt after the order's payment was already confirmed, resolved, or under review. The buyer paid twice.
 - `other_rail`: money confirmed on a released Bitcoin attempt while another rail owns the payment: the order is bound to Stripe or PayPal, or the payment is managed by Locks (or any adapter other than `paykit` or `sandbox`). The order and payment are left untouched.
 - `detected_unconfirmed`: money was detected on the released attempt but did not confirm within 7 days.
+- `upstream_inconsistent`: upstream reported a recovery-required or invalid lifecycle instead of a Bitcoin observation. No settlement is inferred; the order and payment are left untouched.
 
 ## Polling cadence
 
@@ -33,6 +34,7 @@ A released attempt is first checked on the next Paykit poll pass. After each che
 - `ALERT money detected on a released paykit attempt`: a detection was recorded. No action yet.
 - `ALERT money confirmed on a released paykit attempt …` (`code=paykit_released_attempt_paid_after_settlement`): a `payment_settled` or `other_rail` entry was created.
 - `ALERT money detected on a released paykit attempt never confirmed` (`code=paykit_released_attempt_detected_unconfirmed`).
+- `ALERT released paykit attempt has an invalid upstream lifecycle` (`code=paykit_released_attempt_upstream_inconsistent`).
 
 ## Operator path
 
@@ -48,17 +50,18 @@ cargo run -p marketplace-service --bin paykit-attempts-admin -- list
 PAYKIT_ADMIN_OPERATOR=<operator> cargo run -p marketplace-service --bin paykit-attempts-admin -- \
   resolve <order_id> <invoice_id> refunded '<refund reference>'
 
-# detected_unconfirmed only: no money was confirmed (the detected transaction
-# was dropped or replaced), so no refund is due. Refused for payment_settled
-# and other_rail, which close only as refunded.
+# detected_unconfirmed or upstream_inconsistent only: no money was confirmed,
+# so no refund is due. Refused for payment_settled and other_rail, which close
+# only as refunded.
 PAYKIT_ADMIN_OPERATOR=<operator> cargo run -p marketplace-service --bin paykit-attempts-admin -- \
   resolve <order_id> <invoice_id> dismissed '<reason>'
 ```
 
 For each entry:
 
-1. Read the frozen observation (`txid`, `observed_sats`) and confirm the transaction on-chain against the invoice total.
+1. Read the persisted evidence. Money reasons carry a frozen observation (`txid`, `observed_sats`) to confirm on-chain against the invoice total; `upstream_inconsistent` carries the exact lifecycle reason instead.
 2. `payment_settled` and `other_rail`: the seller holds funds the order cannot take. Ask the seller to return them to the buyer, then record the refund reference.
 3. `detected_unconfirmed`: if the transaction was dropped or replaced, dismiss with the reason. If it has since confirmed, the buyer's money is real: have the seller refund it and resolve as `refunded` with the reference.
+4. `upstream_inconsistent`: inspect the persisted lifecycle reason and upstream state. If no money exists, dismiss with the operator finding; if money exists, refund it before resolving as `refunded`.
 
 A resolution is recorded once. Resolving an entry that is not waiting for review fails, and the row is left unchanged. `dismissed` is refused for `payment_settled` and `other_rail`, which close only as `refunded`; the database enforces the same rule.
