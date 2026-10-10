@@ -151,6 +151,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/notifications", get(queries::list_notifications))
         .route("/v1/me/priv-keys", get(crate::priv_keys::get_own_priv_keys))
         .route(
+            "/v1/me/priv-keys/release",
+            post(crate::priv_keys::release_own_priv_keys),
+        )
+        .route(
             "/v0/sellers/me/payment-config",
             put(crate::payment_methods::put_payment_config)
                 .get(crate::payment_methods::get_own_payment_config),
