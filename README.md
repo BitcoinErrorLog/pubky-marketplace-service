@@ -997,6 +997,15 @@ advance a payment (ADR-0019 §7).
   window IS the hold window. It flips the payment to the `locks` adapter,
   which permanently refuses `payment.sandbox_advance`, and does **not**
   advance the payment state.
+- **Lock resources.** A listing's `digitalLock.policyUri` is
+  `[pubky://]<creator><prefix><LOCK_ID>.json`, where `<prefix>` is the
+  fork's `/pub/locks.app/` or upstream Locks v0.1.0-rc10's
+  `/pub/app.locks/` (pubky/locks#50). The service stores the resource
+  under the prefix it was given and fetches the lock document from the
+  seller's homeserver at that path; it never mints a path of its own, so
+  the prefix needs no setting. The lock id is the content address and the
+  lookup HMAC covers `{creator, bundle_id}` only, so neither depends on
+  the prefix.
 - **Correlation secrecy.** The bundle id is stored only as
   XChaCha20-Poly1305 ciphertext (random 24-byte nonce, payment id as
   associated data, so ciphertexts cannot be transplanted between rows);
