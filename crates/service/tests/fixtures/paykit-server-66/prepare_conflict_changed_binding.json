@@ -1,0 +1,17 @@
+{
+  "description": "The same operation id with a different amount: a changed binding",
+  "name": "prepare_conflict_changed_binding",
+  "request": {
+    "body": "{\"amount_sats\":120001,\"creator\":\"pubkyfakhefh31c9ykt7q31wxpch4t7gu58p8apo4h8rwjcxqug4hikno\",\"operation_id\":\"marketplace-payment:RCSYZPCY72B6PT0HDQ7SR225NC:1\",\"payment_window_seconds\":1800,\"reader\":\"pubky1sr9wqk4pok3ikbrzgy4hep8cykeifhpqk9izb13ezo86ey4wzuo\",\"reference\":\"a59ea622-851b-4eab-b7dc-0e5da7f73cea\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "9pnyN6bgNCVSoi5WOAdjMPqMU7etuwx33p0mDhJs_b8UwQqGQrExc-M1qTJD0HnBoGEX3o4cY04diDL8OYW7Bw"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"operation_conflict\",\"message\":\"operation binding conflicts with persisted payment state\"}}",
+    "content_type": "application/json",
+    "status": 409
+  },
+  "sent_at": "2026-10-09T14:30:43.850936538Z",
+  "server_revision": "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8"
+}

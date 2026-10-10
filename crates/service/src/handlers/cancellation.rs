@@ -42,6 +42,7 @@ use crate::executor::insert_event;
 use crate::handlers::holds::{release_lines, HeldQuantity};
 use crate::handlers::{fetch_order_for_update, finish_order_action, guard_order_action};
 use crate::model::OrderRow;
+use crate::payment_attempt::PreparedAttempt;
 use crate::queries::ORDER_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult};
 
@@ -306,6 +307,13 @@ async fn end_paykit_request(
         order.paykit_stack_id.clone(),
         order.paykit_stack_endpoint.clone(),
     ) else {
+        // An attempt prepared through the upstream API is unpublished:
+        // paykit-server holds no invoice for it, so there is nothing to void
+        // there and the release is local.
+        if PreparedAttempt::load(tx, order.id).await?.is_some() {
+            void_preparing_request(tx, order.id, now).await?;
+            return Ok(None);
+        }
         tracing::error!(
             order_id = %order.id,
             "ALERT a preparing order is missing its persisted paykit pin at cancel"

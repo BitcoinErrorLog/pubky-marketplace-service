@@ -1,0 +1,17 @@
+{
+  "description": "A new preparation that commits after the 2 second request deadline (composed service): the caller is told `dependency_timeout` although the commit is durable",
+  "name": "prepare_deadline_exceeded",
+  "request": {
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyfpmeakmsx7xou5a1574kazxbs8dfzbcfpcez8cg1do38rrctkbgo\",\"operation_id\":\"marketplace-payment:A4BE7TBKJJ7W8W2FQMSP8SXETM:12\",\"payment_window_seconds\":1800,\"reader\":\"pubky1sr9wqk4pok3ikbrzgy4hep8cykeifhpqk9izb13ezo86ey4wzuo\",\"reference\":\"9264467f-5630-4c27-8c9f-25d80f8f1262\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "VHYuHI10_EdSC0cVo4It0pccVnxHVa0g1Ac2h41hGG2OJkj_PluefGldhdx_VLTcpGuq5SQ2XpMyNBVZ8XrvCA"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"dependency_timeout\",\"message\":\"request deadline exceeded\"}}",
+    "content_type": "application/json",
+    "status": 503
+  },
+  "sent_at": "2026-10-09T14:30:51.177452261Z",
+  "server_revision": "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8"
+}

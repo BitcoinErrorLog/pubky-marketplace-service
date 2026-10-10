@@ -1,0 +1,17 @@
+{
+  "description": "The next bind attempt of the same order: a new operation id and reference give a new invoice",
+  "name": "prepare_next_attempt",
+  "request": {
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyfakhefh31c9ykt7q31wxpch4t7gu58p8apo4h8rwjcxqug4hikno\",\"operation_id\":\"marketplace-payment:EE8WX4Q06YB336B18BSGRGMBDC:2\",\"payment_window_seconds\":1800,\"reader\":\"pubky1sr9wqk4pok3ikbrzgy4hep8cykeifhpqk9izb13ezo86ey4wzuo\",\"reference\":\"8bc53a6c-f1fc-47b1-b1ea-092fec966977\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "H6Ds6w2n2cKPp8A51mdxlFbBLiU1kFF8rzg5GSTdXwfybXuErCezUOiRDHtFHZkQhu3n-BNBslG1FCVHcbs4DA"
+  },
+  "response": {
+    "body": "{\"invoice_id\":\"6f675d67-0cea-42d6-ac47-929106a59963\",\"state\":\"prepared\",\"total_sats\":120000,\"prepare_expires_at\":\"2026-10-09T14:45:43.914166Z\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T14:30:43.859957159Z",
+  "server_revision": "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8"
+}

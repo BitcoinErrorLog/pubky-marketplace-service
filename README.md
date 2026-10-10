@@ -181,10 +181,64 @@ true, and a 503 is an outage).
 Flipping the setting is a deployment step: register the service's public key
 in the upstream allowlist first, then set `PAYKIT_SERVER_API=upstream` and
 repoint `PAYKIT_SERVER_URL`; setting it back to `fork` (or unsetting it) and
-repointing is the rollback. Upstream does not serve the payment-request
-lifecycle routes (prepare, activate, void, resolve) yet, so with `upstream`
-a Bitcoin bind answers `paykit_unavailable` until those land. PayPal and
-Stripe are not affected.
+repointing is the rollback. PayPal and Stripe are not affected.
+
+#### Bitcoin bind on `upstream`: the prepare slice
+
+With `upstream` the Bitcoin bind prepares an unpublished payment request with
+the signed `POST /marketplace/payment-requests/prepare`
+(`pubky/paykit-server` #66, issue #26 "Marketplace lifecycle contract
+decisions"). Only preparation is served so far: activation, void, resolve and
+a status lookup by `invoice_id` land in later slices, so **an order bound on
+`upstream` is not yet payable**. It stays `preparing` until its hold expires
+or the buyer cancels, and nothing is queued for activation. Keep
+`PAYKIT_SERVER_API=fork` for real Bitcoin sales until the activation slice
+ships.
+
+| | `fork` | `upstream` |
+| --- | --- | --- |
+| Route | `POST /v0/payment-requests` | `POST /marketplace/payment-requests/prepare` |
+| Operation | `idempotency_key` = `{reference}:{attempt}` | `operation_id` = `marketplace-payment:{attempt_reference}:{attempt}` |
+| `reference` | the 26-character Crockford `attempt_reference` | a UUIDv4 derived from the order id and the attempt (`payment_attempt::payment_reference`), persisted in `orders.paykit_payment_reference` |
+| Time bound sent | `expires_at`, the hold deadline, echoed back and compared | `payment_window_seconds`, the remaining hold rounded up (a duration that starts at activation); no deadline is sent or checked |
+| Answer | `invoice_id`, `state`, `stack_id`, `allocation_mode`, `nonce_sats`, `total_sats`, `expires_at`, `prepare_expires_at`, `derived_address_fingerprint` | `invoice_id`, `state`, `total_sats`, `prepare_expires_at`, nothing else |
+| Total | `total_sats = amount_sats + nonce_sats` | `total_sats = amount_sats` |
+| Pins written | stack id and endpoint, allocation mode, fingerprint | none of those; the attempt columns instead (migration 0052) |
+| Activation | `paykit.activate` outbox row in the bind transaction | none yet |
+
+The attempt's activation deadline is the server's `prepare_expires_at`
+(15 minutes on its database clock by default), stored in
+`orders.paykit_prepare_expires_at`; an answer whose deadline already passed
+refuses the bind. `orders.paykit_asset` records what the attempt is
+denominated in (`BTC`); a later asset needs no migration, and a stored asset
+this build does not know is refused rather than read as Bitcoin. A prepared
+attempt leaves nothing at paykit-server (no invoice, no outbox row), so a
+buyer cancel or the hold expiring releases it locally with no Paykit call.
+
+Refusals map as follows; a refused bind leaves the order unbound and releases
+its hold:
+
+| paykit-server | bind answer |
+| --- | --- |
+| `409 operation_conflict` (a changed binding: a bug here, alerted) | `paykit_rejected` |
+| `400 invalid_request` (malformed request or over-cap window) | `paykit_rejected` |
+| `409 creator_session_invalid`, `503 seller_setup_pending` (the seller has no Bitcoin receiving details) | `seller_account_unclaimed`, the outcome the fork gives a seller without a claimed account |
+| `409 reader_not_payable` | `buyer_paykit_wallet_required` |
+| `503 reader_setup_pending` | `buyer_paykit_wallet_setup_needed` |
+| `401 invalid_signature` (the key is not in `trusted_public_keys`; alerted) | `paykit_unavailable` |
+| `503 creator_session_unavailable`, `dependency_unavailable`, `dependency_timeout`, `reader_registry_unavailable`; `502 reader_registry_malformed`; `429 rate_limited`; anything else (including the retired `409 conflict`) | `paykit_unavailable` |
+| a `200` that is not the closed answer, or whose `total_sats` is not the amount | `paykit_rejected`, `paykit_total_inconsistent` |
+
+`dependency_timeout` means the request outlived paykit-server's 15-second
+deadline and the preparation may still have committed. That is harmless: it is
+unpublished and lapses at its activation deadline. The service does not retry
+the attempt (its client also gives up at 10 seconds); the buyer's next bind
+reserves the next attempt and prepares a new operation. An exact retry of the
+same operation would replay the late commit, which the fixtures and tests pin.
+
+The contract tests replay exchanges captured from a real paykit-server at
+`f9079d5` (`crates/service/tests/fixtures/paykit-server-66/`; its
+`capture/README.md` says how they were captured).
 
 ### Address autocomplete proxy
 

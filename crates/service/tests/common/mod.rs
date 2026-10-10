@@ -5,6 +5,8 @@
 
 pub mod fx_feed;
 pub mod paykit_review;
+pub mod paykit_server_66;
+pub mod paykit_upstream_prepare;
 
 use std::sync::Arc;
 
@@ -2041,6 +2043,8 @@ struct FakePaykitState {
     setup_status_failure: Option<u16>,
     /// Body served verbatim instead of the scripted status, when forced.
     setup_status_body: Option<Value>,
+    /// The upstream `prepare` route: stored operations and test knobs.
+    prepare: paykit_upstream_prepare::PrepareState,
 }
 
 /// A local paykit-server double serving the fork's marketplace surface
@@ -3010,6 +3014,7 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         setup_statuses: HashMap::new(),
         setup_status_failure: None,
         setup_status_body: None,
+        prepare: Default::default(),
     }));
     let router = Router::new()
         .route("/health/ready", axum::routing::get(serve_paykit_health))
@@ -3024,6 +3029,10 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         .route(
             "/v0/payment-requests",
             axum::routing::post(serve_paykit_payment_request),
+        )
+        .route(
+            "/marketplace/payment-requests/prepare",
+            axum::routing::post(paykit_upstream_prepare::serve_upstream_prepare),
         )
         .route(
             "/v0/payment-requests/{invoice_id}/activate",

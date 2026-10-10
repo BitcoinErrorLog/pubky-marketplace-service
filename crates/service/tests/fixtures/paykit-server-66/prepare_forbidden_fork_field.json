@@ -1,0 +1,17 @@
+{
+  "description": "A fork-only field (`stack_id`): the closed schema refuses it",
+  "name": "prepare_forbidden_fork_field",
+  "request": {
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyfakhefh31c9ykt7q31wxpch4t7gu58p8apo4h8rwjcxqug4hikno\",\"operation_id\":\"marketplace-payment:PN6HTAKG6ZYMB7V9CM3MZA4S88:6\",\"payment_window_seconds\":1800,\"reader\":\"pubky1sr9wqk4pok3ikbrzgy4hep8cykeifhpqk9izb13ezo86ey4wzuo\",\"reference\":\"a85bcf96-2bbc-4977-ba78-ee1d2ef07805\",\"stack_id\":\"stack-1\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "hbjUlszlOy5I0mk728Ndp-t-eENfPAfEooihk0Ch3Zk91ajDy9sS4kjOa0Ubu5wO72TvDnIk7puas6Z_x5gXDA"
+  },
+  "response": {
+    "body": "{\"error\":{\"code\":\"invalid_request\",\"message\":\"request is invalid\"}}",
+    "content_type": "application/json",
+    "status": 400
+  },
+  "sent_at": "2026-10-09T14:30:43.945547501Z",
+  "server_revision": "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8"
+}

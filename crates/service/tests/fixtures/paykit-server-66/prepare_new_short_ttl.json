@@ -1,0 +1,17 @@
+{
+  "description": "A preparation on a server configured with `marketplace_prepare_ttl = \"1s\"`",
+  "name": "prepare_new_short_ttl",
+  "request": {
+    "body": "{\"amount_sats\":120000,\"creator\":\"pubkyksruwog8ib4kpg1z9sam3w1z6683aerisczywstygy9ui3ritxto\",\"operation_id\":\"marketplace-payment:YWFA349J8GCG6RYXSNS2S007NC:11\",\"payment_window_seconds\":1800,\"reader\":\"pubky1sr9wqk4pok3ikbrzgy4hep8cykeifhpqk9izb13ezo86ey4wzuo\",\"reference\":\"22ee0e87-c16a-419c-b92b-8c39958b30fe\"}",
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "signature": "-M2ntURhBh675d2sQaIe0XLLTMWeefw4VN6z76azZMgkWYhfzo2b8_16w2iAUJJVAcU88jl3P210_6eH0UjZDw"
+  },
+  "response": {
+    "body": "{\"invoice_id\":\"2cd5aa62-8d2b-4d7c-96cf-22e27962e7f7\",\"state\":\"prepared\",\"total_sats\":120000,\"prepare_expires_at\":\"2026-10-09T14:30:47.491986Z\"}",
+    "content_type": "application/json",
+    "status": 200
+  },
+  "sent_at": "2026-10-09T14:30:46.435221704Z",
+  "server_revision": "f9079d50424f31ff0a7ca3df3a12ddc43c398ea8"
+}
