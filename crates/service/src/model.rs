@@ -714,6 +714,17 @@ pub struct OrderRow {
     pub updated_at: DateTime<Utc>,
     pub offer_award_id: Option<Uuid>,
     pub priced_from: String,
+    /// What the buyer sends, and where it settles (`USDT`,
+    /// `arbitrum-one`): NULL for every order that is not paid in USDT. The
+    /// five `payment_*` columns are all set or all NULL. The order's
+    /// `currency` and `total_minor` stay the price of record.
+    pub payment_asset: Option<String>,
+    pub payment_network: Option<String>,
+    /// The amount sent, in units of `10^-payment_exponent`.
+    pub payment_amount_minor: Option<i64>,
+    pub payment_exponent: Option<i16>,
+    /// How the amount was derived from the price (`parity`).
+    pub payment_quote_basis: Option<String>,
 }
 
 impl std::fmt::Debug for OrderRow {
@@ -807,6 +818,11 @@ impl std::fmt::Debug for OrderRow {
             .field("updated_at", &self.updated_at)
             .field("offer_award_id", &self.offer_award_id)
             .field("priced_from", &self.priced_from)
+            .field("payment_asset", &self.payment_asset)
+            .field("payment_network", &self.payment_network)
+            .field("payment_amount_minor", &self.payment_amount_minor)
+            .field("payment_exponent", &self.payment_exponent)
+            .field("payment_quote_basis", &self.payment_quote_basis)
             .finish()
     }
 }
@@ -910,6 +926,11 @@ impl OrderRow {
             updated_at: now,
             offer_award_id: None,
             priced_from,
+            payment_asset: None,
+            payment_network: None,
+            payment_amount_minor: None,
+            payment_exponent: None,
+            payment_quote_basis: None,
         }
     }
 
@@ -1146,6 +1167,22 @@ impl OrderRow {
             .paykit_total_sats
             .map(|amount| money_json(amount, "SAT", 0))
             .into();
+        // Only an order that carries asset terms (USDT) names them, so the
+        // projection of every other order is byte-identical to a build
+        // without them, whatever the USDT flag says.
+        if let (Some(asset), Some(network), Some(amount), Some(exponent), Some(basis)) = (
+            &self.payment_asset,
+            &self.payment_network,
+            self.payment_amount_minor,
+            self.payment_exponent,
+            &self.payment_quote_basis,
+        ) {
+            view["payment_asset"] = json!(asset);
+            view["payment_network"] = json!(network);
+            view["payment_amount_minor"] = json!(amount);
+            view["payment_exponent"] = json!(exponent);
+            view["payment_quote_basis"] = json!(basis);
+        }
         view
     }
 }

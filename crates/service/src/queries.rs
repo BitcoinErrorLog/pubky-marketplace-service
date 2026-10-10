@@ -74,7 +74,9 @@ pub const ORDER_COLUMNS: &str =
      paykit_address_fingerprint, paykit_bind_attempt, paykit_activation_state, \
      paykit_observation, paykit_seller_confirmation_entered_at, \
      paykit_seller_confirmation_deadline, \
-     fulfillment, first_revealed_at, created_at, updated_at, offer_award_id, priced_from";
+     fulfillment, first_revealed_at, created_at, updated_at, offer_award_id, priced_from, \
+     payment_asset, payment_network, payment_amount_minor, payment_exponent, \
+     payment_quote_basis";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
      state, confirmations, amount_minor, currency, exponent, \

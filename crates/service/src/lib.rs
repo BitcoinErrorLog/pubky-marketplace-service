@@ -34,6 +34,7 @@ pub(crate) mod logging;
 pub mod migrations;
 pub mod model;
 pub mod paykit_attempts;
+pub mod payment_attempt;
 pub mod payment_availability;
 pub mod payment_methods;
 pub mod payments;
