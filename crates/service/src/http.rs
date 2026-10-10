@@ -262,10 +262,6 @@ async fn log_request(request: axum::extract::Request, next: middleware::Next) ->
     response
 }
 
-/// Public health/capability surface. `pickup_available` tells clients
-/// whether local pickup can be used on this deployment (the sealing key is
-/// configured AND sandbox payments are disabled, §A7); clients hide the
-/// pickup option everywhere when it is off.
 /// The build this process runs, baked in at compile time by `build.rs`.
 async fn version() -> Json<Value> {
     Json(json!({
@@ -276,6 +272,10 @@ async fn version() -> Json<Value> {
     }))
 }
 
+/// Public health/capability surface. `pickup_available` tells clients
+/// whether local pickup can be used on this deployment (the sealing key is
+/// configured AND sandbox payments are disabled, §A7); clients hide the
+/// pickup option everywhere when it is off.
 async fn health(State(state): State<AppState>) -> Json<Value> {
     let (bitcoin_offer_available, age_seconds) = state
         .payment_availability
