@@ -667,8 +667,31 @@ pub struct PrepareLocksPayload {
     pub payment_id: Uuid,
 }
 
-/// The Locks content-lock path prefix inside a pubky lock resource.
+/// The Locks content-lock path prefix inside a pubky lock resource, as the
+/// fork's Locks writes it.
 pub const LOCKS_CONTENT_LOCK_PREFIX: &str = "/pub/locks.app/";
+
+/// The content-lock path prefix upstream Locks writes from v0.1.0-rc10
+/// (`pubky/locks#50`, `locks-core/src/ids.rs` `CONTENT_LOCK_PREFIX`).
+pub const UPSTREAM_LOCKS_CONTENT_LOCK_PREFIX: &str = "/pub/app.locks/";
+
+/// Every content-lock path prefix a lock resource may carry. A resource
+/// keeps the prefix it was written with: the seller's homeserver serves the
+/// lock document only there.
+pub const LOCKS_CONTENT_LOCK_PREFIXES: [&str; 2] = [
+    LOCKS_CONTENT_LOCK_PREFIX,
+    UPSTREAM_LOCKS_CONTENT_LOCK_PREFIX,
+];
+
+/// Splits a bare lock resource into its creator, its content-lock prefix
+/// (one of [`LOCKS_CONTENT_LOCK_PREFIXES`]) and the rest of the path.
+/// Performs no validation of the creator or the rest.
+pub fn split_lock_resource(resource: &str) -> Option<(&str, &'static str, &str)> {
+    LOCKS_CONTENT_LOCK_PREFIXES.iter().find_map(|prefix| {
+        let (creator, path) = resource.split_once(prefix)?;
+        Some((creator, *prefix, path))
+    })
+}
 
 /// The exact `pubky://` URL scheme the Shop client prefixes to a Locks
 /// policy URI (`digitalLock.policyUri`). Only this exact, case-sensitive
@@ -678,7 +701,8 @@ pub const LOCKS_CONTENT_LOCK_PREFIX: &str = "/pub/locks.app/";
 pub const PUBKY_RESOURCE_SCHEME: &str = "pubky://";
 
 /// Canonicalizes an addressed lock resource to the bare form
-/// `<creator>/pub/locks.app/<LOCK_ID>.json`: strips an optional leading
+/// `<creator><prefix><LOCK_ID>.json`, where `<prefix>` is either of
+/// [`LOCKS_CONTENT_LOCK_PREFIXES`] and is kept as given: strips an optional leading
 /// [`PUBKY_RESOURCE_SCHEME`], requires the remainder to name a valid pubky
 /// creator and a 52-character Crockford lock id that decodes to exactly 32
 /// bytes, and renders the id in canonical UPPERCASE Crockford (a lowercase
@@ -687,18 +711,15 @@ pub fn canonical_lock_resource(resource: &str) -> Option<String> {
     let resource = resource
         .strip_prefix(PUBKY_RESOURCE_SCHEME)
         .unwrap_or(resource);
-    let (creator, path) = resource.split_at(resource.find(LOCKS_CONTENT_LOCK_PREFIX)?);
-    let lock_id = path
-        .strip_prefix(LOCKS_CONTENT_LOCK_PREFIX)?
-        .strip_suffix(".json")?
-        .to_ascii_uppercase();
+    let (creator, prefix, path) = split_lock_resource(resource)?;
+    let lock_id = path.strip_suffix(".json")?.to_ascii_uppercase();
     if !(is_valid_pubky(creator) && crockford_id_regex_52().is_match(&lock_id)) {
         return None;
     }
     let decoded = base32::decode(base32::Alphabet::Crockford, &lock_id)
         .filter(|decoded| decoded.len() == 32)?;
     Some(format!(
-        "{creator}{LOCKS_CONTENT_LOCK_PREFIX}{}.json",
+        "{creator}{prefix}{}.json",
         base32::encode(base32::Alphabet::Crockford, &decoded)
     ))
 }
@@ -1488,7 +1509,7 @@ fn validate_listing_payload(
     }
     if let Some(lock) = &mut payload.digital_lock {
         // Persist only the canonical bare form: a Shop-authored
-        // `pubky://<creator>/pub/locks.app/<id>.json` policy URI and its
+        // `pubky://<creator>/pub/app.locks/<id>.json` policy URI and its
         // bare spelling are the SAME lock, so validation normalizes the
         // payload before it is bound to SQL and change detection always
         // compares canonical against canonical.
@@ -3329,6 +3350,18 @@ mod tests {
     }
 
     #[test]
+    fn lock_resource_keeps_either_content_lock_prefix() {
+        for prefix in LOCKS_CONTENT_LOCK_PREFIXES {
+            let bare = bare_lock_resource().replace(LOCKS_CONTENT_LOCK_PREFIX, prefix);
+            assert_eq!(
+                canonical_lock_resource(&format!("{PUBKY_RESOURCE_SCHEME}{bare}")).as_deref(),
+                Some(bare.as_str()),
+                "{prefix} resources canonicalize under their own prefix"
+            );
+        }
+    }
+
+    #[test]
     fn canonical_lock_resource_uppercases_a_lowercase_lock_id() {
         let bare = bare_lock_resource();
         let lowercase = bare.replace(LOCK_ID, &LOCK_ID.to_ascii_lowercase());
@@ -3354,8 +3387,9 @@ mod tests {
             // Embedded whitespace anywhere invalidates the resource.
             bare.replacen(LOCKS_CONTENT_LOCK_PREFIX, " /pub/locks.app/", 1),
             format!("{bare} "),
-            // A path other than `/pub/locks.app/`.
+            // A path other than `/pub/locks.app/` or `/pub/app.locks/`.
             bare.replace(LOCKS_CONTENT_LOCK_PREFIX, "/pub/other.app/"),
+            bare.replace(LOCKS_CONTENT_LOCK_PREFIX, "/pub/app.locks/content/"),
             // An id that is not 52 Crockford characters.
             bare.replace(LOCK_ID, &LOCK_ID[..51]),
             bare.replace(LOCK_ID, &format!("{LOCK_ID}0")),
