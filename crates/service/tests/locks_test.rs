@@ -14,6 +14,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
+use marketplace_domain::commands::{LOCKS_CONTENT_LOCK_PREFIX, UPSTREAM_LOCKS_CONTENT_LOCK_PREFIX};
 use marketplace_service::clock::{AdjustableClock, Clock};
 use marketplace_service::config::Config;
 use marketplace_service::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
@@ -3115,11 +3116,38 @@ async fn denominated_locks_order(
     lock_asset: &str,
     lock_amount: Option<i64>,
 ) -> (TestApp, TestActor, PendingOrder, i64) {
+    denominated_locks_order_under(
+        pool,
+        LOCKS_CONTENT_LOCK_PREFIX,
+        currency,
+        exponent,
+        unit_minor,
+        lock_asset,
+        lock_amount,
+    )
+    .await
+}
+
+/// [`denominated_locks_order`] with the seller's lock published, and its
+/// policy URI written, under the content-lock `prefix`.
+async fn denominated_locks_order_under(
+    pool: PgPool,
+    prefix: &str,
+    currency: &str,
+    exponent: i32,
+    unit_minor: i64,
+    lock_asset: &str,
+    lock_amount: Option<i64>,
+) -> (TestApp, TestActor, PendingOrder, i64) {
     let total = unit_minor + DENOMINATED_SHIPPING_MINOR;
     let lock_amount = lock_amount.unwrap_or(total);
     let seller_key = common::random_keypair();
     let seller_pubky = seller_key.1.clone();
-    let resource = lock_resource_for_payment(&seller_pubky, lock_amount, lock_asset);
+    let resource = lock_resource_for_payment(&seller_pubky, lock_amount, lock_asset).replacen(
+        LOCKS_CONTENT_LOCK_PREFIX,
+        prefix,
+        1,
+    );
     let path = resource
         .strip_prefix(&seller_pubky)
         .expect("creator prefixes resource")
@@ -3258,6 +3286,24 @@ async fn prepare_accepts_a_usd2_listing_with_a_usd_lock(pool: PgPool) {
     let (app, buyer, order, total) =
         denominated_locks_order(pool, "USD", 2, 12_500, "USD", None).await;
     assert_eq!(total, 13_700);
+    assert_prepare_accepts(&app, &buyer, &order, "USD", 2, total).await;
+}
+
+// Upstream Locks v0.1.0-rc10 publishes content locks under `/pub/app.locks/`
+// (pubky/locks#50). Prepare accepts that resource and fetches the document
+// there: the scripted homeserver serves it at no other path.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_accepts_a_lock_published_under_the_upstream_prefix(pool: PgPool) {
+    let (app, buyer, order, total) = denominated_locks_order_under(
+        pool,
+        UPSTREAM_LOCKS_CONTENT_LOCK_PREFIX,
+        "USD",
+        2,
+        12_500,
+        "USD",
+        None,
+    )
+    .await;
     assert_prepare_accepts(&app, &buyer, &order, "USD", 2, total).await;
 }
 

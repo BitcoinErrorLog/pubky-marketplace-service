@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use base32::Alphabet;
 use chrono::{DateTime, FixedOffset};
-use marketplace_domain::commands::{canonical_lock_resource, LOCKS_CONTENT_LOCK_PREFIX};
+use marketplace_domain::commands::{canonical_lock_resource, split_lock_resource};
 use pubky_common::crypto::PublicKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -268,13 +268,6 @@ impl ContentLock {
         ))
     }
 
-    /// Mirrors `pubky/locks@ba49a777:locks-core/src/lock_policy.rs:211-214`
-    /// (`content_lock_path`) and `locks-core/src/ids.rs:329-358`
-    /// (`ContentLockPath` display): `/pub/locks.app/<lock_id>.json`.
-    pub fn content_lock_path(&self) -> Option<String> {
-        Some(format!("/pub/locks.app/{}.json", self.lock_id()?))
-    }
-
     /// Mirrors
     /// `pubky/locks@ba49a777:locks-core/src/lock_policy.rs:146-188`
     /// (`validate_paykit_payment_v1_policy`): when any criterion is
@@ -396,7 +389,8 @@ fn validate_paykit_payment_params(params: &Value) -> Result<(), PaykitPaymentPar
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentLockIdentityRejection {
     /// The advertised resource itself is not a canonical
-    /// `pubky<creator>/pub/locks.app/<lock_id>.json`.
+    /// `pubky<creator>/pub/locks.app/<lock_id>.json` or
+    /// `pubky<creator>/pub/app.locks/<lock_id>.json`.
     InvalidResource,
     /// The document does not decode into the strict typed `ContentLock`.
     InvalidDocument,
@@ -427,11 +421,9 @@ pub struct LockResourceParts {
 /// to the bare remainder.
 pub fn parse_lock_resource_typed(resource: &str) -> Option<LockResourceParts> {
     let canonical = canonical_lock_resource(resource)?;
-    let (creator, path) = canonical.split_at(canonical.find(LOCKS_CONTENT_LOCK_PREFIX)?);
+    let (creator, _prefix, path) = split_lock_resource(&canonical)?;
     let creator = PubkyIdentity::parse(creator)?;
-    let lock_id = path
-        .strip_prefix(LOCKS_CONTENT_LOCK_PREFIX)?
-        .strip_suffix(".json")?;
+    let lock_id = path.strip_suffix(".json")?;
     Some(LockResourceParts {
         creator,
         lock_id: lock_id.to_string(),
@@ -441,7 +433,10 @@ pub fn parse_lock_resource_typed(resource: &str) -> Option<LockResourceParts> {
 /// Mirrors `pubky/locks@ba49a777:locks-sdk/src/discovery.rs:37-53`
 /// (`validate_content_lock_value`): strict typed decode first, creator
 /// comparison by key identity, then the content-address check against the
-/// TYPED serialization's derived path.
+/// TYPED serialization's derived lock id. Upstream compares the whole
+/// content-lock path; the service compares the lock id alone, because the
+/// resource may carry either content-lock prefix and the prefix is not part
+/// of the content address.
 pub fn validate_content_lock_value(
     document: &Value,
     expected_resource: &str,
@@ -453,10 +448,10 @@ pub fn validate_content_lock_value(
     if content_lock.creator != expected.creator {
         return Err(ContentLockIdentityRejection::CreatorMismatch);
     }
-    let actual_path = content_lock
-        .content_lock_path()
+    let actual_lock_id = content_lock
+        .lock_id()
         .ok_or(ContentLockIdentityRejection::InvalidDocument)?;
-    if actual_path != format!("/pub/locks.app/{}.json", expected.lock_id) {
+    if actual_lock_id != expected.lock_id {
         return Err(ContentLockIdentityRejection::PathMismatch);
     }
     Ok(content_lock)

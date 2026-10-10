@@ -44,7 +44,7 @@
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
-    canonical_lock_resource, PrepareLocksPayload, RegisterLocksPayload, LOCKS_CONTENT_LOCK_PREFIX,
+    canonical_lock_resource, split_lock_resource, PrepareLocksPayload, RegisterLocksPayload,
 };
 use marketplace_domain::{ids, Command, ErrorCode};
 use serde_json::json;
@@ -507,8 +507,9 @@ pub async fn prepare(
             "The seller's Locks resource is invalid.",
         )));
     };
-    let Some((creator, content_path)) = canonical_resource.split_once(LOCKS_CONTENT_LOCK_PREFIX)
-    else {
+    // The document is fetched under the prefix the seller published it
+    // with (`/pub/locks.app/` or upstream's `/pub/app.locks/`).
+    let Some((creator, prefix, content_path)) = split_lock_resource(&canonical_resource) else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
@@ -523,10 +524,7 @@ pub async fn prepare(
         )));
     }
     let content = match homeserver
-        .fetch_content_lock(
-            creator,
-            &format!("{LOCKS_CONTENT_LOCK_PREFIX}{content_path}"),
-        )
+        .fetch_content_lock(creator, &format!("{prefix}{content_path}"))
         .await
     {
         HomeserverFetchOutcome::Found(value) => value,

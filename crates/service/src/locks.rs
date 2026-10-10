@@ -576,10 +576,15 @@ mod tests {
             .expect("fixture creator")
             .strip_prefix("pubky")
             .expect("fixture creator carries the pubky scheme prefix");
-        let resource = format!("{creator}/pub/locks.app/{LOCK_ID}.json");
+        for prefix in marketplace_domain::commands::LOCKS_CONTENT_LOCK_PREFIXES {
+            let resource = format!("{creator}{prefix}{LOCK_ID}.json");
+            let lock = crate::content_lock::validate_content_lock_value(&document, &resource)
+                .expect("the marketplace mirror reproduces the upstream path");
+            assert_eq!(lock.lock_id().as_deref(), Some(LOCK_ID), "{prefix}");
+        }
+        let resource = format!("{creator}/pub/app.locks/{LOCK_ID}.json");
         let lock = crate::content_lock::validate_content_lock_value(&document, &resource)
-            .expect("the marketplace mirror reproduces the upstream path");
-        assert_eq!(lock.lock_id().as_deref(), Some(LOCK_ID));
+            .expect("the upstream rc10 path validates");
         assert_eq!(
             lock.validate_paykit_payment_v1_policy(),
             Ok(()),
