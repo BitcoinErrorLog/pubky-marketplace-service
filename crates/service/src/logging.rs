@@ -108,7 +108,7 @@ pub(crate) fn log_http_request(method: &str, route: &str, response: &Response, l
         .extensions()
         .get::<crate::auth::Actor>()
         .map(|actor| actor_prefix(&actor.0));
-    if route == "/health" {
+    if route == "/health" || route == "/version" {
         tracing::debug!(method, route, status, latency_ms, "http.request");
     } else if let Some(actor_prefix) = actor_prefix_value {
         tracing::info!(

@@ -198,6 +198,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/version", get(version))
         .route("/ready", get(ready))
         .route(
             "/v1/auth/sessions",
@@ -259,6 +260,16 @@ async fn log_request(request: axum::extract::Request, next: middleware::Next) ->
     let latency_ms = started.elapsed().as_millis() as u64;
     logging::log_http_request(&method, &route, &response, latency_ms);
     response
+}
+
+/// The build this process runs, baked in at compile time by `build.rs`.
+async fn version() -> Json<Value> {
+    Json(json!({
+        "name": "marketplace-service",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("MARKETPLACE_GIT_COMMIT"),
+        "built_at": env!("MARKETPLACE_BUILT_AT"),
+    }))
 }
 
 /// Public health/capability surface. `pickup_available` tells clients

@@ -4,6 +4,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY contracts ./contracts
+# Baked into the binary for GET /version (crates/service/build.rs).
+ARG GIT_COMMIT
+ARG RAILWAY_GIT_COMMIT_SHA
+ARG BUILD_TIME
+ENV GIT_COMMIT=${GIT_COMMIT} RAILWAY_GIT_COMMIT_SHA=${RAILWAY_GIT_COMMIT_SHA} BUILD_TIME=${BUILD_TIME}
 RUN cargo build --release -p marketplace-service
 
 FROM debian:bookworm-slim
