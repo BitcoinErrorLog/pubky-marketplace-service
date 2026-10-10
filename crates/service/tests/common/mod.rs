@@ -2464,6 +2464,22 @@ fn paykit_error(status: StatusCode, code: &str) -> axum::response::Response {
     (status, axum::Json(json!({ "error": { "code": code } }))).into_response()
 }
 
+fn paykit_status_error(status: StatusCode, code: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let message = match code {
+        "recovery_required" => "payment request requires recovery",
+        "invalid_conflict" => "payment request lifecycle is inconsistent",
+        "conflict" => "request conflicts with persisted payment state",
+        "unavailable" => "payment request state is unavailable",
+        _ => "fake paykit status error",
+    };
+    (
+        status,
+        axum::Json(json!({ "error": { "code": code, "message": message } })),
+    )
+        .into_response()
+}
+
 fn paykit_record_call(
     state: &Arc<Mutex<FakePaykitState>>,
     method: &str,
@@ -3237,7 +3253,7 @@ async fn serve_marketplace_status(
     let response = {
         let guard = state.lock().expect("fake paykit lock");
         if let Some((status, code)) = &guard.marketplace_status_failure {
-            return paykit_error(StatusCode::from_u16(*status).unwrap(), code);
+            return paykit_status_error(StatusCode::from_u16(*status).unwrap(), code);
         }
         guard.marketplace_status_bodies.get(&invoice_id).cloned()
     };

@@ -830,6 +830,19 @@ struct MarketplaceStatusBody {
     resolved_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceStatusErrorEnvelope {
+    error: MarketplaceStatusErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceStatusErrorBody {
+    code: String,
+    message: String,
+}
+
 /// Reads upstream paykit-server's `/transactions/status` body, which is
 /// exactly `{status, confirmations, amount_matched}`. `None` means the bytes
 /// are not that shape, and the caller fails closed as before.
@@ -1817,9 +1830,9 @@ impl PaykitClient {
 
     /// Reads one Marketplace invoice through the dedicated signed status
     /// endpoint. Producer fixture: paykit-server
-    /// `cce84b127febdc0411cd709df2b7cc913f6c4726`, tree
-    /// `faa5a49144fc27667360d15f6a0a306e58188c18` (composed reviewed typed
-    /// lifecycle, status, and live-harness commits).
+    /// `34620d4dd612818152f3039e2ea34b214a2725ce`, tree
+    /// `1d731a345f89ab4d6fb26a6ff15dd5b9a564ff2c` (typed lifecycle error
+    /// envelopes on top of the published status contract).
     pub async fn marketplace_payment_status(
         &self,
         seller_pubky: &str,
@@ -1844,7 +1857,30 @@ impl PaykitClient {
             return (PaykitStatusOutcome::NotFound, None);
         }
         if !response.status().is_success() {
-            return (PaykitStatusOutcome::Unavailable, None);
+            let status = response.status();
+            let Ok(envelope) = response.json::<MarketplaceStatusErrorEnvelope>().await else {
+                return (PaykitStatusOutcome::Unavailable, None);
+            };
+            let reason = match (status, envelope.error.code.as_str()) {
+                (reqwest::StatusCode::SERVICE_UNAVAILABLE, "recovery_required") => {
+                    "recovery_required"
+                }
+                (reqwest::StatusCode::CONFLICT, "invalid_conflict") => "invalid_conflict",
+                _ => return (PaykitStatusOutcome::Unavailable, None),
+            };
+            tracing::error!(
+                %invoice_id,
+                reason,
+                message = %envelope.error.message,
+                "ALERT upstream paykit request lifecycle requires manual review"
+            );
+            return (
+                PaykitStatusOutcome::ManualReview {
+                    reason: reason.to_string(),
+                    observation: None,
+                },
+                None,
+            );
         }
         let Ok(body) = response.json::<MarketplaceStatusBody>().await else {
             return (PaykitStatusOutcome::Unavailable, None);
@@ -1861,8 +1897,6 @@ impl PaykitClient {
                         | "canceled"
                         | "proof_submitted"
                         | "active_recurring"
-                        | "recovery_required"
-                        | "invalid_conflict"
                 )
             })
             || !body.payment_state.as_deref().is_none_or(|state| {
@@ -1906,25 +1940,7 @@ impl PaykitClient {
             body.request_state.as_deref(),
             Some("accepted" | "proof_submitted" | "active_recurring")
         );
-        let manual_review_state = matches!(
-            body.request_state.as_deref(),
-            Some("recovery_required" | "invalid_conflict")
-        );
         let Some(bitcoin) = body.bitcoin else {
-            if manual_review_state {
-                tracing::error!(
-                    %invoice_id,
-                    request_state = ?body.request_state,
-                    "ALERT upstream paykit request lifecycle requires manual review"
-                );
-                return (
-                    PaykitStatusOutcome::ManualReview {
-                        reason: body.request_state.unwrap_or_default(),
-                        observation: None,
-                    },
-                    delivery,
-                );
-            }
             return match body.payment_state.as_deref() {
                 Some("undetected" | "expired") => (PaykitStatusOutcome::Undetected, delivery),
                 _ => (PaykitStatusOutcome::Unavailable, delivery),
@@ -1941,20 +1957,7 @@ impl PaykitClient {
                 confirmations: Some(bitcoin.confirmations),
             },
         };
-        if manual_review_state {
-            tracing::error!(
-                %invoice_id,
-                request_state = ?body.request_state,
-                "ALERT upstream paykit request lifecycle requires manual review"
-            );
-            return (
-                PaykitStatusOutcome::ManualReview {
-                    reason: body.request_state.unwrap_or_default(),
-                    observation: Some(facts.observation),
-                },
-                delivery,
-            );
-        }
+
         if bitcoin.amount_matched
             && matches!(body.request_state.as_deref(), None | Some("proposed"))
         {

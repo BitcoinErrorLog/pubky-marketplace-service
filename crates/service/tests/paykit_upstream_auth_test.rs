@@ -451,36 +451,29 @@ async fn marketplace_status_distinguishes_acceptance_lag_from_manual_review_stat
         ));
     }
 
-    for request_state in ["recovery_required", "invalid_conflict"] {
+    for (status, code) in [(503, "recovery_required"), (409, "invalid_conflict")] {
         let paykit = upstream_paykit().await;
-        let mut fixture = producer_status_fixture();
-        fixture["request_state"] = json!(request_state);
-        paykit.set_marketplace_status(STATUS_INVOICE, fixture);
+        paykit.fail_marketplace_status_with(status, code);
         assert!(matches!(
             upstream_client(&paykit)
                 .marketplace_payment_status(SELLER, STATUS_INVOICE, deadline)
                 .await
                 .0,
-            PaykitStatusOutcome::ManualReview { reason, .. } if reason == request_state
+            PaykitStatusOutcome::ManualReview { reason, observation: None } if reason == code
         ));
     }
 
-    let paykit = upstream_paykit().await;
-    let mut fixture = producer_status_fixture();
-    fixture["request_state"] = json!("recovery_required");
-    fixture["bitcoin"] = Value::Null;
-    fixture["payment_state"] = json!("undetected");
-    paykit.set_marketplace_status(STATUS_INVOICE, fixture);
-    assert!(matches!(
-        upstream_client(&paykit)
-            .marketplace_payment_status(SELLER, STATUS_INVOICE, deadline)
-            .await
-            .0,
-        PaykitStatusOutcome::ManualReview {
-            observation: None,
-            ..
-        }
-    ));
+    for (status, code) in [(503, "unavailable"), (409, "conflict")] {
+        let paykit = upstream_paykit().await;
+        paykit.fail_marketplace_status_with(status, code);
+        assert_eq!(
+            upstream_client(&paykit)
+                .marketplace_payment_status(SELLER, STATUS_INVOICE, deadline)
+                .await
+                .0,
+            PaykitStatusOutcome::Unavailable
+        );
+    }
 }
 
 #[tokio::test]
@@ -1370,17 +1363,7 @@ async fn upstream_worker_routes_invalid_request_lifecycle_to_manual_review(pool:
     drain_outbox(&pool, client, app.clock.now(), 30)
         .await
         .unwrap();
-    let (invoice_id, deadline): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as("SELECT paykit_invoice_id, paykit_expires_at FROM orders WHERE id = $1")
-            .bind(order_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let mut fixture = producer_status_fixture();
-    fixture["invoice_id"] = json!(invoice_id);
-    fixture["payment_deadline"] = json!(deadline.to_rfc3339());
-    fixture["request_state"] = json!("invalid_conflict");
-    paykit.set_marketplace_status(invoice_id, fixture);
+    paykit.fail_marketplace_status_with(409, "invalid_conflict");
 
     assert_eq!(poll_now(&app, app.clock.now()).await, 1);
     let (payment_state, review_reason, order_state): (String, Option<String>, String) =
