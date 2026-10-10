@@ -741,6 +741,10 @@ pub struct PaykitObservation {
 pub struct PaykitStatusFacts {
     pub allocation_mode: String,
     pub late_settlement: bool,
+    /// Upstream's exact activated invoice deadline. Fork status does not
+    /// carry it. Used to re-pin a lost activation response before applying
+    /// later status.
+    pub payment_deadline: Option<chrono::DateTime<chrono::Utc>>,
     pub observation: PaykitObservation,
 }
 
@@ -782,6 +786,12 @@ impl PaykitDeliveryState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaykitStatusOutcome {
     Undetected,
+    /// Upstream Marketplace invoice is active without a Bitcoin observation.
+    /// Its producer-owned deadline must survive lost-activation recovery so
+    /// the worker can keep polling through the bounded late-observation tail.
+    ActiveUndetected {
+        payment_deadline: chrono::DateTime<chrono::Utc>,
+    },
     Detected {
         facts: PaykitStatusFacts,
     },
@@ -791,8 +801,56 @@ pub enum PaykitStatusOutcome {
         amount_matched: bool,
         facts: PaykitStatusFacts,
     },
+    /// Matching money observed before request acceptance reaches status.
+    /// This is not payment authority; worker polls until existing deadline.
+    AcceptancePending {
+        facts: PaykitStatusFacts,
+    },
+    /// Producer reported a lifecycle that cannot be trusted automatically.
+    ManualReview {
+        reason: String,
+        observation: Option<PaykitObservation>,
+    },
     NotFound,
     Unavailable,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceBitcoinStatus {
+    txid: String,
+    observed_sats: u64,
+    confirmations: u32,
+    amount_matched: bool,
+    paid_on_time: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceStatusBody {
+    invoice_id: uuid::Uuid,
+    state: String,
+    proposal_delivery_state: String,
+    request_state: Option<String>,
+    payment_state: Option<String>,
+    activated_at: Option<chrono::DateTime<chrono::Utc>>,
+    payment_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    bitcoin: Option<MarketplaceBitcoinStatus>,
+    outcome: Option<String>,
+    resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceStatusErrorEnvelope {
+    error: MarketplaceStatusErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceStatusErrorBody {
+    code: String,
+    message: String,
 }
 
 /// Reads upstream paykit-server's `/transactions/status` body, which is
@@ -853,32 +911,77 @@ pub enum PaykitRequestError {
     Unavailable,
 }
 
-/// The phase-1 prepared invoice, parsed from the verbatim §B.11.3 200 body.
-/// Every field is required: a body missing any of them is a contract-shape
-/// violation and the bind is refused.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// One prepared invoice, with API-specific fields kept closed instead of
+/// manufacturing fork pins for upstream invoices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaykitPrepared {
+    Fork {
+        invoice_id: uuid::Uuid,
+        stack_id: String,
+        allocation_mode: String,
+        nonce_sats: u64,
+        total_sats: u64,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        prepare_expires_at: chrono::DateTime<chrono::Utc>,
+        derived_address_fingerprint: String,
+    },
+    Upstream {
+        invoice_id: uuid::Uuid,
+        total_sats: u64,
+        prepare_expires_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PaykitPrepared {
-    pub invoice_id: uuid::Uuid,
-    pub state: String,
-    pub stack_id: String,
-    pub allocation_mode: String,
-    pub nonce_sats: u64,
-    pub total_sats: u64,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
-    pub prepare_expires_at: chrono::DateTime<chrono::Utc>,
-    pub derived_address_fingerprint: String,
+struct ForkPrepared {
+    invoice_id: uuid::Uuid,
+    state: String,
+    stack_id: String,
+    allocation_mode: String,
+    nonce_sats: u64,
+    total_sats: u64,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    prepare_expires_at: chrono::DateTime<chrono::Utc>,
+    derived_address_fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamPrepared {
+    invoice_id: uuid::Uuid,
+    state: String,
+    total_sats: u64,
+    prepare_expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The phase-2 activation 200 body (`state` is `"observing"`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaykitActivated {
     pub invoice_id: uuid::Uuid,
-    pub state: String,
     pub activated_at: chrono::DateTime<chrono::Utc>,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub payment_deadline: chrono::DateTime<chrono::Utc>,
     pub total_sats: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForkActivated {
+    invoice_id: uuid::Uuid,
+    state: String,
+    activated_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    total_sats: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamActivated {
+    invoice_id: uuid::Uuid,
+    state: String,
+    activated_at: chrono::DateTime<chrono::Utc>,
+    payment_deadline: chrono::DateTime<chrono::Utc>,
+    total_sats: u64,
 }
 
 /// The void 200 body.
@@ -893,13 +996,27 @@ pub struct PaykitVoided {
 /// The resolve success body (§B.9): the recorded resolution, echoing the
 /// invoice, the resolution, and the instant, with the finalized state
 /// (`resolved_paid_manually` / `resolved_closed`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaykitResolved {
     pub invoice_id: uuid::Uuid,
-    pub resolution: String,
+    pub outcome: String,
     pub resolved_at: chrono::DateTime<chrono::Utc>,
-    pub state: String,
+}
+
+/// Durable address of one invoice. Upstream deliberately has no stack pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaykitLifecycleTarget {
+    Fork { endpoint: String, stack_id: String },
+    Upstream { creator: String },
+}
+
+impl PaykitLifecycleTarget {
+    fn api(&self) -> PaykitApi {
+        match self {
+            Self::Fork { .. } => PaykitApi::Fork,
+            Self::Upstream { .. } => PaykitApi::Upstream,
+        }
+    }
 }
 
 /// The verbatim outcome of one signed `resolve` call, for the delivery
@@ -948,8 +1065,11 @@ impl PaykitCommandError {
         match (status.as_u16(), code.as_str()) {
             (409, "prepare_expired") => PaykitCommandError::PrepareExpired,
             (409, "invoice_finalized") => PaykitCommandError::InvoiceFinalized,
+            (409, "lifecycle_terminal" | "invoice_active") => PaykitCommandError::InvoiceFinalized,
             (404, "unknown_invoice") => PaykitCommandError::UnknownInvoice,
+            (404, "not_found") => PaykitCommandError::UnknownInvoice,
             (409, "activation_total_mismatch") => PaykitCommandError::ActivationTotalMismatch,
+            (409, "total_mismatch") => PaykitCommandError::ActivationTotalMismatch,
             (409, "stack_identity_mismatch") => PaykitCommandError::StackIdentityMismatch,
             _ if status.is_server_error() => PaykitCommandError::Unavailable,
             _ if status.is_client_error() => PaykitCommandError::UnexpectedRejection(code),
@@ -968,10 +1088,9 @@ impl PaykitCommandError {
 ///   [`paykit_signature_preimage`] (method, path and body), and seller
 ///   readiness is the signed `POST /setup/status`.
 ///
-/// The payment-request lifecycle routes (prepare, activate, void, resolve)
-/// are fork routes today. Under `Upstream` they are signed like every other
-/// request but upstream does not serve them yet, so a Bitcoin bind answers
-/// `paykit_unavailable` until the lifecycle adapter lands.
+/// New work uses this configured API. Follow-up lifecycle commands instead
+/// use the API persisted with their invoice, so a cutover or rollback cannot
+/// reinterpret queued work's route, body, or signature framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaykitApi {
     #[default]
@@ -986,6 +1105,13 @@ impl PaykitApi {
             "fork" => Ok(Self::Fork),
             "upstream" => Ok(Self::Upstream),
             _ => anyhow::bail!("{ENV_PAYKIT_SERVER_API} must be `fork` or `upstream`"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fork => "fork",
+            Self::Upstream => "upstream",
         }
     }
 }
@@ -1050,6 +1176,28 @@ pub fn attempt_reference(order_id: uuid::Uuid, attempt: i32) -> String {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     crockford_bundle_id(&bytes)
+}
+
+/// Stable UUID-v4 reference for one upstream bind attempt. Version and
+/// variant bits are set after deterministic derivation, so transport replay
+/// reuses one reference while a new bind attempt gets a new one.
+pub fn upstream_attempt_reference(order_id: uuid::Uuid, attempt: i32) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::new()
+        .chain_update(b"pubky-marketplace/upstream-paykit-reference/v1")
+        .chain_update(order_id.as_bytes())
+        .chain_update(attempt.to_be_bytes())
+        .finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+/// Stable operation identity paired with [`upstream_attempt_reference`].
+pub fn upstream_operation_id(reference: &str, attempt: i32) -> String {
+    format!("marketplace-payment:{reference}:{attempt}")
 }
 
 /// The single per-order reference every bind used before per-attempt
@@ -1225,13 +1373,14 @@ impl PaykitClient {
     /// Canonicalizes `value` and signs it for a `POST` to `url`. The fork
     /// signs the body alone; upstream signs the request preimage, whose path
     /// is the URL's path (including any base-URL prefix the server sees).
-    fn signed_body(
+    fn signed_body_for_api(
         &self,
+        api: PaykitApi,
         url: &str,
         value: &serde_json::Value,
     ) -> anyhow::Result<(String, String)> {
         let body = serde_json_canonicalizer::to_string(value)?;
-        let message = match self.api {
+        let message = match api {
             PaykitApi::Fork => body.as_bytes().to_vec(),
             PaykitApi::Upstream => {
                 let url = url::Url::parse(url)?;
@@ -1245,12 +1394,24 @@ impl PaykitClient {
         Ok((body, signature))
     }
 
+    fn signed_body(
+        &self,
+        url: &str,
+        value: &serde_json::Value,
+    ) -> anyhow::Result<(String, String)> {
+        self.signed_body_for_api(self.api, url, value)
+    }
+
     /// The base URL this client dials. The bind persists this value as the
     /// order's `paykit_stack_endpoint` in the same transaction as phase 1,
     /// so later activate/void calls route to the issuing stack even after
     /// `PAYKIT_SERVER_URL` is repointed.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub fn api(&self) -> PaykitApi {
+        self.api
     }
 
     /// Phase 1 (§B.11.3): prepares (or idempotently replays) the Paykit
@@ -1260,28 +1421,47 @@ impl PaykitClient {
     /// `{reference}:{bind_attempt}`. The 200 body is the verbatim
     /// prepared shape; a legacy 204 or a body missing any field is a
     /// hard refusal.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_payment_request(
         &self,
         seller_pubky: &str,
         buyer_pubky: &str,
-        reference: &str,
+        order_id: uuid::Uuid,
+        bind_attempt: i32,
         amount_sats: u64,
         expires_at: chrono::DateTime<chrono::Utc>,
-        idempotency_key: &str,
+        payment_window_seconds: i64,
     ) -> Result<PaykitPrepared, PaykitRequestError> {
-        let url = format!("{}/v0/payment-requests", self.base_url);
-        let (body, signature) = self
-            .signed_body(
-                &url,
-                &serde_json::json!({
+        let reference = match self.api {
+            PaykitApi::Fork => attempt_reference(order_id, bind_attempt),
+            PaykitApi::Upstream => upstream_attempt_reference(order_id, bind_attempt),
+        };
+        let (url, request) = match self.api {
+            PaykitApi::Fork => (
+                format!("{}/v0/payment-requests", self.base_url),
+                serde_json::json!({
                     "amount_sats": amount_sats,
                     "creator": pubky_app_key(seller_pubky),
                     "reader": pubky_app_key(buyer_pubky),
                     "reference": reference,
                     "expires_at": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    "idempotency_key": idempotency_key,
+                    "idempotency_key": format!("{reference}:{bind_attempt}"),
                 }),
-            )
+            ),
+            PaykitApi::Upstream => (
+                format!("{}/marketplace/payment-requests/prepare", self.base_url),
+                serde_json::json!({
+                    "amount_sats": amount_sats,
+                    "creator": pubky_app_key(seller_pubky),
+                    "operation_id": upstream_operation_id(&reference, bind_attempt),
+                    "payment_window_seconds": payment_window_seconds,
+                    "reader": pubky_app_key(buyer_pubky),
+                    "reference": reference,
+                }),
+            ),
+        };
+        let (body, signature) = self
+            .signed_body(&url, &request)
             .map_err(|_| PaykitRequestError::Rejected)?;
         let response = self
             .http
@@ -1300,16 +1480,39 @@ impl PaykitClient {
                 );
                 return Err(PaykitRequestError::Rejected);
             }
-            return match response.json::<PaykitPrepared>().await {
-                Ok(prepared) => Ok(prepared),
-                Err(error) => {
-                    tracing::error!(
-                        error = %error,
-                        "paykit phase 1 returned a body violating the prepared shape"
-                    );
-                    Err(PaykitRequestError::Rejected)
-                }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| PaykitRequestError::Rejected)?;
+            let prepared = match self.api {
+                PaykitApi::Fork => serde_json::from_slice::<ForkPrepared>(&bytes)
+                    .ok()
+                    .filter(|prepared| prepared.state == "prepared")
+                    .map(|prepared| PaykitPrepared::Fork {
+                        invoice_id: prepared.invoice_id,
+                        stack_id: prepared.stack_id,
+                        allocation_mode: prepared.allocation_mode,
+                        nonce_sats: prepared.nonce_sats,
+                        total_sats: prepared.total_sats,
+                        expires_at: prepared.expires_at,
+                        prepare_expires_at: prepared.prepare_expires_at,
+                        derived_address_fingerprint: prepared.derived_address_fingerprint,
+                    }),
+                PaykitApi::Upstream => serde_json::from_slice::<UpstreamPrepared>(&bytes)
+                    .ok()
+                    .filter(|prepared| {
+                        prepared.state == "prepared" && prepared.total_sats == amount_sats
+                    })
+                    .map(|prepared| PaykitPrepared::Upstream {
+                        invoice_id: prepared.invoice_id,
+                        total_sats: prepared.total_sats,
+                        prepare_expires_at: prepared.prepare_expires_at,
+                    }),
             };
+            return prepared.ok_or_else(|| {
+                tracing::error!("paykit phase 1 returned a body violating the prepared shape");
+                PaykitRequestError::Rejected
+            });
         }
         let code = response
             .json::<serde_json::Value>()
@@ -1317,11 +1520,37 @@ impl PaykitClient {
             .ok()
             .and_then(|body| body["error"]["code"].as_str().map(str::to_owned))
             .unwrap_or_default();
-        match code.as_str() {
-            "creator_session_invalid" => Err(PaykitRequestError::SellerAccountUnavailable),
-            "reader_not_payable" => Err(PaykitRequestError::ReaderNotPayable),
-            "reader_setup_pending" => Err(PaykitRequestError::ReaderSetupPending),
-            "invalid_request" | "invoice_conflict" => Err(PaykitRequestError::Rejected),
+        match (status, code.as_str()) {
+            (_, "creator_session_invalid" | "seller_setup_pending") => {
+                Err(PaykitRequestError::SellerAccountUnavailable)
+            }
+            (_, "reader_not_payable") => Err(PaykitRequestError::ReaderNotPayable),
+            (_, "reader_setup_pending") => Err(PaykitRequestError::ReaderSetupPending),
+            (_, "operation_conflict") => {
+                tracing::error!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "ALERT upstream paykit refused a marketplace-derived prepare request"
+                );
+                Err(PaykitRequestError::Rejected)
+            }
+            (_, "invalid_signature") => {
+                tracing::error!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "ALERT upstream paykit rejected the Marketplace signing identity"
+                );
+                Err(PaykitRequestError::Unavailable)
+            }
+            (_, "invalid_request" | "invoice_conflict") | (reqwest::StatusCode::CONFLICT, _) => {
+                Err(PaykitRequestError::Rejected)
+            }
+            // A timed-out preparation may have committed remotely. Never
+            // replay this spent attempt: next bind reserves a fresh identity,
+            // while orphan preparation stays unpublished and expires.
+            (_, "dependency_timeout") => Err(PaykitRequestError::Unavailable),
             // `bitcoin_creation_disabled` (503, §C.16) and everything else:
             // refused cleanly as an availability failure, as today.
             _ => Err(PaykitRequestError::Unavailable),
@@ -1332,12 +1561,13 @@ impl PaykitClient {
     /// stack endpoint, which may predate the configured base URL).
     async fn post_signed_to(
         &self,
+        api: PaykitApi,
         endpoint: &str,
         path: &str,
         body: serde_json::Value,
     ) -> Result<reqwest::Response, PaykitCommandError> {
         let url = format!("{}{path}", endpoint.trim_end_matches('/'));
-        let (body, signature) = self.signed_body(&url, &body).map_err(|_| {
+        let (body, signature) = self.signed_body_for_api(api, &url, &body).map_err(|_| {
             PaykitCommandError::UnexpectedRejection("body did not canonicalize".to_string())
         })?;
         self.http
@@ -1365,33 +1595,68 @@ impl PaykitClient {
     /// `total_sats` are echoed as guards.
     pub async fn activate_payment_request(
         &self,
-        endpoint: &str,
+        target: &PaykitLifecycleTarget,
         invoice_id: uuid::Uuid,
-        stack_id: &str,
         total_sats: u64,
         activation_attempt: u64,
     ) -> Result<PaykitActivated, PaykitCommandError> {
-        let response = self
-            .post_signed_to(
-                endpoint,
-                &format!("/v0/payment-requests/{invoice_id}/activate"),
+        let (endpoint, path, body) = match target {
+            PaykitLifecycleTarget::Fork { endpoint, stack_id } => (
+                endpoint.as_str(),
+                format!("/v0/payment-requests/{invoice_id}/activate"),
                 serde_json::json!({
                     "invoice_id": invoice_id,
                     "stack_id": stack_id,
                     "total_sats": total_sats,
                     "activation_attempt": activation_attempt,
                 }),
-            )
+            ),
+            PaykitLifecycleTarget::Upstream { creator } => (
+                self.base_url.as_str(),
+                "/marketplace/payment-requests/activate".to_string(),
+                serde_json::json!({
+                    "creator": pubky_app_key(creator),
+                    "invoice_id": invoice_id,
+                    "total_sats": total_sats,
+                }),
+            ),
+        };
+        let response = self
+            .post_signed_to(target.api(), endpoint, &path, body)
             .await?;
         let status = response.status();
         if status.is_success() {
-            return response.json::<PaykitActivated>().await.map_err(|error| {
-                tracing::warn!(
-                    error = %error,
-                    "paykit activate returned a malformed success body; retrying"
-                );
-                PaykitCommandError::Unavailable
-            });
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| PaykitCommandError::Unavailable)?;
+            let activated = match target {
+                PaykitLifecycleTarget::Fork { .. } => {
+                    serde_json::from_slice::<ForkActivated>(&bytes)
+                        .ok()
+                        .filter(|body| body.state == "observing")
+                        .map(|body| PaykitActivated {
+                            invoice_id: body.invoice_id,
+                            activated_at: body.activated_at,
+                            payment_deadline: body.expires_at,
+                            total_sats: body.total_sats,
+                        })
+                }
+                PaykitLifecycleTarget::Upstream { .. } => {
+                    serde_json::from_slice::<UpstreamActivated>(&bytes)
+                        .ok()
+                        .filter(|body| body.state == "active")
+                        .map(|body| PaykitActivated {
+                            invoice_id: body.invoice_id,
+                            activated_at: body.activated_at,
+                            payment_deadline: body.payment_deadline,
+                            total_sats: body.total_sats,
+                        })
+                }
+            };
+            return activated
+                .filter(|body| body.invoice_id == invoice_id && body.total_sats == total_sats)
+                .ok_or(PaykitCommandError::Unavailable);
         }
         let (status, code) = Self::error_code(response).await;
         Err(PaykitCommandError::from_status(status, code))
@@ -1401,31 +1666,47 @@ impl PaykitClient {
     /// value phase 1 returned, never one re-derived from configuration.
     pub async fn void_payment_request(
         &self,
-        endpoint: &str,
+        target: &PaykitLifecycleTarget,
         invoice_id: uuid::Uuid,
-        stack_id: &str,
         reason: &str,
     ) -> Result<PaykitVoided, PaykitCommandError> {
-        let response = self
-            .post_signed_to(
-                endpoint,
-                &format!("/v0/payment-requests/{invoice_id}/void"),
+        let (endpoint, path, body) = match target {
+            PaykitLifecycleTarget::Fork { endpoint, stack_id } => (
+                endpoint.as_str(),
+                format!("/v0/payment-requests/{invoice_id}/void"),
                 serde_json::json!({
                     "invoice_id": invoice_id,
                     "stack_id": stack_id,
                     "reason": reason,
                 }),
-            )
+            ),
+            PaykitLifecycleTarget::Upstream { creator } => (
+                self.base_url.as_str(),
+                "/marketplace/payment-requests/void".to_string(),
+                serde_json::json!({
+                    "creator": pubky_app_key(creator),
+                    "invoice_id": invoice_id,
+                }),
+            ),
+        };
+        let response = self
+            .post_signed_to(target.api(), endpoint, &path, body)
             .await?;
         let status = response.status();
         if status.is_success() {
-            return response.json::<PaykitVoided>().await.map_err(|error| {
-                tracing::warn!(
-                    error = %error,
-                    "paykit void returned a malformed success body; retrying"
-                );
-                PaykitCommandError::Unavailable
-            });
+            let body = response
+                .json::<PaykitVoided>()
+                .await
+                .map_err(|_| PaykitCommandError::Unavailable)?;
+            let accepted_state = match target {
+                PaykitLifecycleTarget::Fork { .. } => body.state.starts_with("void_"),
+                PaykitLifecycleTarget::Upstream { .. } => body.state == "voided",
+            };
+            return if body.invoice_id == invoice_id && accepted_state {
+                Ok(body)
+            } else {
+                Err(PaykitCommandError::Unavailable)
+            };
         }
         let (status, code) = Self::error_code(response).await;
         Err(PaykitCommandError::from_status(status, code))
@@ -1438,23 +1719,34 @@ impl PaykitClient {
     /// phase 1 returned, and the call dials the ROW's pinned endpoint.
     pub async fn resolve_payment_request(
         &self,
-        endpoint: &str,
+        target: &PaykitLifecycleTarget,
         invoice_id: uuid::Uuid,
-        stack_id: &str,
         resolution: &str,
         resolved_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<PaykitResolveResponse, PaykitCommandError> {
-        let response = self
-            .post_signed_to(
-                endpoint,
-                &format!("/v0/payment-requests/{invoice_id}/resolve"),
+        let (endpoint, path, request) = match target {
+            PaykitLifecycleTarget::Fork { endpoint, stack_id } => (
+                endpoint.as_str(),
+                format!("/v0/payment-requests/{invoice_id}/resolve"),
                 serde_json::json!({
                     "invoice_id": invoice_id,
                     "resolution": resolution,
                     "resolved_at": resolved_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                     "stack_id": stack_id,
                 }),
-            )
+            ),
+            PaykitLifecycleTarget::Upstream { creator } => (
+                self.base_url.as_str(),
+                "/marketplace/payment-requests/resolve".to_string(),
+                serde_json::json!({
+                    "creator": pubky_app_key(creator),
+                    "invoice_id": invoice_id,
+                    "outcome": resolution,
+                }),
+            ),
+        };
+        let response = self
+            .post_signed_to(target.api(), endpoint, &path, request)
             .await?;
         let status = response.status();
         let retry_after = response
@@ -1464,15 +1756,43 @@ impl PaykitClient {
             .map(str::to_owned);
         let body = response.text().await.unwrap_or_default();
         if status.is_success() {
-            let resolved = serde_json::from_str::<PaykitResolved>(&body)
-                .map_err(|error| {
-                    tracing::warn!(
-                        error = %error,
-                        "paykit resolve returned a malformed success body"
-                    );
-                    error
-                })
-                .ok();
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ForkResolved {
+                invoice_id: uuid::Uuid,
+                resolution: String,
+                resolved_at: chrono::DateTime<chrono::Utc>,
+                state: String,
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct UpstreamResolved {
+                invoice_id: uuid::Uuid,
+                outcome: String,
+                resolved_at: chrono::DateTime<chrono::Utc>,
+            }
+            let resolved = match target {
+                PaykitLifecycleTarget::Fork { .. } => serde_json::from_str::<ForkResolved>(&body)
+                    .ok()
+                    .filter(|value| value.invoice_id == invoice_id && !value.state.is_empty())
+                    .map(|value| PaykitResolved {
+                        invoice_id: value.invoice_id,
+                        outcome: value.resolution,
+                        resolved_at: value.resolved_at,
+                    }),
+                PaykitLifecycleTarget::Upstream { .. } => {
+                    serde_json::from_str::<UpstreamResolved>(&body)
+                        .ok()
+                        .filter(|value| {
+                            value.invoice_id == invoice_id && value.outcome == resolution
+                        })
+                        .map(|value| PaykitResolved {
+                            invoice_id: value.invoice_id,
+                            outcome: value.outcome,
+                            resolved_at: value.resolved_at,
+                        })
+                }
+            };
             return Ok(PaykitResolveResponse {
                 status,
                 code: None,
@@ -1518,6 +1838,181 @@ impl PaykitClient {
         Ok(body["stack_id"].as_str().map(str::to_owned))
     }
 
+    /// Reads one Marketplace invoice through the dedicated signed status
+    /// endpoint. Producer fixture: paykit-server
+    /// `34620d4dd612818152f3039e2ea34b214a2725ce`, tree
+    /// `1d731a345f89ab4d6fb26a6ff15dd5b9a564ff2c` (typed lifecycle error
+    /// envelopes on top of the published status contract).
+    pub async fn marketplace_payment_status(
+        &self,
+        seller_pubky: &str,
+        invoice_id: uuid::Uuid,
+        expected_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> (PaykitStatusOutcome, Option<PaykitDeliveryState>) {
+        let response = self
+            .post_signed_to(
+                PaykitApi::Upstream,
+                &self.base_url,
+                "/marketplace/payment-requests/status",
+                serde_json::json!({
+                    "creator": pubky_app_key(seller_pubky),
+                    "invoice_id": invoice_id,
+                }),
+            )
+            .await;
+        let Ok(response) = response else {
+            return (PaykitStatusOutcome::Unavailable, None);
+        };
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return (PaykitStatusOutcome::NotFound, None);
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let Ok(envelope) = response.json::<MarketplaceStatusErrorEnvelope>().await else {
+                return (PaykitStatusOutcome::Unavailable, None);
+            };
+            let reason = match (status, envelope.error.code.as_str()) {
+                (reqwest::StatusCode::SERVICE_UNAVAILABLE, "recovery_required") => {
+                    "recovery_required"
+                }
+                (reqwest::StatusCode::CONFLICT, "invalid_conflict") => "invalid_conflict",
+                _ => return (PaykitStatusOutcome::Unavailable, None),
+            };
+            tracing::error!(
+                %invoice_id,
+                reason,
+                message = %envelope.error.message,
+                "ALERT upstream paykit request lifecycle requires manual review"
+            );
+            return (
+                PaykitStatusOutcome::ManualReview {
+                    reason: reason.to_string(),
+                    observation: None,
+                },
+                None,
+            );
+        }
+        let Ok(body) = response.json::<MarketplaceStatusBody>().await else {
+            return (PaykitStatusOutcome::Unavailable, None);
+        };
+        if body.invoice_id != invoice_id
+            || !matches!(body.state.as_str(), "prepared" | "active" | "voided")
+            || !body.request_state.as_deref().is_none_or(|state| {
+                matches!(
+                    state,
+                    "proposed"
+                        | "proposal_expired"
+                        | "accepted"
+                        | "rejected"
+                        | "canceled"
+                        | "proof_submitted"
+                        | "active_recurring"
+                )
+            })
+            || !body.payment_state.as_deref().is_none_or(|state| {
+                matches!(state, "undetected" | "detected" | "confirmed" | "expired")
+            })
+            || !body
+                .outcome
+                .as_deref()
+                .is_none_or(|value| matches!(value, "paid_manually" | "refunded" | "abandoned"))
+            || body.outcome.is_some() != body.resolved_at.is_some()
+        {
+            return (PaykitStatusOutcome::Unavailable, None);
+        }
+        let delivery = match body.proposal_delivery_state.as_str() {
+            "unpublished" => None,
+            "pending" => Some(PaykitDeliveryState::Pending),
+            "delivered" => Some(PaykitDeliveryState::Delivered),
+            "failed" => Some(PaykitDeliveryState::Failed),
+            _ => return (PaykitStatusOutcome::Unavailable, None),
+        };
+        // PostgreSQL timestamps retain microsecond precision. Compare the
+        // producer deadline at that persisted precision so a valid status
+        // remains pollable after its recovered deadline is round-tripped.
+        let deadline_matches = expected_deadline.is_none_or(|expected| {
+            body.payment_deadline
+                .is_some_and(|actual| actual.timestamp_micros() == expected.timestamp_micros())
+        });
+        if body.state != "active"
+            || body.activated_at.is_none()
+            || body.payment_deadline.is_none()
+            || !deadline_matches
+            || delivery.is_none()
+        {
+            return if matches!(body.state.as_str(), "prepared" | "voided")
+                && body.proposal_delivery_state == "unpublished"
+                && body.request_state.is_none()
+                && body.payment_state.is_none()
+                && body.activated_at.is_none()
+                && body.payment_deadline.is_none()
+                && body.bitcoin.is_none()
+            {
+                (PaykitStatusOutcome::Undetected, None)
+            } else {
+                (PaykitStatusOutcome::Unavailable, None)
+            };
+        }
+        let safe_request = matches!(
+            body.request_state.as_deref(),
+            Some("accepted" | "proof_submitted" | "active_recurring")
+        );
+        let Some(bitcoin) = body.bitcoin else {
+            return match body.payment_state.as_deref() {
+                Some("undetected" | "expired") => (
+                    PaykitStatusOutcome::ActiveUndetected {
+                        payment_deadline: body
+                            .payment_deadline
+                            .expect("active status requires a payment deadline"),
+                    },
+                    delivery,
+                ),
+                _ => (PaykitStatusOutcome::Unavailable, delivery),
+            };
+        };
+        let facts = PaykitStatusFacts {
+            allocation_mode: "exclusive".to_string(),
+            late_settlement: !bitcoin.paid_on_time
+                || !safe_request
+                || body.payment_state.as_deref() == Some("expired"),
+            payment_deadline: body.payment_deadline,
+            observation: PaykitObservation {
+                txid: Some(bitcoin.txid),
+                observed_sats: Some(bitcoin.observed_sats),
+                confirmations: Some(bitcoin.confirmations),
+            },
+        };
+
+        if bitcoin.amount_matched
+            && matches!(body.request_state.as_deref(), None | Some("proposed"))
+        {
+            return (PaykitStatusOutcome::AcceptancePending { facts }, delivery);
+        }
+        let outcome = if bitcoin.amount_matched
+            && (!safe_request || body.payment_state.as_deref() == Some("expired"))
+        {
+            PaykitStatusOutcome::Confirmed {
+                amount_matched: true,
+                facts,
+            }
+        } else {
+            match body.payment_state.as_deref() {
+                Some("confirmed") => PaykitStatusOutcome::Confirmed {
+                    amount_matched: bitcoin.amount_matched,
+                    facts,
+                },
+                Some("detected") => PaykitStatusOutcome::Detected { facts },
+                Some("undetected" | "expired") => PaykitStatusOutcome::ActiveUndetected {
+                    payment_deadline: body
+                        .payment_deadline
+                        .expect("active status requires a payment deadline"),
+                },
+                _ => PaykitStatusOutcome::Unavailable,
+            }
+        };
+        (outcome, delivery)
+    }
+
     /// Polls the payment status for one order reference against the strict
     /// `paykit.bitcoin_status/v2` contract (W1.14): a missing/wrong
     /// `contract_version`, a missing/unknown `allocation_mode`, an unknown
@@ -1539,6 +2034,12 @@ impl PaykitClient {
         seller_pubky: &str,
         reference: &str,
     ) -> (PaykitStatusOutcome, Option<PaykitDeliveryState>) {
+        if self.api == PaykitApi::Upstream {
+            // Upstream status currently accepts a Locks bundle_id, not the
+            // Marketplace UUID reference or invoice_id. Never guess that
+            // identity: no request is safer than attributing another flow.
+            return (PaykitStatusOutcome::Unavailable, None);
+        }
         let url = format!("{}/transactions/status", self.base_url);
         let Ok((body, signature)) = self.signed_body(
             &url,
@@ -1628,6 +2129,7 @@ impl PaykitClient {
         let facts = PaykitStatusFacts {
             allocation_mode,
             late_settlement: body.late_settlement,
+            payment_deadline: None,
             observation: PaykitObservation {
                 txid: body.txid,
                 observed_sats: body.observed_sats,
@@ -1755,6 +2257,21 @@ pub trait PaykitStatusSource: Send + Sync + 'static {
     {
         Box::pin(async move { (self.status(seller_pubky, reference).await, None) })
     }
+
+    /// Polls using identity persisted with one invoice. Implementations that
+    /// only support the fork keep using the reference route.
+    fn status_for<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        reference: &'a str,
+        api: PaykitApi,
+        invoice_id: uuid::Uuid,
+        expected_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Pin<Box<dyn Future<Output = (PaykitStatusOutcome, Option<PaykitDeliveryState>)> + Send + 'a>>
+    {
+        let _ = (api, invoice_id, expected_deadline);
+        self.status_with_delivery(seller_pubky, reference)
+    }
 }
 
 impl PaykitStatusSource for PaykitClient {
@@ -1773,6 +2290,25 @@ impl PaykitStatusSource for PaykitClient {
     ) -> Pin<Box<dyn Future<Output = (PaykitStatusOutcome, Option<PaykitDeliveryState>)> + Send + 'a>>
     {
         Box::pin(self.payment_status_with_delivery(seller_pubky, reference))
+    }
+
+    fn status_for<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        reference: &'a str,
+        api: PaykitApi,
+        invoice_id: uuid::Uuid,
+        expected_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Pin<Box<dyn Future<Output = (PaykitStatusOutcome, Option<PaykitDeliveryState>)> + Send + 'a>>
+    {
+        match api {
+            PaykitApi::Fork => self.status_with_delivery(seller_pubky, reference),
+            PaykitApi::Upstream => Box::pin(self.marketplace_payment_status(
+                seller_pubky,
+                invoice_id,
+                expected_deadline,
+            )),
+        }
     }
 }
 
@@ -1839,6 +2375,47 @@ mod tests {
     const UPSTREAM_TEST_SEED: &str =
         "0707070707070707070707070707070707070707070707070707070707070707";
     const UPSTREAM_CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[test]
+    fn upstream_attempt_identity_known_answers_stay_stable() {
+        for (order, attempt, expected) in [
+            (
+                "00000000-0000-0000-0000-000000000000",
+                1,
+                "24078310-6330-4644-b272-86ca913119df",
+            ),
+            (
+                "00112233-4455-6677-8899-aabbccddeeff",
+                42,
+                "aced6b3e-d2bb-4dc4-8e63-d5e2ab88b625",
+            ),
+        ] {
+            let reference = upstream_attempt_reference(order.parse().unwrap(), attempt);
+            assert_eq!(reference, expected);
+            assert_eq!(
+                upstream_operation_id(&reference, attempt),
+                format!("marketplace-payment:{expected}:{attempt}")
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_lifecycle_codes_map_to_existing_worker_outcomes() {
+        for code in ["lifecycle_terminal", "invoice_active"] {
+            assert_eq!(
+                PaykitCommandError::from_status(reqwest::StatusCode::CONFLICT, code.into()),
+                PaykitCommandError::InvoiceFinalized
+            );
+        }
+        assert_eq!(
+            PaykitCommandError::from_status(reqwest::StatusCode::CONFLICT, "total_mismatch".into(),),
+            PaykitCommandError::ActivationTotalMismatch
+        );
+        assert_eq!(
+            PaykitCommandError::from_status(reqwest::StatusCode::NOT_FOUND, "not_found".into()),
+            PaykitCommandError::UnknownInvoice
+        );
+    }
 
     fn upstream_test_client(api: PaykitApi) -> PaykitClient {
         PaykitClient::new("https://paykit.example", UPSTREAM_TEST_SEED)

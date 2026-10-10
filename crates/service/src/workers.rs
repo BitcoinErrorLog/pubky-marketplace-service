@@ -58,7 +58,10 @@ use crate::handlers::payment::confirm_order;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
 use crate::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
 use crate::model::{ListingRow, PaymentRow};
-use crate::payments::{PaykitClient, PaykitCommandError, PaykitStatusOutcome, PaykitStatusSource};
+use crate::payments::{
+    PaykitClient, PaykitCommandError, PaykitLifecycleTarget, PaykitStatusOutcome,
+    PaykitStatusSource,
+};
 use crate::queries::PAYMENT_COLUMNS;
 use crate::{expiry, fx, AppState};
 
@@ -778,6 +781,13 @@ struct ActivatePayload {
     activation_attempt: i64,
 }
 
+#[derive(sqlx::FromRow)]
+struct ActivationBounds {
+    hold_expires_at: Option<DateTime<Utc>>,
+    paykit_prepare_expires_at: Option<DateTime<Utc>>,
+    paykit_api: Option<String>,
+}
+
 fn parse_activate_payload(row: &ClaimedOutboxRow) -> anyhow::Result<ActivatePayload> {
     let invoice_id = payload_str(&row.payload, "invoice_id", row.id)?
         .parse()
@@ -917,8 +927,9 @@ async fn deliver_paykit_activation(
     let payload = parse_activate_payload(row)?;
     // Read the order's persisted pin under its row lock; count this try by
     // incrementing the attempt in the payload before the call.
-    let (endpoint, stack_id, total_sats, attempt) = {
+    let (target, total_sats, attempt) = {
         let mut tx = pool.begin().await?;
+        lock_order_payment(&mut tx, payload.order_id).await?;
         let Some(order) = fetch_order_for_update(&mut tx, payload.order_id).await? else {
             anyhow::bail!(
                 "paykit.activate row {} references a missing order {}",
@@ -939,16 +950,24 @@ async fn deliver_paykit_activation(
             // An order that left `pending_payment` with its request still
             // `preparing` (a cancel from before cancel voided the request):
             // never publish it — void instead.
-            let pin = match (
-                order.paykit_invoice_id,
-                order.paykit_stack_id.clone(),
-                order.paykit_stack_endpoint.clone(),
-            ) {
-                (Some(invoice_id), Some(stack_id), Some(stack_endpoint)) => {
-                    Some(crate::handlers::cancellation::PaykitVoidPin {
+            let pin = match (order.paykit_invoice_id, order.paykit_api.as_deref()) {
+                (Some(invoice_id), Some("fork")) => match (
+                    order.paykit_stack_id.clone(),
+                    order.paykit_stack_endpoint.clone(),
+                ) {
+                    (Some(stack_id), Some(stack_endpoint)) => {
+                        Some(crate::handlers::cancellation::PaykitVoidPin::Fork {
+                            invoice_id,
+                            stack_id,
+                            stack_endpoint,
+                        })
+                    }
+                    _ => None,
+                },
+                (Some(invoice_id), Some("upstream")) => {
+                    Some(crate::handlers::cancellation::PaykitVoidPin::Upstream {
                         invoice_id,
-                        stack_id,
-                        stack_endpoint,
+                        creator: order.seller_pubky.clone(),
                     })
                 }
                 _ => None,
@@ -978,6 +997,43 @@ async fn deliver_paykit_activation(
             );
             return Ok(true);
         }
+        if order.paykit_api.as_deref() == Some("upstream") {
+            // `now` is sampled once per worker pass and may be stale behind a
+            // slow batch. PostgreSQL clock time under the locked order is the
+            // authoritative local guard; `GREATEST` retains deterministic
+            // future-time test/sweep calls without letting a stale caller
+            // move the guard backwards in production.
+            let guard_now: DateTime<Utc> =
+                sqlx::query_scalar("SELECT GREATEST($1::timestamptz, clock_timestamp())")
+                    .bind(now)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let activation_cutoff = order.paykit_prepare_expires_at.map(|deadline| {
+                deadline
+                    - chrono::Duration::seconds(
+                        crate::payment_methods::UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
+                    )
+            });
+            let activation_allowed = order.stock_held
+                && order
+                    .hold_expires_at
+                    .is_some_and(|deadline| guard_now < deadline)
+                && activation_cutoff.is_some_and(|deadline| guard_now < deadline);
+            if !activation_allowed {
+                // No signed activate leaves this process. A previous attempt
+                // may have committed remotely with a lost response, so record
+                // the released attempt for signed-status reconciliation; do
+                // not issue a blind remote void.
+                tx.commit().await?;
+                tracing::warn!(
+                    order_id = %order.id,
+                    activation_attempt = payload.activation_attempt,
+                    "refused upstream paykit activation outside the original inventory hold boundary"
+                );
+                void_prepare_effects(pool, row.id, payload.order_id, now).await?;
+                return Ok(true);
+            }
+        }
         let attempt = payload.activation_attempt + 1;
         sqlx::query(
             "UPDATE outbox SET payload = jsonb_set(payload, '{activation_attempt}', $2) \
@@ -987,46 +1043,50 @@ async fn deliver_paykit_activation(
         .bind(serde_json::json!(attempt))
         .execute(&mut *tx)
         .await?;
-        let pin = (
-            order.paykit_stack_endpoint.clone(),
-            order.paykit_stack_id.clone(),
-            order.paykit_total_sats,
-        );
+        let target = match order.paykit_api.as_deref() {
+            Some("fork") => match (
+                order.paykit_stack_endpoint.clone(),
+                order.paykit_stack_id.clone(),
+            ) {
+                (Some(endpoint), Some(stack_id)) => {
+                    PaykitLifecycleTarget::Fork { endpoint, stack_id }
+                }
+                _ => anyhow::bail!(
+                    "preparing fork order {} is missing its persisted paykit pin",
+                    payload.order_id
+                ),
+            },
+            Some("upstream") => PaykitLifecycleTarget::Upstream {
+                creator: order.seller_pubky.clone(),
+            },
+            other => anyhow::bail!(
+                "preparing order {} has invalid paykit_api {:?}",
+                payload.order_id,
+                other
+            ),
+        };
+        let total_sats = order.paykit_total_sats;
         tx.commit().await?;
-        let (Some(endpoint), Some(stack_id), Some(total_sats)) = pin else {
+        let Some(total_sats) = total_sats else {
             anyhow::bail!(
-                "preparing order {} is missing its persisted paykit pin",
+                "preparing order {} is missing paykit_total_sats",
                 payload.order_id
             );
         };
-        (endpoint, stack_id, total_sats, attempt)
+        (target, total_sats, attempt)
     };
     let total_sats = u64::try_from(total_sats)
         .map_err(|_| anyhow::anyhow!("order {} paykit_total_sats is negative", payload.order_id))?;
     match paykit
         .activate_payment_request(
-            &endpoint,
+            &target,
             payload.invoice_id,
-            &stack_id,
             total_sats,
             u64::try_from(attempt).unwrap_or(0),
         )
         .await
     {
         Ok(activated) => {
-            // §B.11.3: a well-formed activation success has
-            // `state: "observing"`. Any other state in a 200 is a
-            // malformed success — retryable under the lease like an
-            // unparseable body, never terminal, never active.
-            if activated.state != "observing" {
-                tracing::warn!(
-                    order_id = %payload.order_id,
-                    invoice_id = %payload.invoice_id,
-                    state = %activated.state,
-                    "paykit activate returned a 200 with a non-observing state; retrying"
-                );
-                return Ok(false);
-            }
             if activated.total_sats != total_sats {
                 tracing::error!(
                     order_id = %payload.order_id,
@@ -1040,15 +1100,48 @@ async fn deliver_paykit_activation(
             }
             let mut tx = pool.begin().await?;
             lock_order_payment(&mut tx, payload.order_id).await?;
+            let bounds: Option<ActivationBounds> = sqlx::query_as(
+                "SELECT hold_expires_at, paykit_prepare_expires_at, paykit_api \
+                 FROM orders WHERE id = $1 FOR UPDATE",
+            )
+            .bind(payload.order_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(bounds) = bounds else {
+                anyhow::bail!("activated paykit order {} vanished", payload.order_id);
+            };
+            if bounds.paykit_api.as_deref() == Some("upstream")
+                && (bounds
+                    .hold_expires_at
+                    .is_none_or(|hold| activated.payment_deadline > hold)
+                    || bounds
+                        .paykit_prepare_expires_at
+                        .is_none_or(|prepare| activated.activated_at >= prepare))
+            {
+                // Remote activation is already durable. Preserve its exact
+                // terms and original local hold; alert instead of extending
+                // inventory or blindly voiding a potentially live request.
+                tracing::error!(
+                    order_id = %payload.order_id,
+                    %activated.activated_at,
+                    %activated.payment_deadline,
+                    prepare_expires_at = ?bounds.paykit_prepare_expires_at,
+                    hold_expires_at = ?bounds.hold_expires_at,
+                    "ALERT upstream paykit activation exceeded persisted inventory bounds"
+                );
+            }
             // Conditional on `preparing` under the row lock: a redelivered
             // row cannot apply the flip twice.
             let flipped = sqlx::query(
                 "UPDATE orders SET paykit_activation_state = 'active', \
-                 paykit_request_state = 'pending', updated_at = $2 \
+                 paykit_request_state = 'pending', paykit_expires_at = $3, \
+                 hold_expires_at = CASE WHEN paykit_api = 'fork' THEN $3 ELSE hold_expires_at END, \
+                 updated_at = $2 \
                  WHERE id = $1 AND paykit_activation_state = 'preparing'",
             )
             .bind(payload.order_id)
             .bind(now)
+            .bind(activated.payment_deadline)
             .execute(&mut *tx)
             .await?;
             let retracked = flipped.rows_affected() == 0
@@ -1096,7 +1189,6 @@ async fn deliver_paykit_activation(
                 tracing::error!(
                     order_id = %payload.order_id,
                     invoice_id = %payload.invoice_id,
-                    stack_id = %stack_id,
                     "ALERT paykit reports an unknown invoice (stack mixup); voiding the bind"
                 );
                 void_prepare_effects(pool, row.id, payload.order_id, now).await?;
@@ -1114,8 +1206,6 @@ async fn deliver_paykit_activation(
             PaykitCommandError::StackIdentityMismatch => {
                 tracing::error!(
                     order_id = %payload.order_id,
-                    persisted_stack_id = %stack_id,
-                    endpoint = %endpoint,
                     "ALERT the persisted paykit endpoint answered with a different stack \
                      identity; voiding the bind"
                 );
@@ -1234,11 +1324,19 @@ async fn deliver_paykit_void(
     let invoice_id: Uuid = payload_str(&row.payload, "invoice_id", row.id)?
         .parse()
         .map_err(|_| anyhow::anyhow!("outbox row {} invoice_id is not a uuid", row.id))?;
-    let stack_id = payload_str(&row.payload, "stack_id", row.id)?;
-    let endpoint = payload_str(&row.payload, "stack_endpoint", row.id)?;
     let reason = payload_str(&row.payload, "reason", row.id)?;
+    let target = match row.payload["paykit_api"].as_str().unwrap_or("fork") {
+        "fork" => PaykitLifecycleTarget::Fork {
+            stack_id: payload_str(&row.payload, "stack_id", row.id)?.to_string(),
+            endpoint: payload_str(&row.payload, "stack_endpoint", row.id)?.to_string(),
+        },
+        "upstream" => PaykitLifecycleTarget::Upstream {
+            creator: payload_str(&row.payload, "creator", row.id)?.to_string(),
+        },
+        value => anyhow::bail!("outbox row {} has invalid paykit_api {value}", row.id),
+    };
     match paykit
-        .void_payment_request(endpoint, invoice_id, stack_id, reason)
+        .void_payment_request(&target, invoice_id, reason)
         .await
     {
         Ok(voided) => {
@@ -1291,7 +1389,6 @@ async fn deliver_paykit_void(
             tracing::error!(
                 row_id = row.id,
                 invoice_id = %invoice_id,
-                stack_id = %stack_id,
                 "ALERT paykit void refused with a stack identity mismatch; stamping delivered"
             );
             stamp_delivered_only(pool, row.id, now).await?;
@@ -1738,8 +1835,11 @@ struct ClaimedPaykitOrder {
     payment_id: Uuid,
     buyer_pubky: String,
     seller_pubky: String,
+    paykit_invoice_id: Uuid,
+    paykit_api: String,
     paykit_request_reference: String,
     paykit_request_state: String,
+    paykit_expires_at: Option<DateTime<Utc>>,
     paykit_allocation_mode: Option<String>,
     paykit_stack_id: Option<String>,
     paykit_stack_endpoint: Option<String>,
@@ -1776,8 +1876,8 @@ async fn claim_due_paykit_orders(
              AND (o.paykit_last_checked_at IS NULL OR o.paykit_last_checked_at <= $2) \
              ORDER BY o.paykit_last_checked_at ASC NULLS FIRST LIMIT $3 \
              FOR UPDATE OF o SKIP LOCKED\
-         ) RETURNING id, payment_id, buyer_pubky, seller_pubky, \
-         paykit_request_reference, paykit_request_state, paykit_allocation_mode, \
+         ) RETURNING id, payment_id, buyer_pubky, seller_pubky, paykit_invoice_id, paykit_api, \
+         paykit_request_reference, paykit_request_state, paykit_expires_at, paykit_allocation_mode, \
          paykit_stack_id, paykit_stack_endpoint",
     )
     .bind(now)
@@ -1824,8 +1924,11 @@ async fn apply_confirmed_paykit_payment(
     now: DateTime<Utc>,
     late_settlement: bool,
 ) -> anyhow::Result<bool> {
-    let resolution_pins_present =
-        row.paykit_stack_id.is_some() && row.paykit_stack_endpoint.is_some();
+    let resolution_pins_present = match row.paykit_api.as_str() {
+        "fork" => row.paykit_stack_id.is_some() && row.paykit_stack_endpoint.is_some(),
+        "upstream" => row.paykit_stack_id.is_none() && row.paykit_stack_endpoint.is_none(),
+        _ => false,
+    };
     let mut tx = pool.begin().await?;
     let payment: Option<PaymentRow> = sqlx::query_as(&format!(
         "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1 FOR UPDATE"
@@ -2454,8 +2557,10 @@ async fn apply_report_inside_seller_window(
             amount_matched,
             facts,
         } => ("confirmed", *amount_matched, facts),
+        PaykitStatusOutcome::AcceptancePending { facts } => ("confirmed", true, facts),
         PaykitStatusOutcome::Detected { facts } => ("detected", true, facts),
-        PaykitStatusOutcome::Undetected => {
+        PaykitStatusOutcome::ManualReview { .. } => return Ok(false),
+        PaykitStatusOutcome::Undetected | PaykitStatusOutcome::ActiveUndetected { .. } => {
             return mark_shared_manual_disappeared(pool, row, now).await
         }
         PaykitStatusOutcome::NotFound | PaykitStatusOutcome::Unavailable => return Ok(false),
@@ -2545,6 +2650,74 @@ async fn mark_shared_manual_disappeared(
     Ok(false)
 }
 
+/// Producer lifecycle corruption is never payment authority. Stop automatic
+/// handling, preserve the current hold, and surface one durable review.
+async fn apply_upstream_manual_review(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    reason: &str,
+    observation: Option<&crate::payments::PaykitObservation>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let updated: Option<(i64,)> = sqlx::query_as(
+        "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+         review_reason = 'upstream_inconsistent', manual_review_entered_at = $2, updated_at = $2 \
+         WHERE id = $1 AND state IN ('awaiting_entitlement', 'expired') RETURNING revision",
+    )
+    .bind(row.payment_id)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((revision,)) = updated else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let event_id = crate::executor::insert_event(
+        &mut tx,
+        row.id,
+        &ids::payment_aggregate_id(row.payment_id),
+        revision,
+        &row.buyer_pubky,
+        "payment.manual_review",
+        now,
+    )
+    .await?;
+    crate::handlers::insert_bitcoin_manual_review_intent(
+        &mut tx,
+        event_id,
+        &row.seller_pubky,
+        row.id,
+        crate::handlers::BitcoinReviewNotice::ConfirmationFailed,
+        now,
+    )
+    .await?;
+    let observation_json = observation.map(|facts| {
+        crate::bitcoin_review::observation_json("confirmed", false, facts, now, false)
+    });
+    sqlx::query(
+        "UPDATE orders SET paykit_request_state = 'confirmed', \
+         paykit_seller_confirmation_entered_at = NULL, \
+         paykit_seller_confirmation_deadline = NULL, \
+         paykit_observation = COALESCE($3, paykit_observation), updated_at = $2 WHERE id = $1",
+    )
+    .bind(row.id)
+    .bind(now)
+    .bind(observation_json)
+    .execute(&mut *tx)
+    .await?;
+    if let Some(observation) = observation {
+        freeze_paykit_observation(&mut tx, row.id, observation.observed_sats).await?;
+    }
+    tx.commit().await?;
+    tracing::error!(
+        order_id = %row.id,
+        %reason,
+        "ALERT upstream paykit lifecycle routed payment to manual review"
+    );
+    Ok(true)
+}
+
 /// Applies the polled paykit status for ONE claimed order. Errors
 /// propagate to the caller's per-item handler — one bad row must never
 /// stall the rest of the claimed batch.
@@ -2554,9 +2727,40 @@ async fn apply_paykit_status_outcome(
     row: &ClaimedPaykitOrder,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
+    let api = match row.paykit_api.as_str() {
+        "fork" => crate::payments::PaykitApi::Fork,
+        "upstream" => crate::payments::PaykitApi::Upstream,
+        _ => return Ok(false),
+    };
     let (outcome, delivery) = source
-        .status_with_delivery(&row.seller_pubky, &row.paykit_request_reference)
+        .status_for(
+            &row.seller_pubky,
+            &row.paykit_request_reference,
+            api,
+            row.paykit_invoice_id,
+            row.paykit_expires_at,
+        )
         .await;
+    let recovered_deadline = match &outcome {
+        PaykitStatusOutcome::Confirmed { facts, .. }
+        | PaykitStatusOutcome::AcceptancePending { facts }
+        | PaykitStatusOutcome::Detected { facts } => facts.payment_deadline,
+        PaykitStatusOutcome::ActiveUndetected { payment_deadline } => Some(*payment_deadline),
+        _ => None,
+    };
+    if row.paykit_api == "upstream" && row.paykit_expires_at.is_none() {
+        if let Some(deadline) = recovered_deadline {
+            sqlx::query(
+                "UPDATE orders SET paykit_expires_at = $3 WHERE id = $1 \
+                 AND paykit_invoice_id = $2 AND paykit_expires_at IS NULL",
+            )
+            .bind(row.id)
+            .bind(row.paykit_invoice_id)
+            .bind(deadline)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
     if let Some(delivery) = delivery {
         record_paykit_delivery(&state.pool, row, delivery).await?;
     }
@@ -2625,6 +2829,40 @@ async fn apply_paykit_status_outcome(
                 }
             }
         }
+        PaykitStatusOutcome::AcceptancePending { facts } => {
+            if row
+                .paykit_expires_at
+                .or(facts.payment_deadline)
+                .is_some_and(|deadline| now >= deadline)
+            {
+                tracing::error!(
+                    order_id = %row.id,
+                    deadline = ?row.paykit_expires_at,
+                    "ALERT matched upstream money never reached an accepted request state; \
+                     routing to manual review"
+                );
+                apply_confirmed_paykit_payment(
+                    &state.pool,
+                    row,
+                    true,
+                    &facts.observation,
+                    state.confirm_keys(),
+                    now,
+                    true,
+                )
+                .await
+            } else {
+                // Reconciliation may expose Bitcoin before request cursor.
+                // Poll within existing deadline; never extend hold or pay.
+                Ok(false)
+            }
+        }
+        PaykitStatusOutcome::ManualReview {
+            reason,
+            observation,
+        } => {
+            apply_upstream_manual_review(&state.pool, row, &reason, observation.as_ref(), now).await
+        }
         PaykitStatusOutcome::Detected { facts } => {
             // A LATE detection is fail-safe: display-only at most, never
             // the seller-confirmation entry and never a payment authority
@@ -2656,7 +2894,7 @@ async fn apply_paykit_status_outcome(
                 }
             }
         }
-        PaykitStatusOutcome::Undetected => {
+        PaykitStatusOutcome::Undetected | PaykitStatusOutcome::ActiveUndetected { .. } => {
             if row.paykit_allocation_mode.as_deref() == Some("shared_manual") {
                 mark_shared_manual_disappeared(&state.pool, row, now).await
             } else {
@@ -3131,14 +3369,16 @@ async fn expire_preparing_order(
     #[derive(sqlx::FromRow)]
     struct PreparingPin {
         paykit_invoice_id: Option<Uuid>,
+        paykit_api: Option<String>,
         paykit_stack_id: Option<String>,
         paykit_stack_endpoint: Option<String>,
+        seller_pubky: String,
         hold_expires_at: Option<DateTime<Utc>>,
         payment_id: Uuid,
     }
     let pin: Option<PreparingPin> = sqlx::query_as(
-        "SELECT o.paykit_invoice_id, o.paykit_stack_id, o.paykit_stack_endpoint, \
-             o.hold_expires_at, p.id AS payment_id \
+        "SELECT o.paykit_invoice_id, o.paykit_api, o.paykit_stack_id, o.paykit_stack_endpoint, \
+             o.seller_pubky, o.hold_expires_at, p.id AS payment_id \
              FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
     )
     .bind(order_id)
@@ -3146,13 +3386,24 @@ async fn expire_preparing_order(
     .await?;
     let Some(PreparingPin {
         paykit_invoice_id: Some(invoice_id),
-        paykit_stack_id: Some(stack_id),
-        paykit_stack_endpoint: Some(endpoint),
+        paykit_api: Some(api),
+        paykit_stack_id,
+        paykit_stack_endpoint,
+        seller_pubky,
         hold_expires_at,
         payment_id,
     }) = pin
     else {
         anyhow::bail!("preparing order {order_id} is missing its persisted paykit pin");
+    };
+    let target = match (api.as_str(), paykit_stack_endpoint, paykit_stack_id) {
+        ("fork", Some(endpoint), Some(stack_id)) => {
+            PaykitLifecycleTarget::Fork { endpoint, stack_id }
+        }
+        ("upstream", None, None) => PaykitLifecycleTarget::Upstream {
+            creator: seller_pubky,
+        },
+        _ => anyhow::bail!("preparing order {order_id} has invalid paykit lifecycle pins"),
     };
     let Some(paykit) = state
         .payments
@@ -3166,7 +3417,7 @@ async fn expire_preparing_order(
         return Ok(false);
     };
     match paykit
-        .void_payment_request(&endpoint, invoice_id, &stack_id, "hold_expired")
+        .void_payment_request(&target, invoice_id, "hold_expired")
         .await
     {
         Ok(voided) => {
@@ -3213,8 +3464,6 @@ async fn expire_preparing_order(
         Err(PaykitCommandError::StackIdentityMismatch) => {
             tracing::error!(
                 order_id = %order_id,
-                stack_id = %stack_id,
-                endpoint = %endpoint,
                 "ALERT the persisted paykit endpoint answered with a different stack identity \
                  at hold-expiry void; voiding locally"
             );
@@ -3251,7 +3500,6 @@ async fn expire_preparing_order(
             tracing::error!(
                 order_id = %order_id,
                 invoice_id = %invoice_id,
-                endpoint = %endpoint,
                 "ALERT paykit_unreachable_at_void: voiding locally past the 30-minute grace \
                  and deferring the remote void to a paykit.void outbox row"
             );
@@ -3323,30 +3571,38 @@ async fn void_and_expire_preparing_order(
     )
     .await?;
     if enqueue_void_retry {
-        let pin: (Option<Uuid>, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT paykit_invoice_id, paykit_stack_id, paykit_stack_endpoint \
+        let pin: (Option<Uuid>, Option<String>, Option<String>, Option<String>, String) = sqlx::query_as(
+            "SELECT paykit_invoice_id, paykit_api, paykit_stack_id, paykit_stack_endpoint, seller_pubky \
              FROM orders WHERE id = $1",
         )
         .bind(order_id)
         .fetch_one(&mut *tx)
         .await?;
-        let (Some(invoice_id), Some(stack_id), Some(endpoint)) = pin else {
-            anyhow::bail!("preparing order {order_id} is missing its persisted paykit pin");
+        let (Some(invoice_id), Some(api), stack_id, endpoint, creator) = pin else {
+            anyhow::bail!("preparing order {order_id} is missing its paykit invoice");
         };
-        sqlx::query(
-            "INSERT INTO outbox (event_id, kind, payload, created_at) \
-             VALUES ($1, 'paykit.void', $2, $3)",
+        let pin = match (api.as_str(), stack_id, endpoint) {
+            ("fork", Some(stack_id), Some(stack_endpoint)) => {
+                crate::handlers::cancellation::PaykitVoidPin::Fork {
+                    invoice_id,
+                    stack_id,
+                    stack_endpoint,
+                }
+            }
+            ("upstream", None, None) => crate::handlers::cancellation::PaykitVoidPin::Upstream {
+                invoice_id,
+                creator,
+            },
+            _ => anyhow::bail!("preparing order {order_id} has invalid paykit lifecycle pins"),
+        };
+        crate::handlers::cancellation::enqueue_paykit_void(
+            &mut tx,
+            event_id,
+            order_id,
+            &pin,
+            "hold_expired",
+            now,
         )
-        .bind(event_id)
-        .bind(serde_json::json!({
-            "invoice_id": invoice_id,
-            "order_id": order_id,
-            "stack_id": stack_id,
-            "stack_endpoint": endpoint,
-            "reason": "hold_expired",
-        }))
-        .bind(now)
-        .execute(&mut *tx)
         .await?;
     }
     sqlx::query("UPDATE outbox SET delivered_at = $2 WHERE id = $1")

@@ -253,10 +253,16 @@ async fn lock_payment(
 }
 
 /// The persisted phase-1 pin a `paykit.void` row is dialed with.
-pub(crate) struct PaykitVoidPin {
-    pub invoice_id: Uuid,
-    pub stack_id: String,
-    pub stack_endpoint: String,
+pub(crate) enum PaykitVoidPin {
+    Fork {
+        invoice_id: Uuid,
+        stack_id: String,
+        stack_endpoint: String,
+    },
+    Upstream {
+        invoice_id: Uuid,
+        creator: String,
+    },
 }
 
 /// Ends the Paykit leg of an unpaid order that is leaving `pending_payment`
@@ -301,23 +307,33 @@ async fn end_paykit_request(
     if order.paykit_activation_state.as_deref() != Some("preparing") {
         return Ok(None);
     }
-    let (Some(invoice_id), Some(stack_id), Some(stack_endpoint)) = (
-        order.paykit_invoice_id,
-        order.paykit_stack_id.clone(),
-        order.paykit_stack_endpoint.clone(),
-    ) else {
+    let Some(invoice_id) = order.paykit_invoice_id else {
         tracing::error!(
             order_id = %order.id,
             "ALERT a preparing order is missing its persisted paykit pin at cancel"
         );
         return Ok(None);
     };
+    let pin = match order.paykit_api.as_deref() {
+        Some("fork") => match (
+            order.paykit_stack_id.clone(),
+            order.paykit_stack_endpoint.clone(),
+        ) {
+            (Some(stack_id), Some(stack_endpoint)) => PaykitVoidPin::Fork {
+                invoice_id,
+                stack_id,
+                stack_endpoint,
+            },
+            _ => return Ok(None),
+        },
+        Some("upstream") => PaykitVoidPin::Upstream {
+            invoice_id,
+            creator: order.seller_pubky.clone(),
+        },
+        _ => return Ok(None),
+    };
     void_preparing_request(tx, order.id, now).await?;
-    Ok(Some(PaykitVoidPin {
-        invoice_id,
-        stack_id,
-        stack_endpoint,
-    }))
+    Ok(Some(pin))
 }
 
 /// `preparing → voided` for an order that is no longer payable: the request
@@ -361,18 +377,36 @@ pub(crate) async fn enqueue_paykit_void(
     reason: &str,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
+    let payload = match pin {
+        PaykitVoidPin::Fork {
+            invoice_id,
+            stack_id,
+            stack_endpoint,
+        } => serde_json::json!({
+            "invoice_id": invoice_id,
+            "order_id": order_id,
+            "paykit_api": "fork",
+            "stack_id": stack_id,
+            "stack_endpoint": stack_endpoint,
+            "reason": reason,
+        }),
+        PaykitVoidPin::Upstream {
+            invoice_id,
+            creator,
+        } => serde_json::json!({
+            "invoice_id": invoice_id,
+            "order_id": order_id,
+            "paykit_api": "upstream",
+            "creator": creator,
+            "reason": reason,
+        }),
+    };
     sqlx::query(
         "INSERT INTO outbox (event_id, kind, payload, created_at) \
          VALUES ($1, 'paykit.void', $2, $3)",
     )
     .bind(event_id)
-    .bind(serde_json::json!({
-        "invoice_id": pin.invoice_id,
-        "order_id": order_id,
-        "stack_id": pin.stack_id,
-        "stack_endpoint": pin.stack_endpoint,
-        "reason": reason,
-    }))
+    .bind(payload)
     .bind(now)
     .execute(&mut **tx)
     .await?;

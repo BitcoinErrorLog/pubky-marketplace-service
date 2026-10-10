@@ -99,6 +99,7 @@ Railway IaC `preserve()`):
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests. Its pubky-formatted public key goes into paykit-server's `[signed_services] trusted_public_keys`, beside the Locks key, when `PAYKIT_SERVER_API=upstream`; on the fork (`fork`, the default) it is `marketplace.trusted_public_key`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` rc9 with the signed-services allowlist, #55). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
+| `PAYKIT_MAX_PREPARE_TTL_SECONDS` | `900` | largest remaining upstream Paykit preparation TTL Marketplace accepts (60–86400). Align with producer `prepare_ttl_seconds`; a longer response is voided and its bind/inventory transaction rolls back. Up to 60 additional seconds are accepted only for bounded cross-service clock skew |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
 | `PAYKIT_RAIL_STALE_SECONDS` | `60` | stale-out window for cached Paykit rail and seller claim availability; must be at least `PAYKIT_POLL_SECONDS` |
 | `DELIVERY_ASSUME_DAYS` | `14` | days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1) |

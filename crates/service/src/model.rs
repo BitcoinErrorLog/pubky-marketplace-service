@@ -649,6 +649,14 @@ pub struct OrderRow {
     /// Two-phase paykit protocol (§B.11): the invoice phase 1 prepared.
     /// Internal correlation, never serialized.
     pub paykit_invoice_id: Option<Uuid>,
+    /// Durable lifecycle protocol for this invoice. Configuration changes
+    /// must not reinterpret queued work.
+    pub paykit_api: Option<String>,
+    /// Upstream support identity, persisted together; all NULL for fork.
+    pub paykit_payment_reference: Option<Uuid>,
+    pub paykit_operation_id: Option<String>,
+    pub paykit_payment_window_seconds: Option<i32>,
+    pub paykit_asset: Option<String>,
     /// The issuing stack's identity, from the phase-1 response body (never
     /// configuration); every later message on this invoice is checked
     /// against it. Never serialized.
@@ -755,6 +763,14 @@ impl std::fmt::Debug for OrderRow {
             .field("paykit_delivery_state", &self.paykit_delivery_state)
             .field("paykit_last_checked_at", &self.paykit_last_checked_at)
             .field("paykit_invoice_id", &self.paykit_invoice_id)
+            .field("paykit_api", &self.paykit_api)
+            .field("paykit_payment_reference", &self.paykit_payment_reference)
+            .field("paykit_operation_id", &self.paykit_operation_id)
+            .field(
+                "paykit_payment_window_seconds",
+                &self.paykit_payment_window_seconds,
+            )
+            .field("paykit_asset", &self.paykit_asset)
             .field("paykit_stack_id", &self.paykit_stack_id)
             .field("paykit_stack_endpoint", &self.paykit_stack_endpoint)
             .field("paykit_total_sats", &self.paykit_total_sats)
@@ -862,6 +878,11 @@ impl OrderRow {
             paykit_delivery_state: None,
             paykit_last_checked_at: None,
             paykit_invoice_id: None,
+            paykit_api: None,
+            paykit_payment_reference: None,
+            paykit_operation_id: None,
+            paykit_payment_window_seconds: None,
+            paykit_asset: None,
             paykit_stack_id: None,
             paykit_stack_endpoint: None,
             paykit_total_sats: None,
